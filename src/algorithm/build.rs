@@ -1,7 +1,9 @@
 use crate::algorithm::rabitq;
 use crate::algorithm::tuples::*;
+use crate::index::utils::load_proj_vectors;
 use crate::postgres::BufferWriteGuard;
 use crate::postgres::Relation;
+use crate::types::ExternalCentroids;
 use crate::types::RabbitholeIndexingOptions;
 use base::distance::DistanceKind;
 use base::index::VectorOptions;
@@ -35,31 +37,36 @@ pub fn build<T: HeapRelation, R: Reporter>(
     let dims = vector_options.dims;
     let is_residual =
         rabbithole_options.residual_quantization && vector_options.d == DistanceKind::L2;
-    let mut tuples_total = 0_usize;
-    let samples = {
-        let mut rand = rand::thread_rng();
-        let max_number_of_samples = rabbithole_options.nlist.saturating_mul(256);
-        let mut samples = Vec::new();
-        let mut number_of_samples = 0_u32;
-        heap_relation.traverse(|(_, vector)| {
-            pgrx::check_for_interrupts!();
-            assert_eq!(dims as usize, vector.len(), "invalid vector dimensions",);
-            let vector = rabitq::project(&vector);
-            if number_of_samples < max_number_of_samples {
-                samples.extend(vector);
-                number_of_samples += 1;
-            } else {
-                let index = rand.gen_range(0..max_number_of_samples) as usize;
-                let start = index * dims as usize;
-                let end = start + dims as usize;
-                samples[start..end].copy_from_slice(&vector);
-            }
-            tuples_total += 1;
-        });
-        Vec2::from_vec((number_of_samples as _, dims as _), samples)
+    let structure = match &rabbithole_options.external_centroids {
+        Some(_) => Structure::load(vector_options.clone(), rabbithole_options.clone()),
+        None => {
+            let mut tuples_total = 0_usize;
+            let samples = {
+                let mut rand = rand::thread_rng();
+                let max_number_of_samples = rabbithole_options.nlist.saturating_mul(256);
+                let mut samples = Vec::new();
+                let mut number_of_samples = 0_u32;
+                heap_relation.traverse(|(_, vector)| {
+                    pgrx::check_for_interrupts!();
+                    assert_eq!(dims as usize, vector.len(), "invalid vector dimensions",);
+                    let vector = rabitq::project(&vector);
+                    if number_of_samples < max_number_of_samples {
+                        samples.extend(vector);
+                        number_of_samples += 1;
+                    } else {
+                        let index = rand.gen_range(0..max_number_of_samples) as usize;
+                        let start = index * dims as usize;
+                        let end = start + dims as usize;
+                        samples[start..end].copy_from_slice(&vector);
+                    }
+                    tuples_total += 1;
+                });
+                Vec2::from_vec((number_of_samples as _, dims as _), samples)
+            };
+            reporter.tuples_total(tuples_total);
+            Structure::compute(vector_options.clone(), rabbithole_options.clone(), samples)
+        }
     };
-    reporter.tuples_total(tuples_total);
-    let structure = Structure::compute(vector_options.clone(), rabbithole_options.clone(), samples);
     let h2_len = structure.h2_len();
     let h1_len = structure.h1_len();
     let mut meta = Tape::create(&index_relation);
@@ -301,6 +308,68 @@ impl Structure {
             h2_children: (0..rabbithole_options.nlist).collect(),
             h1_means,
             h1_children: (0..rabbithole_options.nlist).map(|_| Vec::new()).collect(),
+        }
+    }
+    fn load(vector_options: VectorOptions, rabbithole_options: RabbitholeIndexingOptions) -> Self {
+        let dims = vector_options.dims;
+        let h1_means = match &rabbithole_options.external_centroids {
+            Some(ExternalCentroids {
+                table,
+                h1_means_column: h1,
+                ..
+            }) => load_proj_vectors(table, h1, rabbithole_options.nlist, vector_options.dims),
+            _ => unreachable!(),
+        };
+        let h1_children = match &rabbithole_options.external_centroids {
+            Some(ExternalCentroids {
+                table,
+                h1_children_column: Some(h1),
+                ..
+            }) => load_proj_vectors(table, h1, 1, vector_options.dims)
+                .into_iter()
+                .map(|v| v.into_iter().map(|f| f as u32).collect())
+                .collect(),
+            _ => (0..rabbithole_options.nlist).map(|_| Vec::new()).collect(),
+        };
+        let h2_mean = match &rabbithole_options.external_centroids {
+            Some(ExternalCentroids {
+                table,
+                h2_mean_column: Some(h2),
+                ..
+            }) => load_proj_vectors(table, h2, 1, vector_options.dims)
+                .pop()
+                .expect("load h2_mean panic"),
+            _ => {
+                let mut centroid = vec![0.0; dims as _];
+                for i in 0..rabbithole_options.nlist {
+                    for j in 0..dims {
+                        centroid[j as usize] += h1_means[i as usize][j as usize];
+                    }
+                }
+                for j in 0..dims {
+                    centroid[j as usize] /= rabbithole_options.nlist as f32;
+                }
+                centroid
+            }
+        };
+        let h2_children = match &rabbithole_options.external_centroids {
+            Some(ExternalCentroids {
+                table,
+                h2_children_column: Some(h2),
+                ..
+            }) => load_proj_vectors(table, h2, 1, vector_options.dims)
+                .pop()
+                .expect("load h2_children panic")
+                .into_iter()
+                .map(|f| f as u32)
+                .collect(),
+            _ => (0..rabbithole_options.nlist).collect(),
+        };
+        Structure {
+            h2_mean,
+            h2_children,
+            h1_means,
+            h1_children,
         }
     }
     fn h2_len(&self) -> u32 {
