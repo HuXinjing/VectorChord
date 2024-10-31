@@ -1,6 +1,7 @@
 use crate::algorithm::rabitq;
 use crate::algorithm::tuples::*;
-use crate::index::utils::load_proj_vectors;
+use crate::index::am_options::PgDistanceKind;
+use crate::index::utils::load_table_vectors;
 use crate::postgres::BufferWriteGuard;
 use crate::postgres::Relation;
 use crate::types::ExternalCentroids;
@@ -9,6 +10,8 @@ use base::distance::DistanceKind;
 use base::index::VectorOptions;
 use base::scalar::ScalarLike;
 use base::search::Pointer;
+use base::vector::VectBorrowed;
+use base::vector::VectorBorrowed;
 use common::vec2::Vec2;
 use rand::Rng;
 use rkyv::ser::serializers::AllocSerializer;
@@ -32,13 +35,18 @@ pub fn build<T: HeapRelation, R: Reporter>(
     rabbithole_options: RabbitholeIndexingOptions,
     heap_relation: T,
     relation: Relation,
+    pg_distance: PgDistanceKind,
     mut reporter: R,
 ) {
     let dims = vector_options.dims;
     let is_residual =
         rabbithole_options.residual_quantization && vector_options.d == DistanceKind::L2;
     let structure = match &rabbithole_options.external_centroids {
-        Some(_) => Structure::load(vector_options.clone(), rabbithole_options.clone()),
+        Some(_) => Structure::load(
+            vector_options.clone(),
+            rabbithole_options.clone(),
+            pg_distance,
+        ),
         None => {
             let mut tuples_total = 0_usize;
             let samples = {
@@ -228,14 +236,35 @@ impl Structure {
             h1_children: (0..rabbithole_options.nlist).map(|_| Vec::new()).collect(),
         }
     }
-    fn load(vector_options: VectorOptions, rabbithole_options: RabbitholeIndexingOptions) -> Self {
+    fn load(
+        vector_options: VectorOptions,
+        rabbithole_options: RabbitholeIndexingOptions,
+        pg_distance: PgDistanceKind,
+    ) -> Self {
         let dims = vector_options.dims;
+        let preprocess_data = match pg_distance {
+            PgDistanceKind::L2 | PgDistanceKind::Dot => {
+                |b: VectBorrowed<f32>| rabitq::project(b.slice())
+            }
+            PgDistanceKind::Cos => {
+                |b: VectBorrowed<f32>| rabitq::project(b.function_normalize().slice())
+            }
+        };
+        let preprocess_index = |b: VectBorrowed<f32>| b.slice().to_vec();
+
         let h1_means = match &rabbithole_options.external_centroids {
             Some(ExternalCentroids {
                 table,
                 h1_means_column: h1,
                 ..
-            }) => load_proj_vectors(table, h1, rabbithole_options.nlist, vector_options.dims),
+            }) => load_table_vectors(
+                table,
+                h1,
+                rabbithole_options.nlist,
+                vector_options.dims,
+                preprocess_data,
+            ),
+
             _ => unreachable!(),
         };
         let h1_children = match &rabbithole_options.external_centroids {
@@ -243,7 +272,7 @@ impl Structure {
                 table,
                 h1_children_column: Some(h1),
                 ..
-            }) => load_proj_vectors(table, h1, 1, vector_options.dims)
+            }) => load_table_vectors(table, h1, 1, vector_options.dims, preprocess_index)
                 .into_iter()
                 .map(|v| v.into_iter().map(|f| f as u32).collect())
                 .collect(),
@@ -254,7 +283,7 @@ impl Structure {
                 table,
                 h2_mean_column: Some(h2),
                 ..
-            }) => load_proj_vectors(table, h2, 1, vector_options.dims)
+            }) => load_table_vectors(table, h2, 1, vector_options.dims, preprocess_data)
                 .pop()
                 .expect("load h2_mean panic"),
             _ => {
@@ -275,7 +304,7 @@ impl Structure {
                 table,
                 h2_children_column: Some(h2),
                 ..
-            }) => load_proj_vectors(table, h2, 1, vector_options.dims)
+            }) => load_table_vectors(table, h2, 1, vector_options.dims, preprocess_index)
                 .pop()
                 .expect("load h2_children panic")
                 .into_iter()
