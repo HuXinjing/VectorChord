@@ -4,16 +4,17 @@
 sudo apt install -y build-essential libreadline-dev zlib1g-dev flex bison libxml2-dev libxslt-dev libssl-dev libxml2-utils xsltproc ccache pkg-config clang
 cargo install --locked cargo-pgrx
 cargo pgrx init
-cargo build --package rabbithole --lib --features pg16 --target x86_64-unknown-linux-gnu --release
-./tools/schema.sh --features pg16 --target x86_64-unknown-linux-gnu --release | expand -t 4 > ./target/schema.sql
+cargo build --package rabbithole --lib --features pg16 --target x86_64-unknown-linux-gnu --profile opt
+./tools/schema.sh --features pg16 --target x86_64-unknown-linux-gnu --profile opt
 
 export SEMVER="0.0.0"
 export VERSION="16"
 export ARCH="x86_64"
 export PLATFORM="amd64"
+export PROFILE="opt"
 ./tools/package.sh
 
-docker build -t rabbithole:pg16-latest -f ./docker/Dockerfile .
+docker build -t rabbithole:pg16-latest --build-arg PG_VERSION=16 -f ./docker/Dockerfile .
 ```
 
 Or you can use `starkind/rabbithole:pg16-latest` to run the bench.
