@@ -13,7 +13,6 @@ if version_info >= (3, 12):
 import h5py
 from faiss import Kmeans
 import numpy as np
-from tqdm import tqdm
 
 DEFAULT_LISTS = 4096
 N_ITER = 25
@@ -129,7 +128,9 @@ def kmeans_cluster(
     if n > MAX_POINTS_PER_CLUSTER * k and not mmap:
         train = reservoir_sampling(iter(data), MAX_POINTS_PER_CLUSTER * args.lists)
     elif n > MAX_POINTS_PER_CLUSTER * k and mmap:
-        reservoir_sampling_np(data, file_path, MAX_POINTS_PER_CLUSTER * args.lists, chunks)
+        reservoir_sampling_np(
+            data, file_path, MAX_POINTS_PER_CLUSTER * args.lists, chunks
+        )
         train = np.array(
             np.memmap(
                 "index.mmap",
@@ -196,6 +197,8 @@ if __name__ == "__main__":
         args.mmap,
         args.chunks,
     )
-    print(f"K-means (k=({args.lists}, {args.lists_2})): {perf_counter() - start_time:.2f}s")
+    print(
+        f"K-means (k=({args.lists}, {args.lists_2})): {perf_counter() - start_time:.2f}s"
+    )
 
     np.save(Path(args.output), centroids, allow_pickle=False)

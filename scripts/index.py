@@ -1,6 +1,5 @@
 import asyncio
 import math
-import os
 from time import perf_counter
 import argparse
 from pathlib import Path
@@ -128,7 +127,7 @@ async def add_centroids(conn, name, centroids):
         copy.set_types(["integer", "integer", "vector"])
         await copy.write_row((0, None, root))
         for i, centroid in tqdm(enumerate(centroids), desc="Adding centroids", total=n):
-            await copy.write_row((i+1, 0, centroid))
+            await copy.write_row((i + 1, 0, centroid))
         while conn.pgconn.flush() == 1:
             await asyncio.sleep(0)
 
@@ -176,9 +175,7 @@ async def monitor_index_build(conn, finish: asyncio.Event):
         blocks_total = None
         while blocks_total is None:
             await asyncio.sleep(1)
-            await acur.execute(
-                f"SELECT blocks_total FROM pg_stat_progress_create_index"
-            )
+            await acur.execute("SELECT blocks_total FROM pg_stat_progress_create_index")
             blocks_total = await acur.fetchone()
         total = 0 if blocks_total is None else blocks_total[0]
         pbar = tqdm(smoothing=0.0, total=total, desc="Building index")
@@ -186,7 +183,7 @@ async def monitor_index_build(conn, finish: asyncio.Event):
             if finish.is_set():
                 pbar.update(pbar.total - pbar.n)
                 return
-            await acur.execute(f"SELECT blocks_done FROM pg_stat_progress_create_index")
+            await acur.execute("SELECT blocks_done FROM pg_stat_progress_create_index")
             blocks_done = await acur.fetchone()
             done = 0 if blocks_done is None else blocks_done[0]
             pbar.update(done - pbar.n)
