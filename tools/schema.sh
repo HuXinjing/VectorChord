@@ -6,6 +6,8 @@ if [[ " $@ " =~ --target' '([^ ]+) ]]; then
     DIR="./target/$TARGET/release"
   elif [[ " $@ " =~ " --profile opt " ]]; then
     DIR="./target/$TARGET/opt"
+  elif [[ " $@ " =~ " --profile release " ]]; then
+    DIR="./target/$TARGET/release"
   else
     DIR="./target/$TARGET/debug"
   fi
@@ -14,6 +16,8 @@ else
     DIR="./target/release"
   elif [[ " $@ " =~ " --profile opt " ]]; then
     DIR="./target/opt"
+  elif [[ " $@ " =~ " --profile release " ]]; then
+    DIR="./target/release"
   else
     DIR="./target/debug"
   fi
@@ -44,4 +48,4 @@ CONTROL_FILEPATH="./vchord.control" SO_FILEPATH="$DIR/libvchord.so" $(dirname "$
 
 PGRX_EMBED=$code cargo rustc --package vchord --bin pgrx_embed_vchord "$@" -- --cfg pgrx_embed
 
-CARGO_PKG_VERSION="0.0.0" QEMU_LD_PREFIX=$QEMU_LD_PREFIX "${RUNNER[@]}" "$DIR/pgrx_embed_vchord" | expand -t 4 > $DIR/schema.sql
+CARGO_PKG_VERSION=${SEMVER} QEMU_LD_PREFIX=$QEMU_LD_PREFIX "${RUNNER[@]}" "$DIR/pgrx_embed_vchord" | expand -t 4 > $DIR/schema.sql

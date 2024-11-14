@@ -17,16 +17,20 @@ concurrency:
 jobs:
   semver:
     runs-on: ubuntu-latest
+    outputs:
+      SEMVER: ${{ steps.semver.outputs.SEMVER }}
     steps:
       - uses: actions/github-script@v7
+        id: semver
         with:
           script: |
-            const tag = github.context.payload.inputs?.tag || github.context.payload.release?.tag_name;
+            const tag = "${{ github.event.inputs.tag }}" || "${{ github.event.release.tag_name }}";
+            console.log(`Tag: ${tag}`);
             const r = /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-((?:0|[1-9]\d*|\d*[a-zA-Z-][0-9a-zA-Z-]*)(?:\.(?:0|[1-9]\d*|\d*[a-zA-Z-][0-9a-zA-Z-]*))*))?(?:\+([0-9a-zA-Z-]+(?:\.[0-9a-zA-Z-]+)*))?$/;
             if (!r.test(tag)) {
               core.setFailed(`Action failed with an invalid semver.`);
             }
-            core.exportVariable('SEMVER', tag);
+            core.setOutput('SEMVER', tag);
 
   build:
     runs-on: ubuntu-latest
@@ -37,6 +41,7 @@ jobs:
         arch: ["x86_64", "aarch64"]
     env:
       PGRX_IMAGE: "kemingy/pgrx:0.12.8"
+      SEMVER: ${{ needs.semver.outputs.SEMVER }}
 
     steps:
       - uses: actions/checkout@v4
@@ -65,8 +70,9 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           docker run --rm -v .:/workspace $CACHE_ENVS $PGRX_IMAGE build --lib --features pg${{ matrix.version }} --target ${{ matrix.arch }}-unknown-linux-gnu --profile $PROFILE
-          docker run --rm -v .:/workspace $CACHE_ENVS --entrypoint bash $PGRX_IMAGE ./tools/schema.sh --features pg${{ matrix.version }} --target ${{ matrix.arch }}-unknown-linux-gnu --profile $PROFILE
+          docker run --rm -v .:/workspace $CACHE_ENVS --entrypoint bash -e SEMVER=${SEMVER} $PGRX_IMAGE ./tools/schema.sh --features pg${{ matrix.version }} --target ${{ matrix.arch }}-unknown-linux-gnu --profile $PROFILE
           ./tools/package.sh
+          ls ./build
           gh release upload --clobber $SEMVER ./build/vchord-pg${VERSION}_${SEMVER}_${PLATFORM}.deb
           gh release upload --clobber $SEMVER ./build/vchord-pg${VERSION}_${ARCH}-unknown-linux-gnu_${SEMVER}.zip
 
@@ -77,6 +83,8 @@ jobs:
       matrix:
         version: ["14", "15", "16", "17"]
         platform: ["amd64", "arm64"]
+    env:
+      SEMVER: ${{ needs.semver.outputs.SEMVER }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
