@@ -5,6 +5,7 @@ use rkyv::{Archive, Deserialize, Serialize};
 #[archive(check_bytes)]
 pub struct MetaTuple {
     pub dims: u32,
+    pub height_of_root: u32,
     pub is_residual: bool,
     pub vectors_first: u32,
     pub forwards_first: u32,

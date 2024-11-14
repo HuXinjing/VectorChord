@@ -11,17 +11,31 @@ pub fn prewarm(relation: Relation, height: i32) -> String {
         .map(rkyv::check_archived_root::<MetaTuple>)
         .expect("data corruption")
         .expect("data corruption");
-    if height > 2 {
+    writeln!(message, "height of root: {}", meta_tuple.height_of_root).unwrap();
+    let prewarm_max_height = if height < 0 { 0 } else { height as u32 };
+    if prewarm_max_height > meta_tuple.height_of_root {
         return message;
     }
-    let lists = vec![meta_tuple.first];
-    writeln!(message, "number of h2 tuples: {}", lists.len()).unwrap();
-    writeln!(message, "number of h2 pages: {}", 1).unwrap();
-    if height == 2 {
-        return message;
-    }
-    let mut counter = 0_usize;
-    let lists: Vec<_> = {
+    let mut lists = {
+        let mut results = Vec::new();
+        let counter = 1_usize;
+        {
+            let vector_guard = relation.read(meta_tuple.mean.0);
+            let vector_tuple = vector_guard
+                .get()
+                .get(meta_tuple.mean.1)
+                .map(rkyv::check_archived_root::<VectorTuple>)
+                .expect("data corruption")
+                .expect("data corruption");
+            let _ = vector_tuple;
+            results.push(meta_tuple.first);
+        }
+        writeln!(message, "number of tuples: {}", results.len()).unwrap();
+        writeln!(message, "number of pages: {}", counter).unwrap();
+        results
+    };
+    let mut make_lists = |lists| {
+        let mut counter = 0_usize;
         let mut results = Vec::new();
         for list in lists {
             let mut current = list;
@@ -54,15 +68,15 @@ pub fn prewarm(relation: Relation, height: i32) -> String {
                 current = h1_guard.get().get_opaque().next;
             }
         }
+        writeln!(message, "number of tuples: {}", results.len()).unwrap();
+        writeln!(message, "number of pages: {}", counter).unwrap();
         results
     };
-    writeln!(message, "number of h1 tuples: {}", lists.len()).unwrap();
-    writeln!(message, "number of h1 pages: {}", counter).unwrap();
-    if height == 1 {
-        return message;
+    for _ in (std::cmp::max(1, prewarm_max_height)..meta_tuple.height_of_root).rev() {
+        lists = make_lists(lists);
     }
-    let mut counter = 0_usize;
-    let lists: Vec<_> = {
+    if prewarm_max_height == 0 {
+        let mut counter = 0_usize;
         let mut results = Vec::new();
         for list in lists {
             let mut current = list;
@@ -86,9 +100,8 @@ pub fn prewarm(relation: Relation, height: i32) -> String {
                 current = h0_guard.get().get_opaque().next;
             }
         }
-        results
-    };
-    writeln!(message, "number of h0 tuples: {}", lists.len()).unwrap();
-    writeln!(message, "number of h0 pages: {}", counter).unwrap();
+        writeln!(message, "number of tuples: {}", results.len()).unwrap();
+        writeln!(message, "number of pages: {}", counter).unwrap();
+    }
     message
 }

@@ -1,12 +1,12 @@
 use serde::{Deserialize, Serialize};
-use validator::Validate;
+use validator::{Validate, ValidationError, ValidationErrors};
 
 #[derive(Debug, Clone, Serialize, Deserialize, Validate)]
 #[serde(deny_unknown_fields)]
 pub struct RabbitholeInternalBuildOptions {
     #[serde(default = "RabbitholeInternalBuildOptions::default_lists")]
-    #[validate(range(min = 1, max = 1_000_000))]
-    pub lists: u32,
+    #[validate(length(min = 1, max = 8), custom(function = RabbitholeInternalBuildOptions::validate_lists))]
+    pub lists: Vec<u32>,
     #[serde(default = "RabbitholeInternalBuildOptions::default_spherical_centroids")]
     pub spherical_centroids: bool,
     #[serde(default = "RabbitholeInternalBuildOptions::default_build_threads")]
@@ -15,8 +15,17 @@ pub struct RabbitholeInternalBuildOptions {
 }
 
 impl RabbitholeInternalBuildOptions {
-    fn default_lists() -> u32 {
-        1000
+    fn default_lists() -> Vec<u32> {
+        vec![1000]
+    }
+    fn validate_lists(lists: &[u32]) -> Result<(), ValidationError> {
+        if !lists.is_sorted() {
+            return Err(ValidationError::new("`lists` should be in ascending order"));
+        }
+        if !lists.iter().all(|x| (1..=1 << 24).contains(x)) {
+            return Err(ValidationError::new("list is too long or too short"));
+        }
+        Ok(())
     }
     fn default_spherical_centroids() -> bool {
         false
@@ -57,7 +66,7 @@ impl Default for RabbitholeBuildOptions {
 }
 
 impl Validate for RabbitholeBuildOptions {
-    fn validate(&self) -> Result<(), validator::ValidationErrors> {
+    fn validate(&self) -> Result<(), ValidationErrors> {
         use RabbitholeBuildOptions::*;
         match self {
             Internal(internal_build) => internal_build.validate(),

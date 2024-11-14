@@ -8,7 +8,7 @@ pub fn k_means<S: ScalarLike>(
     parallelism: &impl Parallelism,
     c: usize,
     dims: usize,
-    samples: Vec<Vec<S>>,
+    samples: &Vec<Vec<S>>,
     is_spherical: bool,
     iterations: usize,
 ) -> Vec<Vec<S>> {
@@ -16,7 +16,7 @@ pub fn k_means<S: ScalarLike>(
     assert!(dims > 0);
     let n = samples.len();
     if n <= c {
-        quick_centers(c, dims, samples, is_spherical)
+        quick_centers(c, dims, samples.clone(), is_spherical)
     } else {
         let mut lloyd_k_means = LloydKMeans::new(parallelism, c, dims, samples, is_spherical);
         for _ in 0..iterations {
@@ -75,7 +75,7 @@ struct LloydKMeans<'a, P, S> {
     centroids: Vec<Vec<S>>,
     assign: Vec<usize>,
     rng: StdRng,
-    samples: Vec<Vec<S>>,
+    samples: &'a Vec<Vec<S>>,
 }
 
 const DELTA: f32 = f16::EPSILON.to_f32_const();
@@ -85,7 +85,7 @@ impl<'a, P: Parallelism, S: ScalarLike> LloydKMeans<'a, P, S> {
         parallelism: &'a P,
         c: usize,
         dims: usize,
-        samples: Vec<Vec<S>>,
+        samples: &'a Vec<Vec<S>>,
         is_spherical: bool,
     ) -> Self {
         let n = samples.len();
@@ -127,7 +127,7 @@ impl<'a, P: Parallelism, S: ScalarLike> LloydKMeans<'a, P, S> {
         let dims = self.dims;
         let c = self.c;
         let rand = &mut self.rng;
-        let samples = &self.samples;
+        let samples = self.samples;
         let n = samples.len();
 
         let (sum, mut count) = self

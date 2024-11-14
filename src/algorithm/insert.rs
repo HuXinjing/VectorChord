@@ -77,7 +77,7 @@ pub fn insert(relation: Relation, payload: Pointer, vector: Vec<f32>, distance_k
         }
     };
     let h0_payload = payload.as_u64();
-    let list = (
+    let mut list = (
         meta_tuple.first,
         if is_residual {
             let vector_guard = relation.read(meta_tuple.mean.0);
@@ -92,7 +92,7 @@ pub fn insert(relation: Relation, payload: Pointer, vector: Vec<f32>, distance_k
             None
         },
     );
-    let list = {
+    let make_list = |list: (u32, Option<Vec<f32>>)| {
         let mut results = Vec::new();
         {
             let lut = if is_residual {
@@ -163,6 +163,9 @@ pub fn insert(relation: Relation, payload: Pointer, vector: Vec<f32>, distance_k
             (first, mean)
         }
     };
+    for _ in (1..meta_tuple.height_of_root).rev() {
+        list = make_list(list);
+    }
     let code = if is_residual {
         rabitq::code(dims, &f32::vector_sub(&vector, list.1.as_ref().unwrap()))
     } else {

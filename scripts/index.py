@@ -71,7 +71,7 @@ def get_ivf_ops_config(metric, workers, k=None, name=None):
         config = "residual_quantization = true"
         internal_centroids_cfg = f"""
         [build.internal]
-        lists = {k}
+        lists = [{k}]
         build_threads = {workers}
         spherical_centroids = false
         """
@@ -80,7 +80,7 @@ def get_ivf_ops_config(metric, workers, k=None, name=None):
         config = "residual_quantization = false"
         internal_centroids_cfg = f"""
         [build.internal]
-        lists = {k}
+        lists = [{k}]
         build_threads = {workers}
         spherical_centroids = true
         """
@@ -89,7 +89,7 @@ def get_ivf_ops_config(metric, workers, k=None, name=None):
         config = "residual_quantization = false"
         internal_centroids_cfg = f"""
         [build.internal]
-        lists = {k}
+        lists = [{k}]
         build_threads = {workers}
         spherical_centroids = true
         """

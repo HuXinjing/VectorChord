@@ -16,7 +16,7 @@ CREATE INDEX ON t USING vchordrq (val vector_l2_ops)
 WITH (options = $$
 residual_quantization = true
 [build.internal]
-lists = 32
+lists = [32]
 spherical_centroids = false
 $$);
 
@@ -25,7 +25,7 @@ CREATE INDEX ON t USING vchordrq (val vector_ip_ops)
 WITH (options = $$
 residual_quantization = false
 [build.internal]
-lists = 32
+lists = [32]
 spherical_centroids = true
 $$);
 
@@ -34,7 +34,7 @@ CREATE INDEX ON t USING vchordrq (val vector_cosine_ops)
 WITH (options = $$
 residual_quantization = false
 [build.internal]
-lists = 32
+lists = [32]
 spherical_centroids = true
 $$);
 

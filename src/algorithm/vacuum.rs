@@ -5,19 +5,17 @@ use base::search::Pointer;
 pub fn vacuum(relation: Relation, delay: impl Fn(), callback: impl Fn(Pointer) -> bool) {
     // step 1: vacuum height_0_tuple
     {
-        let h1_firsts = {
-            let meta_guard = relation.read(0);
-            let meta_tuple = meta_guard
-                .get()
-                .get(1)
-                .map(rkyv::check_archived_root::<MetaTuple>)
-                .expect("data corruption")
-                .expect("data corruption");
-            vec![meta_tuple.first]
-        };
-        let h0_firsts = {
+        let meta_guard = relation.read(0);
+        let meta_tuple = meta_guard
+            .get()
+            .get(1)
+            .map(rkyv::check_archived_root::<MetaTuple>)
+            .expect("data corruption")
+            .expect("data corruption");
+        let mut firsts = vec![meta_tuple.first];
+        let make_firsts = |firsts| {
             let mut results = Vec::new();
-            for first in h1_firsts {
+            for first in firsts {
                 let mut current = first;
                 while current != u32::MAX {
                     let h1_guard = relation.read(current);
@@ -39,7 +37,10 @@ pub fn vacuum(relation: Relation, delay: impl Fn(), callback: impl Fn(Pointer) -
             }
             results
         };
-        for first in h0_firsts {
+        for _ in (1..meta_tuple.height_of_root).rev() {
+            firsts = make_firsts(firsts);
+        }
+        for first in firsts {
             let mut current = first;
             while current != u32::MAX {
                 delay();

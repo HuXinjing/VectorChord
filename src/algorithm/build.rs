@@ -38,7 +38,7 @@ pub fn build<T: HeapRelation, R: Reporter>(
     let dims = vector_options.dims;
     let is_residual =
         vchordrq_options.residual_quantization && vector_options.d == DistanceKind::L2;
-    let structure = match vchordrq_options.build {
+    let structures = match vchordrq_options.build {
         RabbitholeBuildOptions::External(external_build) => Structure::extern_build(
             vector_options.clone(),
             heap_relation.opfamily(),
@@ -48,7 +48,8 @@ pub fn build<T: HeapRelation, R: Reporter>(
             let mut tuples_total = 0_u64;
             let samples = {
                 let mut rand = rand::thread_rng();
-                let max_number_of_samples = internal_build.lists.saturating_mul(256);
+                let max_number_of_samples =
+                    internal_build.lists.last().unwrap().saturating_mul(256);
                 let mut samples = Vec::new();
                 let mut number_of_samples = 0_u32;
                 heap_relation.traverse(false, |(_, vector)| {
@@ -68,58 +69,90 @@ pub fn build<T: HeapRelation, R: Reporter>(
             Structure::internal_build(vector_options.clone(), internal_build.clone(), samples)
         }
     };
-    let h2_len = structure.h2_len();
-    let h1_len = structure.h1_len();
     let mut meta = Tape::create(&relation, false);
     assert_eq!(meta.first(), 0);
     let mut forwards = Tape::<std::convert::Infallible>::create(&relation, false);
     assert_eq!(forwards.first(), 1);
     let mut vectors = Tape::create(&relation, true);
     assert_eq!(vectors.first(), 2);
-    let h2_means = (0..h2_len)
-        .map(|i| {
-            vectors.push(&VectorTuple {
+    let mut pointer_of_means = Vec::<Vec<(u32, u16)>>::new();
+    for i in 0..structures.len() {
+        let mut level = Vec::new();
+        for j in 0..structures[i].len() {
+            let pointer = vectors.push(&VectorTuple {
                 payload: None,
-                vector: structure.h2_means(i).clone(),
-            })
-        })
-        .collect::<Vec<_>>();
-    let h1_means = (0..h1_len)
-        .map(|i| {
-            vectors.push(&VectorTuple {
-                payload: None,
-                vector: structure.h1_means(i).clone(),
-            })
-        })
-        .collect::<Vec<_>>();
-    let h1_firsts = (0..h1_len)
-        .map(|_| {
-            let tape = Tape::<Height0Tuple>::create(&relation, false);
-            tape.first()
-        })
-        .collect::<Vec<_>>();
-    let h2_firsts = (0..h2_len)
-        .map(|i| {
-            let mut tape = Tape::<Height1Tuple>::create(&relation, false);
-            let mut cache = Vec::new();
-            let h2_mean = structure.h2_means(i);
-            let children = structure.h2_children(i);
-            for child in children.iter().copied() {
-                let h1_mean = structure.h1_means(child);
-                let code = if is_residual {
-                    rabitq::code(dims, &f32::vector_sub(h1_mean, h2_mean))
-                } else {
-                    rabitq::code(dims, h1_mean)
-                };
-                cache.push((child, code));
-                if cache.len() == 32 {
+                vector: structures[i].means[j].clone(),
+            });
+            level.push(pointer);
+        }
+        pointer_of_means.push(level);
+    }
+    let mut pointer_of_firsts = Vec::<Vec<u32>>::new();
+    for i in 0..structures.len() {
+        let mut level = Vec::new();
+        for j in 0..structures[i].len() {
+            if i == 0 {
+                let tape = Tape::<Height0Tuple>::create(&relation, false);
+                level.push(tape.first());
+            } else {
+                let mut tape = Tape::<Height1Tuple>::create(&relation, false);
+                let mut cache = Vec::new();
+                let h2_mean = &structures[i].means[j];
+                let h2_children = &structures[i].children[j];
+                for child in h2_children.iter().copied() {
+                    let h1_mean = &structures[i - 1].means[child as usize];
+                    let code = if is_residual {
+                        rabitq::code(dims, &f32::vector_sub(h1_mean, h2_mean))
+                    } else {
+                        rabitq::code(dims, h1_mean)
+                    };
+                    cache.push((child, code));
+                    if cache.len() == 32 {
+                        let group = std::mem::take(&mut cache);
+                        let codes = std::array::from_fn(|k| group[k].1.clone());
+                        let packed = rabitq::pack_codes(dims, codes);
+                        tape.push(&Height1Tuple {
+                            mask: [true; 32],
+                            mean: std::array::from_fn(|k| {
+                                pointer_of_means[i - 1][group[k].0 as usize]
+                            }),
+                            first: std::array::from_fn(|k| {
+                                pointer_of_firsts[i - 1][group[k].0 as usize]
+                            }),
+                            dis_u_2: packed.dis_u_2,
+                            factor_ppc: packed.factor_ppc,
+                            factor_ip: packed.factor_ip,
+                            factor_err: packed.factor_err,
+                            t: packed.t,
+                        });
+                    }
+                }
+                if !cache.is_empty() {
                     let group = std::mem::take(&mut cache);
-                    let code = std::array::from_fn(|i| group[i].1.clone());
-                    let packed = rabitq::pack_codes(dims, code);
+                    let codes = std::array::from_fn(|k| {
+                        if k < group.len() {
+                            group[k].1.clone()
+                        } else {
+                            rabitq::dummy_code(dims)
+                        }
+                    });
+                    let packed = rabitq::pack_codes(dims, codes);
                     tape.push(&Height1Tuple {
-                        mask: [true; 32],
-                        mean: std::array::from_fn(|i| h1_means[group[i].0 as usize]),
-                        first: std::array::from_fn(|i| h1_firsts[group[i].0 as usize]),
+                        mask: std::array::from_fn(|k| k < group.len()),
+                        mean: std::array::from_fn(|k| {
+                            if k < group.len() {
+                                pointer_of_means[i - 1][group[k].0 as usize]
+                            } else {
+                                Default::default()
+                            }
+                        }),
+                        first: std::array::from_fn(|k| {
+                            if k < group.len() {
+                                pointer_of_firsts[i - 1][group[k].0 as usize]
+                            } else {
+                                Default::default()
+                            }
+                        }),
                         dis_u_2: packed.dis_u_2,
                         factor_ppc: packed.factor_ppc,
                         factor_ip: packed.factor_ip,
@@ -127,122 +160,86 @@ pub fn build<T: HeapRelation, R: Reporter>(
                         t: packed.t,
                     });
                 }
+                level.push(tape.first());
             }
-            if !cache.is_empty() {
-                let group = std::mem::take(&mut cache);
-                let codes = std::array::from_fn(|i| {
-                    if i < group.len() {
-                        group[i].1.clone()
-                    } else {
-                        rabitq::dummy_code(dims)
-                    }
-                });
-                let packed = rabitq::pack_codes(dims, codes);
-                tape.push(&Height1Tuple {
-                    mask: std::array::from_fn(|i| i < group.len()),
-                    mean: std::array::from_fn(|i| {
-                        if i < group.len() {
-                            h1_means[group[i].0 as usize]
-                        } else {
-                            Default::default()
-                        }
-                    }),
-                    first: std::array::from_fn(|i| {
-                        if i < group.len() {
-                            h1_firsts[group[i].0 as usize]
-                        } else {
-                            Default::default()
-                        }
-                    }),
-                    dis_u_2: packed.dis_u_2,
-                    factor_ppc: packed.factor_ppc,
-                    factor_ip: packed.factor_ip,
-                    factor_err: packed.factor_err,
-                    t: packed.t,
-                });
-            }
-            tape.first()
-        })
-        .collect::<Vec<_>>();
+        }
+        pointer_of_firsts.push(level);
+    }
     forwards.head.get_mut().get_opaque_mut().fast_forward = vectors.first();
     meta.push(&MetaTuple {
         dims,
+        height_of_root: structures.len() as u32,
         is_residual,
         vectors_first: vectors.first(),
         forwards_first: forwards.first(),
-        mean: h2_means[0],
-        first: h2_firsts[0],
+        mean: pointer_of_means.last().unwrap()[0],
+        first: pointer_of_firsts.last().unwrap()[0],
     });
 }
 
 struct Structure {
-    h2_means: Vec<Vec<f32>>,
-    h2_children: Vec<Vec<u32>>,
-    h1_means: Vec<Vec<f32>>,
-    h1_children: Vec<Vec<u32>>,
+    means: Vec<Vec<f32>>,
+    children: Vec<Vec<u32>>,
 }
 
 impl Structure {
+    fn len(&self) -> usize {
+        self.children.len()
+    }
     fn internal_build(
         vector_options: VectorOptions,
         internal_build: RabbitholeInternalBuildOptions,
-        samples: Vec<Vec<f32>>,
-    ) -> Self {
-        let h1_means = crate::algorithm::parallelism::RayonParallelism::scoped(
-            internal_build.build_threads as _,
-            Arc::new(|| {
-                pgrx::check_for_interrupts!();
-            }),
-            |parallelism| {
-                k_means::k_means(
-                    parallelism,
-                    internal_build.lists as usize,
-                    vector_options.dims as usize,
-                    samples,
-                    internal_build.spherical_centroids,
-                    10,
-                )
-            },
-        )
-        .expect("failed to create thread pool");
-        let h1_children = vec![Vec::new(); h1_means.len()];
-        let h2_means = crate::algorithm::parallelism::RayonParallelism::scoped(
-            internal_build.build_threads as _,
-            Arc::new(|| {
-                pgrx::check_for_interrupts!();
-            }),
-            |parallelism| {
-                k_means::k_means(
-                    parallelism,
-                    1,
-                    vector_options.dims as usize,
-                    h1_means.clone(),
-                    internal_build.spherical_centroids,
-                    10,
-                )
-            },
-        )
-        .expect("failed to create thread pool");
-        let mut h2_children = vec![Vec::new(); h2_means.len()];
-        for i in 0..h1_means.len() as u32 {
-            let target: usize = k_means::k_means_lookup(&h1_means[i as usize], &h2_means);
-            h2_children[target].push(i);
+        mut samples: Vec<Vec<f32>>,
+    ) -> Vec<Self> {
+        use std::iter::once;
+        for sample in samples.iter_mut() {
+            *sample = rabitq::project(sample);
         }
-        let (h2_means, h2_children) = std::iter::zip(h2_means, h2_children)
-            .filter(|(_, x)| !x.is_empty())
-            .unzip::<_, _, Vec<_>, Vec<_>>();
-        Structure {
-            h2_means: h2_means.into_iter().map(|x| rabitq::project(&x)).collect(),
-            h2_children,
-            h1_means: h1_means.into_iter().map(|x| rabitq::project(&x)).collect(),
-            h1_children,
+        let mut result = Vec::<Self>::new();
+        for w in internal_build.lists.iter().rev().copied().chain(once(1)) {
+            let means = crate::algorithm::parallelism::RayonParallelism::scoped(
+                internal_build.build_threads as _,
+                Arc::new(|| {
+                    pgrx::check_for_interrupts!();
+                }),
+                |parallelism| {
+                    k_means::k_means(
+                        parallelism,
+                        w as usize,
+                        vector_options.dims as usize,
+                        if let Some(structure) = result.last() {
+                            &structure.means
+                        } else {
+                            &samples
+                        },
+                        internal_build.spherical_centroids,
+                        10,
+                    )
+                },
+            )
+            .expect("failed to create thread pool");
+            if let Some(structure) = result.last() {
+                let mut children = vec![Vec::new(); means.len()];
+                for i in 0..structure.len() as u32 {
+                    let target = k_means::k_means_lookup(&structure.means[i as usize], &means);
+                    children[target].push(i);
+                }
+                let (means, children) = std::iter::zip(means, children)
+                    .filter(|(_, x)| !x.is_empty())
+                    .unzip::<_, _, Vec<_>, Vec<_>>();
+                result.push(Structure { means, children });
+            } else {
+                let children = vec![Vec::new(); means.len()];
+                result.push(Structure { means, children });
+            }
         }
+        result
     }
     fn extern_build(
         vector_options: VectorOptions,
         _opfamily: Opfamily,
         external_build: RabbitholeExternalBuildOptions,
-    ) -> Self {
+    ) -> Vec<Self> {
         use std::collections::BTreeMap;
         let RabbitholeExternalBuildOptions { table } = external_build;
         let query = format!("SELECT id, parent, vector FROM {table};");
@@ -328,7 +325,7 @@ impl Structure {
             .into_iter()
             .map(|(k, v)| (k, v.expect("not a connected graph")))
             .collect::<BTreeMap<_, _>>();
-        if heights[&root] != 2 {
+        if !(1..=8).contains(&(heights[&root] - 1)) {
             pgrx::error!(
                 "extern build: unexpected tree height, height = {}",
                 heights[&root]
@@ -359,33 +356,12 @@ impl Structure {
                 })
                 .unzip()
         }
-        let (h2_means, h2_children) = extract(2, &labels, &vectors, &children);
-        let (h1_means, h1_children) = extract(1, &labels, &vectors, &children);
-        Self {
-            h2_means,
-            h2_children,
-            h1_means,
-            h1_children,
+        let mut result = Vec::new();
+        for height in 1..=heights[&root] {
+            let (means, children) = extract(height, &labels, &vectors, &children);
+            result.push(Structure { means, children });
         }
-    }
-    fn h2_len(&self) -> u32 {
-        self.h2_means.len() as _
-    }
-    fn h2_means(&self, i: u32) -> &Vec<f32> {
-        &self.h2_means[i as usize]
-    }
-    fn h2_children(&self, i: u32) -> &Vec<u32> {
-        &self.h2_children[i as usize]
-    }
-    fn h1_len(&self) -> u32 {
-        self.h1_means.len() as _
-    }
-    fn h1_means(&self, i: u32) -> &Vec<f32> {
-        &self.h1_means[i as usize]
-    }
-    #[allow(dead_code)]
-    fn h1_children(&self, i: u32) -> &Vec<u32> {
-        &self.h1_children[i as usize]
+        result
     }
 }
 

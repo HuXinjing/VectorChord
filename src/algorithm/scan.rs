@@ -15,7 +15,7 @@ pub fn scan(
     relation: Relation,
     vector: Vec<f32>,
     distance_kind: DistanceKind,
-    probes: u32,
+    probes: Vec<u32>,
     epsilon: f32,
 ) -> impl Iterator<Item = (Distance, Pointer)> {
     let meta_guard = relation.read(0);
@@ -26,7 +26,9 @@ pub fn scan(
         .expect("data corruption")
         .expect("data corruption");
     let dims = meta_tuple.dims;
+    let height_of_root = meta_tuple.height_of_root;
     assert_eq!(dims as usize, vector.len(), "invalid vector dimensions");
+    assert_eq!(height_of_root as usize, 1 + probes.len(), "invalid probes");
     let vector = rabitq::project(&vector);
     let is_residual = meta_tuple.is_residual;
     let default_lut = if !is_residual {
@@ -34,7 +36,7 @@ pub fn scan(
     } else {
         None
     };
-    let lists: Vec<_> = vec![(
+    let mut lists: Vec<_> = vec![(
         meta_tuple.first,
         if is_residual {
             let vector_guard = relation.read(meta_tuple.mean.0);
@@ -49,7 +51,7 @@ pub fn scan(
             None
         },
     )];
-    let lists: Vec<_> = {
+    let make_lists = |lists: Vec<(u32, Option<Vec<f32>>)>, probes| {
         let mut results = Vec::new();
         for list in lists {
             let lut = if is_residual {
@@ -122,6 +124,9 @@ pub fn scan(
         .take(probes as usize)
         .collect()
     };
+    for i in (1..meta_tuple.height_of_root).rev() {
+        lists = make_lists(lists, probes[i as usize - 1]);
+    }
     {
         let mut results = Vec::new();
         for list in lists {
