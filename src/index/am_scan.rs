@@ -1,6 +1,7 @@
 use super::am_options::Opfamily;
 use crate::algorithm::scan::scan;
 use crate::gucs::executing::epsilon;
+use crate::gucs::executing::max_scan_tuples;
 use crate::gucs::executing::probes;
 use crate::postgres::Relation;
 use base::distance::Distance;
@@ -86,7 +87,11 @@ pub fn scan_next(scanner: &mut Scanner, relation: Relation) -> Option<(Pointer, 
                 epsilon(),
             );
             *scanner = Scanner::Vbase {
-                vbase: Box::new(vbase),
+                vbase: if let Some(max_scan_tuples) = max_scan_tuples() {
+                    Box::new(vbase.take(max_scan_tuples as usize))
+                } else {
+                    Box::new(vbase)
+                },
                 threshold: *threshold,
                 recheck: *recheck,
                 opfamily: *opfamily,
