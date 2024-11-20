@@ -91,6 +91,7 @@ impl Page {
             Some(std::slice::from_raw_parts(ptr, lp_len as _))
         }
     }
+    #[allow(unused)]
     pub fn get_mut(&mut self, i: u16) -> Option<&mut [u8]> {
         use pgrx::pg_sys::{ItemIdData, PageHeaderData};
         if i == 0 {
@@ -132,6 +133,22 @@ impl Page {
     pub fn free(&mut self, i: u16) {
         unsafe {
             pgrx::pg_sys::PageIndexTupleDeleteNoCompact((self as *mut Self).cast(), i);
+        }
+    }
+    pub fn reconstruct(&mut self, removes: &[u16]) {
+        let mut removes = removes.to_vec();
+        removes.sort();
+        removes.dedup();
+        let n = removes.len();
+        if n > 0 {
+            assert!(removes[n - 1] <= self.len());
+            unsafe {
+                pgrx::pg_sys::PageIndexMultiDelete(
+                    (self as *mut Self).cast(),
+                    removes.as_ptr().cast_mut(),
+                    removes.len() as _,
+                );
+            }
         }
     }
     pub fn freespace(&self) -> u16 {

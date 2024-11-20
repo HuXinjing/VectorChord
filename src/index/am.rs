@@ -190,7 +190,7 @@ pub unsafe extern "C" fn ambuild(
                 let vector = unsafe { opfamily.datum_to_vector(*values.add(0), *is_null.add(0)) };
                 let pointer = unsafe { ctid_to_pointer(ctid.read()) };
                 if let Some(vector) = vector {
-                    let vector = match opfamily.preprocess(vector.as_borrowed()) {
+                    let vector = match vector {
                         OwnedVector::Vecf32(x) => x,
                         OwnedVector::Vecf16(_) => unreachable!(),
                         OwnedVector::SVecf32(_) => unreachable!(),
@@ -229,7 +229,10 @@ pub unsafe extern "C" fn ambuild(
     if let Err(errors) = Validate::validate(&vector_options) {
         pgrx::error!("error while validating options: {}", errors);
     }
-    if vector_options.dims > 1600 {
+    if vector_options.dims == 0 {
+        pgrx::error!("error while validating options: dimension cannot be 0");
+    }
+    if vector_options.dims > 60000 {
         pgrx::error!("error while validating options: dimension is too large");
     }
     if let Err(errors) = Validate::validate(&vchordrq_options) {
@@ -564,7 +567,7 @@ unsafe fn parallel_build(
                 let vector = unsafe { opfamily.datum_to_vector(*values.add(0), *is_null.add(0)) };
                 let pointer = unsafe { ctid_to_pointer(ctid.read()) };
                 if let Some(vector) = vector {
-                    let vector = match opfamily.preprocess(vector.as_borrowed()) {
+                    let vector = match vector {
                         OwnedVector::Vecf32(x) => x,
                         OwnedVector::Vecf16(_) => unreachable!(),
                         OwnedVector::SVecf32(_) => unreachable!(),
@@ -659,7 +662,7 @@ pub unsafe extern "C" fn aminsert(
     let opfamily = unsafe { am_options::opfamily(index) };
     let vector = unsafe { opfamily.datum_to_vector(*values.add(0), *is_null.add(0)) };
     if let Some(vector) = vector {
-        let vector = match opfamily.preprocess(vector.as_borrowed()) {
+        let vector = match vector {
             OwnedVector::Vecf32(x) => x,
             OwnedVector::Vecf16(_) => unreachable!(),
             OwnedVector::SVecf32(_) => unreachable!(),
@@ -692,7 +695,7 @@ pub unsafe extern "C" fn aminsert(
     let opfamily = unsafe { am_options::opfamily(index) };
     let vector = unsafe { opfamily.datum_to_vector(*values.add(0), *is_null.add(0)) };
     if let Some(vector) = vector {
-        let vector = match opfamily.preprocess(vector.as_borrowed()) {
+        let vector = match vector {
             OwnedVector::Vecf32(x) => x,
             OwnedVector::Vecf16(_) => unreachable!(),
             OwnedVector::SVecf32(_) => unreachable!(),

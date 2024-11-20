@@ -1,7 +1,7 @@
 use crate::algorithm::rabitq;
 use crate::algorithm::rabitq::fscan_process_lowerbound;
 use crate::algorithm::tuples::*;
-use crate::index::utils::distance;
+use crate::algorithm::vectors;
 use crate::postgres::Relation;
 use base::always_equal::AlwaysEqual;
 use base::distance::Distance;
@@ -36,21 +36,19 @@ pub fn scan(
     } else {
         None
     };
-    let mut lists: Vec<_> = vec![(
-        meta_tuple.first,
-        if is_residual {
-            let vector_guard = relation.read(meta_tuple.mean.0);
-            let vector_tuple = vector_guard
-                .get()
-                .get(meta_tuple.mean.1)
-                .map(rkyv::check_archived_root::<VectorTuple>)
-                .expect("data corruption")
-                .expect("data corruption");
-            Some(vector_tuple.vector.to_vec())
-        } else {
-            None
-        },
-    )];
+    let mut lists: Vec<_> = vec![{
+        let Some((_, original)) = vectors::vector_dist(
+            relation.clone(),
+            &vector,
+            meta_tuple.mean,
+            None,
+            None,
+            is_residual,
+        ) else {
+            panic!("data corruption")
+        };
+        (meta_tuple.first, original)
+    }];
     let make_lists = |lists: Vec<(u32, Option<Vec<f32>>)>, probes| {
         let mut results = Vec::new();
         for list in lists {
@@ -74,23 +72,19 @@ pub fn scan(
                         dims,
                         lut,
                         (
-                            &h1_tuple.dis_u_2,
-                            &h1_tuple.factor_ppc,
-                            &h1_tuple.factor_ip,
-                            &h1_tuple.factor_err,
+                            h1_tuple.dis_u_2,
+                            h1_tuple.factor_ppc,
+                            h1_tuple.factor_ip,
+                            h1_tuple.factor_err,
                             &h1_tuple.t,
                         ),
                         epsilon,
                     );
-                    for j in 0..32 {
-                        if h1_tuple.mask[j] {
-                            results.push((
-                                Reverse(lowerbounds[j]),
-                                AlwaysEqual(h1_tuple.mean[j]),
-                                AlwaysEqual(h1_tuple.first[j]),
-                            ));
-                        }
-                    }
+                    results.push((
+                        Reverse(lowerbounds),
+                        AlwaysEqual(h1_tuple.mean),
+                        AlwaysEqual(h1_tuple.first),
+                    ));
                 }
                 current = h1_guard.get().get_opaque().next;
             }
@@ -100,23 +94,17 @@ pub fn scan(
         std::iter::from_fn(|| {
             while !heap.is_empty() && heap.peek().map(|x| x.0) > cache.peek().map(|x| x.0) {
                 let (_, AlwaysEqual(mean), AlwaysEqual(first)) = heap.pop().unwrap();
-                let vector_guard = relation.read(mean.0);
-                let vector_tuple = vector_guard
-                    .get()
-                    .get(mean.1)
-                    .map(rkyv::check_archived_root::<VectorTuple>)
-                    .expect("data corruption")
-                    .expect("data corruption");
-                let dis_u = distance(distance_kind, &vector, &vector_tuple.vector);
-                cache.push((
-                    Reverse(dis_u),
-                    AlwaysEqual(first),
-                    AlwaysEqual(if is_residual {
-                        Some(vector_tuple.vector.to_vec())
-                    } else {
-                        None
-                    }),
-                ));
+                let Some((Some(dis_u), original)) = vectors::vector_dist(
+                    relation.clone(),
+                    &vector,
+                    mean,
+                    None,
+                    Some(distance_kind),
+                    is_residual,
+                ) else {
+                    panic!("data corruption")
+                };
+                cache.push((Reverse(dis_u), AlwaysEqual(first), AlwaysEqual(original)));
             }
             let (_, AlwaysEqual(first), AlwaysEqual(mean)) = cache.pop()?;
             Some((first, mean))
@@ -150,23 +138,19 @@ pub fn scan(
                         dims,
                         lut,
                         (
-                            &h0_tuple.dis_u_2,
-                            &h0_tuple.factor_ppc,
-                            &h0_tuple.factor_ip,
-                            &h0_tuple.factor_err,
+                            h0_tuple.dis_u_2,
+                            h0_tuple.factor_ppc,
+                            h0_tuple.factor_ip,
+                            h0_tuple.factor_err,
                             &h0_tuple.t,
                         ),
                         epsilon,
                     );
-                    for j in 0..32 {
-                        if h0_tuple.mask[j] {
-                            results.push((
-                                Reverse(lowerbounds[j]),
-                                AlwaysEqual(h0_tuple.mean[j]),
-                                AlwaysEqual(h0_tuple.payload[j]),
-                            ));
-                        }
-                    }
+                    results.push((
+                        Reverse(lowerbounds),
+                        AlwaysEqual(h0_tuple.mean),
+                        AlwaysEqual(h0_tuple.payload),
+                    ));
                 }
                 current = h0_guard.get().get_opaque().next;
             }
@@ -176,18 +160,16 @@ pub fn scan(
         std::iter::from_fn(move || {
             while !heap.is_empty() && heap.peek().map(|x| x.0) > cache.peek().map(|x| x.0) {
                 let (_, AlwaysEqual(mean), AlwaysEqual(pay_u)) = heap.pop().unwrap();
-                let vector_guard = relation.read(mean.0);
-                let Some(vector_tuple) = vector_guard.get().get(mean.1) else {
-                    // fails consistency check
+                let Some((Some(dis_u), _)) = vectors::vector_dist(
+                    relation.clone(),
+                    &vector,
+                    mean,
+                    Some(pay_u),
+                    Some(distance_kind),
+                    false,
+                ) else {
                     continue;
                 };
-                let vector_tuple = rkyv::check_archived_root::<VectorTuple>(vector_tuple)
-                    .expect("data corruption");
-                if vector_tuple.payload != Some(pay_u) {
-                    // fails consistency check
-                    continue;
-                }
-                let dis_u = distance(distance_kind, &vector, &vector_tuple.vector);
                 cache.push((Reverse(dis_u), AlwaysEqual(pay_u)));
             }
             let (Reverse(dis_u), AlwaysEqual(pay_u)) = cache.pop()?;

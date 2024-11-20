@@ -26,11 +26,7 @@ pub fn vacuum(relation: Relation, delay: impl Fn(), callback: impl Fn(Pointer) -
                             .map(rkyv::check_archived_root::<Height1Tuple>)
                             .expect("data corruption")
                             .expect("data corruption");
-                        for j in 0..32 {
-                            if h1_tuple.mask[j] {
-                                results.push(h1_tuple.first[j]);
-                            }
-                        }
+                        results.push(h1_tuple.first);
                     }
                     current = h1_guard.get().get_opaque().next;
                 }
@@ -45,6 +41,7 @@ pub fn vacuum(relation: Relation, delay: impl Fn(), callback: impl Fn(Pointer) -
             while current != u32::MAX {
                 delay();
                 let mut h0_guard = relation.write(current);
+                let mut reconstruct_removes = Vec::new();
                 for i in 1..=h0_guard.get().len() {
                     let h0_tuple = h0_guard
                         .get()
@@ -52,36 +49,11 @@ pub fn vacuum(relation: Relation, delay: impl Fn(), callback: impl Fn(Pointer) -
                         .map(rkyv::check_archived_root::<Height0Tuple>)
                         .expect("data corruption")
                         .expect("data corruption");
-                    let flag = 'flag: {
-                        for j in 0..32 {
-                            if h0_tuple.mask[j] && callback(Pointer::new(h0_tuple.payload[j])) {
-                                break 'flag true;
-                            }
-                        }
-                        false
-                    };
-                    if flag {
-                        // todo: use mutable API
-                        let mut temp = h0_guard
-                            .get()
-                            .get(i)
-                            .map(rkyv::from_bytes::<Height0Tuple>)
-                            .expect("data corruption")
-                            .expect("data corruption");
-                        for j in 0..32 {
-                            if temp.mask[j] && callback(Pointer::new(temp.payload[j])) {
-                                temp.mask[j] = false;
-                            }
-                        }
-                        let temp = rkyv::to_bytes::<_, 8192>(&temp).expect("failed to serialize");
-                        h0_guard
-                            .get_mut()
-                            .get_mut(i)
-                            .expect("data corruption")
-                            .copy_from_slice(&temp);
+                    if callback(Pointer::new(h0_tuple.payload)) {
+                        reconstruct_removes.push(i);
                     }
                 }
-                // todo: cross-tuple vacuum so that we can skip a tuple
+                h0_guard.get_mut().reconstruct(&reconstruct_removes);
                 current = h0_guard.get().get_opaque().next;
             }
         }

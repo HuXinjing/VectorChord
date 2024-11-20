@@ -1,6 +1,7 @@
 use crate::algorithm::k_means;
 use crate::algorithm::rabitq;
 use crate::algorithm::tuples::*;
+use crate::algorithm::vectors;
 use crate::index::am_options::Opfamily;
 use crate::postgres::BufferWriteGuard;
 use crate::postgres::Relation;
@@ -79,11 +80,16 @@ pub fn build<T: HeapRelation, R: Reporter>(
     for i in 0..structures.len() {
         let mut level = Vec::new();
         for j in 0..structures[i].len() {
-            let pointer = vectors.push(&VectorTuple {
-                payload: None,
-                vector: structures[i].means[j].clone(),
-            });
-            level.push(pointer);
+            let slices = vectors::vector_split(&structures[i].means[j]);
+            let mut chain = None;
+            for i in (0..slices.len()).rev() {
+                chain = Some(vectors.push(&VectorTuple {
+                    payload: None,
+                    slice: slices[i].to_vec(),
+                    chain,
+                }));
+            }
+            level.push(chain.unwrap());
         }
         pointer_of_means.push(level);
     }
@@ -96,7 +102,6 @@ pub fn build<T: HeapRelation, R: Reporter>(
                 level.push(tape.first());
             } else {
                 let mut tape = Tape::<Height1Tuple>::create(&relation, false);
-                let mut cache = Vec::new();
                 let h2_mean = &structures[i].means[j];
                 let h2_children = &structures[i].children[j];
                 for child in h2_children.iter().copied() {
@@ -106,58 +111,14 @@ pub fn build<T: HeapRelation, R: Reporter>(
                     } else {
                         rabitq::code(dims, h1_mean)
                     };
-                    cache.push((child, code));
-                    if cache.len() == 32 {
-                        let group = std::mem::take(&mut cache);
-                        let codes = std::array::from_fn(|k| group[k].1.clone());
-                        let packed = rabitq::pack_codes(dims, codes);
-                        tape.push(&Height1Tuple {
-                            mask: [true; 32],
-                            mean: std::array::from_fn(|k| {
-                                pointer_of_means[i - 1][group[k].0 as usize]
-                            }),
-                            first: std::array::from_fn(|k| {
-                                pointer_of_firsts[i - 1][group[k].0 as usize]
-                            }),
-                            dis_u_2: packed.dis_u_2,
-                            factor_ppc: packed.factor_ppc,
-                            factor_ip: packed.factor_ip,
-                            factor_err: packed.factor_err,
-                            t: packed.t,
-                        });
-                    }
-                }
-                if !cache.is_empty() {
-                    let group = std::mem::take(&mut cache);
-                    let codes = std::array::from_fn(|k| {
-                        if k < group.len() {
-                            group[k].1.clone()
-                        } else {
-                            rabitq::dummy_code(dims)
-                        }
-                    });
-                    let packed = rabitq::pack_codes(dims, codes);
                     tape.push(&Height1Tuple {
-                        mask: std::array::from_fn(|k| k < group.len()),
-                        mean: std::array::from_fn(|k| {
-                            if k < group.len() {
-                                pointer_of_means[i - 1][group[k].0 as usize]
-                            } else {
-                                Default::default()
-                            }
-                        }),
-                        first: std::array::from_fn(|k| {
-                            if k < group.len() {
-                                pointer_of_firsts[i - 1][group[k].0 as usize]
-                            } else {
-                                Default::default()
-                            }
-                        }),
-                        dis_u_2: packed.dis_u_2,
-                        factor_ppc: packed.factor_ppc,
-                        factor_ip: packed.factor_ip,
-                        factor_err: packed.factor_err,
-                        t: packed.t,
+                        mean: pointer_of_means[i - 1][child as usize],
+                        first: pointer_of_firsts[i - 1][child as usize],
+                        dis_u_2: code.dis_u_2,
+                        factor_ppc: code.factor_ppc,
+                        factor_ip: code.factor_ip,
+                        factor_err: code.factor_err,
+                        t: code.t(),
                     });
                 }
                 level.push(tape.first());
