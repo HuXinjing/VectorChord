@@ -141,3 +141,12 @@ fn asymmetric_binary_dot_product(x: &[u64], y: &(Vec<u64>, Vec<u64>, Vec<u64>, V
     }
     (t0 << 0) + (t1 << 1) + (t2 << 2) + (t3 << 3)
 }
+
+pub fn distance(d: DistanceKind, lhs: &[f32], rhs: &[f32]) -> Distance {
+    match d {
+        DistanceKind::L2 => Distance::from_f32(f32::reduce_sum_of_d2(lhs, rhs)),
+        DistanceKind::Dot => Distance::from_f32(-f32::reduce_sum_of_xy(lhs, rhs)),
+        DistanceKind::Hamming => unimplemented!(),
+        DistanceKind::Jaccard => unimplemented!(),
+    }
+}

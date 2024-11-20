@@ -1,4 +1,4 @@
-use crate::vchordrq::algorithm::parallelism::{ParallelIterator, Parallelism};
+use super::parallelism::{ParallelIterator, Parallelism};
 use base::scalar::*;
 use half::f16;
 use rand::rngs::StdRng;

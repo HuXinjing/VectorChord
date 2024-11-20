@@ -1,13 +1,12 @@
 use crate::postgres::BufferWriteGuard;
 use crate::postgres::Relation;
-use crate::vchordrq::algorithm::rabitq;
-use crate::vchordrq::algorithm::tuples::*;
-use crate::vchordrq::algorithm::vectors;
-use crate::vchordrq::index::am_options::Opfamily;
-use crate::vchordrq::types::VchordrqBuildOptions;
-use crate::vchordrq::types::VchordrqExternalBuildOptions;
-use crate::vchordrq::types::VchordrqIndexingOptions;
-use crate::vchordrq::types::VchordrqInternalBuildOptions;
+use crate::vchordrqfscan::algorithm::rabitq;
+use crate::vchordrqfscan::algorithm::tuples::*;
+use crate::vchordrqfscan::index::am_options::Opfamily;
+use crate::vchordrqfscan::types::VchordrqfscanBuildOptions;
+use crate::vchordrqfscan::types::VchordrqfscanExternalBuildOptions;
+use crate::vchordrqfscan::types::VchordrqfscanIndexingOptions;
+use crate::vchordrqfscan::types::VchordrqfscanInternalBuildOptions;
 use base::distance::DistanceKind;
 use base::index::VectorOptions;
 use base::scalar::ScalarLike;
@@ -30,21 +29,21 @@ pub trait Reporter {
 
 pub fn build<T: HeapRelation, R: Reporter>(
     vector_options: VectorOptions,
-    vchordrq_options: VchordrqIndexingOptions,
+    vchordrqfscan_options: VchordrqfscanIndexingOptions,
     heap_relation: T,
     relation: Relation,
     mut reporter: R,
 ) {
     let dims = vector_options.dims;
     let is_residual =
-        vchordrq_options.residual_quantization && vector_options.d == DistanceKind::L2;
-    let structures = match vchordrq_options.build {
-        VchordrqBuildOptions::External(external_build) => Structure::extern_build(
+        vchordrqfscan_options.residual_quantization && vector_options.d == DistanceKind::L2;
+    let structures = match vchordrqfscan_options.build {
+        VchordrqfscanBuildOptions::External(external_build) => Structure::extern_build(
             vector_options.clone(),
             heap_relation.opfamily(),
             external_build.clone(),
         ),
-        VchordrqBuildOptions::Internal(internal_build) => {
+        VchordrqfscanBuildOptions::Internal(internal_build) => {
             let mut tuples_total = 0_u64;
             let samples = {
                 let mut rand = rand::thread_rng();
@@ -79,16 +78,11 @@ pub fn build<T: HeapRelation, R: Reporter>(
     for i in 0..structures.len() {
         let mut level = Vec::new();
         for j in 0..structures[i].len() {
-            let slices = vectors::vector_split(&structures[i].means[j]);
-            let mut chain = None;
-            for i in (0..slices.len()).rev() {
-                chain = Some(vectors.push(&VectorTuple {
-                    payload: None,
-                    slice: slices[i].to_vec(),
-                    chain,
-                }));
-            }
-            level.push(chain.unwrap());
+            let pointer = vectors.push(&VectorTuple {
+                payload: None,
+                vector: structures[i].means[j].clone(),
+            });
+            level.push(pointer);
         }
         pointer_of_means.push(level);
     }
@@ -101,6 +95,7 @@ pub fn build<T: HeapRelation, R: Reporter>(
                 level.push(tape.first());
             } else {
                 let mut tape = Tape::<Height1Tuple>::create(&relation, false);
+                let mut cache = Vec::new();
                 let h2_mean = &structures[i].means[j];
                 let h2_children = &structures[i].children[j];
                 for child in h2_children.iter().copied() {
@@ -110,14 +105,58 @@ pub fn build<T: HeapRelation, R: Reporter>(
                     } else {
                         rabitq::code(dims, h1_mean)
                     };
+                    cache.push((child, code));
+                    if cache.len() == 32 {
+                        let group = std::mem::take(&mut cache);
+                        let codes = std::array::from_fn(|k| group[k].1.clone());
+                        let packed = rabitq::pack_codes(dims, codes);
+                        tape.push(&Height1Tuple {
+                            mask: [true; 32],
+                            mean: std::array::from_fn(|k| {
+                                pointer_of_means[i - 1][group[k].0 as usize]
+                            }),
+                            first: std::array::from_fn(|k| {
+                                pointer_of_firsts[i - 1][group[k].0 as usize]
+                            }),
+                            dis_u_2: packed.dis_u_2,
+                            factor_ppc: packed.factor_ppc,
+                            factor_ip: packed.factor_ip,
+                            factor_err: packed.factor_err,
+                            t: packed.t,
+                        });
+                    }
+                }
+                if !cache.is_empty() {
+                    let group = std::mem::take(&mut cache);
+                    let codes = std::array::from_fn(|k| {
+                        if k < group.len() {
+                            group[k].1.clone()
+                        } else {
+                            rabitq::dummy_code(dims)
+                        }
+                    });
+                    let packed = rabitq::pack_codes(dims, codes);
                     tape.push(&Height1Tuple {
-                        mean: pointer_of_means[i - 1][child as usize],
-                        first: pointer_of_firsts[i - 1][child as usize],
-                        dis_u_2: code.dis_u_2,
-                        factor_ppc: code.factor_ppc,
-                        factor_ip: code.factor_ip,
-                        factor_err: code.factor_err,
-                        t: code.t(),
+                        mask: std::array::from_fn(|k| k < group.len()),
+                        mean: std::array::from_fn(|k| {
+                            if k < group.len() {
+                                pointer_of_means[i - 1][group[k].0 as usize]
+                            } else {
+                                Default::default()
+                            }
+                        }),
+                        first: std::array::from_fn(|k| {
+                            if k < group.len() {
+                                pointer_of_firsts[i - 1][group[k].0 as usize]
+                            } else {
+                                Default::default()
+                            }
+                        }),
+                        dis_u_2: packed.dis_u_2,
+                        factor_ppc: packed.factor_ppc,
+                        factor_ip: packed.factor_ip,
+                        factor_err: packed.factor_err,
+                        t: packed.t,
                     });
                 }
                 level.push(tape.first());
@@ -148,7 +187,7 @@ impl Structure {
     }
     fn internal_build(
         vector_options: VectorOptions,
-        internal_build: VchordrqInternalBuildOptions,
+        internal_build: VchordrqfscanInternalBuildOptions,
         mut samples: Vec<Vec<f32>>,
     ) -> Vec<Self> {
         use std::iter::once;
@@ -199,10 +238,10 @@ impl Structure {
     fn extern_build(
         vector_options: VectorOptions,
         _opfamily: Opfamily,
-        external_build: VchordrqExternalBuildOptions,
+        external_build: VchordrqfscanExternalBuildOptions,
     ) -> Vec<Self> {
         use std::collections::BTreeMap;
-        let VchordrqExternalBuildOptions { table } = external_build;
+        let VchordrqfscanExternalBuildOptions { table } = external_build;
         let query = format!("SELECT id, parent, vector FROM {table};");
         let mut parents = BTreeMap::new();
         let mut vectors = BTreeMap::new();

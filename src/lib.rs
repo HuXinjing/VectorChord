@@ -7,9 +7,10 @@
 mod datatype;
 mod postgres;
 mod projection;
-mod types;
 mod upgrade;
+mod utils;
 mod vchordrq;
+mod vchordrqfscan;
 
 pgrx::pg_module_magic!();
 pgrx::extension_sql_file!("./sql/bootstrap.sql", bootstrap);
@@ -23,6 +24,7 @@ unsafe extern "C" fn _PG_init() {
     detect::init();
     unsafe {
         vchordrq::init();
+        vchordrqfscan::init();
 
         #[cfg(any(feature = "pg13", feature = "pg14"))]
         pgrx::pg_sys::EmitWarningsOnPlaceholders(c"vchord".as_ptr());
