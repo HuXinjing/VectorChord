@@ -164,7 +164,7 @@ pub fn build<T: HeapRelation, R: Reporter>(
         }
         pointer_of_firsts.push(level);
     }
-    forwards.head.get_mut().get_opaque_mut().fast_forward = vectors.first();
+    forwards.head.get_mut().get_opaque_mut().skip = vectors.first();
     meta.push(&MetaTuple {
         dims,
         height_of_root: structures.len() as u32,
