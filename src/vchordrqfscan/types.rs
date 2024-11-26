@@ -9,6 +9,9 @@ pub struct VchordrqfscanInternalBuildOptions {
     pub lists: Vec<u32>,
     #[serde(default = "VchordrqfscanInternalBuildOptions::default_spherical_centroids")]
     pub spherical_centroids: bool,
+    #[serde(default = "VchordrqfscanInternalBuildOptions::default_sampling_factor")]
+    #[validate(range(min = 1, max = 1024))]
+    pub sampling_factor: u32,
     #[serde(default = "VchordrqfscanInternalBuildOptions::default_build_threads")]
     #[validate(range(min = 1, max = 255))]
     pub build_threads: u16,
@@ -30,6 +33,9 @@ impl VchordrqfscanInternalBuildOptions {
     fn default_spherical_centroids() -> bool {
         false
     }
+    fn default_sampling_factor() -> u32 {
+        256
+    }
     fn default_build_threads() -> u16 {
         1
     }
@@ -40,6 +46,7 @@ impl Default for VchordrqfscanInternalBuildOptions {
         Self {
             lists: Self::default_lists(),
             spherical_centroids: Self::default_spherical_centroids(),
+            sampling_factor: Self::default_sampling_factor(),
             build_threads: Self::default_build_threads(),
         }
     }
