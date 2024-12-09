@@ -43,15 +43,17 @@ RUN useradd -u 1000 -U -m ubuntu
 RUN chown -R ubuntu:ubuntu /usr/share/postgresql/ /usr/lib/postgresql/
 USER ubuntu
 ENV PATH="$PATH:/home/ubuntu/.cargo/bin"
-RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- --default-toolchain=none -y
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+RUN rustup target add x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu
 
 WORKDIR /workspace
 COPY rust-toolchain.toml /workspace/rust-toolchain.toml
+RUN rustup target add x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu
+
 # ref: https://github.com/pgcentralfoundation/pgrx/blob/develop/docs/src/extension/build/cross-compile.md
 RUN set -ex; \
     echo 'target.aarch64-unknown-linux-gnu.linker = "aarch64-linux-gnu-gcc"' >> ~/.cargo/config.toml; \
     echo 'target.aarch64-unknown-linux-gnu.runner = ["qemu-aarch64-static", "-L", "/usr/aarch64-linux-gnu"]' >> ~/.cargo/config.toml
-RUN rustup target add x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu
 
 RUN cargo install cargo-pgrx --locked --version=${PGRX_VERSION}
 
