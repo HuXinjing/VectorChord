@@ -1,34 +1,26 @@
+use super::tuples::Vector;
 use crate::postgres::Relation;
-use crate::vchordrq::algorithm::rabitq::distance;
 use crate::vchordrq::algorithm::tuples::VectorTuple;
 use base::distance::Distance;
 use base::distance::DistanceKind;
 
-pub fn vector_split(vector: &[f32]) -> Vec<&[f32]> {
-    match vector.len() {
-        0..=960 => vec![vector],
-        961..=1280 => vec![&vector[..640], &vector[640..]],
-        1281.. => vector.chunks(1920).collect(),
-    }
-}
-
-pub fn vector_dist(
+pub fn vector_dist<V: Vector>(
     relation: Relation,
-    vector: &[f32],
+    vector: V::Borrowed<'_>,
     mean: (u32, u16),
     payload: Option<u64>,
     for_distance: Option<DistanceKind>,
     for_original: bool,
-) -> Option<(Option<Distance>, Option<Vec<f32>>)> {
+) -> Option<(Option<Distance>, Option<V>)> {
     if for_distance.is_none() && !for_original && payload.is_none() {
         return Some((None, None));
     }
-    let slices = vector_split(vector);
-    let mut cursor = Some(mean);
-    let mut result = 0.0f32;
+    let (left_metadata, slices) = V::vector_split(vector);
+    let mut cursor = Ok(mean);
+    let mut result = for_distance.map(|x| V::distance_begin(x));
     let mut original = Vec::new();
     for i in 0..slices.len() {
-        let Some(mean) = cursor else {
+        let Ok(mean) = cursor else {
             // fails consistency check
             return None;
         };
@@ -37,40 +29,47 @@ pub fn vector_dist(
             // fails consistency check
             return None;
         };
-        let vector_tuple =
-            rkyv::check_archived_root::<VectorTuple>(vector_tuple).expect("data corruption");
+        let vector_tuple = unsafe { rkyv::archived_root::<VectorTuple<V>>(vector_tuple) };
         if vector_tuple.payload != payload {
             // fails consistency check
             return None;
         }
-        if let Some(distance_kind) = for_distance {
-            result += distance(distance_kind, slices[i], &vector_tuple.slice).to_f32();
+        if let Some(result) = result.as_mut() {
+            V::distance_next(result, slices[i], &vector_tuple.slice);
         }
         if for_original {
             original.extend_from_slice(&vector_tuple.slice);
         }
-        cursor = vector_tuple.chain.as_ref().cloned();
+        cursor = match &vector_tuple.chain {
+            rkyv::result::ArchivedResult::Ok(x) => Ok(*x),
+            rkyv::result::ArchivedResult::Err(x) => Err(V::metadata_from_archived(x)),
+        };
     }
+    let Err(right_metadata) = cursor else {
+        panic!("data corruption")
+    };
     Some((
-        for_distance.map(|_| Distance::from_f32(result)),
-        for_original.then_some(original),
+        result.map(|r| Distance::from_f32(V::distance_end(r, left_metadata, right_metadata))),
+        for_original.then(|| V::vector_merge(right_metadata, &original)),
     ))
 }
 
-pub fn vector_warm(relation: Relation, mean: (u32, u16)) {
-    let mut cursor = Some(mean);
-    while let Some(mean) = cursor {
+pub fn vector_warm<V: Vector>(relation: Relation, mean: (u32, u16)) {
+    let mut cursor = Ok(mean);
+    while let Ok(mean) = cursor {
         let vector_guard = relation.read(mean.0);
         let Some(vector_tuple) = vector_guard.get().get(mean.1) else {
             // fails consistency check
             return;
         };
-        let vector_tuple =
-            rkyv::check_archived_root::<VectorTuple>(vector_tuple).expect("data corruption");
+        let vector_tuple = unsafe { rkyv::archived_root::<VectorTuple<V>>(vector_tuple) };
         if vector_tuple.payload.is_some() {
             // fails consistency check
             return;
         }
-        cursor = vector_tuple.chain.as_ref().cloned();
+        cursor = match &vector_tuple.chain {
+            rkyv::result::ArchivedResult::Ok(x) => Ok(*x),
+            rkyv::result::ArchivedResult::Err(x) => Err(V::metadata_from_archived(x)),
+        };
     }
 }

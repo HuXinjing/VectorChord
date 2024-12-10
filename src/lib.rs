@@ -3,10 +3,14 @@
 #![allow(clippy::needless_range_loop)]
 #![allow(clippy::too_many_arguments)]
 #![allow(clippy::type_complexity)]
+#![allow(clippy::int_plus_one)]
+#![allow(clippy::unused_unit)]
+#![allow(clippy::infallible_destructuring_match)]
 
 mod datatype;
 mod postgres;
 mod projection;
+mod types;
 mod upgrade;
 mod utils;
 mod vchordrq;
@@ -21,7 +25,7 @@ unsafe extern "C" fn _PG_init() {
     if unsafe { pgrx::pg_sys::IsUnderPostmaster } {
         pgrx::error!("vchord must be loaded via shared_preload_libraries.");
     }
-    detect::init();
+    base::simd::enable();
     unsafe {
         vchordrq::init();
         vchordrqfscan::init();

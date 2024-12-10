@@ -1,12 +1,16 @@
 use super::am_options::Opfamily;
 use crate::postgres::Relation;
 use crate::vchordrq::algorithm::scan::scan;
+use crate::vchordrq::algorithm::tuples::Vector;
 use crate::vchordrq::gucs::executing::epsilon;
 use crate::vchordrq::gucs::executing::max_scan_tuples;
 use crate::vchordrq::gucs::executing::probes;
+use crate::vchordrq::types::OwnedVector;
+use crate::vchordrq::types::VectorKind;
 use base::distance::Distance;
 use base::search::*;
-use base::vector::*;
+use base::vector::VectOwned;
+use half::f16;
 
 pub enum Scanner {
     Initial {
@@ -34,7 +38,7 @@ pub fn scan_build(
     for orderby_vector in orderbys {
         if pair.is_none() {
             pair = orderby_vector;
-        } else if orderby_vector.is_some() && pair != orderby_vector {
+        } else if orderby_vector.is_some() {
             pgrx::error!("vector search with multiple vectors is not supported");
         }
     }
@@ -42,10 +46,6 @@ pub fn scan_build(
         if pair.is_none() {
             pair = sphere_vector;
             threshold = sphere_threshold;
-        } else if pair == sphere_vector {
-            if threshold.is_none() || sphere_threshold < threshold {
-                threshold = sphere_threshold;
-            }
         } else {
             recheck = true;
             break;
@@ -74,28 +74,46 @@ pub fn scan_next(scanner: &mut Scanner, relation: Relation) -> Option<(Pointer, 
     } = scanner
     {
         if let Some((vector, opfamily)) = vector.as_ref() {
-            let vbase = scan(
-                relation,
-                match vector {
-                    OwnedVector::Vecf32(x) => x.slice().to_vec(),
-                    OwnedVector::Vecf16(_) => unreachable!(),
-                    OwnedVector::SVecf32(_) => unreachable!(),
-                    OwnedVector::BVector(_) => unreachable!(),
-                },
-                opfamily.distance_kind(),
-                probes(),
-                epsilon(),
-            );
-            *scanner = Scanner::Vbase {
-                vbase: if let Some(max_scan_tuples) = max_scan_tuples() {
-                    Box::new(vbase.take(max_scan_tuples as usize))
-                } else {
-                    Box::new(vbase)
-                },
-                threshold: *threshold,
-                recheck: *recheck,
-                opfamily: *opfamily,
-            };
+            match opfamily.vector_kind() {
+                VectorKind::Vecf32 => {
+                    let vbase = scan::<VectOwned<f32>>(
+                        relation,
+                        VectOwned::<f32>::from_owned(vector.clone()),
+                        opfamily.distance_kind(),
+                        probes(),
+                        epsilon(),
+                    );
+                    *scanner = Scanner::Vbase {
+                        vbase: if let Some(max_scan_tuples) = max_scan_tuples() {
+                            Box::new(vbase.take(max_scan_tuples as usize))
+                        } else {
+                            Box::new(vbase)
+                        },
+                        threshold: *threshold,
+                        recheck: *recheck,
+                        opfamily: *opfamily,
+                    };
+                }
+                VectorKind::Vecf16 => {
+                    let vbase = scan::<VectOwned<f16>>(
+                        relation,
+                        VectOwned::<f16>::from_owned(vector.clone()),
+                        opfamily.distance_kind(),
+                        probes(),
+                        epsilon(),
+                    );
+                    *scanner = Scanner::Vbase {
+                        vbase: if let Some(max_scan_tuples) = max_scan_tuples() {
+                            Box::new(vbase.take(max_scan_tuples as usize))
+                        } else {
+                            Box::new(vbase)
+                        },
+                        threshold: *threshold,
+                        recheck: *recheck,
+                        opfamily: *opfamily,
+                    };
+                }
+            }
         } else {
             *scanner = Scanner::Empty {};
         }

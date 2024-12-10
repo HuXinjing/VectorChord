@@ -183,7 +183,7 @@ pub unsafe extern "C" fn ambuild(
             ) where
                 F: FnMut((Pointer, Vec<f32>)),
             {
-                use base::vector::OwnedVector;
+                use crate::vchordrqfscan::types::OwnedVector;
                 let state = unsafe { &mut *state.cast::<State<F>>() };
                 let opfamily = state.this.opfamily;
                 let vector = unsafe { opfamily.datum_to_vector(*values.add(0), *is_null.add(0)) };
@@ -191,9 +191,6 @@ pub unsafe extern "C" fn ambuild(
                 if let Some(vector) = vector {
                     let vector = match vector {
                         OwnedVector::Vecf32(x) => x,
-                        OwnedVector::Vecf16(_) => unreachable!(),
-                        OwnedVector::SVecf32(_) => unreachable!(),
-                        OwnedVector::BVector(_) => unreachable!(),
                     };
                     (state.callback)((pointer, vector.into_vec()));
                 }
@@ -572,7 +569,7 @@ unsafe fn parallel_build(
             ) where
                 F: FnMut((Pointer, Vec<f32>)),
             {
-                use base::vector::OwnedVector;
+                use crate::vchordrqfscan::types::OwnedVector;
                 let state = unsafe { &mut *state.cast::<State<F>>() };
                 let opfamily = state.this.opfamily;
                 let vector = unsafe { opfamily.datum_to_vector(*values.add(0), *is_null.add(0)) };
@@ -580,9 +577,6 @@ unsafe fn parallel_build(
                 if let Some(vector) = vector {
                     let vector = match vector {
                         OwnedVector::Vecf32(x) => x,
-                        OwnedVector::Vecf16(_) => unreachable!(),
-                        OwnedVector::SVecf32(_) => unreachable!(),
-                        OwnedVector::BVector(_) => unreachable!(),
                     };
                     (state.callback)((pointer, vector.into_vec()));
                 }
@@ -669,15 +663,12 @@ pub unsafe extern "C" fn aminsert(
     _check_unique: pgrx::pg_sys::IndexUniqueCheck::Type,
     _index_info: *mut pgrx::pg_sys::IndexInfo,
 ) -> bool {
-    use base::vector::OwnedVector;
+    use crate::vchordrqfscan::types::OwnedVector;
     let opfamily = unsafe { am_options::opfamily(index) };
     let vector = unsafe { opfamily.datum_to_vector(*values.add(0), *is_null.add(0)) };
     if let Some(vector) = vector {
         let vector = match vector {
             OwnedVector::Vecf32(x) => x,
-            OwnedVector::Vecf16(_) => unreachable!(),
-            OwnedVector::SVecf32(_) => unreachable!(),
-            OwnedVector::BVector(_) => unreachable!(),
         };
         let pointer = ctid_to_pointer(unsafe { heap_tid.read() });
         algorithm::insert::insert(
@@ -702,15 +693,12 @@ pub unsafe extern "C" fn aminsert(
     _index_unchanged: bool,
     _index_info: *mut pgrx::pg_sys::IndexInfo,
 ) -> bool {
-    use base::vector::OwnedVector;
+    use crate::vchordrqfscan::types::OwnedVector;
     let opfamily = unsafe { am_options::opfamily(index) };
     let vector = unsafe { opfamily.datum_to_vector(*values.add(0), *is_null.add(0)) };
     if let Some(vector) = vector {
         let vector = match vector {
             OwnedVector::Vecf32(x) => x,
-            OwnedVector::Vecf16(_) => unreachable!(),
-            OwnedVector::SVecf32(_) => unreachable!(),
-            OwnedVector::BVector(_) => unreachable!(),
         };
         let pointer = ctid_to_pointer(unsafe { heap_tid.read() });
         algorithm::insert::insert(

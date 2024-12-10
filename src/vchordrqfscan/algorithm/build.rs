@@ -7,10 +7,10 @@ use crate::vchordrqfscan::types::VchordrqfscanBuildOptions;
 use crate::vchordrqfscan::types::VchordrqfscanExternalBuildOptions;
 use crate::vchordrqfscan::types::VchordrqfscanIndexingOptions;
 use crate::vchordrqfscan::types::VchordrqfscanInternalBuildOptions;
+use crate::vchordrqfscan::types::VectorOptions;
 use base::distance::DistanceKind;
-use base::index::VectorOptions;
-use base::scalar::ScalarLike;
 use base::search::Pointer;
+use base::simd::ScalarLike;
 use rand::Rng;
 use rkyv::ser::serializers::AllocSerializer;
 use std::marker::PhantomData;
@@ -268,7 +268,7 @@ impl Structure {
                 if vector_options.dims != vector.as_borrowed().dims() {
                     pgrx::error!("extern build: incorrect dimension, id = {id}");
                 }
-                vectors.insert(id, crate::projection::project(vector.slice()));
+                vectors.insert(id, crate::projection::project(vector.as_borrowed().slice()));
             }
         });
         let mut children = parents

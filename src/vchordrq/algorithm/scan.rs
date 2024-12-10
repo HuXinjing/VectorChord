@@ -1,23 +1,23 @@
 use crate::postgres::Relation;
-use crate::vchordrq::algorithm::rabitq;
 use crate::vchordrq::algorithm::rabitq::fscan_process_lowerbound;
 use crate::vchordrq::algorithm::tuples::*;
 use crate::vchordrq::algorithm::vectors;
 use base::always_equal::AlwaysEqual;
 use base::distance::Distance;
 use base::distance::DistanceKind;
-use base::scalar::ScalarLike;
 use base::search::Pointer;
+use base::vector::VectorBorrowed;
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
 
-pub fn scan(
+pub fn scan<V: Vector>(
     relation: Relation,
-    vector: Vec<f32>,
+    vector: V,
     distance_kind: DistanceKind,
     probes: Vec<u32>,
     epsilon: f32,
 ) -> impl Iterator<Item = (Distance, Pointer)> {
+    let vector = vector.as_borrowed();
     let meta_guard = relation.read(0);
     let meta_tuple = meta_guard
         .get()
@@ -27,19 +27,19 @@ pub fn scan(
         .expect("data corruption");
     let dims = meta_tuple.dims;
     let height_of_root = meta_tuple.height_of_root;
-    assert_eq!(dims as usize, vector.len(), "invalid vector dimensions");
+    assert_eq!(dims, vector.dims(), "invalid vector dimensions");
     assert_eq!(height_of_root as usize, 1 + probes.len(), "invalid probes");
-    let vector = crate::projection::project(&vector);
+    let vector = V::random_projection(vector);
     let is_residual = meta_tuple.is_residual;
     let default_lut = if !is_residual {
-        Some(rabitq::fscan_preprocess(&vector))
+        Some(V::rabitq_fscan_preprocess(vector.as_borrowed()))
     } else {
         None
     };
     let mut lists: Vec<_> = vec![{
-        let Some((_, original)) = vectors::vector_dist(
+        let Some((_, original)) = vectors::vector_dist::<V>(
             relation.clone(),
-            &vector,
+            vector.as_borrowed(),
             meta_tuple.mean,
             None,
             None,
@@ -49,11 +49,17 @@ pub fn scan(
         };
         (meta_tuple.first, original)
     }];
-    let make_lists = |lists: Vec<(u32, Option<Vec<f32>>)>, probes| {
+    let make_lists = |lists: Vec<(u32, Option<V>)>, probes| {
         let mut results = Vec::new();
         for list in lists {
             let lut = if is_residual {
-                &rabitq::fscan_preprocess(&f32::vector_sub(&vector, list.1.as_ref().unwrap()))
+                &V::rabitq_fscan_preprocess(
+                    V::residual(
+                        vector.as_borrowed(),
+                        list.1.as_ref().map(|x| x.as_borrowed()).unwrap(),
+                    )
+                    .as_borrowed(),
+                )
             } else {
                 default_lut.as_ref().unwrap()
             };
@@ -94,9 +100,9 @@ pub fn scan(
         std::iter::from_fn(|| {
             while !heap.is_empty() && heap.peek().map(|x| x.0) > cache.peek().map(|x| x.0) {
                 let (_, AlwaysEqual(mean), AlwaysEqual(first)) = heap.pop().unwrap();
-                let Some((Some(dis_u), original)) = vectors::vector_dist(
+                let Some((Some(dis_u), original)) = vectors::vector_dist::<V>(
                     relation.clone(),
-                    &vector,
+                    vector.as_borrowed(),
                     mean,
                     None,
                     Some(distance_kind),
@@ -119,7 +125,13 @@ pub fn scan(
         let mut results = Vec::new();
         for list in lists {
             let lut = if is_residual {
-                &rabitq::fscan_preprocess(&f32::vector_sub(&vector, list.1.as_ref().unwrap()))
+                &V::rabitq_fscan_preprocess(
+                    V::residual(
+                        vector.as_borrowed(),
+                        list.1.as_ref().map(|x| x.as_borrowed()).unwrap(),
+                    )
+                    .as_borrowed(),
+                )
             } else {
                 default_lut.as_ref().unwrap()
             };
@@ -160,9 +172,9 @@ pub fn scan(
         std::iter::from_fn(move || {
             while !heap.is_empty() && heap.peek().map(|x| x.0) > cache.peek().map(|x| x.0) {
                 let (_, AlwaysEqual(mean), AlwaysEqual(pay_u)) = heap.pop().unwrap();
-                let Some((Some(dis_u), _)) = vectors::vector_dist(
+                let Some((Some(dis_u), _)) = vectors::vector_dist::<V>(
                     relation.clone(),
-                    &vector,
+                    vector.as_borrowed(),
                     mean,
                     Some(pay_u),
                     Some(distance_kind),

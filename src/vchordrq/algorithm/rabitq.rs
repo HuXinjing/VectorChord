@@ -1,5 +1,5 @@
 use base::distance::{Distance, DistanceKind};
-use base::scalar::ScalarLike;
+use base::simd::ScalarLike;
 
 #[derive(Debug, Clone)]
 pub struct Code {
@@ -12,7 +12,7 @@ pub struct Code {
 
 impl Code {
     pub fn t(&self) -> Vec<u64> {
-        use quantization::utils::InfiniteByteChunks;
+        use crate::utils::infinite_byte_chunks::InfiniteByteChunks;
         let mut result = Vec::new();
         for x in InfiniteByteChunks::<_, 64>::new(self.signs.iter().copied())
             .take(self.signs.len().div_ceil(64))
@@ -62,13 +62,13 @@ pub fn code(dims: u32, vector: &[f32]) -> Code {
 pub type Lut = (f32, f32, f32, f32, (Vec<u64>, Vec<u64>, Vec<u64>, Vec<u64>));
 
 pub fn fscan_preprocess(vector: &[f32]) -> Lut {
-    use quantization::quantize;
+    use base::simd::quantize;
     let dis_v_2 = f32::reduce_sum_of_x2(vector);
-    let (k, b, qvector) = quantize::quantize::<15>(vector);
+    let (k, b, qvector) = quantize::quantize(vector, 15.0);
     let qvector_sum = if vector.len() <= 4369 {
-        quantize::reduce_sum_of_x_as_u16(&qvector) as f32
+        base::simd::u8::reduce_sum_of_x_as_u16(&qvector) as f32
     } else {
-        quantize::reduce_sum_of_x_as_u32(&qvector) as f32
+        base::simd::u8::reduce_sum_of_x_as_u32(&qvector) as f32
     };
     (dis_v_2, b, k, qvector_sum, binarize(&qvector))
 }
@@ -119,34 +119,10 @@ fn binarize(vector: &[u8]) -> (Vec<u64>, Vec<u64>, Vec<u64>, Vec<u64>) {
     (t0, t1, t2, t3)
 }
 
-#[detect::multiversion(v2, fallback)]
 fn asymmetric_binary_dot_product(x: &[u64], y: &(Vec<u64>, Vec<u64>, Vec<u64>, Vec<u64>)) -> u32 {
-    assert_eq!(x.len(), y.0.len());
-    assert_eq!(x.len(), y.1.len());
-    assert_eq!(x.len(), y.2.len());
-    assert_eq!(x.len(), y.3.len());
-    let n = x.len();
-    let (mut t0, mut t1, mut t2, mut t3) = (0, 0, 0, 0);
-    for i in 0..n {
-        t0 += (x[i] & y.0[i]).count_ones();
-    }
-    for i in 0..n {
-        t1 += (x[i] & y.1[i]).count_ones();
-    }
-    for i in 0..n {
-        t2 += (x[i] & y.2[i]).count_ones();
-    }
-    for i in 0..n {
-        t3 += (x[i] & y.3[i]).count_ones();
-    }
+    let t0 = base::simd::bit::sum_of_and(x, &y.0);
+    let t1 = base::simd::bit::sum_of_and(x, &y.1);
+    let t2 = base::simd::bit::sum_of_and(x, &y.2);
+    let t3 = base::simd::bit::sum_of_and(x, &y.3);
     (t0 << 0) + (t1 << 1) + (t2 << 2) + (t3 << 3)
-}
-
-pub fn distance(d: DistanceKind, lhs: &[f32], rhs: &[f32]) -> Distance {
-    match d {
-        DistanceKind::L2 => Distance::from_f32(f32::reduce_sum_of_d2(lhs, rhs)),
-        DistanceKind::Dot => Distance::from_f32(-f32::reduce_sum_of_xy(lhs, rhs)),
-        DistanceKind::Hamming => unimplemented!(),
-        DistanceKind::Jaccard => unimplemented!(),
-    }
 }

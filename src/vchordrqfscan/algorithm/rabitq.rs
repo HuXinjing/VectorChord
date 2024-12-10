@@ -1,6 +1,6 @@
+use crate::utils::infinite_byte_chunks::InfiniteByteChunks;
 use base::distance::{Distance, DistanceKind};
-use base::scalar::ScalarLike;
-use quantization::utils::InfiniteByteChunks;
+use base::simd::ScalarLike;
 
 #[derive(Debug, Clone)]
 pub struct Code {
@@ -74,19 +74,19 @@ pub fn pack_codes(dims: u32, codes: [Code; 32]) -> PackedCodes {
                     .take(dims.div_ceil(4) as usize)
                     .collect::<Vec<_>>()
             });
-            quantization::fast_scan::b4::pack(dims.div_ceil(4), signs).collect()
+            base::simd::fast_scan::b4::pack(dims.div_ceil(4), signs).collect()
         },
     }
 }
 
 pub fn fscan_preprocess(vector: &[f32]) -> (f32, f32, f32, f32, Vec<u8>) {
-    use quantization::quantize;
+    use base::simd::quantize;
     let dis_v_2 = f32::reduce_sum_of_x2(vector);
-    let (k, b, qvector) = quantize::quantize::<15>(vector);
+    let (k, b, qvector) = quantize::quantize(vector, 15.0);
     let qvector_sum = if vector.len() <= 4369 {
-        quantize::reduce_sum_of_x_as_u16(&qvector) as f32
+        base::simd::u8::reduce_sum_of_x_as_u16(&qvector) as f32
     } else {
-        quantize::reduce_sum_of_x_as_u32(&qvector) as f32
+        base::simd::u8::reduce_sum_of_x_as_u32(&qvector) as f32
     };
     (dis_v_2, b, k, qvector_sum, compress(qvector))
 }
@@ -105,7 +105,7 @@ pub fn fscan_process_lowerbound(
     epsilon: f32,
 ) -> [Distance; 32] {
     let &(dis_v_2, b, k, qvector_sum, ref s) = lut;
-    let r = quantization::fast_scan::b4::fast_scan_b4(dims.div_ceil(4), t, s);
+    let r = base::simd::fast_scan::b4::fast_scan_b4(dims.div_ceil(4), t, s);
     match distance_kind {
         DistanceKind::L2 => std::array::from_fn(|i| {
             let rough = dis_u_2[i]

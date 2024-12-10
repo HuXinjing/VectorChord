@@ -1,3 +1,6 @@
+use base::distance::DistanceKind;
+use base::vector::{VectBorrowed, VectOwned};
+use half::f16;
 use serde::{Deserialize, Serialize};
 use validator::{Validate, ValidationError, ValidationErrors};
 
@@ -93,5 +96,49 @@ pub struct VchordrqIndexingOptions {
 impl VchordrqIndexingOptions {
     fn default_residual_quantization() -> bool {
         false
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum OwnedVector {
+    Vecf32(VectOwned<f32>),
+    Vecf16(VectOwned<f16>),
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum BorrowedVector<'a> {
+    Vecf32(VectBorrowed<'a, f32>),
+    Vecf16(VectBorrowed<'a, f16>),
+}
+
+#[repr(u8)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub enum VectorKind {
+    Vecf32,
+    Vecf16,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Validate)]
+#[serde(deny_unknown_fields)]
+#[validate(schema(function = "Self::validate_self"))]
+pub struct VectorOptions {
+    #[validate(range(min = 1, max = 1_048_575))]
+    #[serde(rename = "dimensions")]
+    pub dims: u32,
+    #[serde(rename = "vector")]
+    pub v: VectorKind,
+    #[serde(rename = "distance")]
+    pub d: DistanceKind,
+}
+
+impl VectorOptions {
+    pub fn validate_self(&self) -> Result<(), ValidationError> {
+        match (self.v, self.d, self.dims) {
+            (VectorKind::Vecf32, DistanceKind::L2, 1..65536) => Ok(()),
+            (VectorKind::Vecf32, DistanceKind::Dot, 1..65536) => Ok(()),
+            (VectorKind::Vecf16, DistanceKind::L2, 1..65536) => Ok(()),
+            (VectorKind::Vecf16, DistanceKind::Dot, 1..65536) => Ok(()),
+            _ => Err(ValidationError::new("not valid vector options")),
+        }
     }
 }

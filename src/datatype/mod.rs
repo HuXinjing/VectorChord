@@ -1,3 +1,10 @@
+pub mod binary_scalar8;
+pub mod functions_scalar8;
+pub mod memory_pgvector_halfvec;
 pub mod memory_pgvector_vector;
+pub mod memory_scalar8;
+pub mod operators_pgvector_halfvec;
 pub mod operators_pgvector_vector;
+pub mod operators_scalar8;
+pub mod text_scalar8;
 pub mod typmod;

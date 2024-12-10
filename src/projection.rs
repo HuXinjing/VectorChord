@@ -67,7 +67,7 @@ pub fn prewarm(n: usize) {
 }
 
 pub fn project(vector: &[f32]) -> Vec<f32> {
-    use base::scalar::ScalarLike;
+    use base::simd::ScalarLike;
     let n = vector.len();
     let matrix = MATRIXS[n].get_or_init(|| orthogonal_matrix(n));
     (0..n)

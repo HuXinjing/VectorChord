@@ -2,7 +2,7 @@ use crate::postgres::Relation;
 use crate::vchordrq::algorithm::tuples::*;
 use base::search::Pointer;
 
-pub fn vacuum(relation: Relation, delay: impl Fn(), callback: impl Fn(Pointer) -> bool) {
+pub fn vacuum<V: Vector>(relation: Relation, delay: impl Fn(), callback: impl Fn(Pointer) -> bool) {
     // step 1: vacuum height_0_tuple
     {
         let meta_guard = relation.read(0);
@@ -78,8 +78,8 @@ pub fn vacuum(relation: Relation, delay: impl Fn(), callback: impl Fn(Pointer) -
                     let Some(vector_tuple) = read.get().get(i) else {
                         continue;
                     };
-                    let vector_tuple = rkyv::check_archived_root::<VectorTuple>(vector_tuple)
-                        .expect("data corruption");
+                    let vector_tuple =
+                        unsafe { rkyv::archived_root::<VectorTuple<V>>(vector_tuple) };
                     if let Some(payload) = vector_tuple.payload.as_ref().copied() {
                         if callback(Pointer::new(payload)) {
                             break 'flag true;
@@ -95,8 +95,8 @@ pub fn vacuum(relation: Relation, delay: impl Fn(), callback: impl Fn(Pointer) -
                     let Some(vector_tuple) = write.get().get(i) else {
                         continue;
                     };
-                    let vector_tuple = rkyv::check_archived_root::<VectorTuple>(vector_tuple)
-                        .expect("data corruption");
+                    let vector_tuple =
+                        unsafe { rkyv::archived_root::<VectorTuple<V>>(vector_tuple) };
                     if let Some(payload) = vector_tuple.payload.as_ref().copied() {
                         if callback(Pointer::new(payload)) {
                             write.get_mut().free(i);

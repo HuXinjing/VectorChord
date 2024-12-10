@@ -1,11 +1,15 @@
 use crate::postgres::Relation;
 use crate::vchordrq::algorithm;
 use crate::vchordrq::algorithm::build::{HeapRelation, Reporter};
+use crate::vchordrq::algorithm::tuples::Vector;
 use crate::vchordrq::index::am_options::{Opfamily, Reloption};
 use crate::vchordrq::index::am_scan::Scanner;
 use crate::vchordrq::index::utils::{ctid_to_pointer, pointer_to_ctid};
 use crate::vchordrq::index::{am_options, am_scan};
+use crate::vchordrq::types::VectorKind;
 use base::search::Pointer;
+use base::vector::VectOwned;
+use half::f16;
 use pgrx::datum::Internal;
 use pgrx::pg_sys::Datum;
 
@@ -163,17 +167,17 @@ pub unsafe extern "C" fn ambuild(
         index_info: *mut pgrx::pg_sys::IndexInfo,
         opfamily: Opfamily,
     }
-    impl HeapRelation for Heap {
+    impl<V: Vector> HeapRelation<V> for Heap {
         fn traverse<F>(&self, progress: bool, callback: F)
         where
-            F: FnMut((Pointer, Vec<f32>)),
+            F: FnMut((Pointer, V)),
         {
             pub struct State<'a, F> {
                 pub this: &'a Heap,
                 pub callback: F,
             }
             #[pgrx::pg_guard]
-            unsafe extern "C" fn call<F>(
+            unsafe extern "C" fn call<F, V: Vector>(
                 _index: pgrx::pg_sys::Relation,
                 ctid: pgrx::pg_sys::ItemPointer,
                 values: *mut Datum,
@@ -181,21 +185,14 @@ pub unsafe extern "C" fn ambuild(
                 _tuple_is_alive: bool,
                 state: *mut core::ffi::c_void,
             ) where
-                F: FnMut((Pointer, Vec<f32>)),
+                F: FnMut((Pointer, V)),
             {
-                use base::vector::OwnedVector;
                 let state = unsafe { &mut *state.cast::<State<F>>() };
                 let opfamily = state.this.opfamily;
                 let vector = unsafe { opfamily.datum_to_vector(*values.add(0), *is_null.add(0)) };
                 let pointer = unsafe { ctid_to_pointer(ctid.read()) };
                 if let Some(vector) = vector {
-                    let vector = match vector {
-                        OwnedVector::Vecf32(x) => x,
-                        OwnedVector::Vecf16(_) => unreachable!(),
-                        OwnedVector::SVecf32(_) => unreachable!(),
-                        OwnedVector::BVector(_) => unreachable!(),
-                    };
-                    (state.callback)((pointer, vector.into_vec()));
+                    (state.callback)((pointer, V::from_owned(vector)));
                 }
             }
             let table_am = unsafe { &*(*self.heap).rd_tableam };
@@ -213,7 +210,7 @@ pub unsafe extern "C" fn ambuild(
                     progress,
                     0,
                     pgrx::pg_sys::InvalidBlockNumber,
-                    Some(call::<F>),
+                    Some(call::<F, V>),
                     (&mut state) as *mut State<F> as *mut _,
                     std::ptr::null_mut(),
                 );
@@ -246,13 +243,22 @@ pub unsafe extern "C" fn ambuild(
     };
     let mut reporter = PgReporter {};
     let index_relation = unsafe { Relation::new(index) };
-    algorithm::build::build(
-        vector_options,
-        vchordrq_options,
-        heap_relation.clone(),
-        index_relation.clone(),
-        reporter.clone(),
-    );
+    match opfamily.vector_kind() {
+        VectorKind::Vecf32 => algorithm::build::build::<VectOwned<f32>, Heap, _>(
+            vector_options,
+            vchordrq_options,
+            heap_relation.clone(),
+            index_relation.clone(),
+            reporter.clone(),
+        ),
+        VectorKind::Vecf16 => algorithm::build::build::<VectOwned<f16>, Heap, _>(
+            vector_options,
+            vchordrq_options,
+            heap_relation.clone(),
+            index_relation.clone(),
+            reporter.clone(),
+        ),
+    }
     if let Some(leader) = unsafe { VchordrqLeader::enter(heap, index, (*index_info).ii_Concurrent) }
     {
         unsafe {
@@ -283,17 +289,42 @@ pub unsafe extern "C" fn ambuild(
     } else {
         let mut indtuples = 0;
         reporter.tuples_done(indtuples);
-        heap_relation.traverse(true, |(payload, vector)| {
-            algorithm::insert::insert(
-                index_relation.clone(),
-                payload,
-                vector,
-                opfamily.distance_kind(),
-                true,
-            );
-            indtuples += 1;
-            reporter.tuples_done(indtuples);
-        });
+        match opfamily.vector_kind() {
+            VectorKind::Vecf32 => {
+                HeapRelation::<VectOwned<f32>>::traverse(
+                    &heap_relation,
+                    true,
+                    |(pointer, vector)| {
+                        algorithm::insert::insert::<VectOwned<f32>>(
+                            unsafe { Relation::new(index) },
+                            pointer,
+                            vector,
+                            opfamily.distance_kind(),
+                            true,
+                        );
+                        indtuples += 1;
+                        reporter.tuples_done(indtuples);
+                    },
+                );
+            }
+            VectorKind::Vecf16 => {
+                HeapRelation::<VectOwned<f16>>::traverse(
+                    &heap_relation,
+                    true,
+                    |(pointer, vector)| {
+                        algorithm::insert::insert::<VectOwned<f16>>(
+                            unsafe { Relation::new(index) },
+                            pointer,
+                            vector,
+                            opfamily.distance_kind(),
+                            true,
+                        );
+                        indtuples += 1;
+                        reporter.tuples_done(indtuples);
+                    },
+                );
+            }
+        }
     }
     unsafe { pgrx::pgbox::PgBox::<pgrx::pg_sys::IndexBuildResult>::alloc0().into_pg() }
 }
@@ -540,17 +571,17 @@ unsafe fn parallel_build(
         opfamily: Opfamily,
         scan: *mut pgrx::pg_sys::TableScanDescData,
     }
-    impl HeapRelation for Heap {
+    impl<V: Vector> HeapRelation<V> for Heap {
         fn traverse<F>(&self, progress: bool, callback: F)
         where
-            F: FnMut((Pointer, Vec<f32>)),
+            F: FnMut((Pointer, V)),
         {
             pub struct State<'a, F> {
                 pub this: &'a Heap,
                 pub callback: F,
             }
             #[pgrx::pg_guard]
-            unsafe extern "C" fn call<F>(
+            unsafe extern "C" fn call<F, V: Vector>(
                 _index: pgrx::pg_sys::Relation,
                 ctid: pgrx::pg_sys::ItemPointer,
                 values: *mut Datum,
@@ -558,21 +589,14 @@ unsafe fn parallel_build(
                 _tuple_is_alive: bool,
                 state: *mut core::ffi::c_void,
             ) where
-                F: FnMut((Pointer, Vec<f32>)),
+                F: FnMut((Pointer, V)),
             {
-                use base::vector::OwnedVector;
                 let state = unsafe { &mut *state.cast::<State<F>>() };
                 let opfamily = state.this.opfamily;
                 let vector = unsafe { opfamily.datum_to_vector(*values.add(0), *is_null.add(0)) };
                 let pointer = unsafe { ctid_to_pointer(ctid.read()) };
                 if let Some(vector) = vector {
-                    let vector = match vector {
-                        OwnedVector::Vecf32(x) => x,
-                        OwnedVector::Vecf16(_) => unreachable!(),
-                        OwnedVector::SVecf32(_) => unreachable!(),
-                        OwnedVector::BVector(_) => unreachable!(),
-                    };
-                    (state.callback)((pointer, vector.into_vec()));
+                    (state.callback)((pointer, V::from_owned(vector)));
                 }
             }
             let table_am = unsafe { &*(*self.heap).rd_tableam };
@@ -590,7 +614,7 @@ unsafe fn parallel_build(
                     progress,
                     0,
                     pgrx::pg_sys::InvalidBlockNumber,
-                    Some(call::<F>),
+                    Some(call::<F, V>),
                     (&mut state) as *mut State<F> as *mut _,
                     self.scan,
                 );
@@ -612,28 +636,54 @@ unsafe fn parallel_build(
         opfamily,
         scan,
     };
-    heap_relation.traverse(reporter.is_some(), |(payload, vector)| {
-        algorithm::insert::insert(
-            index_relation.clone(),
-            payload,
-            vector,
-            opfamily.distance_kind(),
-            true,
-        );
-        unsafe {
-            let indtuples;
-            {
-                pgrx::pg_sys::SpinLockAcquire(&raw mut (*vchordrqshared).mutex);
-                (*vchordrqshared).indtuples += 1;
-                indtuples = (*vchordrqshared).indtuples;
-                pgrx::pg_sys::SpinLockRelease(&raw mut (*vchordrqshared).mutex);
-            }
-            if let Some(reporter) = reporter.as_mut() {
-                reporter.tuples_done(indtuples);
-            }
+    match opfamily.vector_kind() {
+        VectorKind::Vecf32 => {
+            HeapRelation::<VectOwned<f32>>::traverse(&heap_relation, true, |(pointer, vector)| {
+                algorithm::insert::insert::<VectOwned<f32>>(
+                    index_relation.clone(),
+                    pointer,
+                    vector,
+                    opfamily.distance_kind(),
+                    true,
+                );
+                unsafe {
+                    let indtuples;
+                    {
+                        pgrx::pg_sys::SpinLockAcquire(&raw mut (*vchordrqshared).mutex);
+                        (*vchordrqshared).indtuples += 1;
+                        indtuples = (*vchordrqshared).indtuples;
+                        pgrx::pg_sys::SpinLockRelease(&raw mut (*vchordrqshared).mutex);
+                    }
+                    if let Some(reporter) = reporter.as_mut() {
+                        reporter.tuples_done(indtuples);
+                    }
+                }
+            });
         }
-    });
-
+        VectorKind::Vecf16 => {
+            HeapRelation::<VectOwned<f16>>::traverse(&heap_relation, true, |(pointer, vector)| {
+                algorithm::insert::insert::<VectOwned<f16>>(
+                    index_relation.clone(),
+                    pointer,
+                    vector,
+                    opfamily.distance_kind(),
+                    true,
+                );
+                unsafe {
+                    let indtuples;
+                    {
+                        pgrx::pg_sys::SpinLockAcquire(&raw mut (*vchordrqshared).mutex);
+                        (*vchordrqshared).indtuples += 1;
+                        indtuples = (*vchordrqshared).indtuples;
+                        pgrx::pg_sys::SpinLockRelease(&raw mut (*vchordrqshared).mutex);
+                    }
+                    if let Some(reporter) = reporter.as_mut() {
+                        reporter.tuples_done(indtuples);
+                    }
+                }
+            });
+        }
+    }
     unsafe {
         pgrx::pg_sys::SpinLockAcquire(&raw mut (*vchordrqshared).mutex);
         (*vchordrqshared).nparticipantsdone += 1;
@@ -658,23 +708,26 @@ pub unsafe extern "C" fn aminsert(
     _check_unique: pgrx::pg_sys::IndexUniqueCheck::Type,
     _index_info: *mut pgrx::pg_sys::IndexInfo,
 ) -> bool {
-    use base::vector::OwnedVector;
     let opfamily = unsafe { am_options::opfamily(index) };
     let vector = unsafe { opfamily.datum_to_vector(*values.add(0), *is_null.add(0)) };
     if let Some(vector) = vector {
-        let vector = match vector {
-            OwnedVector::Vecf32(x) => x,
-            OwnedVector::Vecf16(_) => unreachable!(),
-            OwnedVector::SVecf32(_) => unreachable!(),
-            OwnedVector::BVector(_) => unreachable!(),
-        };
         let pointer = ctid_to_pointer(unsafe { heap_tid.read() });
-        algorithm::insert::insert(
-            unsafe { Relation::new(index) },
-            pointer,
-            vector.into_vec(),
-            opfamily.distance_kind(),
-        );
+        match opfamily.vector_kind() {
+            VectorKind::Vecf32 => algorithm::insert::insert::<VectOwned<f32>>(
+                unsafe { Relation::new(index) },
+                pointer,
+                VectOwned::<f32>::from_owned(vector),
+                opfamily.distance_kind(),
+                false,
+            ),
+            VectorKind::Vecf16 => algorithm::insert::insert::<VectOwned<f16>>(
+                unsafe { Relation::new(index) },
+                pointer,
+                VectOwned::<f16>::from_owned(vector),
+                opfamily.distance_kind(),
+                false,
+            ),
+        }
     }
     false
 }
@@ -691,24 +744,26 @@ pub unsafe extern "C" fn aminsert(
     _index_unchanged: bool,
     _index_info: *mut pgrx::pg_sys::IndexInfo,
 ) -> bool {
-    use base::vector::OwnedVector;
     let opfamily = unsafe { am_options::opfamily(index) };
     let vector = unsafe { opfamily.datum_to_vector(*values.add(0), *is_null.add(0)) };
     if let Some(vector) = vector {
-        let vector = match vector {
-            OwnedVector::Vecf32(x) => x,
-            OwnedVector::Vecf16(_) => unreachable!(),
-            OwnedVector::SVecf32(_) => unreachable!(),
-            OwnedVector::BVector(_) => unreachable!(),
-        };
         let pointer = ctid_to_pointer(unsafe { heap_tid.read() });
-        algorithm::insert::insert(
-            unsafe { Relation::new(index) },
-            pointer,
-            vector.into_vec(),
-            opfamily.distance_kind(),
-            false,
-        );
+        match opfamily.vector_kind() {
+            VectorKind::Vecf32 => algorithm::insert::insert::<VectOwned<f32>>(
+                unsafe { Relation::new(index) },
+                pointer,
+                VectOwned::<f32>::from_owned(vector),
+                opfamily.distance_kind(),
+                false,
+            ),
+            VectorKind::Vecf16 => algorithm::insert::insert::<VectOwned<f16>>(
+                unsafe { Relation::new(index) },
+                pointer,
+                VectOwned::<f16>::from_owned(vector),
+                opfamily.distance_kind(),
+                false,
+            ),
+        }
     }
     false
 }
@@ -833,15 +888,25 @@ pub unsafe extern "C" fn ambulkdelete(
             pgrx::pg_sys::palloc0(size_of::<pgrx::pg_sys::IndexBulkDeleteResult>()).cast()
         };
     }
+    let opfamily = unsafe { am_options::opfamily((*info).index) };
     let callback = callback.unwrap();
     let callback = |p: Pointer| unsafe { callback(&mut pointer_to_ctid(p), callback_state) };
-    algorithm::vacuum::vacuum(
-        unsafe { Relation::new((*info).index) },
-        || unsafe {
-            pgrx::pg_sys::vacuum_delay_point();
-        },
-        callback,
-    );
+    match opfamily.vector_kind() {
+        VectorKind::Vecf32 => algorithm::vacuum::vacuum::<VectOwned<f32>>(
+            unsafe { Relation::new((*info).index) },
+            || unsafe {
+                pgrx::pg_sys::vacuum_delay_point();
+            },
+            callback,
+        ),
+        VectorKind::Vecf16 => algorithm::vacuum::vacuum::<VectOwned<f16>>(
+            unsafe { Relation::new((*info).index) },
+            || unsafe {
+                pgrx::pg_sys::vacuum_delay_point();
+            },
+            callback,
+        ),
+    }
     stats
 }
 

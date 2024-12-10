@@ -6,8 +6,8 @@ use crate::vchordrqfscan::algorithm::tuples::*;
 use base::always_equal::AlwaysEqual;
 use base::distance::Distance;
 use base::distance::DistanceKind;
-use base::scalar::ScalarLike;
 use base::search::Pointer;
+use base::simd::ScalarLike;
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
 

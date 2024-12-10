@@ -1,4 +1,5 @@
 use base::vector::*;
+use half::f16;
 use pgrx::datum::FromDatum;
 use pgrx::datum::IntoDatum;
 use pgrx::pg_sys::Datum;
@@ -12,21 +13,21 @@ use std::ops::Deref;
 use std::ptr::NonNull;
 
 #[repr(C, align(8))]
-pub struct PgvectorVectorHeader {
+pub struct PgvectorHalfvecHeader {
     varlena: u32,
     dims: u16,
     unused: u16,
-    phantom: [f32; 0],
+    phantom: [f16; 0],
 }
 
-impl PgvectorVectorHeader {
+impl PgvectorHalfvecHeader {
     fn size_of(len: usize) -> usize {
         if len > 65535 {
             panic!("vector is too large");
         }
-        (size_of::<Self>() + size_of::<f32>() * len).next_multiple_of(8)
+        (size_of::<Self>() + size_of::<f16>() * len).next_multiple_of(8)
     }
-    pub fn as_borrowed(&self) -> VectBorrowed<'_, f32> {
+    pub fn as_borrowed(&self) -> VectBorrowed<'_, f16> {
         unsafe {
             VectBorrowed::new_unchecked(std::slice::from_raw_parts(
                 self.phantom.as_ptr(),
@@ -36,67 +37,67 @@ impl PgvectorVectorHeader {
     }
 }
 
-pub enum PgvectorVectorInput<'a> {
-    Owned(PgvectorVectorOutput),
-    Borrowed(&'a PgvectorVectorHeader),
+pub enum PgvectorHalfvecInput<'a> {
+    Owned(PgvectorHalfvecOutput),
+    Borrowed(&'a PgvectorHalfvecHeader),
 }
 
-impl PgvectorVectorInput<'_> {
-    unsafe fn new(p: NonNull<PgvectorVectorHeader>) -> Self {
+impl PgvectorHalfvecInput<'_> {
+    unsafe fn new(p: NonNull<PgvectorHalfvecHeader>) -> Self {
         let q = unsafe {
             NonNull::new(pgrx::pg_sys::pg_detoast_datum(p.cast().as_ptr()).cast()).unwrap()
         };
         if p != q {
-            PgvectorVectorInput::Owned(PgvectorVectorOutput(q))
+            PgvectorHalfvecInput::Owned(PgvectorHalfvecOutput(q))
         } else {
-            unsafe { PgvectorVectorInput::Borrowed(p.as_ref()) }
+            unsafe { PgvectorHalfvecInput::Borrowed(p.as_ref()) }
         }
     }
 }
 
-impl Deref for PgvectorVectorInput<'_> {
-    type Target = PgvectorVectorHeader;
+impl Deref for PgvectorHalfvecInput<'_> {
+    type Target = PgvectorHalfvecHeader;
 
     fn deref(&self) -> &Self::Target {
         match self {
-            PgvectorVectorInput::Owned(x) => x,
-            PgvectorVectorInput::Borrowed(x) => x,
+            PgvectorHalfvecInput::Owned(x) => x,
+            PgvectorHalfvecInput::Borrowed(x) => x,
         }
     }
 }
 
-pub struct PgvectorVectorOutput(NonNull<PgvectorVectorHeader>);
+pub struct PgvectorHalfvecOutput(NonNull<PgvectorHalfvecHeader>);
 
-impl PgvectorVectorOutput {
-    pub fn new(vector: VectBorrowed<'_, f32>) -> PgvectorVectorOutput {
+impl PgvectorHalfvecOutput {
+    pub fn new(vector: VectBorrowed<'_, f16>) -> PgvectorHalfvecOutput {
         unsafe {
             let slice = vector.slice();
-            let size = PgvectorVectorHeader::size_of(slice.len());
+            let size = PgvectorHalfvecHeader::size_of(slice.len());
 
-            let ptr = pgrx::pg_sys::palloc0(size) as *mut PgvectorVectorHeader;
+            let ptr = pgrx::pg_sys::palloc0(size) as *mut PgvectorHalfvecHeader;
             (&raw mut (*ptr).varlena).write((size << 2) as u32);
             (&raw mut (*ptr).dims).write(vector.dims() as _);
             (&raw mut (*ptr).unused).write(0);
             std::ptr::copy_nonoverlapping(slice.as_ptr(), (*ptr).phantom.as_mut_ptr(), slice.len());
-            PgvectorVectorOutput(NonNull::new(ptr).unwrap())
+            PgvectorHalfvecOutput(NonNull::new(ptr).unwrap())
         }
     }
-    pub fn into_raw(self) -> *mut PgvectorVectorHeader {
+    pub fn into_raw(self) -> *mut PgvectorHalfvecHeader {
         let result = self.0.as_ptr();
         std::mem::forget(self);
         result
     }
 }
 
-impl Deref for PgvectorVectorOutput {
-    type Target = PgvectorVectorHeader;
+impl Deref for PgvectorHalfvecOutput {
+    type Target = PgvectorHalfvecHeader;
 
     fn deref(&self) -> &Self::Target {
         unsafe { self.0.as_ref() }
     }
 }
 
-impl Drop for PgvectorVectorOutput {
+impl Drop for PgvectorHalfvecOutput {
     fn drop(&mut self) {
         unsafe {
             pgrx::pg_sys::pfree(self.0.as_ptr() as _);
@@ -104,18 +105,18 @@ impl Drop for PgvectorVectorOutput {
     }
 }
 
-impl FromDatum for PgvectorVectorInput<'_> {
+impl FromDatum for PgvectorHalfvecInput<'_> {
     unsafe fn from_polymorphic_datum(datum: Datum, is_null: bool, _typoid: Oid) -> Option<Self> {
         if is_null {
             None
         } else {
-            let ptr = NonNull::new(datum.cast_mut_ptr::<PgvectorVectorHeader>()).unwrap();
-            unsafe { Some(PgvectorVectorInput::new(ptr)) }
+            let ptr = NonNull::new(datum.cast_mut_ptr::<PgvectorHalfvecHeader>()).unwrap();
+            unsafe { Some(PgvectorHalfvecInput::new(ptr)) }
         }
     }
 }
 
-impl IntoDatum for PgvectorVectorOutput {
+impl IntoDatum for PgvectorHalfvecOutput {
     fn into_datum(self) -> Option<Datum> {
         Some(Datum::from(self.into_raw() as *mut ()))
     }
@@ -129,71 +130,71 @@ impl IntoDatum for PgvectorVectorOutput {
     }
 }
 
-impl FromDatum for PgvectorVectorOutput {
+impl FromDatum for PgvectorHalfvecOutput {
     unsafe fn from_polymorphic_datum(datum: Datum, is_null: bool, _typoid: Oid) -> Option<Self> {
         if is_null {
             None
         } else {
-            let p = NonNull::new(datum.cast_mut_ptr::<PgvectorVectorHeader>())?;
+            let p = NonNull::new(datum.cast_mut_ptr::<PgvectorHalfvecHeader>())?;
             let q =
                 unsafe { NonNull::new(pgrx::pg_sys::pg_detoast_datum(p.cast().as_ptr()).cast())? };
             if p != q {
-                Some(PgvectorVectorOutput(q))
+                Some(PgvectorHalfvecOutput(q))
             } else {
                 let header = p.as_ptr();
                 let vector = unsafe { (*header).as_borrowed() };
-                Some(PgvectorVectorOutput::new(vector))
+                Some(PgvectorHalfvecOutput::new(vector))
             }
         }
     }
 }
 
-unsafe impl pgrx::datum::UnboxDatum for PgvectorVectorOutput {
-    type As<'src> = PgvectorVectorOutput;
+unsafe impl pgrx::datum::UnboxDatum for PgvectorHalfvecOutput {
+    type As<'src> = PgvectorHalfvecOutput;
     #[inline]
     unsafe fn unbox<'src>(d: pgrx::datum::Datum<'src>) -> Self::As<'src>
     where
         Self: 'src,
     {
-        let p = NonNull::new(d.sans_lifetime().cast_mut_ptr::<PgvectorVectorHeader>()).unwrap();
+        let p = NonNull::new(d.sans_lifetime().cast_mut_ptr::<PgvectorHalfvecHeader>()).unwrap();
         let q = unsafe {
             NonNull::new(pgrx::pg_sys::pg_detoast_datum(p.cast().as_ptr()).cast()).unwrap()
         };
         if p != q {
-            PgvectorVectorOutput(q)
+            PgvectorHalfvecOutput(q)
         } else {
             let header = p.as_ptr();
             let vector = unsafe { (*header).as_borrowed() };
-            PgvectorVectorOutput::new(vector)
+            PgvectorHalfvecOutput::new(vector)
         }
     }
 }
 
-unsafe impl SqlTranslatable for PgvectorVectorInput<'_> {
+unsafe impl SqlTranslatable for PgvectorHalfvecInput<'_> {
     fn argument_sql() -> Result<SqlMapping, ArgumentError> {
-        Ok(SqlMapping::As(String::from("vector")))
+        Ok(SqlMapping::As(String::from("halfvec")))
     }
     fn return_sql() -> Result<Returns, ReturnsError> {
-        Ok(Returns::One(SqlMapping::As(String::from("vector"))))
+        Ok(Returns::One(SqlMapping::As(String::from("halfvec"))))
     }
 }
 
-unsafe impl SqlTranslatable for PgvectorVectorOutput {
+unsafe impl SqlTranslatable for PgvectorHalfvecOutput {
     fn argument_sql() -> Result<SqlMapping, ArgumentError> {
-        Ok(SqlMapping::As(String::from("vector")))
+        Ok(SqlMapping::As(String::from("halfvec")))
     }
     fn return_sql() -> Result<Returns, ReturnsError> {
-        Ok(Returns::One(SqlMapping::As(String::from("vector"))))
+        Ok(Returns::One(SqlMapping::As(String::from("halfvec"))))
     }
 }
 
-unsafe impl<'fcx> pgrx::callconv::ArgAbi<'fcx> for PgvectorVectorInput<'fcx> {
+unsafe impl<'fcx> pgrx::callconv::ArgAbi<'fcx> for PgvectorHalfvecInput<'fcx> {
     unsafe fn unbox_arg_unchecked(arg: pgrx::callconv::Arg<'_, 'fcx>) -> Self {
         unsafe { arg.unbox_arg_using_from_datum().unwrap() }
     }
 }
 
-unsafe impl pgrx::callconv::BoxRet for PgvectorVectorOutput {
+unsafe impl pgrx::callconv::BoxRet for PgvectorHalfvecOutput {
     unsafe fn box_into<'fcx>(
         self,
         fcinfo: &mut pgrx::callconv::FcInfo<'fcx>,

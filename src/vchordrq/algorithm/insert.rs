@@ -1,23 +1,23 @@
 use crate::postgres::Relation;
-use crate::vchordrq::algorithm::rabitq;
 use crate::vchordrq::algorithm::rabitq::fscan_process_lowerbound;
 use crate::vchordrq::algorithm::tuples::*;
 use crate::vchordrq::algorithm::vectors;
 use base::always_equal::AlwaysEqual;
 use base::distance::Distance;
 use base::distance::DistanceKind;
-use base::scalar::ScalarLike;
 use base::search::Pointer;
+use base::vector::VectorBorrowed;
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
 
-pub fn insert(
+pub fn insert<V: Vector>(
     relation: Relation,
     payload: Pointer,
-    vector: Vec<f32>,
+    vector: V,
     distance_kind: DistanceKind,
     in_building: bool,
 ) {
+    let vector = vector.as_borrowed();
     let meta_guard = relation.read(0);
     let meta_tuple = meta_guard
         .get()
@@ -26,25 +26,26 @@ pub fn insert(
         .expect("data corruption")
         .expect("data corruption");
     let dims = meta_tuple.dims;
-    assert_eq!(dims as usize, vector.len(), "invalid vector dimensions");
-    let vector = crate::projection::project(&vector);
+    assert_eq!(dims, vector.dims(), "invalid vector dimensions");
+    let vector = V::random_projection(vector);
+    let vector = vector.as_borrowed();
     let is_residual = meta_tuple.is_residual;
     let default_lut = if !is_residual {
-        Some(rabitq::fscan_preprocess(&vector))
+        Some(V::rabitq_fscan_preprocess(vector))
     } else {
         None
     };
     let h0_vector = {
-        let slices = vectors::vector_split(&vector);
-        let mut chain = None;
+        let (metadata, slices) = V::vector_split(vector);
+        let mut chain = Err(metadata);
         for i in (0..slices.len()).rev() {
-            let tuple = rkyv::to_bytes::<_, 8192>(&VectorTuple {
+            let tuple = rkyv::to_bytes::<_, 8192>(&VectorTuple::<V> {
                 slice: slices[i].to_vec(),
                 payload: Some(payload.as_u64()),
                 chain,
             })
             .unwrap();
-            chain = Some(append(
+            chain = Ok(append(
                 relation.clone(),
                 meta_tuple.vectors_first,
                 &tuple,
@@ -53,13 +54,13 @@ pub fn insert(
                 true,
             ));
         }
-        chain.unwrap()
+        chain.ok().unwrap()
     };
     let h0_payload = payload.as_u64();
     let mut list = {
-        let Some((_, original)) = vectors::vector_dist(
+        let Some((_, original)) = vectors::vector_dist::<V>(
             relation.clone(),
-            &vector,
+            vector,
             meta_tuple.mean,
             None,
             None,
@@ -69,11 +70,14 @@ pub fn insert(
         };
         (meta_tuple.first, original)
     };
-    let make_list = |list: (u32, Option<Vec<f32>>)| {
+    let make_list = |list: (u32, Option<V>)| {
         let mut results = Vec::new();
         {
             let lut = if is_residual {
-                &rabitq::fscan_preprocess(&f32::vector_sub(&vector, list.1.as_ref().unwrap()))
+                &V::rabitq_fscan_preprocess(
+                    V::residual(vector, list.1.as_ref().map(|x| x.as_borrowed()).unwrap())
+                        .as_borrowed(),
+                )
             } else {
                 default_lut.as_ref().unwrap()
             };
@@ -114,9 +118,9 @@ pub fn insert(
         {
             while !heap.is_empty() && heap.peek().map(|x| x.0) > cache.peek().map(|x| x.0) {
                 let (_, AlwaysEqual(mean), AlwaysEqual(first)) = heap.pop().unwrap();
-                let Some((Some(dis_u), original)) = vectors::vector_dist(
+                let Some((Some(dis_u), original)) = vectors::vector_dist::<V>(
                     relation.clone(),
-                    &vector,
+                    vector,
                     mean,
                     None,
                     Some(distance_kind),
@@ -134,9 +138,12 @@ pub fn insert(
         list = make_list(list);
     }
     let code = if is_residual {
-        rabitq::code(dims, &f32::vector_sub(&vector, list.1.as_ref().unwrap()))
+        V::rabitq_code(
+            dims,
+            V::residual(vector, list.1.as_ref().map(|x| x.as_borrowed()).unwrap()).as_borrowed(),
+        )
     } else {
-        rabitq::code(dims, &vector)
+        V::rabitq_code(dims, vector)
     };
     let tuple = rkyv::to_bytes::<_, 8192>(&Height0Tuple {
         mean: h0_vector,

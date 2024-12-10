@@ -1,3 +1,4 @@
+use crate::types::scalar8::Scalar8Borrowed;
 use base::vector::*;
 use pgrx::datum::FromDatum;
 use pgrx::datum::IntoDatum;
@@ -12,91 +13,102 @@ use std::ops::Deref;
 use std::ptr::NonNull;
 
 #[repr(C, align(8))]
-pub struct PgvectorVectorHeader {
+pub struct Scalar8Header {
     varlena: u32,
     dims: u16,
     unused: u16,
-    phantom: [f32; 0],
+    sum_of_x2: f32,
+    k: f32,
+    b: f32,
+    sum_of_code: f32,
+    phantom: [u8; 0],
 }
 
-impl PgvectorVectorHeader {
+impl Scalar8Header {
     fn size_of(len: usize) -> usize {
         if len > 65535 {
             panic!("vector is too large");
         }
-        (size_of::<Self>() + size_of::<f32>() * len).next_multiple_of(8)
+        (size_of::<Self>() + size_of::<u8>() * len).next_multiple_of(8)
     }
-    pub fn as_borrowed(&self) -> VectBorrowed<'_, f32> {
+    pub fn as_borrowed(&self) -> Scalar8Borrowed<'_> {
         unsafe {
-            VectBorrowed::new_unchecked(std::slice::from_raw_parts(
-                self.phantom.as_ptr(),
-                self.dims as usize,
-            ))
+            Scalar8Borrowed::new_unchecked(
+                self.sum_of_x2,
+                self.k,
+                self.b,
+                self.sum_of_code,
+                std::slice::from_raw_parts(self.phantom.as_ptr(), self.dims as usize),
+            )
         }
     }
 }
 
-pub enum PgvectorVectorInput<'a> {
-    Owned(PgvectorVectorOutput),
-    Borrowed(&'a PgvectorVectorHeader),
+pub enum Scalar8Input<'a> {
+    Owned(Scalar8Output),
+    Borrowed(&'a Scalar8Header),
 }
 
-impl PgvectorVectorInput<'_> {
-    unsafe fn new(p: NonNull<PgvectorVectorHeader>) -> Self {
+impl Scalar8Input<'_> {
+    unsafe fn new(p: NonNull<Scalar8Header>) -> Self {
         let q = unsafe {
             NonNull::new(pgrx::pg_sys::pg_detoast_datum(p.cast().as_ptr()).cast()).unwrap()
         };
         if p != q {
-            PgvectorVectorInput::Owned(PgvectorVectorOutput(q))
+            Scalar8Input::Owned(Scalar8Output(q))
         } else {
-            unsafe { PgvectorVectorInput::Borrowed(p.as_ref()) }
+            unsafe { Scalar8Input::Borrowed(p.as_ref()) }
         }
     }
 }
 
-impl Deref for PgvectorVectorInput<'_> {
-    type Target = PgvectorVectorHeader;
+impl Deref for Scalar8Input<'_> {
+    type Target = Scalar8Header;
 
     fn deref(&self) -> &Self::Target {
         match self {
-            PgvectorVectorInput::Owned(x) => x,
-            PgvectorVectorInput::Borrowed(x) => x,
+            Scalar8Input::Owned(x) => x,
+            Scalar8Input::Borrowed(x) => x,
         }
     }
 }
 
-pub struct PgvectorVectorOutput(NonNull<PgvectorVectorHeader>);
+pub struct Scalar8Output(NonNull<Scalar8Header>);
 
-impl PgvectorVectorOutput {
-    pub fn new(vector: VectBorrowed<'_, f32>) -> PgvectorVectorOutput {
+impl Scalar8Output {
+    pub fn new(vector: Scalar8Borrowed<'_>) -> Scalar8Output {
         unsafe {
-            let slice = vector.slice();
-            let size = PgvectorVectorHeader::size_of(slice.len());
+            let code = vector.code();
+            let size = Scalar8Header::size_of(code.len());
 
-            let ptr = pgrx::pg_sys::palloc0(size) as *mut PgvectorVectorHeader;
+            let ptr = pgrx::pg_sys::palloc0(size) as *mut Scalar8Header;
             (&raw mut (*ptr).varlena).write((size << 2) as u32);
             (&raw mut (*ptr).dims).write(vector.dims() as _);
             (&raw mut (*ptr).unused).write(0);
-            std::ptr::copy_nonoverlapping(slice.as_ptr(), (*ptr).phantom.as_mut_ptr(), slice.len());
-            PgvectorVectorOutput(NonNull::new(ptr).unwrap())
+            (&raw mut (*ptr).sum_of_x2).write(vector.sum_of_x2());
+            (&raw mut (*ptr).k).write(vector.k());
+            (&raw mut (*ptr).b).write(vector.b());
+            (&raw mut (*ptr).sum_of_code).write(vector.sum_of_code());
+            std::ptr::copy_nonoverlapping(code.as_ptr(), (*ptr).phantom.as_mut_ptr(), code.len());
+            Scalar8Output(NonNull::new(ptr).unwrap())
         }
     }
-    pub fn into_raw(self) -> *mut PgvectorVectorHeader {
+    pub fn into_raw(self) -> *mut Scalar8Header {
         let result = self.0.as_ptr();
         std::mem::forget(self);
         result
     }
 }
 
-impl Deref for PgvectorVectorOutput {
-    type Target = PgvectorVectorHeader;
+impl Deref for Scalar8Output {
+    type Target = Scalar8Header;
 
     fn deref(&self) -> &Self::Target {
         unsafe { self.0.as_ref() }
     }
 }
 
-impl Drop for PgvectorVectorOutput {
+impl Drop for Scalar8Output {
     fn drop(&mut self) {
         unsafe {
             pgrx::pg_sys::pfree(self.0.as_ptr() as _);
@@ -104,18 +116,18 @@ impl Drop for PgvectorVectorOutput {
     }
 }
 
-impl FromDatum for PgvectorVectorInput<'_> {
+impl FromDatum for Scalar8Input<'_> {
     unsafe fn from_polymorphic_datum(datum: Datum, is_null: bool, _typoid: Oid) -> Option<Self> {
         if is_null {
             None
         } else {
-            let ptr = NonNull::new(datum.cast_mut_ptr::<PgvectorVectorHeader>()).unwrap();
-            unsafe { Some(PgvectorVectorInput::new(ptr)) }
+            let ptr = NonNull::new(datum.cast_mut_ptr::<Scalar8Header>()).unwrap();
+            unsafe { Some(Scalar8Input::new(ptr)) }
         }
     }
 }
 
-impl IntoDatum for PgvectorVectorOutput {
+impl IntoDatum for Scalar8Output {
     fn into_datum(self) -> Option<Datum> {
         Some(Datum::from(self.into_raw() as *mut ()))
     }
@@ -129,71 +141,71 @@ impl IntoDatum for PgvectorVectorOutput {
     }
 }
 
-impl FromDatum for PgvectorVectorOutput {
+impl FromDatum for Scalar8Output {
     unsafe fn from_polymorphic_datum(datum: Datum, is_null: bool, _typoid: Oid) -> Option<Self> {
         if is_null {
             None
         } else {
-            let p = NonNull::new(datum.cast_mut_ptr::<PgvectorVectorHeader>())?;
+            let p = NonNull::new(datum.cast_mut_ptr::<Scalar8Header>())?;
             let q =
                 unsafe { NonNull::new(pgrx::pg_sys::pg_detoast_datum(p.cast().as_ptr()).cast())? };
             if p != q {
-                Some(PgvectorVectorOutput(q))
+                Some(Scalar8Output(q))
             } else {
                 let header = p.as_ptr();
                 let vector = unsafe { (*header).as_borrowed() };
-                Some(PgvectorVectorOutput::new(vector))
+                Some(Scalar8Output::new(vector))
             }
         }
     }
 }
 
-unsafe impl pgrx::datum::UnboxDatum for PgvectorVectorOutput {
-    type As<'src> = PgvectorVectorOutput;
+unsafe impl pgrx::datum::UnboxDatum for Scalar8Output {
+    type As<'src> = Scalar8Output;
     #[inline]
     unsafe fn unbox<'src>(d: pgrx::datum::Datum<'src>) -> Self::As<'src>
     where
         Self: 'src,
     {
-        let p = NonNull::new(d.sans_lifetime().cast_mut_ptr::<PgvectorVectorHeader>()).unwrap();
+        let p = NonNull::new(d.sans_lifetime().cast_mut_ptr::<Scalar8Header>()).unwrap();
         let q = unsafe {
             NonNull::new(pgrx::pg_sys::pg_detoast_datum(p.cast().as_ptr()).cast()).unwrap()
         };
         if p != q {
-            PgvectorVectorOutput(q)
+            Scalar8Output(q)
         } else {
             let header = p.as_ptr();
             let vector = unsafe { (*header).as_borrowed() };
-            PgvectorVectorOutput::new(vector)
+            Scalar8Output::new(vector)
         }
     }
 }
 
-unsafe impl SqlTranslatable for PgvectorVectorInput<'_> {
+unsafe impl SqlTranslatable for Scalar8Input<'_> {
     fn argument_sql() -> Result<SqlMapping, ArgumentError> {
-        Ok(SqlMapping::As(String::from("vector")))
+        Ok(SqlMapping::As(String::from("scalar8")))
     }
     fn return_sql() -> Result<Returns, ReturnsError> {
-        Ok(Returns::One(SqlMapping::As(String::from("vector"))))
+        Ok(Returns::One(SqlMapping::As(String::from("scalar8"))))
     }
 }
 
-unsafe impl SqlTranslatable for PgvectorVectorOutput {
+unsafe impl SqlTranslatable for Scalar8Output {
     fn argument_sql() -> Result<SqlMapping, ArgumentError> {
-        Ok(SqlMapping::As(String::from("vector")))
+        Ok(SqlMapping::As(String::from("scalar8")))
     }
     fn return_sql() -> Result<Returns, ReturnsError> {
-        Ok(Returns::One(SqlMapping::As(String::from("vector"))))
+        Ok(Returns::One(SqlMapping::As(String::from("scalar8"))))
     }
 }
 
-unsafe impl<'fcx> pgrx::callconv::ArgAbi<'fcx> for PgvectorVectorInput<'fcx> {
+unsafe impl<'fcx> pgrx::callconv::ArgAbi<'fcx> for Scalar8Input<'fcx> {
     unsafe fn unbox_arg_unchecked(arg: pgrx::callconv::Arg<'_, 'fcx>) -> Self {
         unsafe { arg.unbox_arg_using_from_datum().unwrap() }
     }
 }
 
-unsafe impl pgrx::callconv::BoxRet for PgvectorVectorOutput {
+unsafe impl pgrx::callconv::BoxRet for Scalar8Output {
     unsafe fn box_into<'fcx>(
         self,
         fcinfo: &mut pgrx::callconv::FcInfo<'fcx>,

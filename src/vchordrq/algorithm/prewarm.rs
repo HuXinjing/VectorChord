@@ -3,7 +3,7 @@ use crate::vchordrq::algorithm::tuples::*;
 use crate::vchordrq::algorithm::vectors;
 use std::fmt::Write;
 
-pub fn prewarm(relation: Relation, height: i32) -> String {
+pub fn prewarm<V: Vector>(relation: Relation, height: i32) -> String {
     let mut message = String::new();
     let meta_guard = relation.read(0);
     let meta_tuple = meta_guard
@@ -21,7 +21,7 @@ pub fn prewarm(relation: Relation, height: i32) -> String {
         let mut results = Vec::new();
         let counter = 1_usize;
         {
-            vectors::vector_warm(relation.clone(), meta_tuple.mean);
+            vectors::vector_warm::<V>(relation.clone(), meta_tuple.mean);
             results.push(meta_tuple.first);
         }
         writeln!(message, "number of tuples: {}", results.len()).unwrap();
@@ -44,7 +44,7 @@ pub fn prewarm(relation: Relation, height: i32) -> String {
                         .map(rkyv::check_archived_root::<Height1Tuple>)
                         .expect("data corruption")
                         .expect("data corruption");
-                    vectors::vector_warm(relation.clone(), h1_tuple.mean);
+                    vectors::vector_warm::<V>(relation.clone(), h1_tuple.mean);
                     results.push(h1_tuple.first);
                 }
                 current = h1_guard.get().get_opaque().next;

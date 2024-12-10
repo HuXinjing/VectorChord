@@ -2,25 +2,25 @@ use crate::postgres::BufferWriteGuard;
 use crate::postgres::Relation;
 use crate::vchordrq::algorithm::rabitq;
 use crate::vchordrq::algorithm::tuples::*;
-use crate::vchordrq::algorithm::vectors;
 use crate::vchordrq::index::am_options::Opfamily;
 use crate::vchordrq::types::VchordrqBuildOptions;
 use crate::vchordrq::types::VchordrqExternalBuildOptions;
 use crate::vchordrq::types::VchordrqIndexingOptions;
 use crate::vchordrq::types::VchordrqInternalBuildOptions;
+use crate::vchordrq::types::VectorOptions;
 use base::distance::DistanceKind;
-use base::index::VectorOptions;
-use base::scalar::ScalarLike;
 use base::search::Pointer;
+use base::simd::ScalarLike;
+use base::vector::VectorBorrowed;
 use rand::Rng;
 use rkyv::ser::serializers::AllocSerializer;
 use std::marker::PhantomData;
 use std::sync::Arc;
 
-pub trait HeapRelation {
+pub trait HeapRelation<V: Vector> {
     fn traverse<F>(&self, progress: bool, callback: F)
     where
-        F: FnMut((Pointer, Vec<f32>));
+        F: FnMut((Pointer, V));
     fn opfamily(&self) -> Opfamily;
 }
 
@@ -28,7 +28,7 @@ pub trait Reporter {
     fn tuples_total(&mut self, tuples_total: u64);
 }
 
-pub fn build<T: HeapRelation, R: Reporter>(
+pub fn build<V: Vector, T: HeapRelation<V>, R: Reporter>(
     vector_options: VectorOptions,
     vchordrq_options: VchordrqIndexingOptions,
     heap_relation: T,
@@ -56,13 +56,14 @@ pub fn build<T: HeapRelation, R: Reporter>(
                 let mut samples = Vec::new();
                 let mut number_of_samples = 0_u32;
                 heap_relation.traverse(false, |(_, vector)| {
-                    assert_eq!(dims as usize, vector.len(), "invalid vector dimensions");
+                    let vector = vector.as_borrowed();
+                    assert_eq!(dims, vector.dims(), "invalid vector dimensions");
                     if number_of_samples < max_number_of_samples {
-                        samples.push(vector);
+                        samples.push(V::build_to_vecf32(vector));
                         number_of_samples += 1;
                     } else {
                         let index = rand.gen_range(0..max_number_of_samples) as usize;
-                        samples[index] = vector;
+                        samples[index] = V::build_to_vecf32(vector);
                     }
                     tuples_total += 1;
                 });
@@ -74,21 +75,22 @@ pub fn build<T: HeapRelation, R: Reporter>(
     };
     let mut meta = Tape::create(&relation, false);
     assert_eq!(meta.first(), 0);
-    let mut vectors = Tape::create(&relation, true);
+    let mut vectors = Tape::<VectorTuple<V>>::create(&relation, true);
     let mut pointer_of_means = Vec::<Vec<(u32, u16)>>::new();
     for i in 0..structures.len() {
         let mut level = Vec::new();
         for j in 0..structures[i].len() {
-            let slices = vectors::vector_split(&structures[i].means[j]);
-            let mut chain = None;
+            let vector = V::build_from_vecf32(&structures[i].means[j]);
+            let (metadata, slices) = V::vector_split(vector.as_borrowed());
+            let mut chain = Err(metadata);
             for i in (0..slices.len()).rev() {
-                chain = Some(vectors.push(&VectorTuple {
+                chain = Ok(vectors.push(&VectorTuple {
                     payload: None,
                     slice: slices[i].to_vec(),
                     chain,
                 }));
             }
-            level.push(chain.unwrap());
+            level.push(chain.ok().unwrap());
         }
         pointer_of_means.push(level);
     }
@@ -224,7 +226,7 @@ impl Structure {
                 if vector_options.dims != vector.as_borrowed().dims() {
                     pgrx::error!("extern build: incorrect dimension, id = {id}");
                 }
-                vectors.insert(id, crate::projection::project(vector.slice()));
+                vectors.insert(id, crate::projection::project(vector.as_borrowed().slice()));
             }
         });
         let mut children = parents

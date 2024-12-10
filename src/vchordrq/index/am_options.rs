@@ -1,10 +1,13 @@
+use crate::datatype::memory_pgvector_halfvec::PgvectorHalfvecInput;
+use crate::datatype::memory_pgvector_halfvec::PgvectorHalfvecOutput;
 use crate::datatype::memory_pgvector_vector::PgvectorVectorInput;
 use crate::datatype::memory_pgvector_vector::PgvectorVectorOutput;
 use crate::datatype::typmod::Typmod;
 use crate::vchordrq::types::VchordrqIndexingOptions;
+use crate::vchordrq::types::VectorOptions;
+use crate::vchordrq::types::{BorrowedVector, OwnedVector, VectorKind};
 use base::distance::*;
-use base::index::*;
-use base::vector::*;
+use base::vector::VectorBorrowed;
 use pgrx::datum::FromDatum;
 use pgrx::heap_tuple::PgHeapTuple;
 use serde::Deserialize;
@@ -26,7 +29,7 @@ impl Reloption {
     }];
     unsafe fn options(&self) -> &CStr {
         unsafe {
-            let ptr = std::ptr::addr_of!(*self)
+            let ptr = (&raw const *self)
                 .cast::<std::ffi::c_char>()
                 .offset(self.options as _);
             CStr::from_ptr(ptr)
@@ -56,6 +59,9 @@ fn convert_name_to_vd(name: &str) -> Option<(VectorKind, PgDistanceKind)> {
         Some("vector_l2") => Some((VectorKind::Vecf32, PgDistanceKind::L2)),
         Some("vector_ip") => Some((VectorKind::Vecf32, PgDistanceKind::Dot)),
         Some("vector_cosine") => Some((VectorKind::Vecf32, PgDistanceKind::Cos)),
+        Some("halfvec_l2") => Some((VectorKind::Vecf16, PgDistanceKind::L2)),
+        Some("halfvec_ip") => Some((VectorKind::Vecf16, PgDistanceKind::Dot)),
+        Some("halfvec_cosine") => Some((VectorKind::Vecf16, PgDistanceKind::Cos)),
         _ => None,
     }
 }
@@ -130,7 +136,10 @@ impl Opfamily {
                 let vector = unsafe { PgvectorVectorInput::from_datum(datum, false).unwrap() };
                 self.preprocess(BorrowedVector::Vecf32(vector.as_borrowed()))
             }
-            _ => unreachable!(),
+            VectorKind::Vecf16 => {
+                let vector = unsafe { PgvectorHalfvecInput::from_datum(datum, false).unwrap() };
+                self.preprocess(BorrowedVector::Vecf16(vector.as_borrowed()))
+            }
         };
         Some(vector)
     }
@@ -148,7 +157,10 @@ impl Opfamily {
                 .get_by_index::<PgvectorVectorOutput>(NonZero::new(1).unwrap())
                 .unwrap()
                 .map(|vector| self.preprocess(BorrowedVector::Vecf32(vector.as_borrowed()))),
-            _ => unreachable!(),
+            VectorKind::Vecf16 => tuple
+                .get_by_index::<PgvectorHalfvecOutput>(NonZero::new(1).unwrap())
+                .unwrap()
+                .map(|vector| self.preprocess(BorrowedVector::Vecf16(vector.as_borrowed()))),
         };
         let radius = tuple.get_by_index::<f32>(NonZero::new(2).unwrap()).unwrap();
         (center, radius)
@@ -161,8 +173,6 @@ impl Opfamily {
             (B::Vecf32(x), PgDistanceKind::Dot) => O::Vecf32(x.own()),
             (B::Vecf32(x), PgDistanceKind::Cos) => O::Vecf32(x.function_normalize()),
             (B::Vecf16(x), _) => O::Vecf16(x.own()),
-            (B::SVecf32(x), _) => O::SVecf32(x.own()),
-            (B::BVector(x), _) => O::BVector(x.own()),
         }
     }
     pub fn process(self, x: Distance) -> f32 {
@@ -174,6 +184,9 @@ impl Opfamily {
     }
     pub fn distance_kind(self) -> DistanceKind {
         self.pg_distance.to_distance()
+    }
+    pub fn vector_kind(self) -> VectorKind {
+        self.vector
     }
 }
 

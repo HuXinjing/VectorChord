@@ -1,7 +1,7 @@
 #![allow(clippy::ptr_arg)]
 
 use super::parallelism::{ParallelIterator, Parallelism};
-use base::scalar::*;
+use base::simd::*;
 use half::f16;
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
@@ -121,7 +121,7 @@ fn rabitq_index<P: Parallelism>(
     let mut a3 = Vec::new();
     let mut a4 = Vec::new();
     for vectors in centroids.chunks(32) {
-        use quantization::fast_scan::b4::pack;
+        use base::simd::fast_scan::b4::pack;
         let code_alphas = std::array::from_fn::<_, 32, _>(|i| {
             if let Some(vector) = vectors.get(i) {
                 code_alpha(vector)
@@ -197,7 +197,7 @@ fn rabitq_index<P: Parallelism>(
                 ),
                 epsilon: f32,
             ) -> [Distance; 32] {
-                use quantization::fast_scan::b4::fast_scan_b4;
+                use base::simd::fast_scan::b4::fast_scan_b4;
                 let &(dis_v_2, b, k, qvector_sum, ref s) = lut;
                 let r = fast_scan_b4(dims.div_ceil(4), t, s);
                 std::array::from_fn(|i| {
@@ -210,17 +210,17 @@ fn rabitq_index<P: Parallelism>(
                 })
             }
             use base::distance::Distance;
-            use quantization::quantize;
+            use base::simd::quantize;
 
             let lut = {
                 let vector = &samples[i];
                 let dis_v_2 = f32::reduce_sum_of_x2(vector);
                 let (k, b, qvector) =
-                    quantize::quantize::<15>(f32::vector_to_f32_borrowed(vector).as_ref());
+                    quantize::quantize(f32::vector_to_f32_borrowed(vector).as_ref(), 15.0);
                 let qvector_sum = if vector.len() <= 4369 {
-                    quantize::reduce_sum_of_x_as_u16(&qvector) as f32
+                    u8::reduce_sum_of_x_as_u16(&qvector) as f32
                 } else {
-                    quantize::reduce_sum_of_x_as_u32(&qvector) as f32
+                    u8::reduce_sum_of_x_as_u32(&qvector) as f32
                 };
                 (dis_v_2, b, k, qvector_sum, gen(qvector))
             };

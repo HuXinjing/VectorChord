@@ -4,9 +4,9 @@ use crate::vchordrqfscan::algorithm::scan::scan;
 use crate::vchordrqfscan::gucs::executing::epsilon;
 use crate::vchordrqfscan::gucs::executing::max_scan_tuples;
 use crate::vchordrqfscan::gucs::executing::probes;
+use crate::vchordrqfscan::types::OwnedVector;
 use base::distance::Distance;
 use base::search::*;
-use base::vector::*;
 
 pub enum Scanner {
     Initial {
@@ -34,7 +34,7 @@ pub fn scan_build(
     for orderby_vector in orderbys {
         if pair.is_none() {
             pair = orderby_vector;
-        } else if orderby_vector.is_some() && pair != orderby_vector {
+        } else if orderby_vector.is_some() {
             pgrx::error!("vector search with multiple vectors is not supported");
         }
     }
@@ -42,10 +42,6 @@ pub fn scan_build(
         if pair.is_none() {
             pair = sphere_vector;
             threshold = sphere_threshold;
-        } else if pair == sphere_vector {
-            if threshold.is_none() || sphere_threshold < threshold {
-                threshold = sphere_threshold;
-            }
         } else {
             recheck = true;
             break;
@@ -78,9 +74,6 @@ pub fn scan_next(scanner: &mut Scanner, relation: Relation) -> Option<(Pointer, 
                 relation,
                 match vector {
                     OwnedVector::Vecf32(x) => x.slice().to_vec(),
-                    OwnedVector::Vecf16(_) => unreachable!(),
-                    OwnedVector::SVecf32(_) => unreachable!(),
-                    OwnedVector::BVector(_) => unreachable!(),
                 },
                 opfamily.distance_kind(),
                 probes(),
