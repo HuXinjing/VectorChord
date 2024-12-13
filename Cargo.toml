@@ -20,7 +20,7 @@ pg16 = ["pgrx/pg16", "pgrx-catalog/pg16"]
 pg17 = ["pgrx/pg17", "pgrx-catalog/pg17"]
 
 [dependencies]
-base = { git = "https://github.com/tensorchord/pgvecto.rs.git", rev = "c911e8a476effaf05cd4b1a037826b100177bdad" }
+base = { git = "https://github.com/tensorchord/pgvecto.rs.git", rev = "0374439c8593ead1f61fc2477a4b79a49fcdceb8" }
 
 # lock algebra version forever so that the QR decomposition never changes for same input
 nalgebra = "=0.33.0"

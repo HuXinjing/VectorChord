@@ -20,8 +20,10 @@ RUN set -eux; \
         postgresql-common gnupg \
         crossbuild-essential-arm64 \
         qemu-user-static \
-        libreadline-dev zlib1g-dev flex bison libxml2-dev libxslt-dev libssl-dev libxml2-utils xsltproc ccache pkg-config \
-        clang
+        libreadline-dev zlib1g-dev flex bison libxml2-dev libxslt-dev libssl-dev libxml2-utils xsltproc ccache pkg-config
+
+RUN curl --proto '=https' --tlsv1.2 -sSf https://apt.llvm.org/llvm.sh | sudo bash -s -- 18; \
+    sudo update-alternatives --install /usr/bin/clang clang $(which clang-18) 255
 
 # set up sccache
 RUN set -ex; \

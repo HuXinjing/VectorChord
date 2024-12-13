@@ -25,7 +25,6 @@ unsafe extern "C" fn _PG_init() {
     if unsafe { pgrx::pg_sys::IsUnderPostmaster } {
         pgrx::error!("vchord must be loaded via shared_preload_libraries.");
     }
-    base::simd::enable();
     unsafe {
         vchordrq::init();
         vchordrqfscan::init();
