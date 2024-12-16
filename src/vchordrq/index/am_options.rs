@@ -172,14 +172,16 @@ impl Opfamily {
             (B::Vecf32(x), PgDistanceKind::L2) => O::Vecf32(x.own()),
             (B::Vecf32(x), PgDistanceKind::Dot) => O::Vecf32(x.own()),
             (B::Vecf32(x), PgDistanceKind::Cos) => O::Vecf32(x.function_normalize()),
-            (B::Vecf16(x), _) => O::Vecf16(x.own()),
+            (B::Vecf16(x), PgDistanceKind::L2) => O::Vecf16(x.own()),
+            (B::Vecf16(x), PgDistanceKind::Dot) => O::Vecf16(x.own()),
+            (B::Vecf16(x), PgDistanceKind::Cos) => O::Vecf16(x.function_normalize()),
         }
     }
     pub fn process(self, x: Distance) -> f32 {
         match self.pg_distance {
             PgDistanceKind::Cos => f32::from(x) + 1.0f32,
             PgDistanceKind::L2 => f32::from(x).sqrt(),
-            _ => f32::from(x),
+            PgDistanceKind::Dot => x.into(),
         }
     }
     pub fn distance_kind(self) -> DistanceKind {
