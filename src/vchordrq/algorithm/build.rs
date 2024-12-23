@@ -229,6 +229,29 @@ impl Structure {
                 vectors.insert(id, crate::projection::project(vector.as_borrowed().slice()));
             }
         });
+        if parents.len() >= 2 && parents.values().all(|x| x.is_none()) {
+            // if there are more than one vertexs and no edges,
+            // assume there is an implicit root
+            let n = parents.len();
+            let mut result = Vec::new();
+            result.push(Structure {
+                means: vectors.values().cloned().collect::<Vec<_>>(),
+                children: vec![Vec::new(); n],
+            });
+            result.push(Structure {
+                means: vec![{
+                    // compute the vector on root, without normalizing it
+                    let mut sum = vec![0.0f32; vector_options.dims as _];
+                    for vector in vectors.values() {
+                        f32::vector_add_inplace(&mut sum, vector);
+                    }
+                    f32::vector_mul_scalar_inplace(&mut sum, 1.0 / n as f32);
+                    sum
+                }],
+                children: vec![(0..n as u32).collect()],
+            });
+            return result;
+        }
         let mut children = parents
             .keys()
             .map(|x| (*x, Vec::new()))
