@@ -203,20 +203,32 @@ impl Structure {
     ) -> Vec<Self> {
         use std::collections::BTreeMap;
         let VchordrqExternalBuildOptions { table } = external_build;
-        let query = format!("SELECT id, parent, vector FROM {table};");
         let mut parents = BTreeMap::new();
         let mut vectors = BTreeMap::new();
         pgrx::spi::Spi::connect(|client| {
             use crate::datatype::memory_pgvector_vector::PgvectorVectorOutput;
             use base::vector::VectorBorrowed;
             use pgrx::pg_sys::panic::ErrorReportable;
-            let table = client.select(&query, None, None).unwrap_or_report();
-            for row in table {
+            let schema_query = "SELECT n.nspname::TEXT 
+                FROM pg_catalog.pg_extension e
+                LEFT JOIN pg_catalog.pg_namespace n ON n.oid = e.extnamespace
+                WHERE e.extname = 'vector';";
+            let pgvector_schema: String = client
+                .select(schema_query, None, None)
+                .unwrap_or_report()
+                .first()
+                .get_by_name("nspname")
+                .expect("external build: cannot get schema of pgvector")
+                .expect("external build: cannot get schema of pgvector");
+            let dump_query =
+                format!("SELECT id, parent, vector::{pgvector_schema}.vector FROM {table};");
+            let centroids = client.select(&dump_query, None, None).unwrap_or_report();
+            for row in centroids {
                 let id: Option<i32> = row.get_by_name("id").unwrap();
                 let parent: Option<i32> = row.get_by_name("parent").unwrap();
                 let vector: Option<PgvectorVectorOutput> = row.get_by_name("vector").unwrap();
-                let id = id.expect("extern build: id could not be NULL");
-                let vector = vector.expect("extern build: vector could not be NULL");
+                let id = id.expect("external build: id could not be NULL");
+                let vector = vector.expect("external build: vector could not be NULL");
                 let pop = parents.insert(id, parent);
                 if pop.is_some() {
                     pgrx::error!(
@@ -224,7 +236,7 @@ impl Structure {
                     );
                 }
                 if vector_options.dims != vector.as_borrowed().dims() {
-                    pgrx::error!("extern build: incorrect dimension, id = {id}");
+                    pgrx::error!("external build: incorrect dimension, id = {id}");
                 }
                 vectors.insert(id, crate::projection::project(vector.as_borrowed().slice()));
             }
@@ -275,7 +287,7 @@ impl Structure {
             }
         }
         let Some(root) = root else {
-            pgrx::error!("extern build: there are no root");
+            pgrx::error!("external build: there are no root");
         };
         let mut heights = BTreeMap::<_, _>::new();
         fn dfs_for_heights(
@@ -284,7 +296,7 @@ impl Structure {
             u: i32,
         ) {
             if heights.contains_key(&u) {
-                pgrx::error!("extern build: detect a cycle, id = {u}");
+                pgrx::error!("external build: detect a cycle, id = {u}");
             }
             heights.insert(u, None);
             let mut height = None;
@@ -293,7 +305,7 @@ impl Structure {
                 let new = heights[&v].unwrap() + 1;
                 if let Some(height) = height {
                     if height != new {
-                        pgrx::error!("extern build: two heights, id = {u}");
+                        pgrx::error!("external build: two heights, id = {u}");
                     }
                 } else {
                     height = Some(new);
@@ -311,7 +323,7 @@ impl Structure {
             .collect::<BTreeMap<_, _>>();
         if !(1..=8).contains(&(heights[&root] - 1)) {
             pgrx::error!(
-                "extern build: unexpected tree height, height = {}",
+                "external build: unexpected tree height, height = {}",
                 heights[&root]
             );
         }
