@@ -7,6 +7,10 @@ on:
         description: 'pgrx version'
         required: true
         type: string
+      toolchain:
+        description: 'additional rust toolchain'
+        required: true
+        type: string
 
 concurrency:
   group: ${{ github.ref }}-${{ github.workflow }}
@@ -21,9 +25,11 @@ permissions:
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    runs-on: ubicloud-standard-8
     steps:
       - uses: actions/checkout@v4
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
       - name: Login to ghcr.io
@@ -38,6 +44,10 @@ jobs:
           context: .
           file: ./docker/pgrx.Dockerfile
           push: true
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          platforms: "linux/amd64,linux/arm64"
           build-args: |
             PGRX_VERSION=${{ github.event.inputs.version }}
-          tags: ${{ env.IMAGE_NAME }}:${{ github.event.inputs.version }}
+            RUST_TOOLCHAIN=${{ github.event.inputs.toolchain }}
+          tags: ${{ env.IMAGE_NAME }}:${{ github.event.inputs.version }}-${{ github.event.inputs.toolchain }}
