@@ -4,9 +4,9 @@ ARG TARGETARCH
 
 FROM tensorchord/vchord-binary:pg${PG_MAJOR}-v${SEMVER} as binary
 
-FROM rust:1.78-bookworm as builder
-ARG TRUNK_VER=0.12.25
-ENV CARGO_REGISTRIES_CRATES_IO_PROTOCOL sparse 
+FROM rust:1.82-bookworm as builder
+ARG TRUNK_VER=0.15.6
+ENV CARGO_REGISTRIES_CRATES_IO_PROTOCOL sparse
 RUN cargo install --version $TRUNK_VER pg-trunk
 
 FROM modelzai/pg-slim:${PG_MAJOR}-${TARGETARCH}
@@ -131,6 +131,12 @@ RUN trunk install plpython3u
 
 # Install pgvector
 RUN trunk install pgvector --version ${PGVECTOR}
+
+# Install pgmq
+RUN trunk install pgmq --version 1.4.5
+
+# Install pg_later
+RUN trunk install pg_later --version 0.3.0
 
 # Clone and build AWS SDK for C++
 RUN git clone https://github.com/aws/aws-sdk-cpp.git && \
