@@ -72,10 +72,7 @@ pub fn build<T: HeapRelation, R: Reporter>(
     };
     let mut meta = Tape::create(&relation, false);
     assert_eq!(meta.first(), 0);
-    let mut forwards = Tape::<std::convert::Infallible, _>::create(&relation, false);
-    assert_eq!(forwards.first(), 1);
     let mut vectors = Tape::create(&relation, true);
-    assert_eq!(vectors.first(), 2);
     let mut pointer_of_means = Vec::<Vec<(u32, u16)>>::new();
     for i in 0..structures.len() {
         let mut level = Vec::new();
@@ -166,13 +163,11 @@ pub fn build<T: HeapRelation, R: Reporter>(
         }
         pointer_of_firsts.push(level);
     }
-    forwards.head.get_opaque_mut().skip = vectors.first();
     meta.push(&MetaTuple {
         dims,
         height_of_root: structures.len() as u32,
         is_residual,
         vectors_first: vectors.first(),
-        forwards_first: forwards.first(),
         mean: pointer_of_means.last().unwrap()[0],
         first: pointer_of_firsts.last().unwrap()[0],
     });
@@ -244,20 +239,32 @@ impl Structure {
     ) -> Vec<Self> {
         use std::collections::BTreeMap;
         let VchordrqfscanExternalBuildOptions { table } = external_build;
-        let query = format!("SELECT id, parent, vector FROM {table};");
         let mut parents = BTreeMap::new();
         let mut vectors = BTreeMap::new();
         pgrx::spi::Spi::connect(|client| {
             use crate::datatype::memory_pgvector_vector::PgvectorVectorOutput;
             use pgrx::pg_sys::panic::ErrorReportable;
             use vector::VectorBorrowed;
-            let table = client.select(&query, None, None).unwrap_or_report();
-            for row in table {
+            let schema_query = "SELECT n.nspname::TEXT 
+                FROM pg_catalog.pg_extension e
+                LEFT JOIN pg_catalog.pg_namespace n ON n.oid = e.extnamespace
+                WHERE e.extname = 'vector';";
+            let pgvector_schema: String = client
+                .select(schema_query, None, None)
+                .unwrap_or_report()
+                .first()
+                .get_by_name("nspname")
+                .expect("external build: cannot get schema of pgvector")
+                .expect("external build: cannot get schema of pgvector");
+            let dump_query =
+                format!("SELECT id, parent, vector::{pgvector_schema}.vector FROM {table};");
+            let centroids = client.select(&dump_query, None, None).unwrap_or_report();
+            for row in centroids {
                 let id: Option<i32> = row.get_by_name("id").unwrap();
                 let parent: Option<i32> = row.get_by_name("parent").unwrap();
                 let vector: Option<PgvectorVectorOutput> = row.get_by_name("vector").unwrap();
-                let id = id.expect("extern build: id could not be NULL");
-                let vector = vector.expect("extern build: vector could not be NULL");
+                let id = id.expect("external build: id could not be NULL");
+                let vector = vector.expect("external build: vector could not be NULL");
                 let pop = parents.insert(id, parent);
                 if pop.is_some() {
                     pgrx::error!(
@@ -265,11 +272,34 @@ impl Structure {
                     );
                 }
                 if vector_options.dims != vector.as_borrowed().dims() {
-                    pgrx::error!("extern build: incorrect dimension, id = {id}");
+                    pgrx::error!("external build: incorrect dimension, id = {id}");
                 }
                 vectors.insert(id, crate::projection::project(vector.as_borrowed().slice()));
             }
         });
+        if parents.len() >= 2 && parents.values().all(|x| x.is_none()) {
+            // if there are more than one vertexs and no edges,
+            // assume there is an implicit root
+            let n = parents.len();
+            let mut result = Vec::new();
+            result.push(Structure {
+                means: vectors.values().cloned().collect::<Vec<_>>(),
+                children: vec![Vec::new(); n],
+            });
+            result.push(Structure {
+                means: vec![{
+                    // compute the vector on root, without normalizing it
+                    let mut sum = vec![0.0f32; vector_options.dims as _];
+                    for vector in vectors.values() {
+                        f32::vector_add_inplace(&mut sum, vector);
+                    }
+                    f32::vector_mul_scalar_inplace(&mut sum, 1.0 / n as f32);
+                    sum
+                }],
+                children: vec![(0..n as u32).collect()],
+            });
+            return result;
+        }
         let mut children = parents
             .keys()
             .map(|x| (*x, Vec::new()))
@@ -293,7 +323,7 @@ impl Structure {
             }
         }
         let Some(root) = root else {
-            pgrx::error!("extern build: there are no root");
+            pgrx::error!("external build: there are no root");
         };
         let mut heights = BTreeMap::<_, _>::new();
         fn dfs_for_heights(
@@ -302,7 +332,7 @@ impl Structure {
             u: i32,
         ) {
             if heights.contains_key(&u) {
-                pgrx::error!("extern build: detect a cycle, id = {u}");
+                pgrx::error!("external build: detect a cycle, id = {u}");
             }
             heights.insert(u, None);
             let mut height = None;
@@ -311,7 +341,7 @@ impl Structure {
                 let new = heights[&v].unwrap() + 1;
                 if let Some(height) = height {
                     if height != new {
-                        pgrx::error!("extern build: two heights, id = {u}");
+                        pgrx::error!("external build: two heights, id = {u}");
                     }
                 } else {
                     height = Some(new);
@@ -329,7 +359,7 @@ impl Structure {
             .collect::<BTreeMap<_, _>>();
         if !(1..=8).contains(&(heights[&root] - 1)) {
             pgrx::error!(
-                "extern build: unexpected tree height, height = {}",
+                "external build: unexpected tree height, height = {}",
                 heights[&root]
             );
         }
@@ -367,7 +397,7 @@ impl Structure {
     }
 }
 
-struct Tape<'a, 'b, T, R: 'b + RelationWrite> {
+struct Tape<'a: 'b, 'b, T, R: 'b + RelationWrite> {
     relation: &'a R,
     head: R::WriteGuard<'b>,
     first: u32,
@@ -377,7 +407,8 @@ struct Tape<'a, 'b, T, R: 'b + RelationWrite> {
 
 impl<'a: 'b, 'b, T, R: 'b + RelationWrite> Tape<'a, 'b, T, R> {
     fn create(relation: &'a R, tracking_freespace: bool) -> Self {
-        let head = relation.extend(tracking_freespace);
+        let mut head = relation.extend(tracking_freespace);
+        head.get_opaque_mut().skip = head.id();
         let first = head.id();
         Self {
             relation,

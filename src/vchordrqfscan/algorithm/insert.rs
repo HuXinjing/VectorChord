@@ -12,10 +12,11 @@ use std::collections::BinaryHeap;
 use std::num::NonZeroU64;
 
 pub fn insert(
-    relation: impl RelationWrite,
+    relation: impl RelationWrite + Clone,
     payload: NonZeroU64,
     vector: Vec<f32>,
     distance_kind: DistanceKind,
+    in_building: bool,
 ) {
     let meta_guard = relation.read(0);
     let meta_tuple = meta_guard
@@ -32,56 +33,20 @@ pub fn insert(
     } else {
         None
     };
-    let h0_vector = 'h0_vector: {
+    let h0_vector = {
         let tuple = rkyv::to_bytes::<_, 8192>(&VectorTuple {
             vector: vector.clone(),
             payload: Some(payload),
         })
         .unwrap();
-        if let Some(mut write) = relation.search(tuple.len()) {
-            let i = write.alloc(&tuple).unwrap();
-            break 'h0_vector (write.id(), i);
-        }
-        let mut current = relation.read(meta_tuple.forwards_first).get_opaque().skip;
-        let mut changed = false;
-        loop {
-            let read = relation.read(current);
-            let flag = 'flag: {
-                if read.freespace() as usize >= tuple.len() {
-                    break 'flag true;
-                }
-                if read.get_opaque().next == u32::MAX {
-                    break 'flag true;
-                }
-                false
-            };
-            if flag {
-                drop(read);
-                let mut write = relation.write(current, true);
-                if let Some(i) = write.alloc(&tuple) {
-                    break (current, i);
-                }
-                if write.get_opaque().next == u32::MAX {
-                    if changed {
-                        relation
-                            .write(meta_tuple.forwards_first, false)
-                            .get_opaque_mut()
-                            .skip = write.id();
-                    }
-                    let mut extend = relation.extend(true);
-                    write.get_opaque_mut().next = extend.id();
-                    if let Some(i) = extend.alloc(&tuple) {
-                        break (extend.id(), i);
-                    } else {
-                        panic!("a tuple cannot even be fit in a fresh page");
-                    }
-                }
-                current = write.get_opaque().next;
-            } else {
-                current = read.get_opaque().next;
-            }
-            changed = true;
-        }
+        append(
+            relation.clone(),
+            meta_tuple.vectors_first,
+            &tuple,
+            true,
+            true,
+            true,
+        )
     };
     let h0_payload = payload;
     let mut list = (
@@ -186,23 +151,97 @@ pub fn insert(
         t: vec![0; (dims.div_ceil(4) * 16) as usize],
     })
     .unwrap();
-    let first = list.0;
+    append_by_update(
+        relation.clone(),
+        list.0,
+        &dummy,
+        in_building,
+        in_building,
+        |bytes| {
+            let t = rkyv::check_archived_root::<Height0Tuple>(bytes).expect("data corruption");
+            t.mask.iter().any(|x| *x)
+        },
+        |bytes| put(bytes, dims, &code, h0_vector, h0_payload),
+    );
+}
+
+fn append(
+    relation: impl RelationWrite,
+    first: u32,
+    tuple: &[u8],
+    tracking_freespace: bool,
+    skipping_traversal: bool,
+    updating_skip: bool,
+) -> (u32, u16) {
+    if tracking_freespace {
+        if let Some(mut write) = relation.search(tuple.len()) {
+            let i = write.alloc(tuple).unwrap();
+            return (write.id(), i);
+        }
+    }
+    assert!(first != u32::MAX);
+    let mut current = first;
+    loop {
+        let read = relation.read(current);
+        if read.freespace() as usize >= tuple.len() || read.get_opaque().next == u32::MAX {
+            drop(read);
+            let mut write = relation.write(current, tracking_freespace);
+            if let Some(i) = write.alloc(tuple) {
+                return (current, i);
+            }
+            if write.get_opaque().next == u32::MAX {
+                let mut extend = relation.extend(tracking_freespace);
+                write.get_opaque_mut().next = extend.id();
+                drop(write);
+                if let Some(i) = extend.alloc(tuple) {
+                    let result = (extend.id(), i);
+                    drop(extend);
+                    if updating_skip {
+                        let mut past = relation.write(first, tracking_freespace);
+                        let skip = &mut past.get_opaque_mut().skip;
+                        assert!(*skip != u32::MAX);
+                        *skip = std::cmp::max(*skip, result.0);
+                    }
+                    return result;
+                } else {
+                    panic!("a tuple cannot even be fit in a fresh page");
+                }
+            }
+            if skipping_traversal && current == first && write.get_opaque().skip != first {
+                current = write.get_opaque().skip;
+            } else {
+                current = write.get_opaque().next;
+            }
+        } else {
+            if skipping_traversal && current == first && read.get_opaque().skip != first {
+                current = read.get_opaque().skip;
+            } else {
+                current = read.get_opaque().next;
+            }
+        }
+    }
+}
+
+fn append_by_update(
+    relation: impl RelationWrite,
+    first: u32,
+    tuple: &[u8],
+    skipping_traversal: bool,
+    updating_skip: bool,
+    can_update: impl Fn(&[u8]) -> bool,
+    mut update: impl FnMut(&mut [u8]) -> bool,
+) {
     assert!(first != u32::MAX);
     let mut current = first;
     loop {
         let read = relation.read(current);
         let flag = 'flag: {
             for i in 1..=read.len() {
-                let h0_tuple = read
-                    .get(i)
-                    .map(rkyv::check_archived_root::<Height0Tuple>)
-                    .expect("data corruption")
-                    .expect("data corruption");
-                if h0_tuple.mask.iter().any(|x| *x) {
+                if can_update(read.get(i).expect("data corruption")) {
                     break 'flag true;
                 }
             }
-            if read.freespace() as usize >= dummy.len() {
+            if read.freespace() as usize >= tuple.len() {
                 break 'flag true;
             }
             if read.get_opaque().next == u32::MAX {
@@ -214,48 +253,47 @@ pub fn insert(
             drop(read);
             let mut write = relation.write(current, false);
             for i in 1..=write.len() {
-                let flag = put(
-                    write.get_mut(i).expect("data corruption"),
-                    dims,
-                    &code,
-                    h0_vector,
-                    h0_payload,
-                );
-                if flag {
+                if update(write.get_mut(i).expect("data corruption")) {
                     return;
                 }
             }
-            if let Some(i) = write.alloc(&dummy) {
-                let flag = put(
-                    write.get_mut(i).expect("data corruption"),
-                    dims,
-                    &code,
-                    h0_vector,
-                    h0_payload,
-                );
-                assert!(flag, "a put fails even on a fresh tuple");
-                return;
+            if let Some(i) = write.alloc(tuple) {
+                if update(write.get_mut(i).expect("data corruption")) {
+                    return;
+                }
+                panic!("an update fails on a fresh tuple");
             }
             if write.get_opaque().next == u32::MAX {
                 let mut extend = relation.extend(false);
                 write.get_opaque_mut().next = extend.id();
-                if let Some(i) = extend.alloc(&dummy) {
-                    let flag = put(
-                        extend.get_mut(i).expect("data corruption"),
-                        dims,
-                        &code,
-                        h0_vector,
-                        h0_payload,
-                    );
-                    assert!(flag, "a put fails even on a fresh tuple");
-                    return;
-                } else {
-                    panic!("a tuple cannot even be fit in a fresh page");
+                drop(write);
+                if let Some(i) = extend.alloc(tuple) {
+                    if update(extend.get_mut(i).expect("data corruption")) {
+                        let id = extend.id();
+                        drop(extend);
+                        if updating_skip {
+                            let mut past = relation.write(first, false);
+                            let skip = &mut past.get_opaque_mut().skip;
+                            assert!(*skip != u32::MAX);
+                            *skip = std::cmp::max(*skip, id);
+                        }
+                        return;
+                    }
+                    panic!("an update fails on a fresh tuple");
                 }
+                panic!("a tuple cannot even be fit in a fresh page");
             }
-            current = write.get_opaque().next;
+            if skipping_traversal && current == first && write.get_opaque().skip != first {
+                current = write.get_opaque().skip;
+            } else {
+                current = write.get_opaque().next;
+            }
         } else {
-            current = read.get_opaque().next;
+            if skipping_traversal && current == first && read.get_opaque().skip != first {
+                current = read.get_opaque().skip;
+            } else {
+                current = read.get_opaque().next;
+            }
         }
     }
 }
