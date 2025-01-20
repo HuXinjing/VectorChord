@@ -20,7 +20,6 @@ pg16 = ["pgrx/pg16", "pgrx-catalog/pg16"]
 pg17 = ["pgrx/pg17", "pgrx-catalog/pg17"]
 
 [dependencies]
-algorithm = { path = "./crates/algorithm" }
 always_equal = { path = "./crates/always_equal" }
 distance = { path = "./crates/distance" }
 rabitq = { path = "./crates/rabitq" }
@@ -28,11 +27,8 @@ random_orthogonal_matrix = { path = "./crates/random_orthogonal_matrix" }
 simd = { path = "./crates/simd" }
 vector = { path = "./crates/vector" }
 
-# lock rkyv version forever so that data is always compatible
-rkyv = { version = "=0.7.45", features = ["validation"] }
-
 half.workspace = true
-log = "0.4.22"
+log = "0.4.25"
 paste = "1"
 pgrx = { version = "=0.12.9", default-features = false, features = ["cshim"] }
 pgrx-catalog = "0.1.0"
@@ -41,9 +37,11 @@ rayon = "1.10.0"
 serde.workspace = true
 toml = "0.8.19"
 validator = { version = "0.19.0", features = ["derive"] }
+zerocopy = "0.8.14"
+zerocopy-derive = "0.8.14"
 
 [patch.crates-io]
-half = { git = "https://github.com/tensorchord/half-rs.git" }
+half = { git = "https://github.com/tensorchord/half-rs.git", rev = "3f9a8843d6722bd1833de2289347640ad8770146" }
 
 [lints]
 workspace = true
@@ -57,7 +55,7 @@ version = "0.0.0"
 edition = "2021"
 
 [workspace.dependencies]
-half = { version = "2.4.1", features = ["rkyv", "serde"] }
+half = { version = "2.4.1", features = ["serde", "zerocopy"] }
 rand = "0.8.5"
 serde = "1"
 

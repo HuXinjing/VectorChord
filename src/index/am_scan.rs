@@ -1,12 +1,14 @@
 use super::am_options::Opfamily;
+use crate::algorithm::operator::Vector;
+use crate::algorithm::operator::{Dot, L2, Op};
+use crate::algorithm::scan::scan;
+use crate::gucs::executing::epsilon;
+use crate::gucs::executing::max_scan_tuples;
+use crate::gucs::executing::probes;
 use crate::postgres::PostgresRelation;
-use crate::vchordrq::algorithm::scan::scan;
-use crate::vchordrq::algorithm::tuples::Vector;
-use crate::vchordrq::gucs::executing::epsilon;
-use crate::vchordrq::gucs::executing::max_scan_tuples;
-use crate::vchordrq::gucs::executing::probes;
-use crate::vchordrq::types::OwnedVector;
-use crate::vchordrq::types::VectorKind;
+use crate::types::DistanceKind;
+use crate::types::OwnedVector;
+use crate::types::VectorKind;
 use distance::Distance;
 use half::f16;
 use std::num::NonZeroU64;
@@ -74,12 +76,11 @@ pub fn scan_next(scanner: &mut Scanner, relation: PostgresRelation) -> Option<(N
     } = scanner
     {
         if let Some((vector, opfamily)) = vector.as_ref() {
-            match opfamily.vector_kind() {
-                VectorKind::Vecf32 => {
-                    let vbase = scan::<VectOwned<f32>>(
+            match (opfamily.vector_kind(), opfamily.distance_kind()) {
+                (VectorKind::Vecf32, DistanceKind::L2) => {
+                    let vbase = scan::<Op<VectOwned<f32>, L2>>(
                         relation,
                         VectOwned::<f32>::from_owned(vector.clone()),
-                        opfamily.distance_kind(),
                         probes(),
                         epsilon(),
                     );
@@ -94,11 +95,46 @@ pub fn scan_next(scanner: &mut Scanner, relation: PostgresRelation) -> Option<(N
                         opfamily: *opfamily,
                     };
                 }
-                VectorKind::Vecf16 => {
-                    let vbase = scan::<VectOwned<f16>>(
+                (VectorKind::Vecf32, DistanceKind::Dot) => {
+                    let vbase = scan::<Op<VectOwned<f32>, Dot>>(
+                        relation,
+                        VectOwned::<f32>::from_owned(vector.clone()),
+                        probes(),
+                        epsilon(),
+                    );
+                    *scanner = Scanner::Vbase {
+                        vbase: if let Some(max_scan_tuples) = max_scan_tuples() {
+                            Box::new(vbase.take(max_scan_tuples as usize))
+                        } else {
+                            Box::new(vbase)
+                        },
+                        threshold: *threshold,
+                        recheck: *recheck,
+                        opfamily: *opfamily,
+                    };
+                }
+                (VectorKind::Vecf16, DistanceKind::L2) => {
+                    let vbase = scan::<Op<VectOwned<f16>, L2>>(
                         relation,
                         VectOwned::<f16>::from_owned(vector.clone()),
-                        opfamily.distance_kind(),
+                        probes(),
+                        epsilon(),
+                    );
+                    *scanner = Scanner::Vbase {
+                        vbase: if let Some(max_scan_tuples) = max_scan_tuples() {
+                            Box::new(vbase.take(max_scan_tuples as usize))
+                        } else {
+                            Box::new(vbase)
+                        },
+                        threshold: *threshold,
+                        recheck: *recheck,
+                        opfamily: *opfamily,
+                    };
+                }
+                (VectorKind::Vecf16, DistanceKind::Dot) => {
+                    let vbase = scan::<Op<VectOwned<f16>, Dot>>(
+                        relation,
+                        VectOwned::<f16>::from_owned(vector.clone()),
                         probes(),
                         epsilon(),
                     );

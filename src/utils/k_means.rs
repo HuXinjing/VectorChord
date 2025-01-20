@@ -3,6 +3,7 @@ use half::f16;
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 use simd::Floating;
+use simd::fast_scan::{any_pack, padding_pack};
 
 pub fn k_means<P: Parallelism>(
     parallelism: &P,
@@ -81,39 +82,64 @@ fn rabitq_index<P: Parallelism>(
     samples: &[Vec<f32>],
     centroids: &[Vec<f32>],
 ) -> Vec<usize> {
-    let mut a0 = Vec::new();
-    let mut a1 = Vec::new();
-    let mut a2 = Vec::new();
-    let mut a3 = Vec::new();
-    let mut a4 = Vec::new();
-    for vectors in centroids.chunks(32) {
-        use simd::fast_scan::pack;
-        let x = std::array::from_fn::<_, 32, _>(|i| {
-            if let Some(vector) = vectors.get(i) {
-                rabitq::block::code(dims as _, vector)
-            } else {
-                rabitq::block::dummy_code(dims as _)
-            }
+    struct Branch {
+        dis_u_2: f32,
+        factor_ppc: f32,
+        factor_ip: f32,
+        factor_err: f32,
+        signs: Vec<bool>,
+    }
+    let branches = {
+        let mut branches = Vec::new();
+        for centroid in centroids {
+            let code = rabitq::code(dims as _, centroid);
+            branches.push(Branch {
+                dis_u_2: code.dis_u_2,
+                factor_ppc: code.factor_ppc,
+                factor_ip: code.factor_ip,
+                factor_err: code.factor_err,
+                signs: code.signs,
+            });
+        }
+        branches
+    };
+    struct Block {
+        dis_u_2: [f32; 32],
+        factor_ppc: [f32; 32],
+        factor_ip: [f32; 32],
+        factor_err: [f32; 32],
+        elements: Vec<[u64; 2]>,
+    }
+    impl Block {
+        fn code(&self) -> (&[f32; 32], &[f32; 32], &[f32; 32], &[f32; 32], &[[u64; 2]]) {
+            (
+                &self.dis_u_2,
+                &self.factor_ppc,
+                &self.factor_ip,
+                &self.factor_err,
+                &self.elements,
+            )
+        }
+    }
+    let mut blocks = Vec::new();
+    for chunk in branches.chunks(32) {
+        blocks.push(Block {
+            dis_u_2: any_pack(chunk.iter().map(|x| x.dis_u_2)),
+            factor_ppc: any_pack(chunk.iter().map(|x| x.factor_ppc)),
+            factor_ip: any_pack(chunk.iter().map(|x| x.factor_ip)),
+            factor_err: any_pack(chunk.iter().map(|x| x.factor_err)),
+            elements: padding_pack(chunk.iter().map(|x| rabitq::pack_to_u4(&x.signs))),
         });
-        a0.push(x.each_ref().map(|x| x.dis_u_2));
-        a1.push(x.each_ref().map(|x| x.factor_ppc));
-        a2.push(x.each_ref().map(|x| x.factor_ip));
-        a3.push(x.each_ref().map(|x| x.factor_err));
-        a4.push(pack(dims.div_ceil(4) as _, x.map(|x| x.signs)).collect::<Vec<_>>());
     }
     parallelism
         .rayon_into_par_iter(0..n)
         .map(|i| {
             use distance::Distance;
-            let lut = rabitq::block::fscan_preprocess(&samples[i]);
+            let lut = rabitq::block::preprocess(&samples[i]);
             let mut result = (Distance::INFINITY, 0);
             for block in 0..c.div_ceil(32) {
-                let lowerbound = rabitq::block::fscan_process_lowerbound_l2(
-                    dims as _,
-                    &lut,
-                    (&a0[block], &a1[block], &a2[block], &a3[block], &a4[block]),
-                    1.9,
-                );
+                let lowerbound =
+                    rabitq::block::process_lowerbound_l2(&lut, blocks[block].code(), 1.9);
                 for j in block * 32..std::cmp::min(block * 32 + 32, c) {
                     if lowerbound[j - block * 32] < result.0 {
                         let dis =

@@ -1,4 +1,4 @@
-use algorithm::{Opaque, Page, PageGuard, RelationRead, RelationWrite};
+use crate::algorithm::{Opaque, Page, PageGuard, RelationRead, RelationWrite};
 use std::mem::{MaybeUninit, offset_of};
 use std::ops::{Deref, DerefMut};
 use std::ptr::NonNull;
@@ -43,17 +43,28 @@ impl PostgresPage {
         this
     }
     #[allow(dead_code)]
-    unsafe fn assume_init_mut(this: &mut MaybeUninit<Self>) -> &mut Self {
-        let this = unsafe { MaybeUninit::assume_init_mut(this) };
-        assert_eq!(offset_of!(Self, opaque), this.header.pd_special as usize);
-        this
-    }
-    #[allow(dead_code)]
     fn clone_into_boxed(&self) -> Box<Self> {
         let mut result = Box::new_uninit();
         unsafe {
             std::ptr::copy(self as *const Self, result.as_mut_ptr(), 1);
             result.assume_init()
+        }
+    }
+    #[allow(dead_code)]
+    fn reconstruct(&mut self, removes: &[u16]) {
+        let mut removes = removes.to_vec();
+        removes.sort();
+        removes.dedup();
+        let n = removes.len();
+        if n > 0 {
+            assert!(removes[n - 1] <= self.len());
+            unsafe {
+                pgrx::pg_sys::PageIndexMultiDelete(
+                    (self as *mut Self).cast(),
+                    removes.as_ptr().cast_mut(),
+                    removes.len() as _,
+                );
+            }
         }
     }
 }
@@ -142,24 +153,22 @@ impl Page for PostgresPage {
             pgrx::pg_sys::PageIndexTupleDeleteNoCompact((self as *mut Self).cast(), i);
         }
     }
-    fn reconstruct(&mut self, removes: &[u16]) {
-        let mut removes = removes.to_vec();
-        removes.sort();
-        removes.dedup();
-        let n = removes.len();
-        if n > 0 {
-            assert!(removes[n - 1] <= self.len());
-            unsafe {
-                pgrx::pg_sys::PageIndexMultiDelete(
-                    (self as *mut Self).cast(),
-                    removes.as_ptr().cast_mut(),
-                    removes.len() as _,
-                );
-            }
-        }
-    }
     fn freespace(&self) -> u16 {
         unsafe { pgrx::pg_sys::PageGetFreeSpace((self as *const Self).cast_mut().cast()) as u16 }
+    }
+    fn clear(&mut self) {
+        unsafe {
+            pgrx::pg_sys::PageInit(
+                (self as *mut PostgresPage as pgrx::pg_sys::Page).cast(),
+                pgrx::pg_sys::BLCKSZ as usize,
+                size_of::<Opaque>(),
+            );
+            (&raw mut self.opaque).write(Opaque {
+                next: u32::MAX,
+                skip: u32::MAX,
+            });
+        }
+        assert_eq!(offset_of!(Self, opaque), self.header.pd_special as usize);
     }
 }
 

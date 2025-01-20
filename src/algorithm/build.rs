@@ -1,25 +1,24 @@
-use crate::vchordrq::algorithm::rabitq;
-use crate::vchordrq::algorithm::tuples::*;
-use crate::vchordrq::index::am_options::Opfamily;
-use crate::vchordrq::types::DistanceKind;
-use crate::vchordrq::types::VchordrqBuildOptions;
-use crate::vchordrq::types::VchordrqExternalBuildOptions;
-use crate::vchordrq::types::VchordrqIndexingOptions;
-use crate::vchordrq::types::VchordrqInternalBuildOptions;
-use crate::vchordrq::types::VectorOptions;
-use algorithm::{Page, PageGuard, RelationWrite};
+use crate::algorithm::RelationWrite;
+use crate::algorithm::operator::{Operator, Vector};
+use crate::algorithm::tape::*;
+use crate::algorithm::tuples::*;
+use crate::index::am_options::Opfamily;
+use crate::types::VchordrqBuildOptions;
+use crate::types::VchordrqExternalBuildOptions;
+use crate::types::VchordrqIndexingOptions;
+use crate::types::VchordrqInternalBuildOptions;
+use crate::types::VectorOptions;
 use rand::Rng;
-use rkyv::ser::serializers::AllocSerializer;
 use simd::Floating;
-use std::marker::PhantomData;
 use std::num::NonZeroU64;
 use std::sync::Arc;
 use vector::VectorBorrowed;
+use vector::VectorOwned;
 
-pub trait HeapRelation<V: Vector> {
+pub trait HeapRelation<O: Operator> {
     fn traverse<F>(&self, progress: bool, callback: F)
     where
-        F: FnMut((NonZeroU64, V));
+        F: FnMut((NonZeroU64, O::Vector));
     fn opfamily(&self) -> Opfamily;
 }
 
@@ -27,7 +26,7 @@ pub trait Reporter {
     fn tuples_total(&mut self, tuples_total: u64);
 }
 
-pub fn build<V: Vector, T: HeapRelation<V>, R: Reporter>(
+pub fn build<O: Operator, T: HeapRelation<O>, R: Reporter>(
     vector_options: VectorOptions,
     vchordrq_options: VchordrqIndexingOptions,
     heap_relation: T,
@@ -35,8 +34,7 @@ pub fn build<V: Vector, T: HeapRelation<V>, R: Reporter>(
     mut reporter: R,
 ) {
     let dims = vector_options.dims;
-    let is_residual =
-        vchordrq_options.residual_quantization && vector_options.d == DistanceKind::L2;
+    let is_residual = vchordrq_options.residual_quantization && O::SUPPORTS_RESIDUAL;
     let structures = match vchordrq_options.build {
         VchordrqBuildOptions::External(external_build) => Structure::extern_build(
             vector_options.clone(),
@@ -58,11 +56,11 @@ pub fn build<V: Vector, T: HeapRelation<V>, R: Reporter>(
                     let vector = vector.as_borrowed();
                     assert_eq!(dims, vector.dims(), "invalid vector dimensions");
                     if number_of_samples < max_number_of_samples {
-                        samples.push(V::build_to_vecf32(vector));
+                        samples.push(O::Vector::build_to_vecf32(vector));
                         number_of_samples += 1;
                     } else {
                         let index = rand.gen_range(0..max_number_of_samples) as usize;
-                        samples[index] = V::build_to_vecf32(vector);
+                        samples[index] = O::Vector::build_to_vecf32(vector);
                     }
                     tuples_total += 1;
                 });
@@ -72,24 +70,32 @@ pub fn build<V: Vector, T: HeapRelation<V>, R: Reporter>(
             Structure::internal_build(vector_options.clone(), internal_build.clone(), samples)
         }
     };
-    let mut meta = Tape::create(&relation, false);
+    let mut meta = TapeWriter::<_, _, MetaTuple>::create(|| relation.extend(false));
     assert_eq!(meta.first(), 0);
-    let mut vectors = Tape::<VectorTuple<V>, _>::create(&relation, true);
-    let mut pointer_of_means = Vec::<Vec<(u32, u16)>>::new();
+    let freepage = TapeWriter::<_, _, FreepageTuple>::create(|| relation.extend(false));
+    let mut vectors = TapeWriter::<_, _, VectorTuple<O::Vector>>::create(|| relation.extend(true));
+    let mut pointer_of_means = Vec::<Vec<IndexPointer>>::new();
     for i in 0..structures.len() {
         let mut level = Vec::new();
         for j in 0..structures[i].len() {
-            let vector = V::build_from_vecf32(&structures[i].means[j]);
-            let (metadata, slices) = V::vector_split(vector.as_borrowed());
-            let mut chain = Err(metadata);
+            let vector = O::Vector::build_from_vecf32(&structures[i].means[j]);
+            let (metadata, slices) = O::Vector::vector_split(vector.as_borrowed());
+            let mut chain = Ok(metadata);
             for i in (0..slices.len()).rev() {
-                chain = Ok(vectors.push(&VectorTuple {
-                    payload: None,
-                    slice: slices[i].to_vec(),
-                    chain,
+                chain = Err(vectors.push(match chain {
+                    Ok(metadata) => VectorTuple::_0 {
+                        payload: None,
+                        elements: slices[i].to_vec(),
+                        metadata,
+                    },
+                    Err(pointer) => VectorTuple::_1 {
+                        payload: None,
+                        elements: slices[i].to_vec(),
+                        pointer,
+                    },
                 }));
             }
-            level.push(chain.ok().unwrap());
+            level.push(chain.err().unwrap());
         }
         pointer_of_means.push(level);
     }
@@ -98,10 +104,14 @@ pub fn build<V: Vector, T: HeapRelation<V>, R: Reporter>(
         let mut level = Vec::new();
         for j in 0..structures[i].len() {
             if i == 0 {
-                let tape = Tape::<Height0Tuple, _>::create(&relation, false);
-                level.push(tape.first());
+                let tape = TapeWriter::<_, _, H0Tuple>::create(|| relation.extend(false));
+                let mut jump = TapeWriter::<_, _, JumpTuple>::create(|| relation.extend(false));
+                jump.push(JumpTuple {
+                    first: tape.first(),
+                });
+                level.push(jump.first());
             } else {
-                let mut tape = Tape::<Height1Tuple, _>::create(&relation, false);
+                let mut tape = H1TapeWriter::<_, _>::create(|| relation.extend(false));
                 let h2_mean = &structures[i].means[j];
                 let h2_children = &structures[i].children[j];
                 for child in h2_children.iter().copied() {
@@ -111,28 +121,30 @@ pub fn build<V: Vector, T: HeapRelation<V>, R: Reporter>(
                     } else {
                         rabitq::code(dims, h1_mean)
                     };
-                    tape.push(&Height1Tuple {
+                    tape.push(H1Branch {
                         mean: pointer_of_means[i - 1][child as usize],
-                        first: pointer_of_firsts[i - 1][child as usize],
                         dis_u_2: code.dis_u_2,
                         factor_ppc: code.factor_ppc,
                         factor_ip: code.factor_ip,
                         factor_err: code.factor_err,
-                        t: code.t(),
+                        signs: code.signs,
+                        first: pointer_of_firsts[i - 1][child as usize],
                     });
                 }
+                let tape = tape.into_inner();
                 level.push(tape.first());
             }
         }
         pointer_of_firsts.push(level);
     }
-    meta.push(&MetaTuple {
+    meta.push(MetaTuple {
         dims,
         height_of_root: structures.len() as u32,
         is_residual,
         vectors_first: vectors.first(),
-        mean: pointer_of_means.last().unwrap()[0],
-        first: pointer_of_firsts.last().unwrap()[0],
+        root_mean: pointer_of_means.last().unwrap()[0],
+        root_first: pointer_of_firsts.last().unwrap()[0],
+        freepage_first: freepage.first(),
     });
 }
 
@@ -342,7 +354,7 @@ impl Structure {
         ) -> (Vec<Vec<f32>>, Vec<Vec<u32>>) {
             labels
                 .iter()
-                .filter(|(_, &(h, _))| h == height)
+                .filter(|(_, (h, _))| *h == height)
                 .map(|(id, _)| {
                     (
                         vectors[id].clone(),
@@ -357,52 +369,5 @@ impl Structure {
             result.push(Structure { means, children });
         }
         result
-    }
-}
-
-struct Tape<'a: 'b, 'b, T, R: 'b + RelationWrite> {
-    relation: &'a R,
-    head: R::WriteGuard<'b>,
-    first: u32,
-    tracking_freespace: bool,
-    _phantom: PhantomData<fn(T) -> T>,
-}
-
-impl<'a: 'b, 'b, T, R: 'b + RelationWrite> Tape<'a, 'b, T, R> {
-    fn create(relation: &'a R, tracking_freespace: bool) -> Self {
-        let mut head = relation.extend(tracking_freespace);
-        head.get_opaque_mut().skip = head.id();
-        let first = head.id();
-        Self {
-            relation,
-            head,
-            first,
-            tracking_freespace,
-            _phantom: PhantomData,
-        }
-    }
-    fn first(&self) -> u32 {
-        self.first
-    }
-}
-
-impl<'a: 'b, 'b, T, R: 'b + RelationWrite> Tape<'a, 'b, T, R>
-where
-    T: rkyv::Serialize<AllocSerializer<8192>>,
-{
-    fn push(&mut self, x: &T) -> (u32, u16) {
-        let bytes = rkyv::to_bytes(x).expect("failed to serialize");
-        if let Some(i) = self.head.alloc(&bytes) {
-            (self.head.id(), i)
-        } else {
-            let next = self.relation.extend(self.tracking_freespace);
-            self.head.get_opaque_mut().next = next.id();
-            self.head = next;
-            if let Some(i) = self.head.alloc(&bytes) {
-                (self.head.id(), i)
-            } else {
-                panic!("tuple is too large to fit in a fresh page")
-            }
-        }
     }
 }

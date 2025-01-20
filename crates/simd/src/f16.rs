@@ -517,7 +517,7 @@ mod reduce_sum_of_xy {
     }
 
     // temporarily disables this for uncertain precision
-    #[expect(dead_code)]
+    #[cfg_attr(not(test), expect(dead_code))]
     #[inline]
     #[cfg(target_arch = "aarch64")]
     #[crate::target_cpu(enable = "v8.3a")]
@@ -894,7 +894,7 @@ mod reduce_sum_of_d2 {
     }
 
     // temporarily disables this for uncertain precision
-    #[expect(dead_code)]
+    #[cfg_attr(not(test), expect(dead_code))]
     #[inline]
     #[cfg(target_arch = "aarch64")]
     #[crate::target_cpu(enable = "v8.3a")]

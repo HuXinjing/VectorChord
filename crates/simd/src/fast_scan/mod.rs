@@ -1,16 +1,16 @@
 /*
 
-## codes layout for 4-bit quantizer
+## code layout for 4-bit quantizer
 
-group i = | vector i | (total bytes = width/2)
+group i = | vector i | (total bytes = n/2)
 
-byte:      | 0      | 1      | 2      | ... | width/2 - 1  |
-bits 0..3: | code 0 | code 2 | code 4 | ... | code width-2 |
-bits 4..7: | code 1 | code 3 | code 5 | ... | code width-1 |
+byte:      | 0      | 1      | 2      | ... | n/2 - 1  |
+bits 0..3: | code 0 | code 2 | code 4 | ... | code n-2 |
+bits 4..7: | code 1 | code 3 | code 5 | ... | code n-1 |
 
-## packed_codes layout for 4-bit quantizer
+## packed_code layout for 4-bit quantizer
 
-group i = | vector 32i | vector 32i+1 | vector 32i+2 | ... | vector 32i+31 | (total bytes = width * 16)
+group i = | vector 32i | vector 32i+1 | vector 32i+2 | ... | vector 32i+31 | (total bytes = n * 16)
 
 byte      | 0                | 1                | 2                | ... | 14               | 15               |
 bits 0..3 | code 0,vector 0  | code 0,vector 8  | code 0,vector 1  | ... | code 0,vector 14 | code 0,vector 15 |
@@ -26,34 +26,105 @@ bits 4..7 | code 2,vector 16 | code 2,vector 24 | code 2,vector 17 | ... | code 
 
 ...
 
-byte      | width*32-32              | width*32-31              | ... | width*32-1               |
-bits 0..3 | code (width-1),vector 0  | code (width-1),vector 8  | ... | code (width-1),vector 15 |
-bits 4..7 | code (width-1),vector 16 | code (width-1),vector 24 | ... | code (width-1),vector 31 |
+byte      | n*32-32              | n*32-31              | ... | n*32-1               |
+bits 0..3 | code (n-1),vector 0  | code (n-1),vector 8  | ... | code (n-1),vector 15 |
+bits 4..7 | code (n-1),vector 16 | code (n-1),vector 24 | ... | code (n-1),vector 31 |
 
 */
 
-pub fn pack(width: u32, r: [Vec<u8>; 32]) -> impl Iterator<Item = u8> {
-    (0..width as usize).flat_map(move |i| {
-        [
-            r[0][i] | (r[16][i] << 4),
-            r[8][i] | (r[24][i] << 4),
-            r[1][i] | (r[17][i] << 4),
-            r[9][i] | (r[25][i] << 4),
-            r[2][i] | (r[18][i] << 4),
-            r[10][i] | (r[26][i] << 4),
-            r[3][i] | (r[19][i] << 4),
-            r[11][i] | (r[27][i] << 4),
-            r[4][i] | (r[20][i] << 4),
-            r[12][i] | (r[28][i] << 4),
-            r[5][i] | (r[21][i] << 4),
-            r[13][i] | (r[29][i] << 4),
-            r[6][i] | (r[22][i] << 4),
-            r[14][i] | (r[30][i] << 4),
-            r[7][i] | (r[23][i] << 4),
-            r[15][i] | (r[31][i] << 4),
-        ]
-        .into_iter()
-    })
+pub fn pack(x: [&[u8]; 32]) -> Vec<[u64; 2]> {
+    let n = {
+        let l = x.each_ref().map(|i| i.len());
+        for i in 1..32 {
+            assert!(l[0] == l[i]);
+        }
+        l[0]
+    };
+    let mut result = Vec::with_capacity(n);
+    for i in 0..n {
+        result.push([
+            u64::from_le_bytes([
+                x[0][i] | (x[16][i] << 4),
+                x[8][i] | (x[24][i] << 4),
+                x[1][i] | (x[17][i] << 4),
+                x[9][i] | (x[25][i] << 4),
+                x[2][i] | (x[18][i] << 4),
+                x[10][i] | (x[26][i] << 4),
+                x[3][i] | (x[19][i] << 4),
+                x[11][i] | (x[27][i] << 4),
+            ]),
+            u64::from_le_bytes([
+                x[4][i] | (x[20][i] << 4),
+                x[12][i] | (x[28][i] << 4),
+                x[5][i] | (x[21][i] << 4),
+                x[13][i] | (x[29][i] << 4),
+                x[6][i] | (x[22][i] << 4),
+                x[14][i] | (x[30][i] << 4),
+                x[7][i] | (x[23][i] << 4),
+                x[15][i] | (x[31][i] << 4),
+            ]),
+        ]);
+    }
+    result
+}
+
+pub fn unpack(x: &[[u64; 2]]) -> [Vec<u8>; 32] {
+    let n = x.len();
+    let mut result = std::array::from_fn(|_| Vec::with_capacity(n));
+    for i in 0..n {
+        let a = x[i][0].to_le_bytes();
+        let b = x[i][1].to_le_bytes();
+        result[0].push(a[0] & 0xf);
+        result[1].push(a[2] & 0xf);
+        result[2].push(a[4] & 0xf);
+        result[3].push(a[6] & 0xf);
+        result[4].push(b[0] & 0xf);
+        result[5].push(b[2] & 0xf);
+        result[6].push(b[4] & 0xf);
+        result[7].push(b[6] & 0xf);
+        result[8].push(a[1] & 0xf);
+        result[9].push(a[3] & 0xf);
+        result[10].push(a[5] & 0xf);
+        result[11].push(a[7] & 0xf);
+        result[12].push(b[1] & 0xf);
+        result[13].push(b[3] & 0xf);
+        result[14].push(b[5] & 0xf);
+        result[15].push(b[7] & 0xf);
+        result[16].push(a[0] >> 4);
+        result[17].push(a[2] >> 4);
+        result[18].push(a[4] >> 4);
+        result[19].push(a[6] >> 4);
+        result[20].push(b[0] >> 4);
+        result[21].push(b[2] >> 4);
+        result[22].push(b[4] >> 4);
+        result[23].push(b[6] >> 4);
+        result[24].push(a[1] >> 4);
+        result[25].push(a[3] >> 4);
+        result[26].push(a[5] >> 4);
+        result[27].push(a[7] >> 4);
+        result[28].push(b[1] >> 4);
+        result[29].push(b[3] >> 4);
+        result[30].push(b[5] >> 4);
+        result[31].push(b[7] >> 4);
+    }
+    result
+}
+
+pub fn padding_pack(x: impl IntoIterator<Item = impl AsRef<[u8]>>) -> Vec<[u64; 2]> {
+    let x = x.into_iter().collect::<Vec<_>>();
+    let x = x.iter().map(|x| x.as_ref()).collect::<Vec<_>>();
+    if x.is_empty() || x.len() > 32 {
+        panic!("too few or too many slices");
+    }
+    let n = x[0].len();
+    let t = vec![0; n];
+    pack(std::array::from_fn(|i| {
+        if i < x.len() { x[i] } else { t.as_slice() }
+    }))
+}
+
+pub fn any_pack<T: Default>(mut x: impl Iterator<Item = T>) -> [T; 32] {
+    std::array::from_fn(|_| x.next()).map(|x| x.unwrap_or_default())
 }
 
 #[allow(clippy::module_inception)]
@@ -61,10 +132,10 @@ mod fast_scan {
     #[inline]
     #[cfg(target_arch = "x86_64")]
     #[crate::target_cpu(enable = "v4")]
-    fn fast_scan_v4(width: u32, codes: &[u8], lut: &[u8]) -> [u16; 32] {
+    fn fast_scan_v4(code: &[[u64; 2]], lut: &[[u64; 2]]) -> [u16; 32] {
         // bounds checking is not enforced by compiler, so check it manually
-        assert_eq!(codes.len(), width as usize * 16);
-        assert_eq!(lut.len(), width as usize * 16);
+        assert_eq!(code.len(), lut.len());
+        let n = code.len();
 
         unsafe {
             use std::arch::x86_64::*;
@@ -99,14 +170,14 @@ mod fast_scan {
             let mut accu_3 = _mm512_setzero_si512();
 
             let mut i = 0_usize;
-            while i + 4 <= width as usize {
-                let c = _mm512_loadu_si512(codes.as_ptr().add(i * 16).cast());
+            while i + 4 <= n {
+                let c = _mm512_loadu_si512(code.as_ptr().add(i).cast());
 
                 let mask = _mm512_set1_epi8(0xf);
                 let clo = _mm512_and_si512(c, mask);
                 let chi = _mm512_and_si512(_mm512_srli_epi16(c, 4), mask);
 
-                let lut = _mm512_loadu_si512(lut.as_ptr().add(i * 16).cast());
+                let lut = _mm512_loadu_si512(lut.as_ptr().add(i).cast());
                 let res_lo = _mm512_shuffle_epi8(lut, clo);
                 accu_0 = _mm512_add_epi16(accu_0, res_lo);
                 accu_1 = _mm512_add_epi16(accu_1, _mm512_srli_epi16(res_lo, 8));
@@ -116,14 +187,14 @@ mod fast_scan {
 
                 i += 4;
             }
-            if i + 2 <= width as usize {
-                let c = _mm256_loadu_si256(codes.as_ptr().add(i * 16).cast());
+            if i + 2 <= n {
+                let c = _mm256_loadu_si256(code.as_ptr().add(i).cast());
 
                 let mask = _mm256_set1_epi8(0xf);
                 let clo = _mm256_and_si256(c, mask);
                 let chi = _mm256_and_si256(_mm256_srli_epi16(c, 4), mask);
 
-                let lut = _mm256_loadu_si256(lut.as_ptr().add(i * 16).cast());
+                let lut = _mm256_loadu_si256(lut.as_ptr().add(i).cast());
                 let res_lo = _mm512_zextsi256_si512(_mm256_shuffle_epi8(lut, clo));
                 accu_0 = _mm512_add_epi16(accu_0, res_lo);
                 accu_1 = _mm512_add_epi16(accu_1, _mm512_srli_epi16(res_lo, 8));
@@ -133,14 +204,14 @@ mod fast_scan {
 
                 i += 2;
             }
-            if i < width as usize {
-                let c = _mm_loadu_si128(codes.as_ptr().add(i * 16).cast());
+            if i < n {
+                let c = _mm_loadu_si128(code.as_ptr().add(i).cast());
 
                 let mask = _mm_set1_epi8(0xf);
                 let clo = _mm_and_si128(c, mask);
                 let chi = _mm_and_si128(_mm_srli_epi16(c, 4), mask);
 
-                let lut = _mm_loadu_si128(lut.as_ptr().add(i * 16).cast());
+                let lut = _mm_loadu_si128(lut.as_ptr().add(i).cast());
                 let res_lo = _mm512_zextsi128_si512(_mm_shuffle_epi8(lut, clo));
                 accu_0 = _mm512_add_epi16(accu_0, res_lo);
                 accu_1 = _mm512_add_epi16(accu_1, _mm512_srli_epi16(res_lo, 8));
@@ -150,7 +221,7 @@ mod fast_scan {
 
                 i += 1;
             }
-            debug_assert_eq!(i, width as usize);
+            debug_assert_eq!(i, n);
 
             let mut result = [0_u16; 32];
 
@@ -178,14 +249,15 @@ mod fast_scan {
             return;
         }
         for _ in 0..if cfg!(not(miri)) { 256 } else { 1 } {
-            for width in 90..110 {
-                let codes = (0..16 * width).map(|_| rand::random()).collect::<Vec<u8>>();
-                let lut = (0..16 * width).map(|_| rand::random()).collect::<Vec<u8>>();
+            for n in 90..110 {
+                let code = (0..n)
+                    .map(|_| [rand::random(), rand::random()])
+                    .collect::<Vec<[u64; 2]>>();
+                let lut = (0..n)
+                    .map(|_| [rand::random(), rand::random()])
+                    .collect::<Vec<[u64; 2]>>();
                 unsafe {
-                    assert_eq!(
-                        fast_scan_v4(width, &codes, &lut),
-                        fast_scan_fallback(width, &codes, &lut)
-                    );
+                    assert_eq!(fast_scan_v4(&code, &lut), fast_scan_fallback(&code, &lut));
                 }
             }
         }
@@ -194,10 +266,10 @@ mod fast_scan {
     #[inline]
     #[cfg(target_arch = "x86_64")]
     #[crate::target_cpu(enable = "v3")]
-    fn fast_scan_v3(width: u32, codes: &[u8], lut: &[u8]) -> [u16; 32] {
+    fn fast_scan_v3(code: &[[u64; 2]], lut: &[[u64; 2]]) -> [u16; 32] {
         // bounds checking is not enforced by compiler, so check it manually
-        assert_eq!(codes.len(), width as usize * 16);
-        assert_eq!(lut.len(), width as usize * 16);
+        assert_eq!(code.len(), lut.len());
+        let n = code.len();
 
         unsafe {
             use std::arch::x86_64::*;
@@ -218,14 +290,14 @@ mod fast_scan {
             let mut accu_3 = _mm256_setzero_si256();
 
             let mut i = 0_usize;
-            while i + 2 <= width as usize {
-                let c = _mm256_loadu_si256(codes.as_ptr().add(i * 16).cast());
+            while i + 2 <= n {
+                let c = _mm256_loadu_si256(code.as_ptr().add(i).cast());
 
                 let mask = _mm256_set1_epi8(0xf);
                 let clo = _mm256_and_si256(c, mask);
                 let chi = _mm256_and_si256(_mm256_srli_epi16(c, 4), mask);
 
-                let lut = _mm256_loadu_si256(lut.as_ptr().add(i * 16).cast());
+                let lut = _mm256_loadu_si256(lut.as_ptr().add(i).cast());
                 let res_lo = _mm256_shuffle_epi8(lut, clo);
                 accu_0 = _mm256_add_epi16(accu_0, res_lo);
                 accu_1 = _mm256_add_epi16(accu_1, _mm256_srli_epi16(res_lo, 8));
@@ -235,14 +307,14 @@ mod fast_scan {
 
                 i += 2;
             }
-            if i < width as usize {
-                let c = _mm_loadu_si128(codes.as_ptr().add(i * 16).cast());
+            if i < n {
+                let c = _mm_loadu_si128(code.as_ptr().add(i).cast());
 
                 let mask = _mm_set1_epi8(0xf);
                 let clo = _mm_and_si128(c, mask);
                 let chi = _mm_and_si128(_mm_srli_epi16(c, 4), mask);
 
-                let lut = _mm_loadu_si128(lut.as_ptr().add(i * 16).cast());
+                let lut = _mm_loadu_si128(lut.as_ptr().add(i).cast());
                 let res_lo = _mm256_zextsi128_si256(_mm_shuffle_epi8(lut, clo));
                 accu_0 = _mm256_add_epi16(accu_0, res_lo);
                 accu_1 = _mm256_add_epi16(accu_1, _mm256_srli_epi16(res_lo, 8));
@@ -252,7 +324,7 @@ mod fast_scan {
 
                 i += 1;
             }
-            debug_assert_eq!(i, width as usize);
+            debug_assert_eq!(i, n);
 
             let mut result = [0_u16; 32];
 
@@ -280,14 +352,15 @@ mod fast_scan {
             return;
         }
         for _ in 0..if cfg!(not(miri)) { 256 } else { 1 } {
-            for width in 90..110 {
-                let codes = (0..16 * width).map(|_| rand::random()).collect::<Vec<u8>>();
-                let lut = (0..16 * width).map(|_| rand::random()).collect::<Vec<u8>>();
+            for n in 90..110 {
+                let code = (0..n)
+                    .map(|_| [rand::random(), rand::random()])
+                    .collect::<Vec<[u64; 2]>>();
+                let lut = (0..n)
+                    .map(|_| [rand::random(), rand::random()])
+                    .collect::<Vec<[u64; 2]>>();
                 unsafe {
-                    assert_eq!(
-                        fast_scan_v3(width, &codes, &lut),
-                        fast_scan_fallback(width, &codes, &lut)
-                    );
+                    assert_eq!(fast_scan_v3(&code, &lut), fast_scan_fallback(&code, &lut));
                 }
             }
         }
@@ -295,10 +368,10 @@ mod fast_scan {
 
     #[cfg(target_arch = "x86_64")]
     #[crate::target_cpu(enable = "v2")]
-    fn fast_scan_v2(width: u32, codes: &[u8], lut: &[u8]) -> [u16; 32] {
+    fn fast_scan_v2(code: &[[u64; 2]], lut: &[[u64; 2]]) -> [u16; 32] {
         // bounds checking is not enforced by compiler, so check it manually
-        assert_eq!(codes.len(), width as usize * 16);
-        assert_eq!(lut.len(), width as usize * 16);
+        assert_eq!(code.len(), lut.len());
+        let n = code.len();
 
         unsafe {
             use std::arch::x86_64::*;
@@ -309,14 +382,14 @@ mod fast_scan {
             let mut accu_3 = _mm_setzero_si128();
 
             let mut i = 0_usize;
-            while i < width as usize {
-                let c = _mm_loadu_si128(codes.as_ptr().add(i * 16).cast());
+            while i < n {
+                let c = _mm_loadu_si128(code.as_ptr().add(i).cast());
 
                 let mask = _mm_set1_epi8(0xf);
                 let clo = _mm_and_si128(c, mask);
                 let chi = _mm_and_si128(_mm_srli_epi16(c, 4), mask);
 
-                let lut = _mm_loadu_si128(lut.as_ptr().add(i * 16).cast());
+                let lut = _mm_loadu_si128(lut.as_ptr().add(i).cast());
                 let res_lo = _mm_shuffle_epi8(lut, clo);
                 accu_0 = _mm_add_epi16(accu_0, res_lo);
                 accu_1 = _mm_add_epi16(accu_1, _mm_srli_epi16(res_lo, 8));
@@ -326,7 +399,7 @@ mod fast_scan {
 
                 i += 1;
             }
-            debug_assert_eq!(i, width as usize);
+            debug_assert_eq!(i, n);
 
             let mut result = [0_u16; 32];
 
@@ -350,14 +423,15 @@ mod fast_scan {
             return;
         }
         for _ in 0..if cfg!(not(miri)) { 256 } else { 1 } {
-            for width in 90..110 {
-                let codes = (0..16 * width).map(|_| rand::random()).collect::<Vec<u8>>();
-                let lut = (0..16 * width).map(|_| rand::random()).collect::<Vec<u8>>();
+            for n in 90..110 {
+                let code = (0..n)
+                    .map(|_| [rand::random(), rand::random()])
+                    .collect::<Vec<[u64; 2]>>();
+                let lut = (0..n)
+                    .map(|_| [rand::random(), rand::random()])
+                    .collect::<Vec<[u64; 2]>>();
                 unsafe {
-                    assert_eq!(
-                        fast_scan_v2(width, &codes, &lut),
-                        fast_scan_fallback(width, &codes, &lut)
-                    );
+                    assert_eq!(fast_scan_v2(&code, &lut), fast_scan_fallback(&code, &lut));
                 }
             }
         }
@@ -365,10 +439,10 @@ mod fast_scan {
 
     #[cfg(target_arch = "aarch64")]
     #[crate::target_cpu(enable = "v8.3a")]
-    fn fast_scan_v8_3a(width: u32, codes: &[u8], lut: &[u8]) -> [u16; 32] {
+    fn fast_scan_v8_3a(code: &[[u64; 2]], lut: &[[u64; 2]]) -> [u16; 32] {
         // bounds checking is not enforced by compiler, so check it manually
-        assert_eq!(codes.len(), width as usize * 16);
-        assert_eq!(lut.len(), width as usize * 16);
+        assert_eq!(code.len(), lut.len());
+        let n = code.len();
 
         unsafe {
             use std::arch::aarch64::*;
@@ -379,14 +453,14 @@ mod fast_scan {
             let mut accu_3 = vdupq_n_u16(0);
 
             let mut i = 0_usize;
-            while i < width as usize {
-                let c = vld1q_u8(codes.as_ptr().add(i * 16).cast());
+            while i < n {
+                let c = vld1q_u8(code.as_ptr().add(i).cast());
 
                 let mask = vdupq_n_u8(0xf);
                 let clo = vandq_u8(c, mask);
                 let chi = vandq_u8(vshrq_n_u8(c, 4), mask);
 
-                let lut = vld1q_u8(lut.as_ptr().add(i * 16).cast());
+                let lut = vld1q_u8(lut.as_ptr().add(i).cast());
                 let res_lo = vreinterpretq_u16_u8(vqtbl1q_u8(lut, clo));
                 accu_0 = vaddq_u16(accu_0, res_lo);
                 accu_1 = vaddq_u16(accu_1, vshrq_n_u16(res_lo, 8));
@@ -396,7 +470,7 @@ mod fast_scan {
 
                 i += 1;
             }
-            debug_assert_eq!(i, width as usize);
+            debug_assert_eq!(i, n);
 
             let mut result = [0_u16; 32];
 
@@ -420,13 +494,17 @@ mod fast_scan {
             return;
         }
         for _ in 0..if cfg!(not(miri)) { 256 } else { 1 } {
-            for width in 90..110 {
-                let codes = (0..16 * width).map(|_| rand::random()).collect::<Vec<u8>>();
-                let lut = (0..16 * width).map(|_| rand::random()).collect::<Vec<u8>>();
+            for n in 90..110 {
+                let code = (0..n)
+                    .map(|_| [rand::random(), rand::random()])
+                    .collect::<Vec<[u64; 2]>>();
+                let lut = (0..n)
+                    .map(|_| [rand::random(), rand::random()])
+                    .collect::<Vec<[u64; 2]>>();
                 unsafe {
                     assert_eq!(
-                        fast_scan_v8_3a(width, &codes, &lut),
-                        fast_scan_fallback(width, &codes, &lut)
+                        fast_scan_v8_3a(&code, &lut),
+                        fast_scan_fallback(&code, &lut)
                     );
                 }
             }
@@ -434,32 +512,24 @@ mod fast_scan {
     }
 
     #[crate::multiversion(@"v4", @"v3", @"v2", @"v8.3a")]
-    pub fn fast_scan(width: u32, codes: &[u8], lut: &[u8]) -> [u16; 32] {
-        let width = width as usize;
+    pub fn fast_scan(code: &[[u64; 2]], lut: &[[u64; 2]]) -> [u16; 32] {
+        assert_eq!(code.len(), lut.len());
+        let n = code.len();
 
-        assert_eq!(codes.len(), width * 16);
-        assert_eq!(lut.len(), width * 16);
-
-        use std::array::from_fn;
-        use std::ops::BitAnd;
-
-        fn load<T: Copy, const N: usize>(slice: &[T]) -> [T; N] {
-            from_fn(|i| slice[i])
-        }
         fn unary<T: Copy, U: Copy, const N: usize>(op: impl Fn(T) -> U, a: [T; N]) -> [U; N] {
-            from_fn(|i| op(a[i]))
+            std::array::from_fn(|i| op(a[i]))
         }
         fn binary<T: Copy, const N: usize>(op: impl Fn(T, T) -> T, a: [T; N], b: [T; N]) -> [T; N] {
-            from_fn(|i| op(a[i], b[i]))
+            std::array::from_fn(|i| op(a[i], b[i]))
         }
         fn shuffle<T: Copy, const N: usize>(a: [T; N], b: [u8; N]) -> [T; N] {
-            from_fn(|i| a[b[i] as usize])
+            std::array::from_fn(|i| a[b[i] as usize])
         }
         fn cast(x: [u8; 16]) -> [u16; 8] {
-            from_fn(|i| u16::from_le_bytes([x[i << 1 | 0], x[i << 1 | 1]]))
+            std::array::from_fn(|i| u16::from_le_bytes([x[i << 1 | 0], x[i << 1 | 1]]))
         }
         fn setr<T: Copy>(x: [[T; 8]; 4]) -> [T; 32] {
-            from_fn(|i| x[i >> 3][i & 7])
+            std::array::from_fn(|i| x[i >> 3][i & 7])
         }
 
         let mut a_0 = [0u16; 8];
@@ -467,14 +537,14 @@ mod fast_scan {
         let mut a_2 = [0u16; 8];
         let mut a_3 = [0u16; 8];
 
-        for i in 0..width {
-            let c = load(&codes[16 * i..]);
+        for i in 0..n {
+            let c = unsafe { std::mem::transmute::<[u64; 2], [u8; 16]>(code[i]) };
 
             let mask = [0xfu8; 16];
-            let clo = binary(u8::bitand, c, mask);
-            let chi = binary(u8::bitand, unary(|x| x >> 4, c), mask);
+            let clo = binary(std::ops::BitAnd::bitand, c, mask);
+            let chi = binary(std::ops::BitAnd::bitand, unary(|x| x >> 4, c), mask);
 
-            let lut = load(&lut[16 * i..]);
+            let lut = unsafe { std::mem::transmute::<[u64; 2], [u8; 16]>(lut[i]) };
             let res_lo = cast(shuffle(lut, clo));
             a_0 = binary(u16::wrapping_add, a_0, res_lo);
             a_1 = binary(u16::wrapping_add, a_1, unary(|x| x >> 8, res_lo));
@@ -491,6 +561,6 @@ mod fast_scan {
 }
 
 #[inline(always)]
-pub fn fast_scan(width: u32, codes: &[u8], lut: &[u8]) -> [u16; 32] {
-    fast_scan::fast_scan(width, codes, lut)
+pub fn fast_scan(code: &[[u64; 2]], lut: &[[u64; 2]]) -> [u16; 32] {
+    fast_scan::fast_scan(code, lut)
 }

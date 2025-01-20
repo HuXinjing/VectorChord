@@ -1,3 +1,14 @@
+pub mod build;
+pub mod freepages;
+pub mod insert;
+pub mod operator;
+pub mod prewarm;
+pub mod scan;
+pub mod tape;
+pub mod tuples;
+pub mod vacuum;
+pub mod vectors;
+
 use std::ops::{Deref, DerefMut};
 
 #[repr(C, align(8))]
@@ -15,8 +26,8 @@ pub trait Page: Sized {
     fn get_mut(&mut self, i: u16) -> Option<&mut [u8]>;
     fn alloc(&mut self, data: &[u8]) -> Option<u16>;
     fn free(&mut self, i: u16);
-    fn reconstruct(&mut self, removes: &[u16]);
     fn freespace(&self) -> u16;
+    fn clear(&mut self);
 }
 
 pub trait PageGuard {

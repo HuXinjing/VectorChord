@@ -1,15 +1,18 @@
+#![feature(vec_pop_if)]
 #![allow(clippy::collapsible_else_if)]
 #![allow(clippy::infallible_destructuring_match)]
 #![allow(clippy::too_many_arguments)]
 #![allow(clippy::type_complexity)]
 
+mod algorithm;
 mod datatype;
+mod gucs;
+mod index;
 mod postgres;
 mod projection;
+mod types;
 mod upgrade;
 mod utils;
-mod vchordrq;
-mod vchordrqfscan;
 
 pgrx::pg_module_magic!();
 pgrx::extension_sql_file!("./sql/bootstrap.sql", bootstrap);
@@ -21,8 +24,8 @@ unsafe extern "C" fn _PG_init() {
         pgrx::error!("vchord must be loaded via shared_preload_libraries.");
     }
     unsafe {
-        vchordrq::init();
-        vchordrqfscan::init();
+        index::init();
+        gucs::init();
 
         #[cfg(any(feature = "pg13", feature = "pg14"))]
         pgrx::pg_sys::EmitWarningsOnPlaceholders(c"vchord".as_ptr());
