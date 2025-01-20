@@ -1,7 +1,7 @@
-use crate::datatype::memory_pgvector_halfvec::PgvectorHalfvecInput;
-use crate::datatype::memory_pgvector_halfvec::PgvectorHalfvecOutput;
-use crate::datatype::memory_pgvector_vector::PgvectorVectorInput;
-use crate::datatype::memory_pgvector_vector::PgvectorVectorOutput;
+use crate::datatype::memory_halfvec::HalfvecInput;
+use crate::datatype::memory_halfvec::HalfvecOutput;
+use crate::datatype::memory_vector::VectorInput;
+use crate::datatype::memory_vector::VectorOutput;
 use crate::datatype::typmod::Typmod;
 use crate::types::{BorrowedVector, OwnedVector};
 use crate::types::{DistanceKind, VectorKind};
@@ -133,11 +133,11 @@ impl Opfamily {
         }
         let vector = match self.vector {
             VectorKind::Vecf32 => {
-                let vector = unsafe { PgvectorVectorInput::from_datum(datum, false).unwrap() };
+                let vector = unsafe { VectorInput::from_datum(datum, false).unwrap() };
                 self.preprocess(BorrowedVector::Vecf32(vector.as_borrowed()))
             }
             VectorKind::Vecf16 => {
-                let vector = unsafe { PgvectorHalfvecInput::from_datum(datum, false).unwrap() };
+                let vector = unsafe { HalfvecInput::from_datum(datum, false).unwrap() };
                 self.preprocess(BorrowedVector::Vecf16(vector.as_borrowed()))
             }
         };
@@ -154,11 +154,11 @@ impl Opfamily {
         let tuple = unsafe { PgHeapTuple::from_composite_datum(datum) };
         let center = match self.vector {
             VectorKind::Vecf32 => tuple
-                .get_by_index::<PgvectorVectorOutput>(NonZero::new(1).unwrap())
+                .get_by_index::<VectorOutput>(NonZero::new(1).unwrap())
                 .unwrap()
                 .map(|vector| self.preprocess(BorrowedVector::Vecf32(vector.as_borrowed()))),
             VectorKind::Vecf16 => tuple
-                .get_by_index::<PgvectorHalfvecOutput>(NonZero::new(1).unwrap())
+                .get_by_index::<HalfvecOutput>(NonZero::new(1).unwrap())
                 .unwrap()
                 .map(|vector| self.preprocess(BorrowedVector::Vecf16(vector.as_borrowed()))),
         };

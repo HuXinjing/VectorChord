@@ -1,14 +1,14 @@
-use crate::datatype::memory_pgvector_halfvec::{PgvectorHalfvecInput, PgvectorHalfvecOutput};
+use crate::datatype::memory_vector::{VectorInput, VectorOutput};
 use std::num::NonZero;
 use vector::VectorBorrowed;
 use vector::vect::VectBorrowed;
 
 #[pgrx::pg_extern(immutable, strict, parallel_safe)]
-fn _vchord_halfvec_sphere_l2_in(
-    lhs: PgvectorHalfvecInput<'_>,
-    rhs: pgrx::composite_type!("sphere_halfvec"),
+fn _vchord_vector_sphere_l2_in(
+    lhs: VectorInput<'_>,
+    rhs: pgrx::composite_type!("sphere_vector"),
 ) -> bool {
-    let center: PgvectorHalfvecOutput = match rhs.get_by_index(NonZero::new(1).unwrap()) {
+    let center: VectorOutput = match rhs.get_by_index(NonZero::new(1).unwrap()) {
         Ok(Some(s)) => s,
         Ok(None) => pgrx::error!("Bad input: empty center at sphere"),
         Err(_) => unreachable!(),
@@ -28,11 +28,11 @@ fn _vchord_halfvec_sphere_l2_in(
 }
 
 #[pgrx::pg_extern(immutable, strict, parallel_safe)]
-fn _vchord_halfvec_sphere_ip_in(
-    lhs: PgvectorHalfvecInput<'_>,
-    rhs: pgrx::composite_type!("sphere_halfvec"),
+fn _vchord_vector_sphere_ip_in(
+    lhs: VectorInput<'_>,
+    rhs: pgrx::composite_type!("sphere_vector"),
 ) -> bool {
-    let center: PgvectorHalfvecOutput = match rhs.get_by_index(NonZero::new(1).unwrap()) {
+    let center: VectorOutput = match rhs.get_by_index(NonZero::new(1).unwrap()) {
         Ok(Some(s)) => s,
         Ok(None) => pgrx::error!("Bad input: empty center at sphere"),
         Err(_) => unreachable!(),
@@ -52,11 +52,11 @@ fn _vchord_halfvec_sphere_ip_in(
 }
 
 #[pgrx::pg_extern(immutable, strict, parallel_safe)]
-fn _vchord_halfvec_sphere_cosine_in(
-    lhs: PgvectorHalfvecInput<'_>,
-    rhs: pgrx::composite_type!("sphere_halfvec"),
+fn _vchord_vector_sphere_cosine_in(
+    lhs: VectorInput<'_>,
+    rhs: pgrx::composite_type!("sphere_vector"),
 ) -> bool {
-    let center: PgvectorHalfvecOutput = match rhs.get_by_index(NonZero::new(1).unwrap()) {
+    let center: VectorOutput = match rhs.get_by_index(NonZero::new(1).unwrap()) {
         Ok(Some(s)) => s,
         Ok(None) => pgrx::error!("Bad input: empty center at sphere"),
         Err(_) => unreachable!(),

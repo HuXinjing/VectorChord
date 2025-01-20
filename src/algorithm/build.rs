@@ -217,7 +217,7 @@ impl Structure {
         let mut parents = BTreeMap::new();
         let mut vectors = BTreeMap::new();
         pgrx::spi::Spi::connect(|client| {
-            use crate::datatype::memory_pgvector_vector::PgvectorVectorOutput;
+            use crate::datatype::memory_vector::VectorOutput;
             use pgrx::pg_sys::panic::ErrorReportable;
             use vector::VectorBorrowed;
             let schema_query = "SELECT n.nspname::TEXT 
@@ -237,7 +237,7 @@ impl Structure {
             for row in centroids {
                 let id: Option<i32> = row.get_by_name("id").unwrap();
                 let parent: Option<i32> = row.get_by_name("parent").unwrap();
-                let vector: Option<PgvectorVectorOutput> = row.get_by_name("vector").unwrap();
+                let vector: Option<VectorOutput> = row.get_by_name("vector").unwrap();
                 let id = id.expect("external build: id could not be NULL");
                 let vector = vector.expect("external build: vector could not be NULL");
                 let pop = parents.insert(id, parent);
