@@ -5,6 +5,8 @@ use zerocopy_derive::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
 pub const ALIGN: usize = 8;
 pub type Tag = u64;
+const MAGIC: u64 = u64::from_ne_bytes(*b"vchordrq");
+const VERSION: u64 = 1;
 
 pub trait Tuple: 'static {
     type Reader<'a>: TupleReader<'a, Tuple = Self>;
@@ -42,6 +44,8 @@ pub fn write_tuple<T: Tuple + WithWriter>(source: &mut [u8]) -> T::Writer<'_> {
 #[repr(C, align(8))]
 #[derive(Debug, Clone, PartialEq, FromBytes, IntoBytes, Immutable, KnownLayout)]
 struct MetaTupleHeader {
+    magic: u64,
+    version: u64,
     dims: u32,
     height_of_root: u32,
     is_residual: Bool,
@@ -69,6 +73,8 @@ impl Tuple for MetaTuple {
 
     fn serialize(&self) -> Vec<u8> {
         MetaTupleHeader {
+            magic: MAGIC,
+            version: VERSION,
             dims: self.dims,
             height_of_root: self.height_of_root,
             is_residual: self.is_residual.into(),
@@ -91,6 +97,17 @@ pub struct MetaTupleReader<'a> {
 impl<'a> TupleReader<'a> for MetaTupleReader<'a> {
     type Tuple = MetaTuple;
     fn deserialize_ref(source: &'a [u8]) -> Self {
+        if source.len() < 16 {
+            panic!("bad bytes")
+        }
+        let magic = u64::from_ne_bytes(std::array::from_fn(|i| source[i + 0]));
+        if magic != MAGIC {
+            panic!("bad magic number");
+        }
+        let version = u64::from_ne_bytes(std::array::from_fn(|i| source[i + 8]));
+        if version != VERSION {
+            panic!("bad version number");
+        }
         let checker = RefChecker::new(source);
         let header = checker.prefix(0);
         Self { header }
