@@ -20,7 +20,8 @@ RUN set -eux; \
         ca-certificates \
         build-essential \
         postgresql-common gnupg \
-        libreadline-dev zlib1g-dev flex bison libxml2-dev libxslt-dev libssl-dev libxml2-utils xsltproc ccache pkg-config
+        libreadline-dev zlib1g-dev flex bison libxml2-dev libxslt-dev libssl-dev libxml2-utils xsltproc ccache pkg-config \
+        zip
 
 RUN set -eux; \
     apt -y install lsb-release wget software-properties-common gnupg; \
