@@ -1,9 +1,72 @@
-use super::parallelism::{ParallelIterator, Parallelism};
+#![allow(clippy::type_complexity)]
+
 use half::f16;
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 use simd::Floating;
 use simd::fast_scan::{any_pack, padding_pack};
+use std::any::Any;
+use std::panic::AssertUnwindSafe;
+use std::sync::Arc;
+
+pub use rayon::iter::ParallelIterator;
+
+pub trait Parallelism: Send + Sync {
+    fn check(&self);
+
+    fn rayon_into_par_iter<I: rayon::iter::IntoParallelIterator>(&self, x: I) -> I::Iter;
+}
+
+struct ParallelismCheckPanic(Box<dyn Any + Send>);
+
+pub struct RayonParallelism {
+    stop: Arc<dyn Fn() + Send + Sync>,
+}
+
+impl RayonParallelism {
+    pub fn scoped<R>(
+        num_threads: usize,
+        stop: Arc<dyn Fn() + Send + Sync>,
+        f: impl FnOnce(&Self) -> R,
+    ) -> Result<R, rayon::ThreadPoolBuildError> {
+        match std::panic::catch_unwind(AssertUnwindSafe(|| {
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(num_threads)
+                .panic_handler(|e| {
+                    if e.downcast_ref::<ParallelismCheckPanic>().is_some() {
+                        return;
+                    }
+                    log::error!("Asynchronous task panickied.");
+                })
+                .build_scoped(
+                    |thread| thread.run(),
+                    |_| {
+                        let pool = Self { stop: stop.clone() };
+                        f(&pool)
+                    },
+                )
+        })) {
+            Ok(x) => x,
+            Err(e) => match e.downcast::<ParallelismCheckPanic>() {
+                Ok(payload) => std::panic::resume_unwind((*payload).0),
+                Err(e) => std::panic::resume_unwind(e),
+            },
+        }
+    }
+}
+
+impl Parallelism for RayonParallelism {
+    fn check(&self) {
+        match std::panic::catch_unwind(AssertUnwindSafe(|| (self.stop)())) {
+            Ok(()) => (),
+            Err(payload) => std::panic::panic_any(ParallelismCheckPanic(payload)),
+        }
+    }
+
+    fn rayon_into_par_iter<I: rayon::iter::IntoParallelIterator>(&self, x: I) -> I::Iter {
+        x.into_par_iter()
+    }
+}
 
 pub fn k_means<P: Parallelism>(
     parallelism: &P,
@@ -108,10 +171,10 @@ fn rabitq_index<P: Parallelism>(
         factor_ppc: [f32; 32],
         factor_ip: [f32; 32],
         factor_err: [f32; 32],
-        elements: Vec<[u64; 2]>,
+        elements: Vec<[u8; 16]>,
     }
     impl Block {
-        fn code(&self) -> (&[f32; 32], &[f32; 32], &[f32; 32], &[f32; 32], &[[u64; 2]]) {
+        fn code(&self) -> (&[f32; 32], &[f32; 32], &[f32; 32], &[f32; 32], &[[u8; 16]]) {
             (
                 &self.dis_u_2,
                 &self.factor_ppc,
@@ -134,16 +197,14 @@ fn rabitq_index<P: Parallelism>(
     parallelism
         .rayon_into_par_iter(0..n)
         .map(|i| {
-            use distance::Distance;
             let lut = rabitq::block::preprocess(&samples[i]);
-            let mut result = (Distance::INFINITY, 0);
+            let mut result = (f32::INFINITY, 0);
             for block in 0..c.div_ceil(32) {
                 let lowerbound =
                     rabitq::block::process_lowerbound_l2(&lut, blocks[block].code(), 1.9);
                 for j in block * 32..std::cmp::min(block * 32 + 32, c) {
-                    if lowerbound[j - block * 32] < result.0 {
-                        let dis =
-                            Distance::from_f32(f32::reduce_sum_of_d2(&samples[i], &centroids[j]));
+                    if lowerbound[j - block * 32].to_f32() < result.0 {
+                        let dis = f32::reduce_sum_of_d2(&samples[i], &centroids[j]);
                         if dis <= result.0 {
                             result = (dis, j);
                         }

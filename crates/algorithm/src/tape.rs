@@ -1,12 +1,9 @@
-use super::RelationRead;
-use super::operator::Accessor1;
-use crate::algorithm::Page;
-use crate::algorithm::PageGuard;
-use crate::algorithm::tuples::*;
-use crate::utils::pipe::Pipe;
+use crate::operator::Accessor1;
+use crate::pipe::Pipe;
+use crate::tuples::*;
+use crate::{Page, PageGuard, RelationRead, RelationWrite};
 use distance::Distance;
-use simd::fast_scan::any_pack;
-use simd::fast_scan::padding_pack;
+use simd::fast_scan::{any_pack, padding_pack};
 use std::marker::PhantomData;
 use std::num::NonZeroU64;
 use std::ops::DerefMut;
@@ -178,7 +175,7 @@ where
     }
 }
 
-pub struct H0BranchWriter {
+pub struct H0Branch {
     pub mean: IndexPointer,
     pub dis_u_2: f32,
     pub factor_ppc: f32,
@@ -188,12 +185,12 @@ pub struct H0BranchWriter {
     pub payload: NonZeroU64,
 }
 
-pub struct H0Tape<G, E> {
+pub struct H0TapeWriter<G, E> {
     tape: TapeWriter<G, E, H0Tuple>,
-    branches: Vec<H0BranchWriter>,
+    branches: Vec<H0Branch>,
 }
 
-impl<G, E> H0Tape<G, E>
+impl<G, E> H0TapeWriter<G, E>
 where
     G: PageGuard + DerefMut,
     G::Target: Page,
@@ -205,7 +202,7 @@ where
             branches: Vec::new(),
         }
     }
-    pub fn push(&mut self, branch: H0BranchWriter) {
+    pub fn push(&mut self, branch: H0Branch) {
         self.branches.push(branch);
         if self.branches.len() == 32 {
             let chunk = std::array::from_fn::<_, 32, _>(|_| self.branches.pop().unwrap());
@@ -253,14 +250,14 @@ where
     }
 }
 
-pub fn read_h1_tape<A>(
-    relation: impl RelationRead,
+pub fn access_1<A>(
+    index: impl RelationRead,
     first: u32,
-    compute_block: impl Fn() -> A + Copy,
+    make_block_accessor: impl Fn() -> A + Copy,
     mut callback: impl FnMut(Distance, IndexPointer, u32),
 ) where
     A: for<'a> Accessor1<
-            [u64; 2],
+            [u8; 16],
             (&'a [f32; 32], &'a [f32; 32], &'a [f32; 32], &'a [f32; 32]),
             Output = [Distance; 32],
         >,
@@ -269,7 +266,7 @@ pub fn read_h1_tape<A>(
     let mut current = first;
     let mut computing = None;
     while current != u32::MAX {
-        let h1_guard = relation.read(current);
+        let h1_guard = index.read(current);
         for i in 1..=h1_guard.len() {
             let h1_tuple = h1_guard
                 .get(i)
@@ -277,7 +274,7 @@ pub fn read_h1_tape<A>(
                 .pipe(read_tuple::<H1Tuple>);
             match h1_tuple {
                 H1TupleReader::_0(h1_tuple) => {
-                    let mut compute = computing.take().unwrap_or_else(compute_block);
+                    let mut compute = computing.take().unwrap_or_else(make_block_accessor);
                     compute.push(h1_tuple.elements());
                     let lowerbounds = compute.finish(h1_tuple.metadata());
                     for i in 0..h1_tuple.len() {
@@ -289,7 +286,7 @@ pub fn read_h1_tape<A>(
                     }
                 }
                 H1TupleReader::_1(h1_tuple) => {
-                    let computing = computing.get_or_insert_with(compute_block);
+                    let computing = computing.get_or_insert_with(make_block_accessor);
                     computing.push(h1_tuple.elements());
                 }
             }
@@ -298,15 +295,15 @@ pub fn read_h1_tape<A>(
     }
 }
 
-pub fn read_h0_tape<A>(
-    relation: impl RelationRead,
+pub fn access_0<A>(
+    index: impl RelationRead,
     first: u32,
-    compute_block: impl Fn() -> A + Copy,
+    make_block_accessor: impl Fn() -> A + Copy,
     compute_binary: impl Fn((f32, f32, f32, f32, &[u64])) -> Distance,
     mut callback: impl FnMut(Distance, IndexPointer, NonZeroU64),
 ) where
     A: for<'a> Accessor1<
-            [u64; 2],
+            [u8; 16],
             (&'a [f32; 32], &'a [f32; 32], &'a [f32; 32], &'a [f32; 32]),
             Output = [Distance; 32],
         >,
@@ -315,7 +312,7 @@ pub fn read_h0_tape<A>(
     let mut current = first;
     let mut computing = None;
     while current != u32::MAX {
-        let h0_guard = relation.read(current);
+        let h0_guard = index.read(current);
         for i in 1..=h0_guard.len() {
             let h0_tuple = h0_guard
                 .get(i)
@@ -329,7 +326,7 @@ pub fn read_h0_tape<A>(
                     }
                 }
                 H0TupleReader::_1(h0_tuple) => {
-                    let mut compute = computing.take().unwrap_or_else(compute_block);
+                    let mut compute = computing.take().unwrap_or_else(make_block_accessor);
                     compute.push(h0_tuple.elements());
                     let lowerbounds = compute.finish(h0_tuple.metadata());
                     for j in 0..32 {
@@ -339,11 +336,56 @@ pub fn read_h0_tape<A>(
                     }
                 }
                 H0TupleReader::_2(h0_tuple) => {
-                    let computing = computing.get_or_insert_with(compute_block);
+                    let computing = computing.get_or_insert_with(make_block_accessor);
                     computing.push(h0_tuple.elements());
                 }
             }
         }
         current = h0_guard.get_opaque().next;
+    }
+}
+
+pub fn append(
+    index: impl RelationWrite,
+    first: u32,
+    bytes: &[u8],
+    tracking_freespace: bool,
+) -> IndexPointer {
+    assert!(first != u32::MAX);
+    let mut current = first;
+    loop {
+        let read = index.read(current);
+        if read.freespace() as usize >= bytes.len() || read.get_opaque().next == u32::MAX {
+            drop(read);
+            let mut write = index.write(current, tracking_freespace);
+            if write.get_opaque().next == u32::MAX {
+                if let Some(i) = write.alloc(bytes) {
+                    return pair_to_pointer((current, i));
+                }
+                let mut extend = index.extend(tracking_freespace);
+                write.get_opaque_mut().next = extend.id();
+                drop(write);
+                let fresh = extend.id();
+                if let Some(i) = extend.alloc(bytes) {
+                    drop(extend);
+                    let mut past = index.write(first, tracking_freespace);
+                    past.get_opaque_mut().skip = fresh.max(past.get_opaque().skip);
+                    return pair_to_pointer((fresh, i));
+                } else {
+                    panic!("a tuple cannot even be fit in a fresh page");
+                }
+            }
+            if current == first && write.get_opaque().skip != first {
+                current = write.get_opaque().skip;
+            } else {
+                current = write.get_opaque().next;
+            }
+        } else {
+            if current == first && read.get_opaque().skip != first {
+                current = read.get_opaque().skip;
+            } else {
+                current = read.get_opaque().next;
+            }
+        }
     }
 }

@@ -1,11 +1,14 @@
 [package]
-name = "vector"
+name = "k_means"
 version.workspace = true
 edition.workspace = true
 
 [dependencies]
-distance = { path = "../distance" }
 half.workspace = true
+log.workspace = true
+rabitq = { path = "../rabitq" }
+rand.workspace = true
+rayon = "1.10.0"
 simd = { path = "../simd" }
 
 [lints]

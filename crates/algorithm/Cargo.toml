@@ -1,0 +1,25 @@
+[package]
+name = "algorithm"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+always_equal = { path = "../always_equal" }
+distance = { path = "../distance" }
+k_means = { path = "../k_means" }
+rabitq = { path = "../rabitq" }
+random_orthogonal_matrix = { path = "../random_orthogonal_matrix" }
+simd = { path = "../simd" }
+vector = { path = "../vector" }
+
+half.workspace = true
+paste = "1"
+rand.workspace = true
+serde.workspace = true
+toml = "0.8.19"
+validator.workspace = true
+zerocopy.workspace = true
+zerocopy-derive.workspace = true
+
+[lints]
+workspace = true

@@ -119,8 +119,6 @@ impl Floating for f32 {
 }
 
 mod reduce_or_of_is_zero_x {
-    // FIXME: add manually-implemented SIMD version
-
     #[crate::multiversion("v4", "v3", "v2", "v8.3a:sve", "v8.3a")]
     pub fn reduce_or_of_is_zero_x(this: &[f32]) -> bool {
         for &x in this {
@@ -1024,8 +1022,7 @@ mod reduce_min_max_of_x {
     #[cfg(target_arch = "x86_64")]
     #[crate::target_cpu(enable = "v3")]
     fn reduce_min_max_of_x_v3(this: &[f32]) -> (f32, f32) {
-        use crate::emulate::emulate_mm256_reduce_max_ps;
-        use crate::emulate::emulate_mm256_reduce_min_ps;
+        use crate::emulate::{emulate_mm256_reduce_max_ps, emulate_mm256_reduce_min_ps};
         unsafe {
             use std::arch::x86_64::*;
             let mut n = this.len();
@@ -1081,8 +1078,7 @@ mod reduce_min_max_of_x {
     #[cfg(target_arch = "x86_64")]
     #[crate::target_cpu(enable = "v2")]
     fn reduce_min_max_of_x_v2(this: &[f32]) -> (f32, f32) {
-        use crate::emulate::emulate_mm_reduce_max_ps;
-        use crate::emulate::emulate_mm_reduce_min_ps;
+        use crate::emulate::{emulate_mm_reduce_max_ps, emulate_mm_reduce_min_ps};
         unsafe {
             use std::arch::x86_64::*;
             let mut n = this.len();

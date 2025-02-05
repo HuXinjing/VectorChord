@@ -5,8 +5,8 @@ edition.workspace = true
 
 [dependencies]
 half.workspace = true
-serde.workspace = true
 simd_macros = { path = "../simd_macros" }
+zerocopy.workspace = true
 
 [dev-dependencies]
 rand.workspace = true

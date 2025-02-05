@@ -1,4 +1,4 @@
-use crate::algorithm::{Opaque, Page, PageGuard, RelationRead, RelationWrite};
+use algorithm::{Opaque, Page, PageGuard, RelationRead, RelationWrite};
 use std::mem::{MaybeUninit, offset_of};
 use std::ops::{Deref, DerefMut};
 use std::ptr::NonNull;
@@ -41,31 +41,6 @@ impl PostgresPage {
         let this = unsafe { MaybeUninit::assume_init_mut(this) };
         assert_eq!(offset_of!(Self, opaque), this.header.pd_special as usize);
         this
-    }
-    #[allow(dead_code)]
-    fn clone_into_boxed(&self) -> Box<Self> {
-        let mut result = Box::new_uninit();
-        unsafe {
-            std::ptr::copy(self as *const Self, result.as_mut_ptr(), 1);
-            result.assume_init()
-        }
-    }
-    #[allow(dead_code)]
-    fn reconstruct(&mut self, removes: &[u16]) {
-        let mut removes = removes.to_vec();
-        removes.sort();
-        removes.dedup();
-        let n = removes.len();
-        if n > 0 {
-            assert!(removes[n - 1] <= self.len());
-            unsafe {
-                pgrx::pg_sys::PageIndexMultiDelete(
-                    (self as *mut Self).cast(),
-                    removes.as_ptr().cast_mut(),
-                    removes.len() as _,
-                );
-            }
-        }
     }
 }
 
@@ -256,16 +231,6 @@ pub struct PostgresRelation {
 impl PostgresRelation {
     pub unsafe fn new(raw: pgrx::pg_sys::Relation) -> Self {
         Self { raw }
-    }
-
-    #[allow(dead_code)]
-    pub fn len(&self) -> u32 {
-        unsafe {
-            pgrx::pg_sys::RelationGetNumberOfBlocksInFork(
-                self.raw,
-                pgrx::pg_sys::ForkNumber::MAIN_FORKNUM,
-            )
-        }
     }
 }
 

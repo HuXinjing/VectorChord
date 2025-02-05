@@ -1,9 +1,6 @@
-use super::am_options;
-use crate::algorithm::operator::{Dot, L2, Op};
-use crate::algorithm::prewarm::prewarm;
-use crate::postgres::PostgresRelation;
-use crate::types::DistanceKind;
-use crate::types::VectorKind;
+use crate::index::storage::PostgresRelation;
+use algorithm::operator::{Dot, L2, Op};
+use algorithm::types::*;
 use half::f16;
 use pgrx::pg_sys::Oid;
 use pgrx_catalog::{PgAm, PgClass};
@@ -24,19 +21,27 @@ fn _vchordrq_prewarm(indexrelid: Oid, height: i32) -> String {
     }
     let index = unsafe { pgrx::pg_sys::index_open(indexrelid, pgrx::pg_sys::ShareLock as _) };
     let relation = unsafe { PostgresRelation::new(index) };
-    let opfamily = unsafe { am_options::opfamily(index) };
+    let opfamily = unsafe { crate::index::opclass::opfamily(index) };
     let message = match (opfamily.vector_kind(), opfamily.distance_kind()) {
         (VectorKind::Vecf32, DistanceKind::L2) => {
-            prewarm::<Op<VectOwned<f32>, L2>>(relation, height)
+            algorithm::prewarm::<Op<VectOwned<f32>, L2>>(relation, height, || {
+                pgrx::check_for_interrupts!();
+            })
         }
         (VectorKind::Vecf32, DistanceKind::Dot) => {
-            prewarm::<Op<VectOwned<f32>, Dot>>(relation, height)
+            algorithm::prewarm::<Op<VectOwned<f32>, Dot>>(relation, height, || {
+                pgrx::check_for_interrupts!();
+            })
         }
         (VectorKind::Vecf16, DistanceKind::L2) => {
-            prewarm::<Op<VectOwned<f16>, L2>>(relation, height)
+            algorithm::prewarm::<Op<VectOwned<f16>, L2>>(relation, height, || {
+                pgrx::check_for_interrupts!();
+            })
         }
         (VectorKind::Vecf16, DistanceKind::Dot) => {
-            prewarm::<Op<VectOwned<f16>, Dot>>(relation, height)
+            algorithm::prewarm::<Op<VectOwned<f16>, Dot>>(relation, height, || {
+                pgrx::check_for_interrupts!();
+            })
         }
     };
     unsafe {

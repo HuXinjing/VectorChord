@@ -1,12 +1,11 @@
-use crate::algorithm::operator::Operator;
-use crate::algorithm::tuples::*;
-use crate::algorithm::vectors;
-use crate::algorithm::{Page, RelationRead};
-use crate::utils::pipe::Pipe;
+use crate::operator::Operator;
+use crate::pipe::Pipe;
+use crate::tuples::*;
+use crate::{Page, RelationRead, vectors};
 use std::fmt::Write;
 
-pub fn prewarm<O: Operator>(relation: impl RelationRead + Clone, height: i32) -> String {
-    let meta_guard = relation.read(0);
+pub fn prewarm<O: Operator>(index: impl RelationRead, height: i32, check: impl Fn()) -> String {
+    let meta_guard = index.read(0);
     let meta_tuple = meta_guard.get(1).unwrap().pipe(read_tuple::<MetaTuple>);
     let height_of_root = meta_tuple.height_of_root();
     let root_mean = meta_tuple.root_mean();
@@ -23,7 +22,7 @@ pub fn prewarm<O: Operator>(relation: impl RelationRead + Clone, height: i32) ->
     let mut state: State = {
         let mut nodes = Vec::new();
         {
-            vectors::vector_access_1::<O, _>(relation.clone(), root_mean, ());
+            vectors::access_1::<O, _>(index.clone(), root_mean, ());
             nodes.push(root_first);
         }
         writeln!(message, "------------------------").unwrap();
@@ -40,8 +39,8 @@ pub fn prewarm<O: Operator>(relation: impl RelationRead + Clone, height: i32) ->
             let mut current = list;
             while current != u32::MAX {
                 counter_pages += 1;
-                pgrx::check_for_interrupts!();
-                let h1_guard = relation.read(current);
+                check();
+                let h1_guard = index.read(current);
                 for i in 1..=h1_guard.len() {
                     counter_tuples += 1;
                     let h1_tuple = h1_guard
@@ -51,7 +50,7 @@ pub fn prewarm<O: Operator>(relation: impl RelationRead + Clone, height: i32) ->
                     match h1_tuple {
                         H1TupleReader::_0(h1_tuple) => {
                             for mean in h1_tuple.mean().iter().copied() {
-                                vectors::vector_access_1::<O, _>(relation.clone(), mean, ());
+                                vectors::access_1::<O, _>(index.clone(), mean, ());
                             }
                             for first in h1_tuple.first().iter().copied() {
                                 nodes.push(first);
@@ -77,7 +76,7 @@ pub fn prewarm<O: Operator>(relation: impl RelationRead + Clone, height: i32) ->
         let mut counter_tuples = 0_usize;
         let mut counter_nodes = 0_usize;
         for list in state {
-            let jump_guard = relation.read(list);
+            let jump_guard = index.read(list);
             let jump_tuple = jump_guard
                 .get(1)
                 .expect("data corruption")
@@ -86,8 +85,8 @@ pub fn prewarm<O: Operator>(relation: impl RelationRead + Clone, height: i32) ->
             let mut current = first;
             while current != u32::MAX {
                 counter_pages += 1;
-                pgrx::check_for_interrupts!();
-                let h0_guard = relation.read(current);
+                check();
+                let h0_guard = index.read(current);
                 for i in 1..=h0_guard.len() {
                     counter_tuples += 1;
                     let h0_tuple = h0_guard

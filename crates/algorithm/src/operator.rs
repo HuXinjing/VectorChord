@@ -1,4 +1,4 @@
-use crate::types::{DistanceKind, OwnedVector};
+use crate::types::*;
 use distance::Distance;
 use half::f16;
 use simd::Floating;
@@ -174,15 +174,15 @@ impl<D: OperatorDistance> Default for Block<D> {
 
 impl
     Accessor2<
-        [u64; 2],
-        [u64; 2],
+        [u8; 16],
+        [u8; 16],
         (&[f32; 32], &[f32; 32], &[f32; 32], &[f32; 32]),
         (f32, f32, f32, f32, f32),
     > for Block<L2>
 {
     type Output = [Distance; 32];
 
-    fn push(&mut self, input: &[[u64; 2]], target: &[[u64; 2]]) {
+    fn push(&mut self, input: &[[u8; 16]], target: &[[u8; 16]]) {
         let t = simd::fast_scan::fast_scan(input, target);
         for i in 0..32 {
             self.0[i] += t[i];
@@ -212,15 +212,15 @@ impl
 
 impl
     Accessor2<
-        [u64; 2],
-        [u64; 2],
+        [u8; 16],
+        [u8; 16],
         (&[f32; 32], &[f32; 32], &[f32; 32], &[f32; 32]),
         (f32, f32, f32, f32, f32),
     > for Block<Dot>
 {
     type Output = [Distance; 32];
 
-    fn push(&mut self, input: &[[u64; 2]], target: &[[u64; 2]]) {
+    fn push(&mut self, input: &[[u8; 16]], target: &[[u8; 16]]) {
         let t = simd::fast_scan::fast_scan(input, target);
         for i in 0..32 {
             self.0[i] += t[i];
@@ -324,7 +324,6 @@ pub struct RAccess<'a, E, M, A> {
 }
 
 impl<'a, E, M, A> RAccess<'a, E, M, A> {
-    #[allow(dead_code)]
     pub fn new((elements, metadata): (&'a [E], M), accessor: A) -> Self {
         Self {
             elements,
@@ -356,22 +355,16 @@ pub trait Vector: VectorOwned {
     fn elements_and_metadata(vector: Self::Borrowed<'_>) -> (&[Self::Element], Self::Metadata);
     fn from_owned(vector: OwnedVector) -> Self;
 
-    fn random_projection(vector: Self::Borrowed<'_>) -> Self;
-
-    fn compute_lut_block(vector: Self::Borrowed<'_>) -> (f32, f32, f32, f32, Vec<[u64; 2]>);
+    fn compute_lut_block(vector: Self::Borrowed<'_>) -> (f32, f32, f32, f32, Vec<[u8; 16]>);
 
     fn compute_lut(
         vector: Self::Borrowed<'_>,
     ) -> (
-        (f32, f32, f32, f32, Vec<[u64; 2]>),
+        (f32, f32, f32, f32, Vec<[u8; 16]>),
         (f32, f32, f32, f32, (Vec<u64>, Vec<u64>, Vec<u64>, Vec<u64>)),
     );
 
     fn code(vector: Self::Borrowed<'_>) -> rabitq::Code;
-
-    fn build_to_vecf32(vector: Self::Borrowed<'_>) -> Vec<f32>;
-
-    fn build_from_vecf32(x: &[f32]) -> Self;
 }
 
 impl Vector for VectOwned<f32> {
@@ -399,18 +392,14 @@ impl Vector for VectOwned<f32> {
         }
     }
 
-    fn random_projection(vector: Self::Borrowed<'_>) -> Self {
-        Self::new(crate::projection::project(vector.slice()))
-    }
-
-    fn compute_lut_block(vector: Self::Borrowed<'_>) -> (f32, f32, f32, f32, Vec<[u64; 2]>) {
+    fn compute_lut_block(vector: Self::Borrowed<'_>) -> (f32, f32, f32, f32, Vec<[u8; 16]>) {
         rabitq::block::preprocess(vector.slice())
     }
 
     fn compute_lut(
         vector: Self::Borrowed<'_>,
     ) -> (
-        (f32, f32, f32, f32, Vec<[u64; 2]>),
+        (f32, f32, f32, f32, Vec<[u8; 16]>),
         (f32, f32, f32, f32, (Vec<u64>, Vec<u64>, Vec<u64>, Vec<u64>)),
     ) {
         rabitq::compute_lut(vector.slice())
@@ -418,14 +407,6 @@ impl Vector for VectOwned<f32> {
 
     fn code(vector: Self::Borrowed<'_>) -> rabitq::Code {
         rabitq::code(vector.dims(), vector.slice())
-    }
-
-    fn build_to_vecf32(vector: Self::Borrowed<'_>) -> Vec<f32> {
-        vector.slice().to_vec()
-    }
-
-    fn build_from_vecf32(x: &[f32]) -> Self {
-        Self::new(x.to_vec())
     }
 }
 
@@ -454,20 +435,14 @@ impl Vector for VectOwned<f16> {
         }
     }
 
-    fn random_projection(vector: Self::Borrowed<'_>) -> Self {
-        Self::new(f16::vector_from_f32(&crate::projection::project(
-            &f16::vector_to_f32(vector.slice()),
-        )))
-    }
-
-    fn compute_lut_block(vector: Self::Borrowed<'_>) -> (f32, f32, f32, f32, Vec<[u64; 2]>) {
+    fn compute_lut_block(vector: Self::Borrowed<'_>) -> (f32, f32, f32, f32, Vec<[u8; 16]>) {
         rabitq::block::preprocess(&f16::vector_to_f32(vector.slice()))
     }
 
     fn compute_lut(
         vector: Self::Borrowed<'_>,
     ) -> (
-        (f32, f32, f32, f32, Vec<[u64; 2]>),
+        (f32, f32, f32, f32, Vec<[u8; 16]>),
         (f32, f32, f32, f32, (Vec<u64>, Vec<u64>, Vec<u64>, Vec<u64>)),
     ) {
         rabitq::compute_lut(&f16::vector_to_f32(vector.slice()))
@@ -475,14 +450,6 @@ impl Vector for VectOwned<f16> {
 
     fn code(vector: Self::Borrowed<'_>) -> rabitq::Code {
         rabitq::code(vector.dims(), &f16::vector_to_f32(vector.slice()))
-    }
-
-    fn build_to_vecf32(vector: Self::Borrowed<'_>) -> Vec<f32> {
-        f16::vector_to_f32(vector.slice())
-    }
-
-    fn build_from_vecf32(x: &[f32]) -> Self {
-        Self::new(f16::vector_from_f32(x))
     }
 }
 
@@ -496,8 +463,8 @@ pub trait OperatorDistance: 'static + Debug + Copy {
     ) -> Distance;
 
     type BlockAccessor: for<'a> Accessor2<
-            [u64; 2],
-            [u64; 2],
+            [u8; 16],
+            [u8; 16],
             (&'a [f32; 32], &'a [f32; 32], &'a [f32; 32], &'a [f32; 32]),
             (f32, f32, f32, f32, f32),
             Output = [Distance; 32],

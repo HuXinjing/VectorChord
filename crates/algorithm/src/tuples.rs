@@ -1,4 +1,5 @@
-use crate::algorithm::operator::Vector;
+use crate::operator::Vector;
+use std::marker::PhantomData;
 use std::num::{NonZeroU8, NonZeroU64};
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 use zerocopy_derive::{FromBytes, Immutable, IntoBytes, KnownLayout};
@@ -141,7 +142,7 @@ impl MetaTupleReader<'_> {
 // freepage tuple
 
 #[repr(C, align(8))]
-#[derive(Debug, Clone, Copy, PartialEq, FromBytes, IntoBytes, Immutable, KnownLayout)]
+#[derive(Debug, Clone, PartialEq, FromBytes, IntoBytes, Immutable, KnownLayout)]
 struct FreepageTupleHeader {
     a: [u32; 1],
     b: [u32; 32],
@@ -233,16 +234,18 @@ impl FreepageTupleWriter<'_> {
 // vector tuple
 
 #[repr(C, align(8))]
-#[derive(Debug, Clone, Copy, PartialEq, FromBytes, IntoBytes, Immutable, KnownLayout)]
+#[derive(Debug, Clone, PartialEq, FromBytes, IntoBytes, Immutable, KnownLayout)]
 struct VectorTupleHeader0 {
     payload: Option<NonZeroU64>,
     metadata_s: usize,
     elements_s: usize,
     elements_e: usize,
+    #[cfg(target_pointer_width = "32")]
+    _padding_0: [ZeroU8; 4],
 }
 
 #[repr(C, align(8))]
-#[derive(Debug, Clone, Copy, PartialEq, FromBytes, IntoBytes, Immutable, KnownLayout)]
+#[derive(Debug, Clone, PartialEq, FromBytes, IntoBytes, Immutable, KnownLayout)]
 struct VectorTupleHeader1 {
     payload: Option<NonZeroU64>,
     pointer: IndexPointer,
@@ -294,6 +297,8 @@ impl<V: Vector> Tuple for VectorTuple<V> {
                         metadata_s,
                         elements_s,
                         elements_e,
+                        #[cfg(target_pointer_width = "32")]
+                        _padding_0: Default::default(),
                     }
                     .as_bytes(),
                 );
@@ -435,10 +440,10 @@ pub enum H1Tuple {
         factor_err: [f32; 32],
         first: [u32; 32],
         len: u32,
-        elements: Vec<[u64; 2]>,
+        elements: Vec<[u8; 16]>,
     },
     _1 {
-        elements: Vec<[u64; 2]>,
+        elements: Vec<[u8; 16]>,
     },
 }
 
@@ -448,7 +453,7 @@ impl H1Tuple {
         freespace -= size_of::<Tag>() as isize;
         freespace -= size_of::<H1TupleHeader0>() as isize;
         if freespace >= 0 {
-            Some(freespace as usize / size_of::<[u64; 2]>())
+            Some(freespace as usize / size_of::<[u8; 16]>())
         } else {
             None
         }
@@ -458,7 +463,7 @@ impl H1Tuple {
         freespace -= size_of::<Tag>() as isize;
         freespace -= size_of::<H1TupleHeader1>() as isize;
         if freespace >= 0 {
-            Some(freespace as usize / size_of::<[u64; 2]>())
+            Some(freespace as usize / size_of::<[u8; 16]>())
         } else {
             None
         }
@@ -536,13 +541,13 @@ pub enum H1TupleReader<'a> {
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct H1TupleReader0<'a> {
     header: &'a H1TupleHeader0,
-    elements: &'a [[u64; 2]],
+    elements: &'a [[u8; 16]],
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct H1TupleReader1<'a> {
     header: &'a H1TupleHeader1,
-    elements: &'a [[u64; 2]],
+    elements: &'a [[u8; 16]],
 }
 
 impl<'a> TupleReader<'a> for H1TupleReader<'a> {
@@ -586,13 +591,13 @@ impl<'a> H1TupleReader0<'a> {
     pub fn first(self) -> &'a [u32] {
         &self.header.first[..self.header.len as usize]
     }
-    pub fn elements(&self) -> &'a [[u64; 2]] {
+    pub fn elements(&self) -> &'a [[u8; 16]] {
         self.elements
     }
 }
 
 impl<'a> H1TupleReader1<'a> {
-    pub fn elements(&self) -> &'a [[u64; 2]] {
+    pub fn elements(&self) -> &'a [[u8; 16]] {
         self.elements
     }
 }
@@ -720,10 +725,10 @@ pub enum H0Tuple {
         factor_ip: [f32; 32],
         factor_err: [f32; 32],
         payload: [Option<NonZeroU64>; 32],
-        elements: Vec<[u64; 2]>,
+        elements: Vec<[u8; 16]>,
     },
     _2 {
-        elements: Vec<[u64; 2]>,
+        elements: Vec<[u8; 16]>,
     },
 }
 
@@ -733,7 +738,7 @@ impl H0Tuple {
         freespace -= size_of::<Tag>() as isize;
         freespace -= size_of::<H0TupleHeader1>() as isize;
         if freespace >= 0 {
-            Some(freespace as usize / size_of::<[u64; 2]>())
+            Some(freespace as usize / size_of::<[u8; 16]>())
         } else {
             None
         }
@@ -743,7 +748,7 @@ impl H0Tuple {
         freespace -= size_of::<Tag>() as isize;
         freespace -= size_of::<H0TupleHeader2>() as isize;
         if freespace >= 0 {
-            Some(freespace as usize / size_of::<[u64; 2]>())
+            Some(freespace as usize / size_of::<[u8; 16]>())
         } else {
             None
         }
@@ -878,7 +883,7 @@ impl<'a> H0TupleReader0<'a> {
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct H0TupleReader1<'a> {
     header: &'a H0TupleHeader1,
-    elements: &'a [[u64; 2]],
+    elements: &'a [[u8; 16]],
 }
 
 impl<'a> H0TupleReader1<'a> {
@@ -893,7 +898,7 @@ impl<'a> H0TupleReader1<'a> {
             &self.header.factor_err,
         )
     }
-    pub fn elements(self) -> &'a [[u64; 2]] {
+    pub fn elements(self) -> &'a [[u8; 16]] {
         self.elements
     }
     pub fn payload(self) -> &'a [Option<NonZeroU64>; 32] {
@@ -904,11 +909,11 @@ impl<'a> H0TupleReader1<'a> {
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct H0TupleReader2<'a> {
     header: &'a H0TupleHeader2,
-    elements: &'a [[u64; 2]],
+    elements: &'a [[u8; 16]],
 }
 
 impl<'a> H0TupleReader2<'a> {
-    pub fn elements(self) -> &'a [[u64; 2]] {
+    pub fn elements(self) -> &'a [[u8; 16]] {
         self.elements
     }
 }
@@ -961,7 +966,7 @@ pub struct H0TupleWriter0<'a> {
 pub struct H0TupleWriter1<'a> {
     header: &'a mut H0TupleHeader1,
     #[allow(dead_code)]
-    elements: &'a mut [[u64; 2]],
+    elements: &'a mut [[u8; 16]],
 }
 
 #[derive(Debug)]
@@ -969,7 +974,7 @@ pub struct H0TupleWriter2<'a> {
     #[allow(dead_code)]
     header: &'a mut H0TupleHeader2,
     #[allow(dead_code)]
-    elements: &'a mut [[u64; 2]],
+    elements: &'a mut [[u8; 16]],
 }
 
 impl<'a> TupleWriter<'a> for H0TupleWriter<'a> {
@@ -1025,15 +1030,14 @@ pub const fn pair_to_pointer(pair: (u32, u16)) -> IndexPointer {
     IndexPointer(value)
 }
 
-#[allow(dead_code)]
-const fn soundness_check(a: (u32, u16)) {
+#[test]
+const fn soundness_check() {
+    let a = (111, 222);
     let b = pair_to_pointer(a);
     let c = pointer_to_pair(b);
     assert!(a.0 == c.0);
     assert!(a.1 == c.1);
 }
-
-const _: () = soundness_check((111, 222));
 
 #[repr(transparent)]
 #[derive(
@@ -1123,15 +1127,17 @@ impl<'a> RefChecker<'a> {
 }
 
 pub struct MutChecker<'a> {
-    flag: Vec<u64>,
-    bytes: &'a mut [u8],
+    flag: usize,
+    bytes: *mut [u8],
+    phantom: PhantomData<&'a mut [u8]>,
 }
 
 impl<'a> MutChecker<'a> {
     pub fn new(bytes: &'a mut [u8]) -> Self {
         Self {
-            flag: vec![0u64; bytes.len().div_ceil(64)],
+            flag: 0,
             bytes,
+            phantom: PhantomData,
         }
     }
     pub fn prefix<T: FromBytes + IntoBytes + KnownLayout + Sized>(
@@ -1143,15 +1149,14 @@ impl<'a> MutChecker<'a> {
         if !(start <= end && end <= self.bytes.len()) {
             panic!("bad bytes");
         }
-        for i in start..end {
-            if (self.flag[i / 64] & (1 << (i % 64))) != 0 {
-                panic!("bad bytes");
-            } else {
-                self.flag[i / 64] |= 1 << (i % 64);
-            }
+        if !(self.flag <= start) {
+            panic!("bad bytes");
+        } else {
+            self.flag = end;
         }
+        #[allow(unsafe_code)]
         let bytes = unsafe {
-            std::slice::from_raw_parts_mut(self.bytes.as_mut_ptr().add(start), end - start)
+            std::slice::from_raw_parts_mut((self.bytes as *mut u8).add(start), end - start)
         };
         FromBytes::mut_from_bytes(bytes).expect("bad bytes")
     }
@@ -1165,21 +1170,19 @@ impl<'a> MutChecker<'a> {
         if !(start <= end && end <= self.bytes.len()) {
             panic!("bad bytes");
         }
-        for i in start..end {
-            if (self.flag[i / 64] & (1 << (i % 64))) != 0 {
-                panic!("bad bytes");
-            } else {
-                self.flag[i / 64] |= 1 << (i % 64);
-            }
+        if !(self.flag <= start) {
+            panic!("bad bytes");
+        } else {
+            self.flag = end;
         }
+        #[allow(unsafe_code)]
         let bytes = unsafe {
-            std::slice::from_raw_parts_mut(self.bytes.as_mut_ptr().add(start), end - start)
+            std::slice::from_raw_parts_mut((self.bytes as *mut u8).add(start), end - start)
         };
         FromBytes::mut_from_bytes(bytes).expect("bad bytes")
     }
 }
 
-// this test only passes if `MIRIFLAGS="-Zmiri-tree-borrows"` is set
 #[test]
 fn aliasing_test() {
     #[repr(C, align(8))]

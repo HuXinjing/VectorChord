@@ -2,6 +2,7 @@
 #![feature(avx512_target_feature)]
 #![cfg_attr(target_arch = "x86_64", feature(stdarch_x86_avx512))]
 #![cfg_attr(target_arch = "x86_64", feature(stdarch_x86_avx512_f16))]
+#![allow(unsafe_code)]
 
 mod aligned;
 mod emulate;
@@ -15,16 +16,7 @@ pub mod quantize;
 pub mod u8;
 
 pub trait Floating:
-    Copy
-    + Send
-    + Sync
-    + std::fmt::Debug
-    + serde::Serialize
-    + for<'a> serde::Deserialize<'a>
-    + Default
-    + 'static
-    + PartialEq
-    + PartialOrd
+    Copy + Send + Sync + std::fmt::Debug + Default + 'static + PartialEq + PartialOrd
 {
     fn zero() -> Self;
     fn infinity() -> Self;
@@ -79,8 +71,7 @@ mod internal {
     pub use is_riscv64_cpu_detected;
 }
 
-pub use simd_macros::multiversion;
-pub use simd_macros::target_cpu;
+pub use simd_macros::{multiversion, target_cpu};
 
 #[cfg(target_arch = "x86_64")]
 #[allow(unused_imports)]

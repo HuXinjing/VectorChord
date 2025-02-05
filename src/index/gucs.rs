@@ -4,8 +4,10 @@ use std::ffi::CStr;
 static PROBES: GucSetting<Option<&'static CStr>> = GucSetting::<Option<&CStr>>::new(Some(c"10"));
 static EPSILON: GucSetting<f64> = GucSetting::<f64>::new(1.9);
 static MAX_SCAN_TUPLES: GucSetting<i32> = GucSetting::<i32>::new(-1);
+static PREWARM_DIM: GucSetting<Option<&CStr>> =
+    GucSetting::<Option<&CStr>>::new(Some(c"64,128,256,384,512,768,1024,1536"));
 
-pub unsafe fn init() {
+pub fn init() {
     GucRegistry::define_string_guc(
         "vchordrq.probes",
         "`probes` argument of vchordrq.",
@@ -34,6 +36,20 @@ pub unsafe fn init() {
         GucContext::Userset,
         GucFlags::default(),
     );
+    GucRegistry::define_string_guc(
+        "vchordrq.prewarm_dim",
+        "prewarm_dim when the extension is loading.",
+        "prewarm_dim when the extension is loading.",
+        &PREWARM_DIM,
+        GucContext::Userset,
+        GucFlags::default(),
+    );
+    unsafe {
+        #[cfg(any(feature = "pg13", feature = "pg14"))]
+        pgrx::pg_sys::EmitWarningsOnPlaceholders(c"vchordrq".as_ptr());
+        #[cfg(any(feature = "pg15", feature = "pg16", feature = "pg17"))]
+        pgrx::pg_sys::MarkGUCPrefixReserved(c"vchordrq".as_ptr());
+    }
 }
 
 pub fn probes() -> Vec<u32> {
@@ -69,4 +85,25 @@ pub fn epsilon() -> f32 {
 pub fn max_scan_tuples() -> Option<u32> {
     let x = MAX_SCAN_TUPLES.get();
     if x < 0 { None } else { Some(x as u32) }
+}
+
+pub fn prewarm_dim() -> Vec<u32> {
+    if let Some(prewarm_dim) = PREWARM_DIM.get() {
+        if let Ok(prewarm_dim) = prewarm_dim.to_str() {
+            let mut result = Vec::new();
+            for dim in prewarm_dim.split(',') {
+                if let Ok(dim) = dim.trim().parse::<u32>() {
+                    result.push(dim);
+                } else {
+                    pgrx::warning!("{dim:?} is not a valid integer");
+                }
+            }
+            result
+        } else {
+            pgrx::warning!("vchordrq.prewarm_dim is not a valid UTF-8 string");
+            Vec::new()
+        }
+    } else {
+        Vec::new()
+    }
 }

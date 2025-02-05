@@ -129,8 +129,6 @@ impl Floating for f16 {
 }
 
 mod reduce_or_of_is_zero_x {
-    // FIXME: add manually-implemented SIMD version
-
     use half::f16;
 
     #[crate::multiversion("v4", "v3", "v2", "v8.3a:sve", "v8.3a")]

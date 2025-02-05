@@ -98,7 +98,7 @@ impl VchordrqIndexingOptions {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone)]
 pub enum OwnedVector {
     Vecf32(VectOwned<f32>),
     Vecf16(VectOwned<f16>),
@@ -146,5 +146,16 @@ impl VectorOptions {
             (VectorKind::Vecf16, DistanceKind::Dot, 1..65536) => Ok(()),
             _ => Err(ValidationError::new("not valid vector options")),
         }
+    }
+}
+
+pub struct Structure<V> {
+    pub means: Vec<V>,
+    pub children: Vec<Vec<u32>>,
+}
+
+impl<V> Structure<V> {
+    pub fn len(&self) -> usize {
+        self.children.len()
     }
 }

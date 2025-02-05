@@ -1,13 +1,29 @@
-pub mod build;
-pub mod freepages;
-pub mod insert;
+#![allow(clippy::collapsible_else_if)]
+#![allow(clippy::type_complexity)]
+#![allow(clippy::len_without_is_empty)]
+#![feature(vec_pop_if)]
+
+mod build;
+mod bulkdelete;
+mod freepages;
+mod insert;
+mod maintain;
+mod pipe;
+mod prewarm;
+mod search;
+mod tape;
+mod tuples;
+mod vectors;
+
 pub mod operator;
-pub mod prewarm;
-pub mod scan;
-pub mod tape;
-pub mod tuples;
-pub mod vacuum;
-pub mod vectors;
+pub mod types;
+
+pub use build::build;
+pub use bulkdelete::bulkdelete;
+pub use insert::insert;
+pub use maintain::maintain;
+pub use prewarm::prewarm;
+pub use search::search;
 
 use std::ops::{Deref, DerefMut};
 
@@ -34,7 +50,7 @@ pub trait PageGuard {
     fn id(&self) -> u32;
 }
 
-pub trait RelationRead {
+pub trait RelationRead: Clone {
     type Page: Page;
     type ReadGuard<'a>: PageGuard + Deref<Target = Self::Page>
     where
