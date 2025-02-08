@@ -7,7 +7,7 @@ use vector::VectorOwned;
 
 pub fn build<O: Operator>(
     vector_options: VectorOptions,
-    vchordrq_options: VchordrqIndexingOptions,
+    vchordrq_options: VchordrqIndexOptions,
     index: impl RelationWrite,
     structures: Vec<Structure<O::Vector>>,
 ) {

@@ -16,6 +16,7 @@ const fn size_of_contents() -> usize {
 }
 
 #[repr(C, align(8))]
+#[derive(Debug)]
 pub struct PostgresPage {
     header: pgrx::pg_sys::PageHeaderData,
     content: [u8; size_of_contents()],
@@ -41,6 +42,13 @@ impl PostgresPage {
         let this = unsafe { MaybeUninit::assume_init_mut(this) };
         assert_eq!(offset_of!(Self, opaque), this.header.pd_special as usize);
         this
+    }
+    pub fn clone_into_boxed(&self) -> Box<Self> {
+        let mut result = Box::new_uninit();
+        unsafe {
+            std::ptr::copy(self as *const Self, result.as_mut_ptr(), 1);
+            result.assume_init()
+        }
     }
 }
 

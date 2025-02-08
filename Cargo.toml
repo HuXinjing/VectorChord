@@ -35,6 +35,8 @@ rand.workspace = true
 serde.workspace = true
 toml = "0.8.19"
 validator.workspace = true
+zerocopy.workspace = true
+zerocopy-derive.workspace = true
 
 [patch.crates-io]
 half = { git = "https://github.com/tensorchord/half-rs.git", rev = "3f9a8843d6722bd1833de2289347640ad8770146" }
