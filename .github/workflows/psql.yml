@@ -4,6 +4,7 @@ on:
   pull_request:
     paths:
       - '.github/workflows/psql.yml'
+      - 'crates/**'
       - 'src/**'
       - 'Cargo.lock'
       - 'Cargo.toml'
@@ -16,6 +17,7 @@ on:
       - main
     paths:
       - '.github/workflows/psql.yml'
+      - 'crates/**'
       - 'src/**'
       - 'Cargo.lock'
       - 'Cargo.toml'

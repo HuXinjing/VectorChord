@@ -1,3 +1,4 @@
+use crate::linkedvec::LinkedVec;
 use crate::operator::*;
 use crate::pipe::Pipe;
 use crate::tape::{access_0, access_1};
@@ -51,7 +52,7 @@ pub fn search<O: Operator>(
         }
     }];
     let step = |state: State<O>, probes| {
-        let mut results = Vec::new();
+        let mut results = LinkedVec::new();
         for (first, residual) in state {
             let lut = if let Some(residual) = residual {
                 &O::Vector::compute_lut_block(residual.as_borrowed())
@@ -72,7 +73,7 @@ pub fn search<O: Operator>(
                 },
             );
         }
-        let mut heap = BinaryHeap::from(results);
+        let mut heap = BinaryHeap::from(results.into_vec());
         let mut cache = BinaryHeap::<(Reverse<Distance>, _, _)>::new();
         std::iter::from_fn(|| {
             while !heap.is_empty() && heap.peek().map(|x| x.0) > cache.peek().map(|x| x.0) {
@@ -116,7 +117,7 @@ pub fn search<O: Operator>(
         state = step(state, probes[i as usize - 1]);
     }
 
-    let mut results = Vec::new();
+    let mut results = LinkedVec::new();
     for (first, residual) in state {
         let lut = if let Some(residual) = residual.as_ref().map(|x| x.as_borrowed()) {
             &O::Vector::compute_lut(residual)
@@ -144,7 +145,7 @@ pub fn search<O: Operator>(
             },
         );
     }
-    let mut heap = BinaryHeap::from(results);
+    let mut heap = BinaryHeap::from(results.into_vec());
     let mut cache = BinaryHeap::<(Reverse<Distance>, _)>::new();
     std::iter::from_fn(move || {
         while !heap.is_empty() && heap.peek().map(|x| x.0) > cache.peek().map(|x| x.0) {

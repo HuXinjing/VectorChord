@@ -2,11 +2,10 @@
 #error "clang version must be >= 16"
 #endif
 
-#include <stddef.h>
-#include <stdint.h>
-
 #ifdef __aarch64__
 
+#include <stddef.h>
+#include <stdint.h>
 #include <arm_neon.h>
 #include <arm_sve.h>
 

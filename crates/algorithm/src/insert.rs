@@ -1,3 +1,4 @@
+use crate::linkedvec::LinkedVec;
 use crate::operator::*;
 use crate::pipe::Pipe;
 use crate::tape::{access_1, append};
@@ -49,7 +50,7 @@ pub fn insert<O: Operator>(index: impl RelationWrite, payload: NonZeroU64, vecto
         }
     };
     let step = |state: State<O>| {
-        let mut results = Vec::new();
+        let mut results = LinkedVec::new();
         {
             let (first, residual) = state;
             let lut = if let Some(residual) = residual {
@@ -71,7 +72,7 @@ pub fn insert<O: Operator>(index: impl RelationWrite, payload: NonZeroU64, vecto
                 },
             );
         }
-        let mut heap = BinaryHeap::from(results);
+        let mut heap = BinaryHeap::from(results.into_vec());
         let mut cache = BinaryHeap::<(Reverse<Distance>, _, _)>::new();
         {
             while !heap.is_empty() && heap.peek().map(|x| x.0) > cache.peek().map(|x| x.0) {

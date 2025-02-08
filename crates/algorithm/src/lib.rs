@@ -8,6 +8,7 @@ mod bulkdelete;
 mod cache;
 mod freepages;
 mod insert;
+mod linkedvec;
 mod maintain;
 mod pipe;
 mod prewarm;
