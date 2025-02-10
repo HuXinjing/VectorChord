@@ -1,6 +1,7 @@
-use crate::linkedvec::LinkedVec;
+use crate::linked_vec::LinkedVec;
 use crate::operator::*;
 use crate::pipe::Pipe;
+use crate::select_heap::SelectHeap;
 use crate::tape::{access_1, append};
 use crate::tuples::*;
 use crate::vectors::{self};
@@ -72,7 +73,7 @@ pub fn insert<O: Operator>(index: impl RelationWrite, payload: NonZeroU64, vecto
                 },
             );
         }
-        let mut heap = BinaryHeap::from(results.into_vec());
+        let mut heap = SelectHeap::from_vec(results.into_vec());
         let mut cache = BinaryHeap::<(Reverse<Distance>, _, _)>::new();
         {
             while !heap.is_empty() && heap.peek().map(|x| x.0) > cache.peek().map(|x| x.0) {

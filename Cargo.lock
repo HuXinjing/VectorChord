@@ -18,6 +18,7 @@ dependencies = [
  "always_equal",
  "distance",
  "half 2.4.1",
+ "heapify",
  "k_means",
  "paste",
  "rabitq",
@@ -26,6 +27,7 @@ dependencies = [
  "serde",
  "simd",
  "toml",
+ "turboselect",
  "validator",
  "vector",
  "zerocopy 0.8.14",
@@ -389,6 +391,12 @@ name = "hashbrown"
 version = "0.15.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "bf151400ff0baff5465007dd2f3e717f3fe502074ca563069ce3a6629d07b289"
+
+[[package]]
+name = "heapify"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0049b265b7f201ca9ab25475b22b47fe444060126a51abe00f77d986fc5cc52e"
 
 [[package]]
 name = "heapless"
@@ -1409,6 +1417,11 @@ dependencies = [
  "toml_datetime",
  "winnow",
 ]
+
+[[package]]
+name = "turboselect"
+version = "0.1.0"
+source = "git+https://github.com/tensorchord/turboselect.git?rev=d8753c4ffe5b47f28670fea21d56cf3658d51b9b#d8753c4ffe5b47f28670fea21d56cf3658d51b9b"
 
 [[package]]
 name = "typenum"
