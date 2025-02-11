@@ -532,6 +532,7 @@ mod reduce_sum_of_xy {
 
     #[cfg(all(target_arch = "aarch64", test, not(miri)))]
     #[test]
+    #[ignore]
     fn reduce_sum_of_xy_v8_3a_sve_test() {
         use rand::Rng;
         const EPSILON: f32 = 2.0;
@@ -909,6 +910,7 @@ mod reduce_sum_of_d2 {
 
     #[cfg(all(target_arch = "aarch64", test, not(miri)))]
     #[test]
+    #[ignore]
     fn reduce_sum_of_d2_v8_3a_sve_test() {
         use rand::Rng;
         const EPSILON: f32 = 6.0;

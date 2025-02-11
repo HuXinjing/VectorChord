@@ -529,15 +529,15 @@ mod fast_scan {
 
             let lut = lut[i];
             let res_lo = zerocopy::transmute!(shuffle(lut, clo));
-            a_0 = binary(|x, y| x + y, a_0, res_lo);
-            a_1 = binary(|x, y| x + y, a_1, res_lo.map(|x| x >> 8));
+            a_0 = binary(u16::wrapping_add, a_0, res_lo);
+            a_1 = binary(u16::wrapping_add, a_1, res_lo.map(|x| x >> 8));
             let res_hi = zerocopy::transmute!(shuffle(lut, chi));
-            a_2 = binary(|x, y| x + y, a_2, res_hi);
-            a_3 = binary(|x, y| x + y, a_3, res_hi.map(|x| x >> 8));
+            a_2 = binary(u16::wrapping_add, a_2, res_hi);
+            a_3 = binary(u16::wrapping_add, a_3, res_hi.map(|x| x >> 8));
         }
 
-        a_0 = binary(|x, y| x - y, a_0, a_1.map(|x| x << 8));
-        a_2 = binary(|x, y| x - y, a_2, a_3.map(|x| x << 8));
+        a_0 = binary(u16::wrapping_sub, a_0, a_1.map(|x| x << 8));
+        a_2 = binary(u16::wrapping_sub, a_2, a_3.map(|x| x << 8));
 
         zerocopy::transmute!([a_0, a_1, a_2, a_3])
     }
