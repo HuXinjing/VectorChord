@@ -1,11 +1,11 @@
 statement ok
-CREATE TABLE t_singlecolumn (id integer, val vector(3));
+CREATE TABLE t_column (id integer, val vector(3));
 
 statement ok
-INSERT INTO t_singlecolumn (id, val) SELECT id, ARRAY[id, id, id]::real[] FROM generate_series(1, 10000) s(id);
+INSERT INTO t_column (id, val) SELECT id, ARRAY[id, id, id]::real[] FROM generate_series(1, 10000) s(id);
 
 statement ok
-CREATE INDEX ON t_singlecolumn USING vchordrq (val vector_l2_ops)
+CREATE INDEX ON t_column USING vchordrq (val vector_l2_ops)
 WITH (options = $$
 residual_quantization = false
 rerank_in_table = true
@@ -17,7 +17,7 @@ statement ok
 SET vchordrq.probes = '';
 
 query I
-SELECT id FROM t_singlecolumn ORDER BY val <-> '[1.9, 1.9, 1.9]' limit 9;
+SELECT id FROM t_column ORDER BY val <-> '[1.9, 1.9, 1.9]' limit 9;
 ----
 2
 1
@@ -30,16 +30,16 @@ SELECT id FROM t_singlecolumn ORDER BY val <-> '[1.9, 1.9, 1.9]' limit 9;
 9
 
 statement ok
-DROP TABLE t_singlecolumn;
+DROP TABLE t_column;
 
 statement ok
-CREATE TABLE t_multicolumn (id integer);
+CREATE TABLE t_expr (id integer);
 
 statement ok
-INSERT INTO t_multicolumn (id) SELECT id FROM generate_series(1, 10000) s(id);
+INSERT INTO t_expr (id) SELECT id FROM generate_series(1, 10000) s(id);
 
 statement ok
-CREATE INDEX ON t_multicolumn USING vchordrq ((ARRAY[id::real, id::real, id::real]::vector(3)) vector_l2_ops)
+CREATE INDEX ON t_expr USING vchordrq ((ARRAY[id::real, id::real, id::real]::vector(3)) vector_l2_ops)
 WITH (options = $$
 residual_quantization = false
 rerank_in_table = true
@@ -51,7 +51,7 @@ statement ok
 SET vchordrq.probes = '';
 
 query I
-SELECT id FROM t_multicolumn ORDER BY ARRAY[id::real, id::real, id::real]::vector(3) <-> '[1.9, 1.9, 1.9]' limit 9;
+SELECT id FROM t_expr ORDER BY ARRAY[id::real, id::real, id::real]::vector(3) <-> '[1.9, 1.9, 1.9]' limit 9;
 ----
 2
 1
@@ -64,4 +64,4 @@ SELECT id FROM t_multicolumn ORDER BY ARRAY[id::real, id::real, id::real]::vecto
 9
 
 statement ok
-DROP TABLE t_multicolumn;
+DROP TABLE t_expr;
