@@ -99,8 +99,10 @@ jobs:
     steps:
       - name: Set up Environment
         run: |
-          sudo apt-get remove -y '^postgres.*' '^libpq.*'
-          sudo apt-get purge -y '^postgres.*' '^libpq.*'
+          if [ "${{ matrix.runner }}" = "ubuntu-24.04" ]; then
+            sudo apt-get remove -y '^postgres.*' '^libpq.*'
+            sudo apt-get purge -y '^postgres.*' '^libpq.*'
+          fi
 
           sudo update-alternatives --install /usr/bin/clang clang $(which clang-18) 255
 
@@ -118,7 +120,13 @@ jobs:
           sudo systemctl stop postgresql
 
           curl -fsSL https://github.com/tensorchord/pgrx/releases/download/v0.12.9/cargo-pgrx-v0.12.9-$(uname -m)-unknown-linux-musl.tar.gz | tar -xOzf - ./cargo-pgrx | install -m 755 /dev/stdin /usr/local/bin/cargo-pgrx
-          cargo pgrx init --pg${{ matrix.version }}=$(which pg_config)
+          if [ "${{ matrix.runner }}" = "ubuntu-24.04" ]; then
+            cargo pgrx init --pg${{ matrix.version }}=$(which pg_config)
+          fi
+          if [ "${{ matrix.runner }}" = "ubuntu-24.04-arm" ]; then
+            mkdir $HOME/.pgrx
+            echo "configs.pg${{ matrix.version }} = \"$(which pg_config)\"" > $HOME/.pgrx/config.toml
+          fi
 
           curl -fsSL https://github.com/risinglightdb/sqllogictest-rs/releases/download/v0.26.4/sqllogictest-bin-v0.26.4-$(uname -m)-unknown-linux-musl.tar.gz | tar -xOzf - ./sqllogictest | install -m 755 /dev/stdin /usr/local/bin/sqllogictest
 

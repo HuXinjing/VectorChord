@@ -3,9 +3,12 @@ use crate::index::gucs::{epsilon, max_scan_tuples, probes};
 use crate::index::opclass::{Opfamily, Sphere, opfamily};
 use crate::index::projection::RandomProject;
 use crate::index::storage::PostgresRelation;
+use algorithm::RerankMethod;
 use algorithm::operator::{Dot, L2, Op, Vector};
 use algorithm::types::*;
 use half::f16;
+use pgrx::pg_sys::Datum;
+use std::cell::LazyCell;
 use std::num::NonZeroU64;
 use vector::VectorOwned;
 use vector::vect::VectOwned;
@@ -106,7 +109,41 @@ pub unsafe extern "C" fn amgettuple(
     }
     let scanner = unsafe { (*scan).opaque.cast::<Scanner>().as_mut().unwrap_unchecked() };
     let relation = unsafe { PostgresRelation::new((*scan).indexRelation) };
-    if let Some((pointer, recheck)) = scanner_next(scanner, relation) {
+    if let Some((pointer, recheck)) = scanner_next(
+        scanner,
+        relation,
+        LazyCell::new(move || unsafe {
+            let index_info = pgrx::pg_sys::BuildIndexInfo((*scan).indexRelation);
+            let heap_relation = (*scan).heapRelation;
+            let estate = Scopeguard::new(pgrx::pg_sys::CreateExecutorState(), |estate| {
+                pgrx::pg_sys::FreeExecutorState(estate);
+            });
+            let econtext = pgrx::pg_sys::MakePerTupleExprContext(*estate.get());
+            move |opfamily: Opfamily, payload| {
+                let slot = Scopeguard::new(
+                    pgrx::pg_sys::table_slot_create(heap_relation, std::ptr::null_mut()),
+                    |slot| pgrx::pg_sys::ExecDropSingleTupleTableSlot(slot),
+                );
+                (*econtext).ecxt_scantuple = *slot.get();
+                let table_am = (*heap_relation).rd_tableam;
+                let fetch_row_version = (*table_am).tuple_fetch_row_version.unwrap();
+                let mut ctid = pointer_to_ctid(payload);
+                if !fetch_row_version(heap_relation, &mut ctid, (*scan).xs_snapshot, *slot.get()) {
+                    return None;
+                }
+                let mut values = [Datum::from(0); 32];
+                let mut is_null = [true; 32];
+                pgrx::pg_sys::FormIndexDatum(
+                    index_info,
+                    *slot.get(),
+                    *estate.get(),
+                    values.as_mut_ptr(),
+                    is_null.as_mut_ptr(),
+                );
+                opfamily.input_vector(values[0], is_null[0])
+            }
+        }),
+    ) {
         let ctid = pointer_to_ctid(pointer);
         unsafe {
             (*scan).xs_heaptid = ctid;
@@ -167,7 +204,15 @@ fn scanner_build(
     Some((vector?, threshold, recheck))
 }
 
-fn scanner_next(scanner: &mut Scanner, relation: PostgresRelation) -> Option<(NonZeroU64, bool)> {
+fn scanner_next<F, I>(
+    scanner: &mut Scanner,
+    relation: PostgresRelation,
+    fetch: LazyCell<F, I>,
+) -> Option<(NonZeroU64, bool)>
+where
+    F: Fn(Opfamily, NonZeroU64) -> Option<OwnedVector> + 'static,
+    I: FnOnce() -> F + 'static,
+{
     if let Scanning::Initial {
         vector,
         threshold,
@@ -187,92 +232,420 @@ fn scanner_next(scanner: &mut Scanner, relation: PostgresRelation) -> Option<(No
                     let vector = RandomProject::project(
                         VectOwned::<f32>::from_owned(vector.clone()).as_borrowed(),
                     );
-                    let vbase = algorithm::search::<Op<VectOwned<f32>, L2>>(
-                        relation, vector, probes, epsilon,
-                    )
-                    .map(move |(distance, payload)| (opfamily.output(distance), payload));
-                    match (max_scan_tuples, threshold) {
-                        (None, None) => {
+                    let (method, results) = algorithm::search::<Op<VectOwned<f32>, L2>>(
+                        relation.clone(),
+                        vector.clone(),
+                        probes,
+                        epsilon,
+                    );
+                    match (method, max_scan_tuples, threshold) {
+                        (RerankMethod::Index, None, None) => {
+                            let vbase = algorithm::rerank_index::<Op<VectOwned<f32>, L2>>(
+                                relation, vector, results,
+                            )
+                            .map(move |(distance, payload)| (opfamily.output(distance), payload));
                             Box::new(vbase.fuse()) as Box<dyn Iterator<Item = (f32, NonZeroU64)>>
                         }
-                        (None, Some(threshold)) => {
+                        (RerankMethod::Index, None, Some(threshold)) => {
+                            let vbase = algorithm::rerank_index::<Op<VectOwned<f32>, L2>>(
+                                relation, vector, results,
+                            )
+                            .map(move |(distance, payload)| (opfamily.output(distance), payload));
                             Box::new(vbase.take_while(move |(x, _)| *x < threshold))
                         }
-                        (Some(max_scan_tuples), None) => Box::new(vbase.take(max_scan_tuples as _)),
-                        (Some(max_scan_tuples), Some(threshold)) => Box::new(
-                            vbase
-                                .take_while(move |(x, _)| *x < threshold)
-                                .take(max_scan_tuples as _),
-                        ),
+                        (RerankMethod::Index, Some(max_scan_tuples), None) => {
+                            let vbase = algorithm::rerank_index::<Op<VectOwned<f32>, L2>>(
+                                relation, vector, results,
+                            )
+                            .map(move |(distance, payload)| (opfamily.output(distance), payload));
+                            Box::new(vbase.take(max_scan_tuples as _))
+                        }
+                        (RerankMethod::Index, Some(max_scan_tuples), Some(threshold)) => {
+                            let vbase = algorithm::rerank_index::<Op<VectOwned<f32>, L2>>(
+                                relation, vector, results,
+                            )
+                            .map(move |(distance, payload)| (opfamily.output(distance), payload));
+                            Box::new(
+                                vbase
+                                    .take_while(move |(x, _)| *x < threshold)
+                                    .take(max_scan_tuples as _),
+                            )
+                        }
+                        (RerankMethod::Heap, None, None) => {
+                            let vbase = algorithm::rerank_heap::<Op<VectOwned<f32>, L2>, _>(
+                                vector,
+                                results,
+                                move |payload| {
+                                    Some(RandomProject::project(
+                                        VectOwned::<f32>::from_owned(fetch(opfamily, payload)?)
+                                            .as_borrowed(),
+                                    ))
+                                },
+                            )
+                            .map(move |(distance, payload)| (opfamily.output(distance), payload));
+                            Box::new(vbase.fuse()) as Box<dyn Iterator<Item = (f32, NonZeroU64)>>
+                        }
+                        (RerankMethod::Heap, None, Some(threshold)) => {
+                            let vbase = algorithm::rerank_heap::<Op<VectOwned<f32>, L2>, _>(
+                                vector,
+                                results,
+                                move |payload| {
+                                    Some(RandomProject::project(
+                                        VectOwned::<f32>::from_owned(fetch(opfamily, payload)?)
+                                            .as_borrowed(),
+                                    ))
+                                },
+                            )
+                            .map(move |(distance, payload)| (opfamily.output(distance), payload));
+                            Box::new(vbase.take_while(move |(x, _)| *x < threshold))
+                        }
+                        (RerankMethod::Heap, Some(max_scan_tuples), None) => {
+                            let vbase = algorithm::rerank_heap::<Op<VectOwned<f32>, L2>, _>(
+                                vector,
+                                results,
+                                move |payload| {
+                                    Some(RandomProject::project(
+                                        VectOwned::<f32>::from_owned(fetch(opfamily, payload)?)
+                                            .as_borrowed(),
+                                    ))
+                                },
+                            )
+                            .map(move |(distance, payload)| (opfamily.output(distance), payload));
+                            Box::new(vbase.take(max_scan_tuples as _))
+                        }
+                        (RerankMethod::Heap, Some(max_scan_tuples), Some(threshold)) => {
+                            let vbase = algorithm::rerank_heap::<Op<VectOwned<f32>, L2>, _>(
+                                vector,
+                                results,
+                                move |payload| {
+                                    Some(RandomProject::project(
+                                        VectOwned::<f32>::from_owned(fetch(opfamily, payload)?)
+                                            .as_borrowed(),
+                                    ))
+                                },
+                            )
+                            .map(move |(distance, payload)| (opfamily.output(distance), payload));
+                            Box::new(
+                                vbase
+                                    .take_while(move |(x, _)| *x < threshold)
+                                    .take(max_scan_tuples as _),
+                            )
+                        }
                     }
                 }
                 (VectorKind::Vecf32, DistanceKind::Dot) => {
                     let vector = RandomProject::project(
                         VectOwned::<f32>::from_owned(vector.clone()).as_borrowed(),
                     );
-                    let vbase = algorithm::search::<Op<VectOwned<f32>, Dot>>(
-                        relation, vector, probes, epsilon,
-                    )
-                    .map(move |(distance, payload)| (opfamily.output(distance), payload));
-                    match (max_scan_tuples, threshold) {
-                        (None, None) => {
-                            Box::new(vbase) as Box<dyn Iterator<Item = (f32, NonZeroU64)>>
+                    let (method, results) = algorithm::search::<Op<VectOwned<f32>, Dot>>(
+                        relation.clone(),
+                        vector.clone(),
+                        probes,
+                        epsilon,
+                    );
+                    match (method, max_scan_tuples, threshold) {
+                        (RerankMethod::Index, None, None) => {
+                            let vbase = algorithm::rerank_index::<Op<VectOwned<f32>, Dot>>(
+                                relation, vector, results,
+                            )
+                            .map(move |(distance, payload)| (opfamily.output(distance), payload));
+                            Box::new(vbase.fuse()) as Box<dyn Iterator<Item = (f32, NonZeroU64)>>
                         }
-                        (None, Some(threshold)) => {
+                        (RerankMethod::Index, None, Some(threshold)) => {
+                            let vbase = algorithm::rerank_index::<Op<VectOwned<f32>, Dot>>(
+                                relation, vector, results,
+                            )
+                            .map(move |(distance, payload)| (opfamily.output(distance), payload));
                             Box::new(vbase.take_while(move |(x, _)| *x < threshold))
                         }
-                        (Some(max_scan_tuples), None) => Box::new(vbase.take(max_scan_tuples as _)),
-                        (Some(max_scan_tuples), Some(threshold)) => Box::new(
-                            vbase
-                                .take_while(move |(x, _)| *x < threshold)
-                                .take(max_scan_tuples as _),
-                        ),
+                        (RerankMethod::Index, Some(max_scan_tuples), None) => {
+                            let vbase = algorithm::rerank_index::<Op<VectOwned<f32>, Dot>>(
+                                relation, vector, results,
+                            )
+                            .map(move |(distance, payload)| (opfamily.output(distance), payload));
+                            Box::new(vbase.take(max_scan_tuples as _))
+                        }
+                        (RerankMethod::Index, Some(max_scan_tuples), Some(threshold)) => {
+                            let vbase = algorithm::rerank_index::<Op<VectOwned<f32>, Dot>>(
+                                relation, vector, results,
+                            )
+                            .map(move |(distance, payload)| (opfamily.output(distance), payload));
+                            Box::new(
+                                vbase
+                                    .take_while(move |(x, _)| *x < threshold)
+                                    .take(max_scan_tuples as _),
+                            )
+                        }
+                        (RerankMethod::Heap, None, None) => {
+                            let vbase = algorithm::rerank_heap::<Op<VectOwned<f32>, Dot>, _>(
+                                vector,
+                                results,
+                                move |payload| {
+                                    Some(RandomProject::project(
+                                        VectOwned::<f32>::from_owned(fetch(opfamily, payload)?)
+                                            .as_borrowed(),
+                                    ))
+                                },
+                            )
+                            .map(move |(distance, payload)| (opfamily.output(distance), payload));
+                            Box::new(vbase.fuse()) as Box<dyn Iterator<Item = (f32, NonZeroU64)>>
+                        }
+                        (RerankMethod::Heap, None, Some(threshold)) => {
+                            let vbase = algorithm::rerank_heap::<Op<VectOwned<f32>, Dot>, _>(
+                                vector,
+                                results,
+                                move |payload| {
+                                    Some(RandomProject::project(
+                                        VectOwned::<f32>::from_owned(fetch(opfamily, payload)?)
+                                            .as_borrowed(),
+                                    ))
+                                },
+                            )
+                            .map(move |(distance, payload)| (opfamily.output(distance), payload));
+                            Box::new(vbase.take_while(move |(x, _)| *x < threshold))
+                        }
+                        (RerankMethod::Heap, Some(max_scan_tuples), None) => {
+                            let vbase = algorithm::rerank_heap::<Op<VectOwned<f32>, Dot>, _>(
+                                vector,
+                                results,
+                                move |payload| {
+                                    Some(RandomProject::project(
+                                        VectOwned::<f32>::from_owned(fetch(opfamily, payload)?)
+                                            .as_borrowed(),
+                                    ))
+                                },
+                            )
+                            .map(move |(distance, payload)| (opfamily.output(distance), payload));
+                            Box::new(vbase.take(max_scan_tuples as _))
+                        }
+                        (RerankMethod::Heap, Some(max_scan_tuples), Some(threshold)) => {
+                            let vbase = algorithm::rerank_heap::<Op<VectOwned<f32>, Dot>, _>(
+                                vector,
+                                results,
+                                move |payload| {
+                                    Some(RandomProject::project(
+                                        VectOwned::<f32>::from_owned(fetch(opfamily, payload)?)
+                                            .as_borrowed(),
+                                    ))
+                                },
+                            )
+                            .map(move |(distance, payload)| (opfamily.output(distance), payload));
+                            Box::new(
+                                vbase
+                                    .take_while(move |(x, _)| *x < threshold)
+                                    .take(max_scan_tuples as _),
+                            )
+                        }
                     }
                 }
                 (VectorKind::Vecf16, DistanceKind::L2) => {
                     let vector = RandomProject::project(
                         VectOwned::<f16>::from_owned(vector.clone()).as_borrowed(),
                     );
-                    let vbase = algorithm::search::<Op<VectOwned<f16>, L2>>(
-                        relation, vector, probes, epsilon,
-                    )
-                    .map(move |(distance, payload)| (opfamily.output(distance), payload));
-                    match (max_scan_tuples, threshold) {
-                        (None, None) => {
-                            Box::new(vbase) as Box<dyn Iterator<Item = (f32, NonZeroU64)>>
+                    let (method, results) = algorithm::search::<Op<VectOwned<f16>, L2>>(
+                        relation.clone(),
+                        vector.clone(),
+                        probes,
+                        epsilon,
+                    );
+                    match (method, max_scan_tuples, threshold) {
+                        (RerankMethod::Index, None, None) => {
+                            let vbase = algorithm::rerank_index::<Op<VectOwned<f16>, L2>>(
+                                relation, vector, results,
+                            )
+                            .map(move |(distance, payload)| (opfamily.output(distance), payload));
+                            Box::new(vbase.fuse()) as Box<dyn Iterator<Item = (f32, NonZeroU64)>>
                         }
-                        (None, Some(threshold)) => {
+                        (RerankMethod::Index, None, Some(threshold)) => {
+                            let vbase = algorithm::rerank_index::<Op<VectOwned<f16>, L2>>(
+                                relation, vector, results,
+                            )
+                            .map(move |(distance, payload)| (opfamily.output(distance), payload));
                             Box::new(vbase.take_while(move |(x, _)| *x < threshold))
                         }
-                        (Some(max_scan_tuples), None) => Box::new(vbase.take(max_scan_tuples as _)),
-                        (Some(max_scan_tuples), Some(threshold)) => Box::new(
-                            vbase
-                                .take_while(move |(x, _)| *x < threshold)
-                                .take(max_scan_tuples as _),
-                        ),
+                        (RerankMethod::Index, Some(max_scan_tuples), None) => {
+                            let vbase = algorithm::rerank_index::<Op<VectOwned<f16>, L2>>(
+                                relation, vector, results,
+                            )
+                            .map(move |(distance, payload)| (opfamily.output(distance), payload));
+                            Box::new(vbase.take(max_scan_tuples as _))
+                        }
+                        (RerankMethod::Index, Some(max_scan_tuples), Some(threshold)) => {
+                            let vbase = algorithm::rerank_index::<Op<VectOwned<f16>, L2>>(
+                                relation, vector, results,
+                            )
+                            .map(move |(distance, payload)| (opfamily.output(distance), payload));
+                            Box::new(
+                                vbase
+                                    .take_while(move |(x, _)| *x < threshold)
+                                    .take(max_scan_tuples as _),
+                            )
+                        }
+                        (RerankMethod::Heap, None, None) => {
+                            let vbase = algorithm::rerank_heap::<Op<VectOwned<f16>, L2>, _>(
+                                vector,
+                                results,
+                                move |payload| {
+                                    Some(RandomProject::project(
+                                        VectOwned::<f16>::from_owned(fetch(opfamily, payload)?)
+                                            .as_borrowed(),
+                                    ))
+                                },
+                            )
+                            .map(move |(distance, payload)| (opfamily.output(distance), payload));
+                            Box::new(vbase.fuse()) as Box<dyn Iterator<Item = (f32, NonZeroU64)>>
+                        }
+                        (RerankMethod::Heap, None, Some(threshold)) => {
+                            let vbase = algorithm::rerank_heap::<Op<VectOwned<f16>, L2>, _>(
+                                vector,
+                                results,
+                                move |payload| {
+                                    Some(RandomProject::project(
+                                        VectOwned::<f16>::from_owned(fetch(opfamily, payload)?)
+                                            .as_borrowed(),
+                                    ))
+                                },
+                            )
+                            .map(move |(distance, payload)| (opfamily.output(distance), payload));
+                            Box::new(vbase.take_while(move |(x, _)| *x < threshold))
+                        }
+                        (RerankMethod::Heap, Some(max_scan_tuples), None) => {
+                            let vbase = algorithm::rerank_heap::<Op<VectOwned<f16>, L2>, _>(
+                                vector,
+                                results,
+                                move |payload| {
+                                    Some(RandomProject::project(
+                                        VectOwned::<f16>::from_owned(fetch(opfamily, payload)?)
+                                            .as_borrowed(),
+                                    ))
+                                },
+                            )
+                            .map(move |(distance, payload)| (opfamily.output(distance), payload));
+                            Box::new(vbase.take(max_scan_tuples as _))
+                        }
+                        (RerankMethod::Heap, Some(max_scan_tuples), Some(threshold)) => {
+                            let vbase = algorithm::rerank_heap::<Op<VectOwned<f16>, L2>, _>(
+                                vector,
+                                results,
+                                move |payload| {
+                                    Some(RandomProject::project(
+                                        VectOwned::<f16>::from_owned(fetch(opfamily, payload)?)
+                                            .as_borrowed(),
+                                    ))
+                                },
+                            )
+                            .map(move |(distance, payload)| (opfamily.output(distance), payload));
+                            Box::new(
+                                vbase
+                                    .take_while(move |(x, _)| *x < threshold)
+                                    .take(max_scan_tuples as _),
+                            )
+                        }
                     }
                 }
                 (VectorKind::Vecf16, DistanceKind::Dot) => {
                     let vector = RandomProject::project(
                         VectOwned::<f16>::from_owned(vector.clone()).as_borrowed(),
                     );
-                    let vbase = algorithm::search::<Op<VectOwned<f16>, Dot>>(
-                        relation, vector, probes, epsilon,
-                    )
-                    .map(move |(distance, payload)| (opfamily.output(distance), payload));
-                    match (max_scan_tuples, threshold) {
-                        (None, None) => {
-                            Box::new(vbase) as Box<dyn Iterator<Item = (f32, NonZeroU64)>>
+                    let (method, results) = algorithm::search::<Op<VectOwned<f16>, Dot>>(
+                        relation.clone(),
+                        vector.clone(),
+                        probes,
+                        epsilon,
+                    );
+                    match (method, max_scan_tuples, threshold) {
+                        (RerankMethod::Index, None, None) => {
+                            let vbase = algorithm::rerank_index::<Op<VectOwned<f16>, Dot>>(
+                                relation, vector, results,
+                            )
+                            .map(move |(distance, payload)| (opfamily.output(distance), payload));
+                            Box::new(vbase.fuse()) as Box<dyn Iterator<Item = (f32, NonZeroU64)>>
                         }
-                        (None, Some(threshold)) => {
+                        (RerankMethod::Index, None, Some(threshold)) => {
+                            let vbase = algorithm::rerank_index::<Op<VectOwned<f16>, Dot>>(
+                                relation, vector, results,
+                            )
+                            .map(move |(distance, payload)| (opfamily.output(distance), payload));
                             Box::new(vbase.take_while(move |(x, _)| *x < threshold))
                         }
-                        (Some(max_scan_tuples), None) => Box::new(vbase.take(max_scan_tuples as _)),
-                        (Some(max_scan_tuples), Some(threshold)) => Box::new(
-                            vbase
-                                .take_while(move |(x, _)| *x < threshold)
-                                .take(max_scan_tuples as _),
-                        ),
+                        (RerankMethod::Index, Some(max_scan_tuples), None) => {
+                            let vbase = algorithm::rerank_index::<Op<VectOwned<f16>, Dot>>(
+                                relation, vector, results,
+                            )
+                            .map(move |(distance, payload)| (opfamily.output(distance), payload));
+                            Box::new(vbase.take(max_scan_tuples as _))
+                        }
+                        (RerankMethod::Index, Some(max_scan_tuples), Some(threshold)) => {
+                            let vbase = algorithm::rerank_index::<Op<VectOwned<f16>, Dot>>(
+                                relation, vector, results,
+                            )
+                            .map(move |(distance, payload)| (opfamily.output(distance), payload));
+                            Box::new(
+                                vbase
+                                    .take_while(move |(x, _)| *x < threshold)
+                                    .take(max_scan_tuples as _),
+                            )
+                        }
+                        (RerankMethod::Heap, None, None) => {
+                            let vbase = algorithm::rerank_heap::<Op<VectOwned<f16>, Dot>, _>(
+                                vector,
+                                results,
+                                move |payload| {
+                                    Some(RandomProject::project(
+                                        VectOwned::<f16>::from_owned(fetch(opfamily, payload)?)
+                                            .as_borrowed(),
+                                    ))
+                                },
+                            )
+                            .map(move |(distance, payload)| (opfamily.output(distance), payload));
+                            Box::new(vbase.fuse()) as Box<dyn Iterator<Item = (f32, NonZeroU64)>>
+                        }
+                        (RerankMethod::Heap, None, Some(threshold)) => {
+                            let vbase = algorithm::rerank_heap::<Op<VectOwned<f16>, Dot>, _>(
+                                vector,
+                                results,
+                                move |payload| {
+                                    Some(RandomProject::project(
+                                        VectOwned::<f16>::from_owned(fetch(opfamily, payload)?)
+                                            .as_borrowed(),
+                                    ))
+                                },
+                            )
+                            .map(move |(distance, payload)| (opfamily.output(distance), payload));
+                            Box::new(vbase.take_while(move |(x, _)| *x < threshold))
+                        }
+                        (RerankMethod::Heap, Some(max_scan_tuples), None) => {
+                            let vbase = algorithm::rerank_heap::<Op<VectOwned<f16>, Dot>, _>(
+                                vector,
+                                results,
+                                move |payload| {
+                                    Some(RandomProject::project(
+                                        VectOwned::<f16>::from_owned(fetch(opfamily, payload)?)
+                                            .as_borrowed(),
+                                    ))
+                                },
+                            )
+                            .map(move |(distance, payload)| (opfamily.output(distance), payload));
+                            Box::new(vbase.take(max_scan_tuples as _))
+                        }
+                        (RerankMethod::Heap, Some(max_scan_tuples), Some(threshold)) => {
+                            let vbase = algorithm::rerank_heap::<Op<VectOwned<f16>, Dot>, _>(
+                                vector,
+                                results,
+                                move |payload| {
+                                    Some(RandomProject::project(
+                                        VectOwned::<f16>::from_owned(fetch(opfamily, payload)?)
+                                            .as_borrowed(),
+                                    ))
+                                },
+                            )
+                            .map(move |(distance, payload)| (opfamily.output(distance), payload));
+                            Box::new(
+                                vbase
+                                    .take_while(move |(x, _)| *x < threshold)
+                                    .take(max_scan_tuples as _),
+                            )
+                        }
                     }
                 }
             },
@@ -283,5 +656,37 @@ fn scanner_next(scanner: &mut Scanner, relation: PostgresRelation) -> Option<(No
         Scanning::Initial { .. } => unreachable!(),
         Scanning::Vbase { vbase, recheck } => vbase.next().map(|(_, x)| (x, *recheck)),
         Scanning::Empty {} => None,
+    }
+}
+
+struct Scopeguard<T, F>
+where
+    T: Copy,
+    F: FnMut(T),
+{
+    t: T,
+    f: F,
+}
+
+impl<T, F> Scopeguard<T, F>
+where
+    T: Copy,
+    F: FnMut(T),
+{
+    fn new(t: T, f: F) -> Self {
+        Scopeguard { t, f }
+    }
+    fn get(&self) -> &T {
+        &self.t
+    }
+}
+
+impl<T, F> Drop for Scopeguard<T, F>
+where
+    T: Copy,
+    F: FnMut(T),
+{
+    fn drop(&mut self) {
+        (self.f)(self.t);
     }
 }
