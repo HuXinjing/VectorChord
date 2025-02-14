@@ -374,11 +374,14 @@ impl Vector for VectOwned<f32> {
 
     fn vector_split(vector: Self::Borrowed<'_>) -> ((), Vec<&[f32]>) {
         let vector = vector.slice();
-        ((), match vector.len() {
-            0..=960 => vec![vector],
-            961..=1280 => vec![&vector[..640], &vector[640..]],
-            1281.. => vector.chunks(1920).collect(),
-        })
+        (
+            (),
+            match vector.len() {
+                0..=960 => vec![vector],
+                961..=1280 => vec![&vector[..640], &vector[640..]],
+                1281.. => vector.chunks(1920).collect(),
+            },
+        )
     }
 
     fn elements_and_metadata(vector: Self::Borrowed<'_>) -> (&[Self::Element], Self::Metadata) {
@@ -417,11 +420,14 @@ impl Vector for VectOwned<f16> {
 
     fn vector_split(vector: Self::Borrowed<'_>) -> ((), Vec<&[f16]>) {
         let vector = vector.slice();
-        ((), match vector.len() {
-            0..=1920 => vec![vector],
-            1921..=2560 => vec![&vector[..1280], &vector[1280..]],
-            2561.. => vector.chunks(3840).collect(),
-        })
+        (
+            (),
+            match vector.len() {
+                0..=1920 => vec![vector],
+                1921..=2560 => vec![&vector[..1280], &vector[1280..]],
+                2561.. => vector.chunks(3840).collect(),
+            },
+        )
     }
 
     fn elements_and_metadata(vector: Self::Borrowed<'_>) -> (&[Self::Element], Self::Metadata) {

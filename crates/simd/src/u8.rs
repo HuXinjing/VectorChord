@@ -51,10 +51,10 @@ mod reduce_sum_of_x_as_u16 {
             println!("test {} ... skipped (v4)", module_path!());
             return;
         }
-        let mut rng = rand::thread_rng();
+        let mut rng = rand::rng();
         for _ in 0..if cfg!(not(miri)) { 256 } else { 1 } {
             let n = 4016;
-            let this = (0..n).map(|_| rng.gen_range(0..16)).collect::<Vec<_>>();
+            let this = (0..n).map(|_| rng.random_range(0..16)).collect::<Vec<_>>();
             for z in 3984..4016 {
                 let this = &this[..z];
                 let specialized = unsafe { reduce_sum_of_x_as_u16_v4(this) };
@@ -101,10 +101,10 @@ mod reduce_sum_of_x_as_u16 {
             println!("test {} ... skipped (v3)", module_path!());
             return;
         }
-        let mut rng = rand::thread_rng();
+        let mut rng = rand::rng();
         for _ in 0..if cfg!(not(miri)) { 256 } else { 1 } {
             let n = 4016;
-            let this = (0..n).map(|_| rng.gen_range(0..16)).collect::<Vec<_>>();
+            let this = (0..n).map(|_| rng.random_range(0..16)).collect::<Vec<_>>();
             for z in 3984..4016 {
                 let this = &this[..z];
                 let specialized = unsafe { reduce_sum_of_x_as_u16_v3(this) };
@@ -151,10 +151,10 @@ mod reduce_sum_of_x_as_u16 {
             println!("test {} ... skipped (v2)", module_path!());
             return;
         }
-        let mut rng = rand::thread_rng();
+        let mut rng = rand::rng();
         for _ in 0..if cfg!(not(miri)) { 256 } else { 1 } {
             let n = 4016;
-            let this = (0..n).map(|_| rng.gen_range(0..16)).collect::<Vec<_>>();
+            let this = (0..n).map(|_| rng.random_range(0..16)).collect::<Vec<_>>();
             for z in 3984..4016 {
                 let this = &this[..z];
                 let specialized = unsafe { reduce_sum_of_x_as_u16_v2(this) };
@@ -200,10 +200,10 @@ mod reduce_sum_of_x_as_u16 {
             println!("test {} ... skipped (v8.3a)", module_path!());
             return;
         }
-        let mut rng = rand::thread_rng();
+        let mut rng = rand::rng();
         for _ in 0..if cfg!(not(miri)) { 256 } else { 1 } {
             let n = 4016;
-            let this = (0..n).map(|_| rng.gen_range(0..16)).collect::<Vec<_>>();
+            let this = (0..n).map(|_| rng.random_range(0..16)).collect::<Vec<_>>();
             for z in 3984..4016 {
                 let this = &this[..z];
                 let specialized = unsafe { reduce_sum_of_x_as_u16_v8_3a(this) };
@@ -263,10 +263,10 @@ mod reduce_sum_of_x {
             println!("test {} ... skipped (v4)", module_path!());
             return;
         }
-        let mut rng = rand::thread_rng();
+        let mut rng = rand::rng();
         for _ in 0..if cfg!(not(miri)) { 256 } else { 1 } {
             let n = 4016;
-            let this = (0..n).map(|_| rng.gen_range(0..16)).collect::<Vec<_>>();
+            let this = (0..n).map(|_| rng.random_range(0..16)).collect::<Vec<_>>();
             for z in 3984..4016 {
                 let this = &this[..z];
                 let specialized = unsafe { reduce_sum_of_x_v4(this) };
@@ -313,10 +313,10 @@ mod reduce_sum_of_x {
             println!("test {} ... skipped (v3)", module_path!());
             return;
         }
-        let mut rng = rand::thread_rng();
+        let mut rng = rand::rng();
         for _ in 0..if cfg!(not(miri)) { 256 } else { 1 } {
             let n = 4016;
-            let this = (0..n).map(|_| rng.gen_range(0..16)).collect::<Vec<_>>();
+            let this = (0..n).map(|_| rng.random_range(0..16)).collect::<Vec<_>>();
             for z in 3984..4016 {
                 let this = &this[..z];
                 let specialized = unsafe { reduce_sum_of_x_v3(this) };

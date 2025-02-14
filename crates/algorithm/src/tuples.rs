@@ -285,7 +285,7 @@ impl<V: Vector> Tuple for VectorTuple<V> {
                 elements,
             } => {
                 buffer.extend((0 as Tag).to_ne_bytes());
-                buffer.extend(std::iter::repeat(0).take(size_of::<VectorTupleHeader0>()));
+                buffer.extend(std::iter::repeat_n(0, size_of::<VectorTupleHeader0>()));
                 while buffer.len() % ALIGN != 0 {
                     buffer.push(0);
                 }
@@ -315,7 +315,7 @@ impl<V: Vector> Tuple for VectorTuple<V> {
                 elements,
             } => {
                 buffer.extend((1 as Tag).to_ne_bytes());
-                buffer.extend(std::iter::repeat(0).take(size_of::<VectorTupleHeader1>()));
+                buffer.extend(std::iter::repeat_n(0, size_of::<VectorTupleHeader1>()));
                 while buffer.len() % ALIGN != 0 {
                     buffer.push(0);
                 }
@@ -493,7 +493,7 @@ impl Tuple for H1Tuple {
                 elements,
             } => {
                 buffer.extend((0 as Tag).to_ne_bytes());
-                buffer.extend(std::iter::repeat(0).take(size_of::<H1TupleHeader0>()));
+                buffer.extend(std::iter::repeat_n(0, size_of::<H1TupleHeader0>()));
                 while buffer.len() % ALIGN != 0 {
                     buffer.push(0);
                 }
@@ -518,7 +518,7 @@ impl Tuple for H1Tuple {
             }
             Self::_1 { elements } => {
                 buffer.extend((1 as Tag).to_ne_bytes());
-                buffer.extend(std::iter::repeat(0).take(size_of::<H1TupleHeader1>()));
+                buffer.extend(std::iter::repeat_n(0, size_of::<H1TupleHeader1>()));
                 while buffer.len() % ALIGN != 0 {
                     buffer.push(0);
                 }
@@ -777,7 +777,7 @@ impl Tuple for H0Tuple {
                 elements,
             } => {
                 buffer.extend((0 as Tag).to_ne_bytes());
-                buffer.extend(std::iter::repeat(0).take(size_of::<H0TupleHeader0>()));
+                buffer.extend(std::iter::repeat_n(0, size_of::<H0TupleHeader0>()));
                 while buffer.len() % ALIGN != 0 {
                     buffer.push(0);
                 }
@@ -808,7 +808,7 @@ impl Tuple for H0Tuple {
                 elements,
             } => {
                 buffer.extend((1 as Tag).to_ne_bytes());
-                buffer.extend(std::iter::repeat(0).take(size_of::<H0TupleHeader1>()));
+                buffer.extend(std::iter::repeat_n(0, size_of::<H0TupleHeader1>()));
                 while buffer.len() % ALIGN != 0 {
                     buffer.push(0);
                 }
@@ -831,7 +831,7 @@ impl Tuple for H0Tuple {
             }
             Self::_2 { elements } => {
                 buffer.extend((2 as Tag).to_ne_bytes());
-                buffer.extend(std::iter::repeat(0).take(size_of::<H0TupleHeader2>()));
+                buffer.extend(std::iter::repeat_n(0, size_of::<H0TupleHeader2>()));
                 while buffer.len() % ALIGN != 0 {
                     buffer.push(0);
                 }
@@ -1200,7 +1200,7 @@ fn aliasing_test() {
     let serialized = {
         let elements = (0u32..1111).collect::<Vec<u32>>();
         let mut buffer = Vec::<u8>::new();
-        buffer.extend(std::iter::repeat(0).take(size_of::<ExampleHeader>()));
+        buffer.extend(std::iter::repeat_n(0, size_of::<ExampleHeader>()));
         while buffer.len() % ALIGN != 0 {
             buffer.push(0);
         }

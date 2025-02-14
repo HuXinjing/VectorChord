@@ -7,6 +7,7 @@ on:
       - ".github/workflows/check.yml"
       - "crates/**"
       - "src/**"
+      - "tests/**"
       - "build.rs"
       - "Cargo.lock"
       - "Cargo.toml"
@@ -17,9 +18,10 @@ on:
   push:
     paths:
       - ".cargo"
-      - ".github/workflows/lint.yml"
+      - ".github/workflows/check.yml"
       - "crates/**"
       - "src/**"
+      - "tests/**"
       - "build.rs"
       - "Cargo.lock"
       - "Cargo.toml"
@@ -68,7 +70,7 @@ jobs:
   lint:
     strategy:
       matrix:
-        runner: ["ubuntu-24.04", "ubuntu-24.04-arm"]
+        runner: ["ubuntu-24.04", "ubicloud-standard-8-arm-ubuntu-2404"]
     runs-on: ${{ matrix.runner }}
 
     steps:
@@ -88,16 +90,14 @@ jobs:
     strategy:
       matrix:
         version: ["13", "14", "15", "16", "17"]
-        runner: ["ubuntu-24.04", "ubuntu-24.04-arm"]
+        runner: ["ubuntu-24.04", "ubicloud-standard-8-arm-ubuntu-2404"]
     runs-on: ${{ matrix.runner }}
 
     steps:
       - name: Set up Environment
         run: |
-          if [ "${{ matrix.runner }}" = "ubuntu-24.04" ]; then
-            sudo apt-get remove -y '^postgres.*' '^libpq.*'
-            sudo apt-get purge -y '^postgres.*' '^libpq.*'
-          fi
+          sudo apt-get remove -y '^postgres.*' '^libpq.*'
+          sudo apt-get purge -y '^postgres.*' '^libpq.*'
 
           sudo update-alternatives --install /usr/bin/clang clang $(which clang-18) 255
 
@@ -115,13 +115,7 @@ jobs:
           sudo systemctl stop postgresql
 
           curl -fsSL https://github.com/tensorchord/pgrx/releases/download/v0.12.9/cargo-pgrx-v0.12.9-$(uname -m)-unknown-linux-musl.tar.gz | tar -xOzf - ./cargo-pgrx | install -m 755 /dev/stdin /usr/local/bin/cargo-pgrx
-          if [ "${{ matrix.runner }}" = "ubuntu-24.04" ]; then
-            cargo pgrx init --pg${{ matrix.version }}=$(which pg_config)
-          fi
-          if [ "${{ matrix.runner }}" = "ubuntu-24.04-arm" ]; then
-            mkdir $HOME/.pgrx
-            echo "configs.pg${{ matrix.version }} = \"$(which pg_config)\"" > $HOME/.pgrx/config.toml
-          fi
+          cargo pgrx init --pg${{ matrix.version }}=$(which pg_config)
 
           curl -fsSL https://github.com/risinglightdb/sqllogictest-rs/releases/download/v0.26.4/sqllogictest-bin-v0.26.4-$(uname -m)-unknown-linux-musl.tar.gz | tar -xOzf - ./sqllogictest | install -m 755 /dev/stdin /usr/local/bin/sqllogictest
 

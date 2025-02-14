@@ -5,8 +5,9 @@ edition.workspace = true
 
 [dependencies]
 distance = { path = "../distance" }
-half.workspace = true
 simd = { path = "../simd" }
+
+half.workspace = true
 
 [lints]
 workspace = true

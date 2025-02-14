@@ -250,14 +250,14 @@ mod reduce_sum_of_xy {
             println!("test {} ... skipped (v4:avx512fp16)", module_path!());
             return;
         }
-        let mut rng = rand::thread_rng();
+        let mut rng = rand::rng();
         for _ in 0..if cfg!(not(miri)) { 256 } else { 1 } {
             let n = 4016;
             let lhs = (0..n)
-                .map(|_| f16::from_f32(rng.gen_range(-1.0..=1.0)))
+                .map(|_| f16::from_f32(rng.random_range(-1.0..=1.0)))
                 .collect::<Vec<_>>();
             let rhs = (0..n)
-                .map(|_| f16::from_f32(rng.gen_range(-1.0..=1.0)))
+                .map(|_| f16::from_f32(rng.random_range(-1.0..=1.0)))
                 .collect::<Vec<_>>();
             for z in 3984..4016 {
                 let lhs = &lhs[..z];
@@ -310,14 +310,14 @@ mod reduce_sum_of_xy {
             println!("test {} ... skipped (v4)", module_path!());
             return;
         }
-        let mut rng = rand::thread_rng();
+        let mut rng = rand::rng();
         for _ in 0..if cfg!(not(miri)) { 256 } else { 1 } {
             let n = 4016;
             let lhs = (0..n)
-                .map(|_| f16::from_f32(rng.gen_range(-1.0..=1.0)))
+                .map(|_| f16::from_f32(rng.random_range(-1.0..=1.0)))
                 .collect::<Vec<_>>();
             let rhs = (0..n)
-                .map(|_| f16::from_f32(rng.gen_range(-1.0..=1.0)))
+                .map(|_| f16::from_f32(rng.random_range(-1.0..=1.0)))
                 .collect::<Vec<_>>();
             let specialized = unsafe { reduce_sum_of_xy_v4(&lhs, &rhs) };
             let fallback = reduce_sum_of_xy_fallback(&lhs, &rhs);
@@ -370,14 +370,14 @@ mod reduce_sum_of_xy {
             println!("test {} ... skipped (v3)", module_path!());
             return;
         }
-        let mut rng = rand::thread_rng();
+        let mut rng = rand::rng();
         for _ in 0..if cfg!(not(miri)) { 256 } else { 1 } {
             let n = 4016;
             let lhs = (0..n)
-                .map(|_| f16::from_f32(rng.gen_range(-1.0..=1.0)))
+                .map(|_| f16::from_f32(rng.random_range(-1.0..=1.0)))
                 .collect::<Vec<_>>();
             let rhs = (0..n)
-                .map(|_| f16::from_f32(rng.gen_range(-1.0..=1.0)))
+                .map(|_| f16::from_f32(rng.random_range(-1.0..=1.0)))
                 .collect::<Vec<_>>();
             for z in 3984..4016 {
                 let lhs = &lhs[..z];
@@ -439,14 +439,14 @@ mod reduce_sum_of_xy {
             println!("test {} ... skipped (v2:f16c:fma)", module_path!());
             return;
         }
-        let mut rng = rand::thread_rng();
+        let mut rng = rand::rng();
         for _ in 0..if cfg!(not(miri)) { 256 } else { 1 } {
             let n = 4016;
             let lhs = (0..n)
-                .map(|_| f16::from_f32(rng.gen_range(-1.0..=1.0)))
+                .map(|_| f16::from_f32(rng.random_range(-1.0..=1.0)))
                 .collect::<Vec<_>>();
             let rhs = (0..n)
-                .map(|_| f16::from_f32(rng.gen_range(-1.0..=1.0)))
+                .map(|_| f16::from_f32(rng.random_range(-1.0..=1.0)))
                 .collect::<Vec<_>>();
             for z in 3984..4016 {
                 let lhs = &lhs[..z];
@@ -492,14 +492,14 @@ mod reduce_sum_of_xy {
             println!("test {} ... skipped (v8.3a:fp16)", module_path!());
             return;
         }
-        let mut rng = rand::thread_rng();
+        let mut rng = rand::rng();
         for _ in 0..if cfg!(not(miri)) { 256 } else { 1 } {
             let n = 4016;
             let lhs = (0..n)
-                .map(|_| f16::from_f32(rng.gen_range(-1.0..=1.0)))
+                .map(|_| f16::from_f32(rng.random_range(-1.0..=1.0)))
                 .collect::<Vec<_>>();
             let rhs = (0..n)
-                .map(|_| f16::from_f32(rng.gen_range(-1.0..=1.0)))
+                .map(|_| f16::from_f32(rng.random_range(-1.0..=1.0)))
                 .collect::<Vec<_>>();
             for z in 3984..4016 {
                 let lhs = &lhs[..z];
@@ -540,14 +540,14 @@ mod reduce_sum_of_xy {
             println!("test {} ... skipped (v8.3a:sve)", module_path!());
             return;
         }
-        let mut rng = rand::thread_rng();
+        let mut rng = rand::rng();
         for _ in 0..if cfg!(not(miri)) { 256 } else { 1 } {
             let n = 4016;
             let lhs = (0..n)
-                .map(|_| f16::from_f32(rng.gen_range(-1.0..=1.0)))
+                .map(|_| f16::from_f32(rng.random_range(-1.0..=1.0)))
                 .collect::<Vec<_>>();
             let rhs = (0..n)
-                .map(|_| f16::from_f32(rng.gen_range(-1.0..=1.0)))
+                .map(|_| f16::from_f32(rng.random_range(-1.0..=1.0)))
                 .collect::<Vec<_>>();
             for z in 3984..4016 {
                 let lhs = &lhs[..z];
@@ -618,14 +618,14 @@ mod reduce_sum_of_d2 {
             println!("test {} ... skipped (v4:avx512fp16)", module_path!());
             return;
         }
-        let mut rng = rand::thread_rng();
+        let mut rng = rand::rng();
         for _ in 0..if cfg!(not(miri)) { 256 } else { 1 } {
             let n = 4016;
             let lhs = (0..n)
-                .map(|_| f16::from_f32(rng.gen_range(-1.0..=1.0)))
+                .map(|_| f16::from_f32(rng.random_range(-1.0..=1.0)))
                 .collect::<Vec<_>>();
             let rhs = (0..n)
-                .map(|_| f16::from_f32(rng.gen_range(-1.0..=1.0)))
+                .map(|_| f16::from_f32(rng.random_range(-1.0..=1.0)))
                 .collect::<Vec<_>>();
             for z in 3984..4016 {
                 let lhs = &lhs[..z];
@@ -680,14 +680,14 @@ mod reduce_sum_of_d2 {
             println!("test {} ... skipped (v4)", module_path!());
             return;
         }
-        let mut rng = rand::thread_rng();
+        let mut rng = rand::rng();
         for _ in 0..if cfg!(not(miri)) { 256 } else { 1 } {
             let n = 4016;
             let lhs = (0..n)
-                .map(|_| f16::from_f32(rng.gen_range(-1.0..=1.0)))
+                .map(|_| f16::from_f32(rng.random_range(-1.0..=1.0)))
                 .collect::<Vec<_>>();
             let rhs = (0..n)
-                .map(|_| f16::from_f32(rng.gen_range(-1.0..=1.0)))
+                .map(|_| f16::from_f32(rng.random_range(-1.0..=1.0)))
                 .collect::<Vec<_>>();
             for z in 3984..4016 {
                 let lhs = &lhs[..z];
@@ -746,14 +746,14 @@ mod reduce_sum_of_d2 {
             println!("test {} ... skipped (v3)", module_path!());
             return;
         }
-        let mut rng = rand::thread_rng();
+        let mut rng = rand::rng();
         for _ in 0..if cfg!(not(miri)) { 256 } else { 1 } {
             let n = 4016;
             let lhs = (0..n)
-                .map(|_| f16::from_f32(rng.gen_range(-1.0..=1.0)))
+                .map(|_| f16::from_f32(rng.random_range(-1.0..=1.0)))
                 .collect::<Vec<_>>();
             let rhs = (0..n)
-                .map(|_| f16::from_f32(rng.gen_range(-1.0..=1.0)))
+                .map(|_| f16::from_f32(rng.random_range(-1.0..=1.0)))
                 .collect::<Vec<_>>();
             for z in 3984..4016 {
                 let lhs = &lhs[..z];
@@ -817,14 +817,14 @@ mod reduce_sum_of_d2 {
             println!("test {} ... skipped (v2:f16c:fma)", module_path!());
             return;
         }
-        let mut rng = rand::thread_rng();
+        let mut rng = rand::rng();
         for _ in 0..if cfg!(not(miri)) { 256 } else { 1 } {
             let n = 4016;
             let lhs = (0..n)
-                .map(|_| f16::from_f32(rng.gen_range(-1.0..=1.0)))
+                .map(|_| f16::from_f32(rng.random_range(-1.0..=1.0)))
                 .collect::<Vec<_>>();
             let rhs = (0..n)
-                .map(|_| f16::from_f32(rng.gen_range(-1.0..=1.0)))
+                .map(|_| f16::from_f32(rng.random_range(-1.0..=1.0)))
                 .collect::<Vec<_>>();
             for z in 3984..4016 {
                 let lhs = &lhs[..z];
@@ -870,14 +870,14 @@ mod reduce_sum_of_d2 {
             println!("test {} ... skipped (v8.3a:fp16)", module_path!());
             return;
         }
-        let mut rng = rand::thread_rng();
+        let mut rng = rand::rng();
         for _ in 0..if cfg!(not(miri)) { 256 } else { 1 } {
             let n = 4016;
             let lhs = (0..n)
-                .map(|_| f16::from_f32(rng.gen_range(-1.0..=1.0)))
+                .map(|_| f16::from_f32(rng.random_range(-1.0..=1.0)))
                 .collect::<Vec<_>>();
             let rhs = (0..n)
-                .map(|_| f16::from_f32(rng.gen_range(-1.0..=1.0)))
+                .map(|_| f16::from_f32(rng.random_range(-1.0..=1.0)))
                 .collect::<Vec<_>>();
             for z in 3984..4016 {
                 let lhs = &lhs[..z];
@@ -918,14 +918,14 @@ mod reduce_sum_of_d2 {
             println!("test {} ... skipped (v8.3a:sve)", module_path!());
             return;
         }
-        let mut rng = rand::thread_rng();
+        let mut rng = rand::rng();
         for _ in 0..if cfg!(not(miri)) { 256 } else { 1 } {
             let n = 4016;
             let lhs = (0..n)
-                .map(|_| f16::from_f32(rng.gen_range(-1.0..=1.0)))
+                .map(|_| f16::from_f32(rng.random_range(-1.0..=1.0)))
                 .collect::<Vec<_>>();
             let rhs = (0..n)
-                .map(|_| f16::from_f32(rng.gen_range(-1.0..=1.0)))
+                .map(|_| f16::from_f32(rng.random_range(-1.0..=1.0)))
                 .collect::<Vec<_>>();
             for z in 3984..4016 {
                 let lhs = &lhs[..z];

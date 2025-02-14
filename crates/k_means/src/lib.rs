@@ -3,73 +3,13 @@
 use half::f16;
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
+use rayon::iter::{IntoParallelIterator, ParallelIterator};
 use simd::Floating;
 use simd::fast_scan::{any_pack, padding_pack};
-use std::any::Any;
-use std::panic::AssertUnwindSafe;
-use std::sync::Arc;
 
-pub use rayon::iter::ParallelIterator;
-
-pub trait Parallelism: Send + Sync {
-    fn check(&self);
-
-    fn rayon_into_par_iter<I: rayon::iter::IntoParallelIterator>(&self, x: I) -> I::Iter;
-}
-
-struct ParallelismCheckPanic(Box<dyn Any + Send>);
-
-pub struct RayonParallelism {
-    stop: Arc<dyn Fn() + Send + Sync>,
-}
-
-impl RayonParallelism {
-    pub fn scoped<R>(
-        num_threads: usize,
-        stop: Arc<dyn Fn() + Send + Sync>,
-        f: impl FnOnce(&Self) -> R,
-    ) -> Result<R, rayon::ThreadPoolBuildError> {
-        match std::panic::catch_unwind(AssertUnwindSafe(|| {
-            rayon::ThreadPoolBuilder::new()
-                .num_threads(num_threads)
-                .panic_handler(|e| {
-                    if e.downcast_ref::<ParallelismCheckPanic>().is_some() {
-                        return;
-                    }
-                    log::error!("Asynchronous task panickied.");
-                })
-                .build_scoped(
-                    |thread| thread.run(),
-                    |_| {
-                        let pool = Self { stop: stop.clone() };
-                        f(&pool)
-                    },
-                )
-        })) {
-            Ok(x) => x,
-            Err(e) => match e.downcast::<ParallelismCheckPanic>() {
-                Ok(payload) => std::panic::resume_unwind((*payload).0),
-                Err(e) => std::panic::resume_unwind(e),
-            },
-        }
-    }
-}
-
-impl Parallelism for RayonParallelism {
-    fn check(&self) {
-        match std::panic::catch_unwind(AssertUnwindSafe(|| (self.stop)())) {
-            Ok(()) => (),
-            Err(payload) => std::panic::panic_any(ParallelismCheckPanic(payload)),
-        }
-    }
-
-    fn rayon_into_par_iter<I: rayon::iter::IntoParallelIterator>(&self, x: I) -> I::Iter {
-        x.into_par_iter()
-    }
-}
-
-pub fn k_means<P: Parallelism>(
-    parallelism: &P,
+pub fn k_means(
+    num_threads: usize,
+    check: impl Fn(),
     c: usize,
     dims: usize,
     samples: &[Vec<f32>],
@@ -82,22 +22,30 @@ pub fn k_means<P: Parallelism>(
     if n <= c {
         quick_centers(c, dims, samples.to_vec(), is_spherical)
     } else {
-        let compute = |parallelism: &P, centroids: &[Vec<f32>]| {
-            if n >= 1000 && c >= 1000 {
-                rabitq_index(parallelism, dims, n, c, samples, centroids)
-            } else {
-                flat_index(parallelism, dims, n, c, samples, centroids)
-            }
-        };
-        let mut lloyd_k_means =
-            LloydKMeans::new(parallelism, c, dims, samples, is_spherical, compute);
-        for _ in 0..iterations {
-            parallelism.check();
-            if lloyd_k_means.iterate() {
-                break;
-            }
-        }
-        lloyd_k_means.finish()
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(num_threads)
+            .build_scoped(
+                |thread| thread.run(),
+                move |_| {
+                    let compute = |centroids: &[Vec<f32>]| {
+                        if n >= 1000 && c >= 1000 {
+                            rabitq_index(dims, n, c, samples, centroids)
+                        } else {
+                            flat_index(dims, n, c, samples, centroids)
+                        }
+                    };
+                    let mut lloyd_k_means =
+                        LloydKMeans::new(c, dims, samples, is_spherical, compute);
+                    for _ in 0..iterations {
+                        check();
+                        if lloyd_k_means.iterate() {
+                            break;
+                        }
+                    }
+                    lloyd_k_means.finish()
+                },
+            )
+            .expect("failed to build thread pool")
     }
 }
 
@@ -124,10 +72,12 @@ fn quick_centers(
     if c == 1 && n == 0 {
         return vec![vec![0.0; dims]];
     }
-    let mut rng = rand::thread_rng();
+    let mut rng = rand::rng();
     let mut centroids = samples;
     for _ in n..c {
-        let r = (0..dims).map(|_| rng.gen_range(-1.0f32..1.0f32)).collect();
+        let r = (0..dims)
+            .map(|_| rng.random_range(-1.0f32..1.0f32))
+            .collect();
         centroids.push(r);
     }
     if is_spherical {
@@ -140,8 +90,7 @@ fn quick_centers(
     centroids
 }
 
-fn rabitq_index<P: Parallelism>(
-    parallelism: &P,
+fn rabitq_index(
     dims: usize,
     n: usize,
     c: usize,
@@ -197,8 +146,8 @@ fn rabitq_index<P: Parallelism>(
             elements: padding_pack(chunk.iter().map(|x| rabitq::pack_to_u4(&x.signs))),
         });
     }
-    parallelism
-        .rayon_into_par_iter(0..n)
+    (0..n)
+        .into_par_iter()
         .map(|i| {
             let lut = rabitq::block::preprocess(&samples[i]);
             let mut result = (f32::INFINITY, 0);
@@ -219,16 +168,15 @@ fn rabitq_index<P: Parallelism>(
         .collect::<Vec<_>>()
 }
 
-fn flat_index<P: Parallelism>(
-    parallelism: &P,
+fn flat_index(
     _dims: usize,
     n: usize,
     c: usize,
     samples: &[Vec<f32>],
     centroids: &[Vec<f32>],
 ) -> Vec<usize> {
-    parallelism
-        .rayon_into_par_iter(0..n)
+    (0..n)
+        .into_par_iter()
         .map(|i| {
             let mut result = (f32::INFINITY, 0);
             for j in 0..c {
@@ -242,8 +190,7 @@ fn flat_index<P: Parallelism>(
         .collect::<Vec<_>>()
 }
 
-struct LloydKMeans<'a, P, F> {
-    parallelism: &'a P,
+struct LloydKMeans<'a, F> {
     dims: usize,
     c: usize,
     is_spherical: bool,
@@ -256,26 +203,19 @@ struct LloydKMeans<'a, P, F> {
 
 const DELTA: f32 = f16::EPSILON.to_f32_const();
 
-impl<'a, P: Parallelism, F: Fn(&P, &[Vec<f32>]) -> Vec<usize>> LloydKMeans<'a, P, F> {
-    fn new(
-        parallelism: &'a P,
-        c: usize,
-        dims: usize,
-        samples: &'a [Vec<f32>],
-        is_spherical: bool,
-        compute: F,
-    ) -> Self {
+impl<'a, F: Fn(&[Vec<f32>]) -> Vec<usize>> LloydKMeans<'a, F> {
+    fn new(c: usize, dims: usize, samples: &'a [Vec<f32>], is_spherical: bool, compute: F) -> Self {
         let n = samples.len();
 
-        let mut rng = StdRng::from_entropy();
+        let mut rng = StdRng::from_seed([7; 32]);
         let mut centroids = Vec::with_capacity(c);
 
         for index in rand::seq::index::sample(&mut rng, n, c).into_iter() {
             centroids.push(samples[index].clone());
         }
 
-        let assign = parallelism
-            .rayon_into_par_iter(0..n)
+        let assign = (0..n)
+            .into_par_iter()
             .map(|i| {
                 let mut result = (f32::INFINITY, 0);
                 for j in 0..c {
@@ -289,7 +229,6 @@ impl<'a, P: Parallelism, F: Fn(&P, &[Vec<f32>]) -> Vec<usize>> LloydKMeans<'a, P
             .collect::<Vec<_>>();
 
         Self {
-            parallelism,
             dims,
             c,
             is_spherical,
@@ -308,9 +247,8 @@ impl<'a, P: Parallelism, F: Fn(&P, &[Vec<f32>]) -> Vec<usize>> LloydKMeans<'a, P
         let samples = self.samples;
         let n = samples.len();
 
-        let (sum, mut count) = self
-            .parallelism
-            .rayon_into_par_iter(0..n)
+        let (sum, mut count) = (0..n)
+            .into_par_iter()
             .fold(
                 || (vec![vec![f32::zero(); dims]; c], vec![0.0f32; c]),
                 |(mut sum, mut count), i| {
@@ -330,9 +268,8 @@ impl<'a, P: Parallelism, F: Fn(&P, &[Vec<f32>]) -> Vec<usize>> LloydKMeans<'a, P
                 },
             );
 
-        let mut centroids = self
-            .parallelism
-            .rayon_into_par_iter(0..c)
+        let mut centroids = (0..c)
+            .into_par_iter()
             .map(|i| f32::vector_mul_scalar(&sum[i], 1.0 / count[i]))
             .collect::<Vec<_>>();
 
@@ -342,7 +279,7 @@ impl<'a, P: Parallelism, F: Fn(&P, &[Vec<f32>]) -> Vec<usize>> LloydKMeans<'a, P
             }
             let mut o = 0;
             loop {
-                let alpha = rand.gen_range(0.0..1.0f32);
+                let alpha = rand.random_range(0.0..1.0f32);
                 let beta = (count[o] - 1.0) / (n - c) as f32;
                 if alpha < beta {
                     break;
@@ -357,15 +294,13 @@ impl<'a, P: Parallelism, F: Fn(&P, &[Vec<f32>]) -> Vec<usize>> LloydKMeans<'a, P
         }
 
         if self.is_spherical {
-            self.parallelism
-                .rayon_into_par_iter(&mut centroids)
-                .for_each(|centroid| {
-                    let l = f32::reduce_sum_of_x2(centroid).sqrt();
-                    f32::vector_mul_scalar_inplace(centroid, 1.0 / l);
-                });
+            (&mut centroids).into_par_iter().for_each(|centroid| {
+                let l = f32::reduce_sum_of_x2(centroid).sqrt();
+                f32::vector_mul_scalar_inplace(centroid, 1.0 / l);
+            });
         }
 
-        let assign = (self.compute)(self.parallelism, &centroids);
+        let assign = (self.compute)(&centroids);
 
         let result = (0..n).all(|i| assign[i] == self.assign[i]);
 

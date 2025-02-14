@@ -4,12 +4,12 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
-half.workspace = true
-log.workspace = true
 rabitq = { path = "../rabitq" }
+simd = { path = "../simd" }
+
+half.workspace = true
 rand.workspace = true
 rayon = "1.10.0"
-simd = { path = "../simd" }
 
 [lints]
 workspace = true

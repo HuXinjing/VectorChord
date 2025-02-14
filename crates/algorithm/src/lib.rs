@@ -1,7 +1,6 @@
 #![allow(clippy::collapsible_else_if)]
 #![allow(clippy::type_complexity)]
 #![allow(clippy::len_without_is_empty)]
-#![feature(vec_pop_if)]
 
 mod build;
 mod bulkdelete;

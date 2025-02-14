@@ -164,11 +164,11 @@ mod reduce_sum_of_x {
             println!("test {} ... skipped (v4)", module_path!());
             return;
         }
-        let mut rng = rand::thread_rng();
+        let mut rng = rand::rng();
         for _ in 0..if cfg!(not(miri)) { 256 } else { 1 } {
             let n = 4016;
             let this = (0..n)
-                .map(|_| rng.gen_range(-1.0..=1.0))
+                .map(|_| rng.random_range(-1.0..=1.0))
                 .collect::<Vec<_>>();
             for z in 3984..4016 {
                 let this = &this[..z];
@@ -225,11 +225,11 @@ mod reduce_sum_of_x {
             println!("test {} ... skipped (v3)", module_path!());
             return;
         }
-        let mut rng = rand::thread_rng();
+        let mut rng = rand::rng();
         for _ in 0..if cfg!(not(miri)) { 256 } else { 1 } {
             let n = 4016;
             let this = (0..n)
-                .map(|_| rng.gen_range(-1.0..=1.0))
+                .map(|_| rng.random_range(-1.0..=1.0))
                 .collect::<Vec<_>>();
             for z in 3984..4016 {
                 let this = &this[..z];
@@ -280,11 +280,11 @@ mod reduce_sum_of_x {
             println!("test {} ... skipped (v2)", module_path!());
             return;
         }
-        let mut rng = rand::thread_rng();
+        let mut rng = rand::rng();
         for _ in 0..if cfg!(not(miri)) { 256 } else { 1 } {
             let n = 4016;
             let this = (0..n)
-                .map(|_| rng.gen_range(-1.0..=1.0))
+                .map(|_| rng.random_range(-1.0..=1.0))
                 .collect::<Vec<_>>();
             for z in 3984..4016 {
                 let this = &this[..z];
@@ -334,11 +334,11 @@ mod reduce_sum_of_x {
             println!("test {} ... skipped (v8_3a)", module_path!());
             return;
         }
-        let mut rng = rand::thread_rng();
+        let mut rng = rand::rng();
         for _ in 0..if cfg!(not(miri)) { 256 } else { 1 } {
             let n = 4016;
             let this = (0..n)
-                .map(|_| rng.gen_range(-1.0..=1.0))
+                .map(|_| rng.random_range(-1.0..=1.0))
                 .collect::<Vec<_>>();
             for z in 3984..4016 {
                 let this = &this[..z];
@@ -374,11 +374,11 @@ mod reduce_sum_of_x {
             println!("test {} ... skipped (v8_3a:sve)", module_path!());
             return;
         }
-        let mut rng = rand::thread_rng();
+        let mut rng = rand::rng();
         for _ in 0..if cfg!(not(miri)) { 256 } else { 1 } {
             let n = 4016;
             let this = (0..n)
-                .map(|_| rng.gen_range(-1.0..=1.0))
+                .map(|_| rng.random_range(-1.0..=1.0))
                 .collect::<Vec<_>>();
             for z in 3984..4016 {
                 let this = &this[..z];
@@ -439,11 +439,11 @@ mod reduce_sum_of_abs_x {
             println!("test {} ... skipped (v4)", module_path!());
             return;
         }
-        let mut rng = rand::thread_rng();
+        let mut rng = rand::rng();
         for _ in 0..if cfg!(not(miri)) { 256 } else { 1 } {
             let n = 4016;
             let this = (0..n)
-                .map(|_| rng.gen_range(-1.0..=1.0))
+                .map(|_| rng.random_range(-1.0..=1.0))
                 .collect::<Vec<_>>();
             for z in 3984..4016 {
                 let this = &this[..z];
@@ -504,11 +504,11 @@ mod reduce_sum_of_abs_x {
             println!("test {} ... skipped (v3)", module_path!());
             return;
         }
-        let mut rng = rand::thread_rng();
+        let mut rng = rand::rng();
         for _ in 0..if cfg!(not(miri)) { 256 } else { 1 } {
             let n = 4016;
             let this = (0..n)
-                .map(|_| rng.gen_range(-1.0..=1.0))
+                .map(|_| rng.random_range(-1.0..=1.0))
                 .collect::<Vec<_>>();
             for z in 3984..4016 {
                 let this = &this[..z];
@@ -562,11 +562,11 @@ mod reduce_sum_of_abs_x {
             println!("test {} ... skipped (v2)", module_path!());
             return;
         }
-        let mut rng = rand::thread_rng();
+        let mut rng = rand::rng();
         for _ in 0..if cfg!(not(miri)) { 256 } else { 1 } {
             let n = 4016;
             let this = (0..n)
-                .map(|_| rng.gen_range(-1.0..=1.0))
+                .map(|_| rng.random_range(-1.0..=1.0))
                 .collect::<Vec<_>>();
             for z in 3984..4016 {
                 let this = &this[..z];
@@ -618,11 +618,11 @@ mod reduce_sum_of_abs_x {
             println!("test {} ... skipped (v8.3a)", module_path!());
             return;
         }
-        let mut rng = rand::thread_rng();
+        let mut rng = rand::rng();
         for _ in 0..if cfg!(not(miri)) { 256 } else { 1 } {
             let n = 4016;
             let this = (0..n)
-                .map(|_| rng.gen_range(-1.0..=1.0))
+                .map(|_| rng.random_range(-1.0..=1.0))
                 .collect::<Vec<_>>();
             for z in 3984..4016 {
                 let this = &this[..z];
@@ -658,11 +658,11 @@ mod reduce_sum_of_abs_x {
             println!("test {} ... skipped (v8.3a:sve)", module_path!());
             return;
         }
-        let mut rng = rand::thread_rng();
+        let mut rng = rand::rng();
         for _ in 0..if cfg!(not(miri)) { 256 } else { 1 } {
             let n = 4016;
             let this = (0..n)
-                .map(|_| rng.gen_range(-1.0..=1.0))
+                .map(|_| rng.random_range(-1.0..=1.0))
                 .collect::<Vec<_>>();
             for z in 3984..4016 {
                 let this = &this[..z];
@@ -721,11 +721,11 @@ mod reduce_sum_of_x2 {
             println!("test {} ... skipped (v4)", module_path!());
             return;
         }
-        let mut rng = rand::thread_rng();
+        let mut rng = rand::rng();
         for _ in 0..if cfg!(not(miri)) { 256 } else { 1 } {
             let n = 4016;
             let this = (0..n)
-                .map(|_| rng.gen_range(-1.0..=1.0))
+                .map(|_| rng.random_range(-1.0..=1.0))
                 .collect::<Vec<_>>();
             for z in 3984..4016 {
                 let this = &this[..z];
@@ -782,11 +782,11 @@ mod reduce_sum_of_x2 {
             println!("test {} ... skipped (v3)", module_path!());
             return;
         }
-        let mut rng = rand::thread_rng();
+        let mut rng = rand::rng();
         for _ in 0..if cfg!(not(miri)) { 256 } else { 1 } {
             let n = 4016;
             let this = (0..n)
-                .map(|_| rng.gen_range(-1.0..=1.0))
+                .map(|_| rng.random_range(-1.0..=1.0))
                 .collect::<Vec<_>>();
             for z in 3984..4016 {
                 let this = &this[..z];
@@ -838,11 +838,11 @@ mod reduce_sum_of_x2 {
             println!("test {} ... skipped (v2:fma)", module_path!());
             return;
         }
-        let mut rng = rand::thread_rng();
+        let mut rng = rand::rng();
         for _ in 0..if cfg!(not(miri)) { 256 } else { 1 } {
             let n = 4016;
             let this = (0..n)
-                .map(|_| rng.gen_range(-1.0..=1.0))
+                .map(|_| rng.random_range(-1.0..=1.0))
                 .collect::<Vec<_>>();
             for z in 3984..4016 {
                 let this = &this[..z];
@@ -892,11 +892,11 @@ mod reduce_sum_of_x2 {
             println!("test {} ... skipped (v8.3a)", module_path!());
             return;
         }
-        let mut rng = rand::thread_rng();
+        let mut rng = rand::rng();
         for _ in 0..if cfg!(not(miri)) { 256 } else { 1 } {
             let n = 4016;
             let this = (0..n)
-                .map(|_| rng.gen_range(-1.0..=1.0))
+                .map(|_| rng.random_range(-1.0..=1.0))
                 .collect::<Vec<_>>();
             for z in 3984..4016 {
                 let this = &this[..z];
@@ -932,11 +932,11 @@ mod reduce_sum_of_x2 {
             println!("test {} ... skipped (v8.3a:sve)", module_path!());
             return;
         }
-        let mut rng = rand::thread_rng();
+        let mut rng = rand::rng();
         for _ in 0..if cfg!(not(miri)) { 256 } else { 1 } {
             let n = 4016;
             let this = (0..n)
-                .map(|_| rng.gen_range(-1.0..=1.0))
+                .map(|_| rng.random_range(-1.0..=1.0))
                 .collect::<Vec<_>>();
             for z in 3984..4016 {
                 let this = &this[..z];
@@ -1002,11 +1002,11 @@ mod reduce_min_max_of_x {
             println!("test {} ... skipped (v4)", module_path!());
             return;
         }
-        let mut rng = rand::thread_rng();
+        let mut rng = rand::rng();
         for _ in 0..if cfg!(not(miri)) { 256 } else { 1 } {
             let n = 200;
             let x = (0..n)
-                .map(|_| rng.gen_range(-1.0..=1.0))
+                .map(|_| rng.random_range(-1.0..=1.0))
                 .collect::<Vec<_>>();
             for z in 50..200 {
                 let x = &x[..z];
@@ -1058,11 +1058,11 @@ mod reduce_min_max_of_x {
             println!("test {} ... skipped (v3)", module_path!());
             return;
         }
-        let mut rng = rand::thread_rng();
+        let mut rng = rand::rng();
         for _ in 0..if cfg!(not(miri)) { 256 } else { 1 } {
             let n = 200;
             let x = (0..n)
-                .map(|_| rng.gen_range(-1.0..=1.0))
+                .map(|_| rng.random_range(-1.0..=1.0))
                 .collect::<Vec<_>>();
             for z in 50..200 {
                 let x = &x[..z];
@@ -1114,11 +1114,11 @@ mod reduce_min_max_of_x {
             println!("test {} ... skipped (v2)", module_path!());
             return;
         }
-        let mut rng = rand::thread_rng();
+        let mut rng = rand::rng();
         for _ in 0..if cfg!(not(miri)) { 256 } else { 1 } {
             let n = 200;
             let x = (0..n)
-                .map(|_| rng.gen_range(-1.0..=1.0))
+                .map(|_| rng.random_range(-1.0..=1.0))
                 .collect::<Vec<_>>();
             for z in 50..200 {
                 let x = &x[..z];
@@ -1169,11 +1169,11 @@ mod reduce_min_max_of_x {
             println!("test {} ... skipped (v8.3a)", module_path!());
             return;
         }
-        let mut rng = rand::thread_rng();
+        let mut rng = rand::rng();
         for _ in 0..if cfg!(not(miri)) { 256 } else { 1 } {
             let n = 200;
             let x = (0..n)
-                .map(|_| rng.gen_range(-1.0..=1.0))
+                .map(|_| rng.random_range(-1.0..=1.0))
                 .collect::<Vec<_>>();
             for z in 50..200 {
                 let x = &x[..z];
@@ -1214,11 +1214,11 @@ mod reduce_min_max_of_x {
             println!("test {} ... skipped (v8.3a:sve)", module_path!());
             return;
         }
-        let mut rng = rand::thread_rng();
+        let mut rng = rand::rng();
         for _ in 0..if cfg!(not(miri)) { 256 } else { 1 } {
             let n = 200;
             let x = (0..n)
-                .map(|_| rng.gen_range(-1.0..=1.0))
+                .map(|_| rng.random_range(-1.0..=1.0))
                 .collect::<Vec<_>>();
             for z in 50..200 {
                 let x = &x[..z];
@@ -1282,14 +1282,14 @@ mod reduce_sum_of_xy {
             println!("test {} ... skipped (v4)", module_path!());
             return;
         }
-        let mut rng = rand::thread_rng();
+        let mut rng = rand::rng();
         for _ in 0..if cfg!(not(miri)) { 256 } else { 1 } {
             let n = 4016;
             let lhs = (0..n)
-                .map(|_| rng.gen_range(-1.0..=1.0))
+                .map(|_| rng.random_range(-1.0..=1.0))
                 .collect::<Vec<_>>();
             let rhs = (0..n)
-                .map(|_| rng.gen_range(-1.0..=1.0))
+                .map(|_| rng.random_range(-1.0..=1.0))
                 .collect::<Vec<_>>();
             for z in 3984..4016 {
                 let lhs = &lhs[..z];
@@ -1355,14 +1355,14 @@ mod reduce_sum_of_xy {
             println!("test {} ... skipped (v3)", module_path!());
             return;
         }
-        let mut rng = rand::thread_rng();
+        let mut rng = rand::rng();
         for _ in 0..if cfg!(not(miri)) { 256 } else { 1 } {
             let n = 4016;
             let lhs = (0..n)
-                .map(|_| rng.gen_range(-1.0..=1.0))
+                .map(|_| rng.random_range(-1.0..=1.0))
                 .collect::<Vec<_>>();
             let rhs = (0..n)
-                .map(|_| rng.gen_range(-1.0..=1.0))
+                .map(|_| rng.random_range(-1.0..=1.0))
                 .collect::<Vec<_>>();
             for z in 3984..4016 {
                 let lhs = &lhs[..z];
@@ -1421,14 +1421,14 @@ mod reduce_sum_of_xy {
             println!("test {} ... skipped (v2:fma)", module_path!());
             return;
         }
-        let mut rng = rand::thread_rng();
+        let mut rng = rand::rng();
         for _ in 0..if cfg!(not(miri)) { 256 } else { 1 } {
             let n = 4016;
             let lhs = (0..n)
-                .map(|_| rng.gen_range(-1.0..=1.0))
+                .map(|_| rng.random_range(-1.0..=1.0))
                 .collect::<Vec<_>>();
             let rhs = (0..n)
-                .map(|_| rng.gen_range(-1.0..=1.0))
+                .map(|_| rng.random_range(-1.0..=1.0))
                 .collect::<Vec<_>>();
             for z in 3984..4016 {
                 let lhs = &lhs[..z];
@@ -1485,14 +1485,14 @@ mod reduce_sum_of_xy {
             println!("test {} ... skipped (v8.3a)", module_path!());
             return;
         }
-        let mut rng = rand::thread_rng();
+        let mut rng = rand::rng();
         for _ in 0..if cfg!(not(miri)) { 256 } else { 1 } {
             let n = 4016;
             let lhs = (0..n)
-                .map(|_| rng.gen_range(-1.0..=1.0))
+                .map(|_| rng.random_range(-1.0..=1.0))
                 .collect::<Vec<_>>();
             let rhs = (0..n)
-                .map(|_| rng.gen_range(-1.0..=1.0))
+                .map(|_| rng.random_range(-1.0..=1.0))
                 .collect::<Vec<_>>();
             for z in 3984..4016 {
                 let lhs = &lhs[..z];
@@ -1530,14 +1530,14 @@ mod reduce_sum_of_xy {
             println!("test {} ... skipped (v8.3a:sve)", module_path!());
             return;
         }
-        let mut rng = rand::thread_rng();
+        let mut rng = rand::rng();
         for _ in 0..if cfg!(not(miri)) { 256 } else { 1 } {
             let n = 4016;
             let lhs = (0..n)
-                .map(|_| rng.gen_range(-1.0..=1.0))
+                .map(|_| rng.random_range(-1.0..=1.0))
                 .collect::<Vec<_>>();
             let rhs = (0..n)
-                .map(|_| rng.gen_range(-1.0..=1.0))
+                .map(|_| rng.random_range(-1.0..=1.0))
                 .collect::<Vec<_>>();
             for z in 3984..4016 {
                 let lhs = &lhs[..z];
@@ -1605,14 +1605,14 @@ mod reduce_sum_of_d2 {
             println!("test {} ... skipped (v4)", module_path!());
             return;
         }
-        let mut rng = rand::thread_rng();
+        let mut rng = rand::rng();
         for _ in 0..if cfg!(not(miri)) { 256 } else { 1 } {
             let n = 4016;
             let lhs = (0..n)
-                .map(|_| rng.gen_range(-1.0..=1.0))
+                .map(|_| rng.random_range(-1.0..=1.0))
                 .collect::<Vec<_>>();
             let rhs = (0..n)
-                .map(|_| rng.gen_range(-1.0..=1.0))
+                .map(|_| rng.random_range(-1.0..=1.0))
                 .collect::<Vec<_>>();
             for z in 3984..4016 {
                 let lhs = &lhs[..z];
@@ -1681,14 +1681,14 @@ mod reduce_sum_of_d2 {
             println!("test {} ... skipped (v3)", module_path!());
             return;
         }
-        let mut rng = rand::thread_rng();
+        let mut rng = rand::rng();
         for _ in 0..if cfg!(not(miri)) { 256 } else { 1 } {
             let n = 4016;
             let lhs = (0..n)
-                .map(|_| rng.gen_range(-1.0..=1.0))
+                .map(|_| rng.random_range(-1.0..=1.0))
                 .collect::<Vec<_>>();
             let rhs = (0..n)
-                .map(|_| rng.gen_range(-1.0..=1.0))
+                .map(|_| rng.random_range(-1.0..=1.0))
                 .collect::<Vec<_>>();
             for z in 3984..4016 {
                 let lhs = &lhs[..z];
@@ -1749,14 +1749,14 @@ mod reduce_sum_of_d2 {
             println!("test {} ... skipped (v2:fma)", module_path!());
             return;
         }
-        let mut rng = rand::thread_rng();
+        let mut rng = rand::rng();
         for _ in 0..if cfg!(not(miri)) { 256 } else { 1 } {
             let n = 4016;
             let lhs = (0..n)
-                .map(|_| rng.gen_range(-1.0..=1.0))
+                .map(|_| rng.random_range(-1.0..=1.0))
                 .collect::<Vec<_>>();
             let rhs = (0..n)
-                .map(|_| rng.gen_range(-1.0..=1.0))
+                .map(|_| rng.random_range(-1.0..=1.0))
                 .collect::<Vec<_>>();
             for z in 3984..4016 {
                 let lhs = &lhs[..z];
@@ -1815,14 +1815,14 @@ mod reduce_sum_of_d2 {
             println!("test {} ... skipped (v8.3a)", module_path!());
             return;
         }
-        let mut rng = rand::thread_rng();
+        let mut rng = rand::rng();
         for _ in 0..if cfg!(not(miri)) { 256 } else { 1 } {
             let n = 4016;
             let lhs = (0..n)
-                .map(|_| rng.gen_range(-1.0..=1.0))
+                .map(|_| rng.random_range(-1.0..=1.0))
                 .collect::<Vec<_>>();
             let rhs = (0..n)
-                .map(|_| rng.gen_range(-1.0..=1.0))
+                .map(|_| rng.random_range(-1.0..=1.0))
                 .collect::<Vec<_>>();
             for z in 3984..4016 {
                 let lhs = &lhs[..z];
@@ -1860,14 +1860,14 @@ mod reduce_sum_of_d2 {
             println!("test {} ... skipped (v8.3a:sve)", module_path!());
             return;
         }
-        let mut rng = rand::thread_rng();
+        let mut rng = rand::rng();
         for _ in 0..if cfg!(not(miri)) { 256 } else { 1 } {
             let n = 4016;
             let lhs = (0..n)
-                .map(|_| rng.gen_range(-1.0..=1.0))
+                .map(|_| rng.random_range(-1.0..=1.0))
                 .collect::<Vec<_>>();
             let rhs = (0..n)
-                .map(|_| rng.gen_range(-1.0..=1.0))
+                .map(|_| rng.random_range(-1.0..=1.0))
                 .collect::<Vec<_>>();
             for z in 3984..4016 {
                 let lhs = &lhs[..z];
@@ -1951,7 +1951,7 @@ mod reduce_sum_of_xy_sparse {
             println!("test {} ... skipped (v4)", module_path!());
             return;
         }
-        let mut rng = rand::thread_rng();
+        let mut rng = rand::rng();
         pub fn sample_u32_sorted(
             rng: &mut (impl Rng + ?Sized),
             length: u32,
@@ -1968,12 +1968,12 @@ mod reduce_sum_of_xy_sparse {
             let lm = 300;
             let lidx = sample_u32_sorted(&mut rng, 10000, lm);
             let lval = (0..lm)
-                .map(|_| rng.gen_range(-1.0..=1.0))
+                .map(|_| rng.random_range(-1.0..=1.0))
                 .collect::<Vec<_>>();
             let rm = 350;
             let ridx = sample_u32_sorted(&mut rng, 10000, rm);
             let rval = (0..rm)
-                .map(|_| rng.gen_range(-1.0..=1.0))
+                .map(|_| rng.random_range(-1.0..=1.0))
                 .collect::<Vec<_>>();
             let specialized = unsafe { reduce_sum_of_xy_sparse_v4(&lidx, &lval, &ridx, &rval) };
             let fallback = reduce_sum_of_xy_sparse_fallback(&lidx, &lval, &ridx, &rval);
@@ -2101,7 +2101,7 @@ mod reduce_sum_of_d2_sparse {
             println!("test {} ... skipped (v4)", module_path!());
             return;
         }
-        let mut rng = rand::thread_rng();
+        let mut rng = rand::rng();
         pub fn sample_u32_sorted(
             rng: &mut (impl Rng + ?Sized),
             length: u32,
@@ -2118,12 +2118,12 @@ mod reduce_sum_of_d2_sparse {
             let lm = 300;
             let lidx = sample_u32_sorted(&mut rng, 10000, lm);
             let lval = (0..lm)
-                .map(|_| rng.gen_range(-1.0..=1.0))
+                .map(|_| rng.random_range(-1.0..=1.0))
                 .collect::<Vec<_>>();
             let rm = 350;
             let ridx = sample_u32_sorted(&mut rng, 10000, rm);
             let rval = (0..rm)
-                .map(|_| rng.gen_range(-1.0..=1.0))
+                .map(|_| rng.random_range(-1.0..=1.0))
                 .collect::<Vec<_>>();
             let specialized = unsafe { reduce_sum_of_d2_sparse_v4(&lidx, &lval, &ridx, &rval) };
             let fallback = reduce_sum_of_d2_sparse_fallback(&lidx, &lval, &ridx, &rval);

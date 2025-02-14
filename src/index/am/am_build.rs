@@ -13,7 +13,6 @@ use rand::Rng;
 use simd::Floating;
 use std::num::NonZeroU64;
 use std::ops::Deref;
-use std::sync::Arc;
 use vector::vect::VectOwned;
 use vector::{VectorBorrowed, VectorOwned};
 
@@ -133,7 +132,7 @@ pub unsafe extern "C" fn ambuild(
         VchordrqBuildSourceOptions::Internal(internal_build) => {
             let mut tuples_total = 0_u64;
             let samples = 'a: {
-                let mut rand = rand::thread_rng();
+                let mut rand = rand::rng();
                 let Some(max_number_of_samples) = internal_build
                     .lists
                     .last()
@@ -156,7 +155,7 @@ pub unsafe extern "C" fn ambuild(
                                 samples.push(VectOwned::<f32>::build_to_vecf32(vector));
                                 number_of_samples += 1;
                             } else {
-                                let index = rand.gen_range(0..max_number_of_samples) as usize;
+                                let index = rand.random_range(0..max_number_of_samples) as usize;
                                 samples[index] = VectOwned::<f32>::build_to_vecf32(vector);
                             }
                             tuples_total += 1;
@@ -174,7 +173,7 @@ pub unsafe extern "C" fn ambuild(
                                 samples.push(VectOwned::<f16>::build_to_vecf32(vector));
                                 number_of_samples += 1;
                             } else {
-                                let index = rand.gen_range(0..max_number_of_samples) as usize;
+                                let index = rand.random_range(0..max_number_of_samples) as usize;
                                 samples[index] = VectOwned::<f16>::build_to_vecf32(vector);
                             }
                             tuples_total += 1;
@@ -388,13 +387,13 @@ mod vchordrq_cached {
             match self {
                 VchordrqCached::_0 {} => {
                     buffer.extend((0 as Tag).to_ne_bytes());
-                    buffer.extend(std::iter::repeat(0).take(size_of::<VchordrqCachedHeader0>()));
+                    buffer.extend(std::iter::repeat_n(0, size_of::<VchordrqCachedHeader0>()));
                     buffer[size_of::<Tag>()..][..size_of::<VchordrqCachedHeader0>()]
                         .copy_from_slice(VchordrqCachedHeader0 {}.as_bytes());
                 }
                 VchordrqCached::_1 { mapping, pages } => {
                     buffer.extend((1 as Tag).to_ne_bytes());
-                    buffer.extend(std::iter::repeat(0).take(size_of::<VchordrqCachedHeader1>()));
+                    buffer.extend(std::iter::repeat_n(0, size_of::<VchordrqCachedHeader1>()));
                     let mapping_s = buffer.len();
                     buffer.extend(mapping.as_bytes());
                     let mapping_e = buffer.len();
@@ -1043,27 +1042,21 @@ pub fn make_internal_build(
     }
     let mut result = Vec::<Structure<Vec<f32>>>::new();
     for w in internal_build.lists.iter().rev().copied().chain(once(1)) {
-        let means = k_means::RayonParallelism::scoped(
+        let means = k_means::k_means(
             internal_build.build_threads as _,
-            Arc::new(|| {
+            || {
                 pgrx::check_for_interrupts!();
-            }),
-            |parallelism| {
-                k_means::k_means(
-                    parallelism,
-                    w as usize,
-                    vector_options.dims as usize,
-                    if let Some(structure) = result.last() {
-                        &structure.means
-                    } else {
-                        &samples
-                    },
-                    internal_build.spherical_centroids,
-                    10,
-                )
             },
-        )
-        .expect("failed to create thread pool");
+            w as usize,
+            vector_options.dims as usize,
+            if let Some(structure) = result.last() {
+                &structure.means
+            } else {
+                &samples
+            },
+            internal_build.spherical_centroids,
+            10,
+        );
         if let Some(structure) = result.last() {
             let mut children = vec![Vec::new(); means.len()];
             for i in 0..structure.len() as u32 {
