@@ -19,7 +19,7 @@ fn _vchordrq_prewarm(indexrelid: Oid, height: i32) -> String {
     if pg_class.relam() != pg_am.oid() {
         pgrx::error!("{:?} is not a vchordrq index", pg_class.relname());
     }
-    let index = unsafe { pgrx::pg_sys::index_open(indexrelid, pgrx::pg_sys::ShareLock as _) };
+    let index = unsafe { pgrx::pg_sys::index_open(indexrelid, pgrx::pg_sys::AccessShareLock as _) };
     let relation = unsafe { PostgresRelation::new(index) };
     let opfamily = unsafe { crate::index::opclass::opfamily(index) };
     let message = match (opfamily.vector_kind(), opfamily.distance_kind()) {
@@ -45,7 +45,7 @@ fn _vchordrq_prewarm(indexrelid: Oid, height: i32) -> String {
         }
     };
     unsafe {
-        pgrx::pg_sys::index_close(index, pgrx::pg_sys::ShareLock as _);
+        pgrx::pg_sys::index_close(index, pgrx::pg_sys::AccessShareLock as _);
     }
     message
 }
