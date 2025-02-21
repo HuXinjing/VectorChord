@@ -9,7 +9,6 @@ mod freepages;
 mod insert;
 mod linked_vec;
 mod maintain;
-mod pipe;
 mod prewarm;
 mod rerank;
 mod search;
@@ -30,6 +29,7 @@ pub use prewarm::prewarm;
 pub use rerank::{rerank_heap, rerank_index};
 pub use search::search;
 
+use crate::tuples::IndexPointer;
 use std::ops::{Deref, DerefMut};
 use zerocopy_derive::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
@@ -78,4 +78,14 @@ pub trait RelationWrite: RelationRead {
 pub enum RerankMethod {
     Index,
     Heap,
+}
+
+pub(crate) struct Branch<T> {
+    pub mean: IndexPointer,
+    pub dis_u_2: f32,
+    pub factor_ppc: f32,
+    pub factor_ip: f32,
+    pub factor_err: f32,
+    pub signs: Vec<bool>,
+    pub extra: T,
 }

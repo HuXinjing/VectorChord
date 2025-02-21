@@ -1,9 +1,7 @@
 use crate::linked_vec::LinkedVec;
 use crate::operator::*;
-use crate::pipe::Pipe;
-use crate::tape::{access_0, access_1};
 use crate::tuples::*;
-use crate::{Page, RelationRead, RerankMethod, vectors};
+use crate::{Page, RelationRead, RerankMethod, tape, vectors};
 use always_equal::AlwaysEqual;
 use distance::Distance;
 use std::cmp::Reverse;
@@ -25,7 +23,8 @@ pub fn search<O: Operator>(
     )>,
 ) {
     let meta_guard = index.read(0);
-    let meta_tuple = meta_guard.get(1).unwrap().pipe(read_tuple::<MetaTuple>);
+    let meta_bytes = meta_guard.get(1).expect("data corruption");
+    let meta_tuple = MetaTuple::deserialize_ref(meta_bytes);
     let dims = meta_tuple.dims();
     let is_residual = meta_tuple.is_residual();
     let rerank_in_heap = meta_tuple.rerank_in_heap();
@@ -52,7 +51,7 @@ pub fn search<O: Operator>(
     let mut state: State<O> = vec![{
         let mean = root_mean;
         if is_residual {
-            let residual_u = vectors::access_1::<O, _>(
+            let residual_u = vectors::read_for_h1_tuple::<O, _>(
                 index.clone(),
                 mean,
                 LAccess::new(
@@ -73,7 +72,7 @@ pub fn search<O: Operator>(
             } else {
                 default_lut.as_ref().map(|x| &x.0).unwrap()
             };
-            access_1(
+            tape::read_h1_tape(
                 index.clone(),
                 first,
                 || {
@@ -85,6 +84,7 @@ pub fn search<O: Operator>(
                 |lowerbound, mean, first| {
                     results.push((Reverse(lowerbound), AlwaysEqual(mean), AlwaysEqual(first)));
                 },
+                |_| (),
             );
         }
         let mut heap = BinaryHeap::from(results.into_vec());
@@ -93,7 +93,7 @@ pub fn search<O: Operator>(
             while !heap.is_empty() && heap.peek().map(|x| x.0) > cache.peek().map(|x| x.0) {
                 let (_, AlwaysEqual(mean), AlwaysEqual(first)) = heap.pop().unwrap();
                 if is_residual {
-                    let (dis_u, residual_u) = vectors::access_1::<O, _>(
+                    let (dis_u, residual_u) = vectors::read_for_h1_tuple::<O, _>(
                         index.clone(),
                         mean,
                         LAccess::new(
@@ -110,7 +110,7 @@ pub fn search<O: Operator>(
                         AlwaysEqual(Some(residual_u)),
                     ));
                 } else {
-                    let dis_u = vectors::access_1::<O, _>(
+                    let dis_u = vectors::read_for_h1_tuple::<O, _>(
                         index.clone(),
                         mean,
                         LAccess::new(
@@ -139,24 +139,29 @@ pub fn search<O: Operator>(
             default_lut.as_ref().unwrap()
         };
         let jump_guard = index.read(first);
-        let jump_tuple = jump_guard
-            .get(1)
-            .expect("data corruption")
-            .pipe(read_tuple::<JumpTuple>);
-        let first = jump_tuple.first();
-        access_0(
+        let jump_bytes = jump_guard.get(1).expect("data corruption");
+        let jump_tuple = JumpTuple::deserialize_ref(jump_bytes);
+        let mut callback = |lowerbound, mean, payload| {
+            results.push((Reverse(lowerbound), AlwaysEqual(mean), AlwaysEqual(payload)));
+        };
+        tape::read_frozen_tape(
             index.clone(),
-            first,
+            jump_tuple.frozen_first(),
             || {
                 RAccess::new(
                     (&lut.0.4, (lut.0.0, lut.0.1, lut.0.2, lut.0.3, epsilon)),
                     O::Distance::block_accessor(),
                 )
             },
+            &mut callback,
+            |_| (),
+        );
+        tape::read_appendable_tape(
+            index.clone(),
+            jump_tuple.appendable_first(),
             |code| O::Distance::compute_lowerbound_binary(&lut.1, code, epsilon),
-            |lowerbound, mean, payload| {
-                results.push((Reverse(lowerbound), AlwaysEqual(mean), AlwaysEqual(payload)));
-            },
+            &mut callback,
+            |_| (),
         );
     }
     (

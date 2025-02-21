@@ -1,11 +1,10 @@
 use crate::operator::*;
-use crate::pipe::Pipe;
 use crate::tuples::*;
 use crate::{Page, PageGuard, RelationRead, RelationWrite, tape};
 use std::num::NonZeroU64;
 use vector::VectorOwned;
 
-pub fn access_1<
+pub fn read_for_h1_tuple<
     O: Operator,
     A: Accessor1<<O::Vector as Vector>::Element, <O::Vector as Vector>::Metadata>,
 >(
@@ -16,21 +15,19 @@ pub fn access_1<
     let mut cursor = Err(mean);
     let mut result = accessor;
     while let Err(mean) = cursor.map_err(pointer_to_pair) {
-        let vector_guard = index.read(mean.0);
-        let vector_tuple = vector_guard
-            .get(mean.1)
-            .expect("data corruption")
-            .pipe(read_tuple::<VectorTuple<O::Vector>>);
-        if vector_tuple.payload().is_some() {
+        let guard = index.read(mean.0);
+        let bytes = guard.get(mean.1).expect("data corruption");
+        let tuple = VectorTuple::<O::Vector>::deserialize_ref(bytes);
+        if tuple.payload().is_some() {
             panic!("data corruption");
         }
-        result.push(vector_tuple.elements());
-        cursor = vector_tuple.metadata_or_pointer();
+        result.push(tuple.elements());
+        cursor = tuple.metadata_or_pointer();
     }
     result.finish(cursor.expect("data corruption"))
 }
 
-pub fn access_0<
+pub fn read_for_h0_tuple<
     O: Operator,
     A: Accessor1<<O::Vector as Vector>::Element, <O::Vector as Vector>::Metadata>,
 >(
@@ -42,18 +39,17 @@ pub fn access_0<
     let mut cursor = Err(mean);
     let mut result = accessor;
     while let Err(mean) = cursor.map_err(pointer_to_pair) {
-        let vector_guard = index.read(mean.0);
-        let vector_tuple = vector_guard
-            .get(mean.1)?
-            .pipe(read_tuple::<VectorTuple<O::Vector>>);
-        if vector_tuple.payload().is_none() {
+        let guard = index.read(mean.0);
+        let bytes = guard.get(mean.1)?;
+        let tuple = VectorTuple::<O::Vector>::deserialize_ref(bytes);
+        if tuple.payload().is_none() {
             panic!("data corruption");
         }
-        if vector_tuple.payload() != Some(payload) {
+        if tuple.payload() != Some(payload) {
             return None;
         }
-        result.push(vector_tuple.elements());
-        cursor = vector_tuple.metadata_or_pointer();
+        result.push(tuple.elements());
+        cursor = tuple.metadata_or_pointer();
     }
     Some(result.finish(cursor.ok()?))
 }
@@ -74,7 +70,7 @@ pub fn append<O: Operator>(
     let (metadata, slices) = O::Vector::vector_split(vector);
     let mut chain = Ok(metadata);
     for i in (0..slices.len()).rev() {
-        let bytes = serialize::<VectorTuple<O::Vector>>(&match chain {
+        let bytes = VectorTuple::<O::Vector>::serialize(&match chain {
             Ok(metadata) => VectorTuple::_0 {
                 elements: slices[i].to_vec(),
                 payload: Some(payload),

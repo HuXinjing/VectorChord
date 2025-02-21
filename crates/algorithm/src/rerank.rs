@@ -22,7 +22,7 @@ pub fn rerank_index<O: Operator>(
     std::iter::from_fn(move || {
         while !heap.is_empty() && heap.peek().map(|x| x.0) > cache.peek().map(|x| x.0) {
             let (_, AlwaysEqual(mean), AlwaysEqual(pay_u)) = heap.pop().unwrap();
-            if let Some(dis_u) = vectors::access_0::<O, _>(
+            if let Some(dis_u) = vectors::read_for_h0_tuple::<O, _>(
                 index.clone(),
                 mean,
                 pay_u,

@@ -287,6 +287,34 @@ where
     }
 }
 
+pub struct FunctionalAccessor<T, P, F> {
+    data: T,
+    p: P,
+    f: F,
+}
+
+impl<T, P, F> FunctionalAccessor<T, P, F> {
+    pub fn new(data: T, p: P, f: F) -> Self {
+        Self { data, p, f }
+    }
+}
+
+impl<E, M, T, P, F, R> Accessor1<E, M> for FunctionalAccessor<T, P, F>
+where
+    P: for<'a> FnMut(&'a mut T, &'a [E]),
+    F: FnOnce(T, M) -> R,
+{
+    type Output = R;
+
+    fn push(&mut self, input: &[E]) {
+        (self.p)(&mut self.data, input);
+    }
+
+    fn finish(self, input: M) -> Self::Output {
+        (self.f)(self.data, input)
+    }
+}
+
 pub struct LAccess<'a, E, M, A> {
     elements: &'a [E],
     metadata: M,

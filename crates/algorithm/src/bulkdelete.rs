@@ -1,7 +1,6 @@
-use crate::operator::Operator;
-use crate::pipe::Pipe;
+use crate::operator::{FunctionalAccessor, Operator};
 use crate::tuples::*;
-use crate::{Page, RelationWrite};
+use crate::{Page, RelationWrite, tape};
 use std::num::NonZeroU64;
 
 pub fn bulkdelete<O: Operator>(
@@ -10,7 +9,8 @@ pub fn bulkdelete<O: Operator>(
     callback: impl Fn(NonZeroU64) -> bool,
 ) {
     let meta_guard = index.read(0);
-    let meta_tuple = meta_guard.get(1).unwrap().pipe(read_tuple::<MetaTuple>);
+    let meta_bytes = meta_guard.get(1).expect("data corruption");
+    let meta_tuple = MetaTuple::deserialize_ref(meta_bytes);
     let height_of_root = meta_tuple.height_of_root();
     let root_first = meta_tuple.root_first();
     let vectors_first = meta_tuple.vectors_first();
@@ -21,25 +21,19 @@ pub fn bulkdelete<O: Operator>(
         let step = |state: State| {
             let mut results = Vec::new();
             for first in state {
-                let mut current = first;
-                while current != u32::MAX {
-                    let h1_guard = index.read(current);
-                    for i in 1..=h1_guard.len() {
-                        let h1_tuple = h1_guard
-                            .get(i)
-                            .expect("data corruption")
-                            .pipe(read_tuple::<H1Tuple>);
-                        match h1_tuple {
-                            H1TupleReader::_0(h1_tuple) => {
-                                for first in h1_tuple.first().iter().copied() {
-                                    results.push(first);
-                                }
-                            }
-                            H1TupleReader::_1(_) => (),
+                tape::read_h1_tape(
+                    index.clone(),
+                    first,
+                    || {
+                        fn push<T>(_: &mut (), _: &[T]) {}
+                        fn finish<T>(_: (), _: (&T, &T, &T, &T)) -> [(); 32] {
+                            [(); 32]
                         }
-                    }
-                    current = h1_guard.get_opaque().next;
-                }
+                        FunctionalAccessor::new((), push, finish)
+                    },
+                    |(), _, first| results.push(first),
+                    |_| check(),
+                );
             }
             results
         };
@@ -48,97 +42,94 @@ pub fn bulkdelete<O: Operator>(
         }
         for first in state {
             let jump_guard = index.read(first);
-            let jump_tuple = jump_guard
-                .get(1)
-                .expect("data corruption")
-                .pipe(read_tuple::<JumpTuple>);
-            let first = jump_tuple.first();
-            let mut current = first;
-            while current != u32::MAX {
-                check();
-                let read = index.read(current);
-                let flag = 'flag: {
-                    for i in 1..=read.len() {
-                        let h0_tuple = read
-                            .get(i)
-                            .expect("data corruption")
-                            .pipe(read_tuple::<H0Tuple>);
-                        match h0_tuple {
-                            H0TupleReader::_0(h0_tuple) => {
-                                let p = h0_tuple.payload();
-                                if let Some(payload) = p {
-                                    if callback(payload) {
+            let jump_bytes = jump_guard.get(1).expect("data corruption");
+            let jump_tuple = JumpTuple::deserialize_ref(jump_bytes);
+            {
+                let mut current = jump_tuple.frozen_first();
+                while current != u32::MAX {
+                    check();
+                    let read = index.read(current);
+                    let flag = 'flag: {
+                        for i in 1..=read.len() {
+                            let bytes = read.get(i).expect("data corruption");
+                            let tuple = FrozenTuple::deserialize_ref(bytes);
+                            if let FrozenTupleReader::_0(tuple) = tuple {
+                                for p in tuple.payload().iter() {
+                                    if Some(true) == p.map(&callback) {
                                         break 'flag true;
                                     }
                                 }
                             }
-                            H0TupleReader::_1(h0_tuple) => {
-                                let p = h0_tuple.payload();
-                                for j in 0..32 {
-                                    if let Some(payload) = p[j] {
-                                        if callback(payload) {
-                                            break 'flag true;
-                                        }
-                                    }
-                                }
-                            }
-                            H0TupleReader::_2(_) => (),
                         }
-                    }
-                    false
-                };
-                if flag {
-                    drop(read);
-                    let mut write = index.write(current, false);
-                    for i in 1..=write.len() {
-                        let h0_tuple = write
-                            .get_mut(i)
-                            .expect("data corruption")
-                            .pipe(write_tuple::<H0Tuple>);
-                        match h0_tuple {
-                            H0TupleWriter::_0(mut h0_tuple) => {
-                                let p = h0_tuple.payload();
-                                if let Some(payload) = *p {
-                                    if callback(payload) {
+                        false
+                    };
+                    if flag {
+                        drop(read);
+                        let mut write = index.write(current, false);
+                        for i in 1..=write.len() {
+                            let bytes = write.get_mut(i).expect("data corruption");
+                            let tuple = FrozenTuple::deserialize_mut(bytes);
+                            if let FrozenTupleWriter::_0(mut tuple) = tuple {
+                                for p in tuple.payload().iter_mut() {
+                                    if Some(true) == p.map(&callback) {
                                         *p = None;
                                     }
                                 }
                             }
-                            H0TupleWriter::_1(mut h0_tuple) => {
-                                let p = h0_tuple.payload();
-                                for j in 0..32 {
-                                    if let Some(payload) = p[j] {
-                                        if callback(payload) {
-                                            p[j] = None;
-                                        }
-                                    }
-                                }
-                            }
-                            H0TupleWriter::_2(_) => (),
                         }
+                        current = write.get_opaque().next;
+                    } else {
+                        current = read.get_opaque().next;
                     }
-                    current = write.get_opaque().next;
-                } else {
-                    current = read.get_opaque().next;
+                }
+            }
+            {
+                let mut current = jump_tuple.appendable_first();
+                while current != u32::MAX {
+                    check();
+                    let read = index.read(current);
+                    let flag = 'flag: {
+                        for i in 1..=read.len() {
+                            let bytes = read.get(i).expect("data corruption");
+                            let tuple = AppendableTuple::deserialize_ref(bytes);
+                            let p = tuple.payload();
+                            if Some(true) == p.map(&callback) {
+                                break 'flag true;
+                            }
+                        }
+                        false
+                    };
+                    if flag {
+                        drop(read);
+                        let mut write = index.write(current, false);
+                        for i in 1..=write.len() {
+                            let bytes = write.get_mut(i).expect("data corruption");
+                            let mut tuple = AppendableTuple::deserialize_mut(bytes);
+                            let p = tuple.payload();
+                            if Some(true) == p.map(&callback) {
+                                *p = None;
+                            }
+                        }
+                        current = write.get_opaque().next;
+                    } else {
+                        current = read.get_opaque().next;
+                    }
                 }
             }
         }
     }
     {
-        let first = vectors_first;
-        let mut current = first;
+        let mut current = vectors_first;
         while current != u32::MAX {
             check();
             let read = index.read(current);
             let flag = 'flag: {
                 for i in 1..=read.len() {
-                    if let Some(vector_bytes) = read.get(i) {
-                        let vector_tuple = vector_bytes.pipe(read_tuple::<VectorTuple<O::Vector>>);
-                        let p = vector_tuple.payload();
-                        if let Some(payload) = p {
-                            if callback(payload) {
-                                break 'flag true;
-                            }
+                    if let Some(bytes) = read.get(i) {
+                        let tuple = VectorTuple::<O::Vector>::deserialize_ref(bytes);
+                        let p = tuple.payload();
+                        if Some(true) == p.map(&callback) {
+                            break 'flag true;
                         }
                     }
                 }
@@ -148,13 +139,11 @@ pub fn bulkdelete<O: Operator>(
                 drop(read);
                 let mut write = index.write(current, true);
                 for i in 1..=write.len() {
-                    if let Some(vector_bytes) = write.get(i) {
-                        let vector_tuple = vector_bytes.pipe(read_tuple::<VectorTuple<O::Vector>>);
-                        let p = vector_tuple.payload();
-                        if let Some(payload) = p {
-                            if callback(payload) {
-                                write.free(i);
-                            }
+                    if let Some(bytes) = write.get(i) {
+                        let tuple = VectorTuple::<O::Vector>::deserialize_ref(bytes);
+                        let p = tuple.payload();
+                        if Some(true) == p.map(&callback) {
+                            write.free(i);
                         }
                     };
                 }

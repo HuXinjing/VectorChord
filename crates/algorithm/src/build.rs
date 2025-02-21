@@ -1,8 +1,9 @@
-use crate::RelationWrite;
 use crate::operator::{Accessor2, Operator, Vector};
-use crate::tape::*;
+use crate::tape::TapeWriter;
 use crate::tuples::*;
 use crate::types::*;
+use crate::{Branch, DerefMut, Page, PageGuard, RelationWrite};
+use simd::fast_scan::{any_pack, padding_pack};
 use vector::VectorOwned;
 
 pub fn build<O: Operator>(
@@ -47,10 +48,13 @@ pub fn build<O: Operator>(
         let mut level = Vec::new();
         for j in 0..structures[i].len() {
             if i == 0 {
-                let tape = TapeWriter::<_, _, H0Tuple>::create(|| index.extend(false));
+                let frozen_tape = TapeWriter::<_, _, FrozenTuple>::create(|| index.extend(false));
+                let appendable_tape =
+                    TapeWriter::<_, _, AppendableTuple>::create(|| index.extend(false));
                 let mut jump = TapeWriter::<_, _, JumpTuple>::create(|| index.extend(false));
                 jump.push(JumpTuple {
-                    first: tape.first(),
+                    frozen_first: frozen_tape.first(),
+                    appendable_first: appendable_tape.first(),
                 });
                 level.push(jump.first());
             } else {
@@ -73,17 +77,46 @@ pub fn build<O: Operator>(
                     } else {
                         O::Vector::code(h1_mean)
                     };
-                    tape.push(H1Branch {
+                    tape.push(Branch {
                         mean: pointer_of_means[i - 1][child as usize],
                         dis_u_2: code.dis_u_2,
                         factor_ppc: code.factor_ppc,
                         factor_ip: code.factor_ip,
                         factor_err: code.factor_err,
                         signs: code.signs,
-                        first: pointer_of_firsts[i - 1][child as usize],
+                        extra: pointer_of_firsts[i - 1][child as usize],
                     });
                 }
-                let tape = tape.into_inner();
+                let (mut tape, branches) = tape.into_inner();
+                if !branches.is_empty() {
+                    let mut remain =
+                        padding_pack(branches.iter().map(|x| rabitq::pack_to_u4(&x.signs)));
+                    loop {
+                        let freespace = tape.freespace();
+                        if H1Tuple::estimate_size_0(remain.len()) <= freespace as usize {
+                            tape.tape_put(H1Tuple::_0 {
+                                mean: any_pack(branches.iter().map(|x| x.mean)),
+                                dis_u_2: any_pack(branches.iter().map(|x| x.dis_u_2)),
+                                factor_ppc: any_pack(branches.iter().map(|x| x.factor_ppc)),
+                                factor_ip: any_pack(branches.iter().map(|x| x.factor_ip)),
+                                factor_err: any_pack(branches.iter().map(|x| x.factor_err)),
+                                first: any_pack(branches.iter().map(|x| x.extra)),
+                                len: branches.len() as _,
+                                elements: remain,
+                            });
+                            break;
+                        }
+                        if let Some(w) = H1Tuple::fit_1(freespace) {
+                            let (left, right) = remain.split_at(std::cmp::min(w, remain.len()));
+                            tape.tape_put(H1Tuple::_1 {
+                                elements: left.to_vec(),
+                            });
+                            remain = right.to_vec();
+                        } else {
+                            tape.tape_move();
+                        }
+                    }
+                }
                 level.push(tape.first());
             }
         }
@@ -99,4 +132,58 @@ pub fn build<O: Operator>(
         root_first: pointer_of_firsts.last().unwrap()[0],
         freepage_first: freepage.first(),
     });
+}
+
+pub struct H1TapeWriter<G, E> {
+    tape: TapeWriter<G, E, H1Tuple>,
+    branches: Vec<Branch<u32>>,
+}
+
+impl<G, E> H1TapeWriter<G, E>
+where
+    G: PageGuard + DerefMut,
+    G::Target: Page,
+    E: Fn() -> G,
+{
+    fn create(extend: E) -> Self {
+        Self {
+            tape: TapeWriter::create(extend),
+            branches: Vec::new(),
+        }
+    }
+    fn push(&mut self, branch: Branch<u32>) {
+        self.branches.push(branch);
+        if self.branches.len() == 32 {
+            let chunk = std::array::from_fn::<_, 32, _>(|_| self.branches.pop().unwrap());
+            let mut remain = padding_pack(chunk.iter().map(|x| rabitq::pack_to_u4(&x.signs)));
+            loop {
+                let freespace = self.tape.freespace();
+                if H1Tuple::estimate_size_0(remain.len()) <= freespace as usize {
+                    self.tape.tape_put(H1Tuple::_0 {
+                        mean: chunk.each_ref().map(|x| x.mean),
+                        dis_u_2: chunk.each_ref().map(|x| x.dis_u_2),
+                        factor_ppc: chunk.each_ref().map(|x| x.factor_ppc),
+                        factor_ip: chunk.each_ref().map(|x| x.factor_ip),
+                        factor_err: chunk.each_ref().map(|x| x.factor_err),
+                        first: chunk.each_ref().map(|x| x.extra),
+                        len: chunk.len() as _,
+                        elements: remain,
+                    });
+                    break;
+                }
+                if let Some(w) = H1Tuple::fit_1(freespace) {
+                    let (left, right) = remain.split_at(std::cmp::min(w, remain.len()));
+                    self.tape.tape_put(H1Tuple::_1 {
+                        elements: left.to_vec(),
+                    });
+                    remain = right.to_vec();
+                } else {
+                    self.tape.tape_move();
+                }
+            }
+        }
+    }
+    fn into_inner(self) -> (TapeWriter<G, E, H1Tuple>, Vec<Branch<u32>>) {
+        (self.tape, self.branches)
+    }
 }

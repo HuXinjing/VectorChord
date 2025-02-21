@@ -1,11 +1,9 @@
 use crate::linked_vec::LinkedVec;
 use crate::operator::*;
-use crate::pipe::Pipe;
 use crate::select_heap::SelectHeap;
-use crate::tape::{access_1, append};
 use crate::tuples::*;
 use crate::vectors::{self};
-use crate::{Page, RelationWrite};
+use crate::{Page, RelationWrite, tape};
 use always_equal::AlwaysEqual;
 use distance::Distance;
 use std::cmp::Reverse;
@@ -15,7 +13,8 @@ use vector::{VectorBorrowed, VectorOwned};
 
 pub fn insert<O: Operator>(index: impl RelationWrite, payload: NonZeroU64, vector: O::Vector) {
     let meta_guard = index.read(0);
-    let meta_tuple = meta_guard.get(1).unwrap().pipe(read_tuple::<MetaTuple>);
+    let meta_bytes = meta_guard.get(1).expect("data corruption");
+    let meta_tuple = MetaTuple::deserialize_ref(meta_bytes);
     let dims = meta_tuple.dims();
     let is_residual = meta_tuple.is_residual();
     let rerank_in_heap = meta_tuple.rerank_in_heap();
@@ -42,7 +41,7 @@ pub fn insert<O: Operator>(index: impl RelationWrite, payload: NonZeroU64, vecto
     let mut state: State<O> = {
         let mean = root_mean;
         if is_residual {
-            let residual_u = vectors::access_1::<O, _>(
+            let residual_u = vectors::read_for_h1_tuple::<O, _>(
                 index.clone(),
                 mean,
                 LAccess::new(
@@ -64,7 +63,7 @@ pub fn insert<O: Operator>(index: impl RelationWrite, payload: NonZeroU64, vecto
             } else {
                 default_lut_block.as_ref().unwrap()
             };
-            access_1(
+            tape::read_h1_tape(
                 index.clone(),
                 first,
                 || {
@@ -76,6 +75,7 @@ pub fn insert<O: Operator>(index: impl RelationWrite, payload: NonZeroU64, vecto
                 |lowerbound, mean, first| {
                     results.push((Reverse(lowerbound), AlwaysEqual(mean), AlwaysEqual(first)));
                 },
+                |_| (),
             );
         }
         let mut heap = SelectHeap::from_vec(results.into_vec());
@@ -84,7 +84,7 @@ pub fn insert<O: Operator>(index: impl RelationWrite, payload: NonZeroU64, vecto
             while !heap.is_empty() && heap.peek().map(|x| x.0) > cache.peek().map(|x| x.0) {
                 let (_, AlwaysEqual(mean), AlwaysEqual(first)) = heap.pop().unwrap();
                 if is_residual {
-                    let (dis_u, residual_u) = vectors::access_1::<O, _>(
+                    let (dis_u, residual_u) = vectors::read_for_h1_tuple::<O, _>(
                         index.clone(),
                         mean,
                         LAccess::new(
@@ -101,7 +101,7 @@ pub fn insert<O: Operator>(index: impl RelationWrite, payload: NonZeroU64, vecto
                         AlwaysEqual(Some(residual_u)),
                     ));
                 } else {
-                    let dis_u = vectors::access_1::<O, _>(
+                    let dis_u = vectors::read_for_h1_tuple::<O, _>(
                         index.clone(),
                         mean,
                         LAccess::new(
@@ -126,7 +126,7 @@ pub fn insert<O: Operator>(index: impl RelationWrite, payload: NonZeroU64, vecto
     } else {
         O::Vector::code(vector.as_borrowed())
     };
-    let bytes = serialize(&H0Tuple::_0 {
+    let bytes = AppendableTuple::serialize(&AppendableTuple {
         mean,
         dis_u_2: code.dis_u_2,
         factor_ppc: code.factor_ppc,
@@ -137,12 +137,8 @@ pub fn insert<O: Operator>(index: impl RelationWrite, payload: NonZeroU64, vecto
     });
 
     let jump_guard = index.read(first);
-    let jump_tuple = jump_guard
-        .get(1)
-        .expect("data corruption")
-        .pipe(read_tuple::<JumpTuple>);
+    let jump_bytes = jump_guard.get(1).expect("data corruption");
+    let jump_tuple = JumpTuple::deserialize_ref(jump_bytes);
 
-    let first = jump_tuple.first();
-
-    append(index.clone(), first, &bytes, false);
+    tape::append(index.clone(), jump_tuple.appendable_first(), &bytes, false);
 }

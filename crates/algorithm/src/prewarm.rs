@@ -1,12 +1,12 @@
-use crate::operator::Operator;
-use crate::pipe::Pipe;
+use crate::operator::{FunctionalAccessor, Operator};
 use crate::tuples::*;
-use crate::{Page, RelationRead, vectors};
+use crate::{Page, RelationRead, tape, vectors};
 use std::fmt::Write;
 
 pub fn prewarm<O: Operator>(index: impl RelationRead, height: i32, check: impl Fn()) -> String {
     let meta_guard = index.read(0);
-    let meta_tuple = meta_guard.get(1).unwrap().pipe(read_tuple::<MetaTuple>);
+    let meta_bytes = meta_guard.get(1).expect("data corruption");
+    let meta_tuple = MetaTuple::deserialize_ref(meta_bytes);
     let height_of_root = meta_tuple.height_of_root();
     let root_mean = meta_tuple.root_mean();
     let root_first = meta_tuple.root_first();
@@ -20,96 +20,89 @@ pub fn prewarm<O: Operator>(index: impl RelationRead, height: i32, check: impl F
     }
     type State = Vec<u32>;
     let mut state: State = {
-        let mut nodes = Vec::new();
+        let mut results = Vec::new();
         {
-            vectors::access_1::<O, _>(index.clone(), root_mean, ());
-            nodes.push(root_first);
+            vectors::read_for_h1_tuple::<O, _>(index.clone(), root_mean, ());
+            results.push(root_first);
         }
         writeln!(message, "------------------------").unwrap();
-        writeln!(message, "number of nodes: {}", nodes.len()).unwrap();
-        writeln!(message, "number of tuples: {}", 1).unwrap();
+        writeln!(message, "number of nodes: {}", results.len()).unwrap();
         writeln!(message, "number of pages: {}", 1).unwrap();
-        nodes
+        results
     };
     let mut step = |state: State| {
-        let mut counter_pages = 0_usize;
-        let mut counter_tuples = 0_usize;
-        let mut nodes = Vec::new();
-        for list in state {
-            let mut current = list;
-            while current != u32::MAX {
-                counter_pages += 1;
-                check();
-                let h1_guard = index.read(current);
-                for i in 1..=h1_guard.len() {
-                    counter_tuples += 1;
-                    let h1_tuple = h1_guard
-                        .get(i)
-                        .expect("data corruption")
-                        .pipe(read_tuple::<H1Tuple>);
-                    match h1_tuple {
-                        H1TupleReader::_0(h1_tuple) => {
-                            for mean in h1_tuple.mean().iter().copied() {
-                                vectors::access_1::<O, _>(index.clone(), mean, ());
-                            }
-                            for first in h1_tuple.first().iter().copied() {
-                                nodes.push(first);
-                            }
-                        }
-                        H1TupleReader::_1(_) => (),
+        let mut counter = 0_usize;
+        let mut results = Vec::new();
+        for first in state {
+            tape::read_h1_tape(
+                index.clone(),
+                first,
+                || {
+                    fn push<T>(_: &mut (), _: &[T]) {}
+                    fn finish<T>(_: (), _: (&T, &T, &T, &T)) -> [(); 32] {
+                        [(); 32]
                     }
-                }
-                current = h1_guard.get_opaque().next;
-            }
+                    FunctionalAccessor::new((), push, finish)
+                },
+                |(), mean, first| {
+                    results.push(first);
+                    vectors::read_for_h1_tuple::<O, _>(index.clone(), mean, ());
+                },
+                |_| {
+                    check();
+                    counter += 1;
+                },
+            );
         }
         writeln!(message, "------------------------").unwrap();
-        writeln!(message, "number of nodes: {}", nodes.len()).unwrap();
-        writeln!(message, "number of tuples: {}", counter_tuples).unwrap();
-        writeln!(message, "number of pages: {}", counter_pages).unwrap();
-        nodes
+        writeln!(message, "number of nodes: {}", results.len()).unwrap();
+        writeln!(message, "number of pages: {}", counter).unwrap();
+        results
     };
     for _ in (std::cmp::max(1, prewarm_max_height)..height_of_root).rev() {
         state = step(state);
     }
     if prewarm_max_height == 0 {
-        let mut counter_pages = 0_usize;
-        let mut counter_tuples = 0_usize;
-        let mut counter_nodes = 0_usize;
-        for list in state {
-            let jump_guard = index.read(list);
-            let jump_tuple = jump_guard
-                .get(1)
-                .expect("data corruption")
-                .pipe(read_tuple::<JumpTuple>);
-            let first = jump_tuple.first();
-            let mut current = first;
-            while current != u32::MAX {
-                counter_pages += 1;
-                check();
-                let h0_guard = index.read(current);
-                for i in 1..=h0_guard.len() {
-                    counter_tuples += 1;
-                    let h0_tuple = h0_guard
-                        .get(i)
-                        .expect("data corruption")
-                        .pipe(read_tuple::<H0Tuple>);
-                    match h0_tuple {
-                        H0TupleReader::_0(_h0_tuple) => {
-                            counter_nodes += 1;
-                        }
-                        H0TupleReader::_1(_h0_tuple) => {
-                            counter_nodes += 32;
-                        }
-                        H0TupleReader::_2(_) => (),
+        let mut counter = 0_usize;
+        let mut results = Vec::new();
+        for first in state {
+            let jump_guard = index.read(first);
+            let jump_bytes = jump_guard.get(1).expect("data corruption");
+            let jump_tuple = JumpTuple::deserialize_ref(jump_bytes);
+            tape::read_frozen_tape(
+                index.clone(),
+                jump_tuple.frozen_first(),
+                || {
+                    fn push<T>(_: &mut (), _: &[T]) {}
+                    fn finish<T>(_: (), _: (&T, &T, &T, &T)) -> [(); 32] {
+                        [(); 32]
                     }
-                }
-                current = h0_guard.get_opaque().next;
-            }
+                    FunctionalAccessor::new((), push, finish)
+                },
+                |(), _, _| {
+                    results.push(());
+                },
+                |_| {
+                    check();
+                    counter += 1;
+                },
+            );
+            tape::read_appendable_tape(
+                index.clone(),
+                jump_tuple.frozen_first(),
+                |_| (),
+                |(), _, _| {
+                    results.push(());
+                },
+                |_| {
+                    check();
+                    counter += 1;
+                },
+            );
         }
         writeln!(message, "------------------------").unwrap();
-        writeln!(message, "number of nodes: {}", counter_nodes).unwrap();
-        writeln!(message, "number of tuples: {}", counter_tuples).unwrap();
-        writeln!(message, "number of pages: {}", counter_pages).unwrap();
+        writeln!(message, "number of nodes: {}", results.len()).unwrap();
+        writeln!(message, "number of pages: {}", counter).unwrap();
     }
     message
 }
