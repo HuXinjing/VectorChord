@@ -69,6 +69,10 @@ jobs:
       - name: Rustfmt
         run: cargo fmt --check
 
+      - name: SQL
+        run: |
+          ! grep -P '\t' -r ./sql
+
   lint:
     strategy:
       matrix:
