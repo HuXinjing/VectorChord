@@ -1,3 +1,4 @@
+#![feature(generic_arg_infer)]
 #![allow(clippy::collapsible_else_if)]
 #![allow(clippy::type_complexity)]
 #![allow(clippy::len_without_is_empty)]

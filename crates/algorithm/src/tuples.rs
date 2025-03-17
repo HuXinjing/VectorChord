@@ -7,7 +7,7 @@ use zerocopy_derive::{FromBytes, Immutable, IntoBytes, KnownLayout};
 pub const ALIGN: usize = 8;
 pub type Tag = u64;
 const MAGIC: u64 = u64::from_ne_bytes(*b"vchordrq");
-const VERSION: u64 = 3;
+const VERSION: u64 = 4;
 
 pub trait Tuple: 'static {
     fn serialize(&self) -> Vec<u8>;
@@ -127,9 +127,9 @@ impl MetaTupleReader<'_> {
 #[repr(C, align(8))]
 #[derive(Debug, Clone, PartialEq, FromBytes, IntoBytes, Immutable, KnownLayout)]
 struct FreepageTupleHeader {
-    a: [u32; 1],
-    b: [u32; 32],
-    c: [u32; 32 * 32],
+    level_0: [u32; 1 << 10],
+    level_1: [u32; 1 << 5],
+    level_2: [u32; 1 << 0],
     _padding_0: [ZeroU8; 4],
 }
 
@@ -141,9 +141,9 @@ pub struct FreepageTuple {}
 impl Tuple for FreepageTuple {
     fn serialize(&self) -> Vec<u8> {
         FreepageTupleHeader {
-            a: std::array::from_fn(|_| 0),
-            b: std::array::from_fn(|_| 0),
-            c: std::array::from_fn(|_| 0),
+            level_0: [0; _],
+            level_1: [0; _],
+            level_2: [0; _],
             _padding_0: Default::default(),
         }
         .as_bytes()
@@ -167,28 +167,37 @@ pub struct FreepageTupleWriter<'a> {
 
 impl FreepageTupleWriter<'_> {
     pub fn mark(&mut self, i: usize) {
-        let c_i = i;
-        self.header.c[c_i / 32] |= 1 << (c_i % 32);
-        let b_i = i / 32;
-        self.header.b[b_i / 32] |= 1 << (b_i % 32);
-        let a_i = i / 32 / 32;
-        self.header.a[a_i / 32] |= 1 << (a_i % 32);
+        assert!(i < 32768, "out of bound: {i}");
+        set(&mut self.header.level_0[i >> 5], (i >> 0) % 32, true);
+        set(&mut self.header.level_1[i >> 10], (i >> 5) % 32, true);
+        set(&mut self.header.level_2[i >> 15], (i >> 10) % 32, true);
     }
-    pub fn fetch(&mut self) -> Option<usize> {
-        if self.header.a[0].trailing_ones() == 32 {
+    #[allow(clippy::just_underscores_and_digits)]
+    fn find(&self) -> Option<usize> {
+        let _3 = 0_usize;
+        let _2 = self.header.level_2[_3 << 0].trailing_zeros() as usize;
+        if _2 == 32 {
             return None;
         }
-        let a_i = self.header.a[0].trailing_zeros() as usize;
-        let b_i = self.header.b[a_i].trailing_zeros() as usize + a_i * 32;
-        let c_i = self.header.c[b_i].trailing_zeros() as usize + b_i * 32;
-        self.header.c[c_i / 32] &= !(1 << (c_i % 32));
-        if self.header.c[b_i] == 0 {
-            self.header.b[b_i / 32] &= !(1 << (b_i % 32));
-            if self.header.b[a_i] == 0 {
-                self.header.a[a_i / 32] &= !(1 << (a_i % 32));
-            }
+        let _1 = self.header.level_1[_3 << 5 | _2 << 0].trailing_zeros() as usize;
+        if _1 == 32 {
+            panic!("data corruption");
         }
-        Some(c_i)
+        let _0 = self.header.level_0[_3 << 10 | _2 << 5 | _1 << 0].trailing_zeros() as usize;
+        if _0 == 32 {
+            panic!("data corruption");
+        }
+        Some(_3 << 15 | _2 << 10 | _1 << 5 | _0 << 0)
+    }
+    pub fn fetch(&mut self) -> Option<usize> {
+        let i = self.find()?;
+        let x = false;
+        set(&mut self.header.level_0[i >> 5], (i >> 0) % 32, x);
+        let x = self.header.level_0[i >> 5] != 0;
+        set(&mut self.header.level_1[i >> 10], (i >> 5) % 32, x);
+        let x = self.header.level_1[i >> 10] != 0;
+        set(&mut self.header.level_2[i >> 15], (i >> 10) % 32, x);
+        Some(i)
     }
 }
 
@@ -1112,6 +1121,16 @@ impl<'a> MutChecker<'a> {
             std::slice::from_raw_parts_mut((self.bytes as *mut u8).add(start), end - start)
         };
         FromBytes::mut_from_bytes(bytes).expect("bad bytes")
+    }
+}
+
+#[inline(always)]
+fn set(a: &mut u32, i: usize, x: bool) {
+    assert!(i < 32, "out of bound: {i}");
+    if x {
+        *a |= 1 << i;
+    } else {
+        *a &= !(1 << i);
     }
 }
 

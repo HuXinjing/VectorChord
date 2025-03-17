@@ -2,27 +2,26 @@ use crate::tuples::*;
 use crate::*;
 use std::cmp::Reverse;
 
-pub fn mark(index: impl RelationWrite, freepage_first: u32, pages: &[u32]) {
-    let mut pages = pages.to_vec();
-    pages.sort_by_key(|x| Reverse(*x));
-    pages.dedup();
+pub fn mark(index: impl RelationWrite, freepage_first: u32, values: &[u32]) {
+    let mut values = {
+        let mut values = values.to_vec();
+        values.sort_by_key(|x| Reverse(*x));
+        values.dedup();
+        values
+    };
     let (mut current, mut offset) = (freepage_first, 0_u32);
-    while !pages.is_empty() {
-        let locals = {
-            let mut local = Vec::new();
-            while let Some(target) = pages.pop_if(|x| (offset..offset + 32768).contains(x)) {
-                local.push(target - offset);
-            }
-            local
-        };
+    loop {
         let mut freespace_guard = index.write(current, false);
         if freespace_guard.len() == 0 {
             freespace_guard.alloc(&FreepageTuple::serialize(&FreepageTuple {}));
         }
         let freespace_bytes = freespace_guard.get_mut(1).expect("data corruption");
         let mut freespace_tuple = FreepageTuple::deserialize_mut(freespace_bytes);
-        for local in locals {
-            freespace_tuple.mark(local as _);
+        while let Some(target) = values.pop_if(|&mut x| x < offset + 32768) {
+            freespace_tuple.mark((target - offset) as usize);
+        }
+        if values.is_empty() {
+            return;
         }
         if freespace_guard.get_opaque().next == u32::MAX {
             let extend = index.extend(false);
@@ -37,12 +36,12 @@ pub fn fetch(index: impl RelationWrite, freepage_first: u32) -> Option<u32> {
     loop {
         let mut freespace_guard = index.write(current, false);
         if freespace_guard.len() == 0 {
-            return None;
+            freespace_guard.alloc(&FreepageTuple::serialize(&FreepageTuple {}));
         }
         let freespace_bytes = freespace_guard.get_mut(1).expect("data corruption");
         let mut freespace_tuple = FreepageTuple::deserialize_mut(freespace_bytes);
-        if let Some(local) = freespace_tuple.fetch() {
-            return Some(local as u32 + offset);
+        if let Some(x) = freespace_tuple.fetch() {
+            return Some(x as u32 + offset);
         }
         if freespace_guard.get_opaque().next == u32::MAX {
             return None;

@@ -48,7 +48,7 @@ pub fn maintain<O: Operator>(index: impl RelationWrite, check: impl Fn()) {
         let jump_bytes = jump_guard.get_mut(1).expect("data corruption");
         let mut jump_tuple = JumpTuple::deserialize_mut(jump_bytes);
 
-        let mut tape = FrozenTapeWriter::<_, _>::create(|| {
+        let expand = || {
             if let Some(id) = freepages::fetch(index.clone(), freepage_first) {
                 let mut write = index.write(id, false);
                 write.clear();
@@ -56,7 +56,9 @@ pub fn maintain<O: Operator>(index: impl RelationWrite, check: impl Fn()) {
             } else {
                 index.extend(false)
             }
-        });
+        };
+
+        let mut tape = FrozenTapeWriter::<_, _>::create(expand);
 
         let mut trace = Vec::new();
 
@@ -113,7 +115,7 @@ pub fn maintain<O: Operator>(index: impl RelationWrite, check: impl Fn()) {
 
         let (frozen_tape, branches) = tape.into_inner();
 
-        let mut appendable_tape = TapeWriter::create(|| index.extend(false));
+        let mut appendable_tape = TapeWriter::create(expand);
 
         for branch in branches {
             appendable_tape.push(AppendableTuple {
