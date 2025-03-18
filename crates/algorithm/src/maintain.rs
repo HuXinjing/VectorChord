@@ -62,6 +62,7 @@ pub fn maintain<O: Operator>(index: impl RelationWrite, check: impl Fn()) {
 
         let mut trace = Vec::new();
 
+        let mut tuples = 0_u64;
         let mut callback = |code: (f32, f32, f32, f32, Vec<_>), mean, payload| {
             tape.push(Branch {
                 mean,
@@ -72,6 +73,7 @@ pub fn maintain<O: Operator>(index: impl RelationWrite, check: impl Fn()) {
                 signs: code.4,
                 extra: payload,
             });
+            tuples += 1;
         };
         let mut step = |id| {
             check();
@@ -131,6 +133,7 @@ pub fn maintain<O: Operator>(index: impl RelationWrite, check: impl Fn()) {
 
         *jump_tuple.frozen_first() = { frozen_tape }.first();
         *jump_tuple.appendable_first() = { appendable_tape }.first();
+        *jump_tuple.tuples() = tuples;
 
         drop(jump_guard);
 

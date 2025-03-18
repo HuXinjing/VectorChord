@@ -1,6 +1,6 @@
 pub mod am_build;
 
-use crate::index::gucs::{epsilon, max_scan_tuples, probes};
+use crate::index::gucs::{epsilon, max_maxsim_tuples, max_scan_tuples, maxsim_threshold, probes};
 use crate::index::opclass::opfamily;
 use crate::index::scanners::*;
 use crate::index::storage::PostgresRelation;
@@ -292,6 +292,8 @@ pub unsafe extern "C" fn amrescan(
             epsilon: epsilon(),
             probes: probes(),
             max_scan_tuples: max_scan_tuples(),
+            max_maxsim_tuples: max_maxsim_tuples(),
+            maxsim_threshold: maxsim_threshold(),
         };
         let scanner = &mut *(*scan).opaque.cast::<Scanner>();
         let fetcher = {
@@ -313,6 +315,22 @@ pub unsafe extern "C" fn amrescan(
             | Opfamily::HalfvecIp
             | Opfamily::HalfvecCosine => {
                 let mut builder = DefaultBuilder::new(opfamily);
+                for i in 0..(*scan).numberOfOrderBys {
+                    let data = (*scan).orderByData.add(i as usize);
+                    let value = (*data).sk_argument;
+                    let is_null = ((*data).sk_flags & pgrx::pg_sys::SK_ISNULL as i32) != 0;
+                    builder.add((*data).sk_strategy, (!is_null).then_some(value));
+                }
+                for i in 0..(*scan).numberOfKeys {
+                    let data = (*scan).keyData.add(i as usize);
+                    let value = (*data).sk_argument;
+                    let is_null = ((*data).sk_flags & pgrx::pg_sys::SK_ISNULL as i32) != 0;
+                    builder.add((*data).sk_strategy, (!is_null).then_some(value));
+                }
+                LazyCell::new(Box::new(move || builder.build(relation, options, fetcher)))
+            }
+            Opfamily::VectorMaxsimIp | Opfamily::HalfvecMaxsimIp => {
+                let mut builder = MaxsimBuilder::new(opfamily);
                 for i in 0..(*scan).numberOfOrderBys {
                     let data = (*scan).orderByData.add(i as usize);
                     let value = (*data).sk_argument;

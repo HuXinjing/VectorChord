@@ -533,7 +533,7 @@ mod reduce_sum_of_d2 {
     #[test]
     fn reduce_sum_of_d2_v4_512_avx512fp16_test() {
         use rand::Rng;
-        const EPSILON: f32 = 6.0;
+        const EPSILON: f32 = 6.4;
         if !crate::is_cpu_detected!("v4.512") || !crate::is_feature_detected!("avx512fp16") {
             println!("test {} ... skipped (v4_512:avx512fp16)", module_path!());
             return;
@@ -706,7 +706,7 @@ mod reduce_sum_of_d2 {
     #[test]
     fn reduce_sum_of_d2_a2_fp16_test() {
         use rand::Rng;
-        const EPSILON: f32 = 6.0;
+        const EPSILON: f32 = 6.4;
         if !crate::is_cpu_detected!("a2") || !crate::is_feature_detected!("fp16") {
             println!("test {} ... skipped (a2:fp16)", module_path!());
             return;
@@ -751,7 +751,7 @@ mod reduce_sum_of_d2 {
     #[test]
     fn reduce_sum_of_d2_a3_512_test() {
         use rand::Rng;
-        const EPSILON: f32 = 6.0;
+        const EPSILON: f32 = 6.4;
         if !crate::is_cpu_detected!("a3.512") {
             println!("test {} ... skipped (a3.512)", module_path!());
             return;

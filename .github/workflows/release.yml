@@ -40,8 +40,8 @@ jobs:
     strategy:
       matrix:
         version: ["13", "14", "15", "16", "17"]
-        runner: ["ubuntu-22.04", "ubuntu-22.04-arm"]
-    runs-on: ${{ matrix.runner }}
+        arch: ["x86_64", "aarch64"]
+    runs-on: ${{ matrix.arch == 'x86_64' && 'ubuntu-22.04' || 'ubuntu-22.04-arm' }}
 
     env:
       CARGO_TERM_COLOR: always
@@ -75,9 +75,8 @@ jobs:
         env:
           SEMVER: ${{ needs.semver.outputs.SEMVER }}
           VERSION: ${{ matrix.version }}
-          ARCH: ${{ matrix.runner == 'ubuntu-22.04' && 'x86_64' || 'aarch64' }}
-          PLATFORM: ${{ matrix.runner == 'ubuntu-22.04' && 'amd64' || 'arm64' }}
-          GH_TOKEN: ${{ github.token }}
+          ARCH: ${{ matrix.arch }}
+          PLATFORM: ${{ matrix.arch == 'x86_64' && 'amd64' || 'arm64' }}
         run: |
           cargo build --lib --features pg$VERSION --release
 
@@ -116,6 +115,10 @@ jobs:
 
           ls ./build
 
+      - name: Upload Artifacts
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
           gh release upload --clobber $SEMVER ./build/postgresql-${VERSION}-vchord_${SEMVER}-1_${PLATFORM}.deb
           gh release upload --clobber $SEMVER ./build/postgresql-${VERSION}-vchord_${SEMVER}_${ARCH}-linux-gnu.zip
 

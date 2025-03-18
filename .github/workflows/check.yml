@@ -47,7 +47,7 @@ env:
 
 jobs:
   style:
-    runs-on: "ubuntu-24.04"
+    runs-on: "ubuntu-latest"
 
     steps:
       - name: Set up Environment
@@ -76,8 +76,8 @@ jobs:
   lint:
     strategy:
       matrix:
-        runner: ["ubuntu-24.04", "ubicloud-standard-8-arm-ubuntu-2404"]
-    runs-on: ${{ matrix.runner }}
+        arch: ["x86_64", "aarch64"]
+    runs-on: ${{ matrix.arch == 'x86_64' && 'ubuntu-24.04' || 'ubuntu-24.04-arm' }}
 
     steps:
       - name: Set up Environment
@@ -125,8 +125,8 @@ jobs:
     strategy:
       matrix:
         version: ["13", "14", "15", "16", "17"]
-        runner: ["ubuntu-24.04", "ubicloud-standard-8-arm-ubuntu-2404"]
-    runs-on: ${{ matrix.runner }}
+        arch: ["x86_64", "aarch64"]
+    runs-on: ${{ matrix.arch == 'x86_64' && 'ubuntu-22.04' || 'ubuntu-22.04-arm' }}
 
     steps:
       - name: Set up Environment
@@ -136,6 +136,7 @@ jobs:
           sudo apt-get remove -y '^postgres.*' '^libpq.*'
           sudo apt-get purge -y '^postgres.*' '^libpq.*'
 
+          curl --proto '=https' --tlsv1.2 -sSf https://apt.llvm.org/llvm.sh | sudo bash -s -- 18
           sudo update-alternatives --install /usr/bin/clang clang $(which clang-18) 255
 
           sudo apt-get install -y postgresql-common
@@ -173,3 +174,57 @@ jobs:
           sudo systemctl start postgresql
           psql -c 'CREATE EXTENSION IF NOT EXISTS vchord CASCADE;'
           sqllogictest --db $USER --user $USER './tests/**/*.slt'
+
+      - name: Package
+        env:
+          SEMVER: "0.0.0"
+          VERSION: ${{ matrix.version }}
+          ARCH: ${{ matrix.arch }}
+          PLATFORM: ${{ matrix.arch == 'x86_64' && 'amd64' || 'arm64' }}
+        run: |
+          cat $(pg_config --sharedir)/extension/vchord--0.0.0.sql | expand -t 4 > ./sql/install/vchord--$SEMVER.sql
+
+          mkdir -p ./build/zip
+          cp -a ./sql/upgrade/. ./build/zip/
+          cp ./sql/install/vchord--$SEMVER.sql ./build/zip/vchord--$SEMVER.sql
+          sed -e "s/@CARGO_VERSION@/$SEMVER/g" < ./vchord.control > ./build/zip/vchord.control
+          cp ./target/release/libvchord.so ./build/zip/vchord.so
+          zip ./build/postgresql-${VERSION}-vchord_${SEMVER}_${ARCH}-linux-gnu.zip -j ./build/zip/*
+
+          mkdir -p ./build/deb
+          mkdir -p ./build/deb/DEBIAN
+          mkdir -p ./build/deb/usr/share/postgresql/$VERSION/extension/
+          mkdir -p ./build/deb/usr/lib/postgresql/$VERSION/lib/
+          for file in $(ls ./build/zip/*.sql | xargs -n 1 basename); do
+              cp ./build/zip/$file ./build/deb/usr/share/postgresql/$VERSION/extension/$file
+          done
+          for file in $(ls ./build/zip/*.control | xargs -n 1 basename); do
+              cp ./build/zip/$file ./build/deb/usr/share/postgresql/$VERSION/extension/$file
+          done
+          for file in $(ls ./build/zip/*.so | xargs -n 1 basename); do
+              cp ./build/zip/$file ./build/deb/usr/lib/postgresql/$VERSION/lib/$file
+          done
+          echo "Package: postgresql-${VERSION}-vchord
+          Version: ${SEMVER}-1
+          Section: database
+          Priority: optional
+          Architecture: ${PLATFORM}
+          Maintainer: Tensorchord <support@tensorchord.ai>
+          Description: Vector database plugin for Postgres, written in Rust, specifically designed for LLM
+          Homepage: https://vectorchord.ai/
+          License: AGPL-3 or Elastic-2" \
+          > ./build/deb/DEBIAN/control
+          (cd ./build/deb && md5sum usr/share/postgresql/$VERSION/extension/* usr/lib/postgresql/$VERSION/lib/*) > ./build/deb/DEBIAN/md5sums
+          dpkg-deb --root-owner-group -Zxz --build ./build/deb/ ./build/postgresql-${VERSION}-vchord_${SEMVER}-1_${PLATFORM}.deb
+
+          ls ./build
+
+      - name: Upload Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: artifacts-psql-${{ matrix.version }}-${{ matrix.arch }}
+          path: |
+            ./build/postgresql-${{ matrix.version }}-vchord_0.0.0_${{ matrix.arch }}-linux-gnu.zip
+            ./build/postgresql-${{ matrix.version }}-vchord_0.0.0-1_${{ matrix.arch == 'x86_64' && 'amd64' || 'arm64' }}.deb
+          compression-level: 9
+          retention-days: 14
