@@ -1,44 +1,51 @@
-pub struct SelectHeap<T> {
-    threshold: usize,
-    inner: Vec<T>,
+use std::collections::BinaryHeap;
+use std::num::NonZero;
+
+pub enum SelectHeap<T> {
+    Sorted { x: Vec<T>, t: NonZero<usize> },
+    Heap { x: BinaryHeap<T> },
 }
 
 impl<T: Ord> SelectHeap<T> {
     pub fn from_vec(mut vec: Vec<T>) -> Self {
         let n = vec.len();
-        if n != 0 {
-            let threshold = n.saturating_sub(n.div_ceil(384));
-            turboselect::select_nth_unstable(&mut vec, threshold);
-            vec[threshold..].sort_unstable();
-            Self {
-                threshold,
-                inner: vec,
-            }
+        if let Some(t) = NonZero::new(n / 384) {
+            let index = n - t.get();
+            turboselect::select_nth_unstable(&mut vec, index);
+            vec[index..].sort_unstable();
+            Self::Sorted { x: vec, t }
         } else {
-            Self {
-                threshold: 0,
-                inner: Vec::new(),
+            Self::Heap {
+                x: BinaryHeap::from(vec),
             }
         }
     }
     pub fn is_empty(&self) -> bool {
-        self.inner.is_empty()
+        match self {
+            SelectHeap::Sorted { x, .. } => x.is_empty(),
+            SelectHeap::Heap { x } => x.is_empty(),
+        }
     }
     pub fn pop(&mut self) -> Option<T> {
-        if self.inner.len() <= self.threshold {
-            heapify::pop_heap(&mut self.inner);
+        match self {
+            SelectHeap::Sorted { x: inner, t } => {
+                let x = inner.pop().expect("inconsistent internal structure");
+                if let Some(value) = NonZero::new(t.get() - 1) {
+                    *t = value;
+                } else {
+                    *self = SelectHeap::Heap {
+                        x: std::mem::take(inner).into(),
+                    };
+                }
+                Some(x)
+            }
+            SelectHeap::Heap { x } => x.pop(),
         }
-        let t = self.inner.pop();
-        if self.inner.len() == self.threshold {
-            heapify::make_heap(&mut self.inner);
-        }
-        t
     }
     pub fn peek(&self) -> Option<&T> {
-        if self.inner.len() <= self.threshold {
-            self.inner.first()
-        } else {
-            self.inner.last()
+        match self {
+            SelectHeap::Sorted { x, .. } => x.last(),
+            SelectHeap::Heap { x } => x.peek(),
         }
     }
 }
@@ -60,4 +67,11 @@ fn test_select_heap() {
         };
         assert_eq!(answer, result);
     }
+}
+
+#[test]
+fn test_issue_209() {
+    let mut heap = SelectHeap::from_vec(vec![0]);
+    assert_eq!(heap.pop(), Some(0));
+    assert_eq!(heap.pop(), None);
 }

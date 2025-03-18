@@ -13,7 +13,6 @@ simd = { path = "../simd" }
 vector = { path = "../vector" }
 
 half.workspace = true
-heapify = "0.2.0"
 paste.workspace = true
 rand.workspace = true
 serde.workspace = true
