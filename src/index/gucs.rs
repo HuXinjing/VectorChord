@@ -8,6 +8,7 @@ static PREWARM_DIM: GucSetting<Option<&CStr>> =
     GucSetting::<Option<&CStr>>::new(Some(c"64,128,256,384,512,768,1024,1536"));
 static MAX_MAXSIM_TUPLES: GucSetting<i32> = GucSetting::<i32>::new(-1);
 static MAXSIM_THRESHOLD: GucSetting<i32> = GucSetting::<i32>::new(0);
+static PRERERANK_FILTERING: GucSetting<bool> = GucSetting::<bool>::new(false);
 
 pub fn init() {
     GucRegistry::define_string_guc(
@@ -63,6 +64,14 @@ pub fn init() {
         &MAXSIM_THRESHOLD,
         0,
         i32::MAX,
+        GucContext::Userset,
+        GucFlags::default(),
+    );
+    GucRegistry::define_bool_guc(
+        "vchordrq.prererank_filtering",
+        "`prererank_filtering` argument of vchordrq.",
+        "`prererank_filtering` argument of vchordrq.",
+        &PRERERANK_FILTERING,
         GucContext::Userset,
         GucFlags::default(),
     );
@@ -140,4 +149,8 @@ pub fn prewarm_dim() -> Vec<u32> {
     } else {
         Vec::new()
     }
+}
+
+pub fn prererank_filtering() -> bool {
+    PRERERANK_FILTERING.get()
 }

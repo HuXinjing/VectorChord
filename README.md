@@ -110,8 +110,7 @@ Now you can play with VectorChord!
   - [Indexing Prewarm](#indexing-prewarm)
   - [Indexing Progress](#indexing-progress)
   - [External Index Precomputation](#external-index-precomputation)
-  <!--TODO: Here we have a memory leak in rerank_in_table, show it until the feature is ready
-  - [Capacity-optimized Index](#capacity-optimized-index) -->
+  - [Capacity-optimized Index](#capacity-optimized-index)
   - [Range Query](#range-query)
 
 ## Installation
@@ -377,8 +376,6 @@ $$);
 
 To simplify the workflow, we provide end-to-end scripts for external index pre-computation, see [scripts](./scripts/README.md#run-external-index-precomputation-toolkit).
 
-<!-- TODO: Here we have a memory leak in rerank_in_table, show it until the feature is ready
-
 ### Capacity-optimized Index
 
 The default behavior of Vectorchord is `performance-optimized`, 
@@ -394,14 +391,12 @@ CREATE INDEX ON items USING vchordrq (embedding vector_l2_ops) WITH (options = $
 residual_quantization = true
 rerank_in_table = true
 [build.internal]
-...
+lists = []
 $$);
 ```
 
 > [!CAUTION]
 > Compared to the `performance-optimized` index, the `capacity-optimized` index will have a **30-50%** increase in latency and QPS loss at query.
-
--->
 
 ### Range Query
 

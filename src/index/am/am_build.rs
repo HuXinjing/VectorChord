@@ -10,61 +10,131 @@ use pgrx::pg_sys::{Datum, ItemPointerData};
 use rand::Rng;
 use simd::Floating;
 use std::ffi::CStr;
-use std::num::NonZero;
 use std::ops::Deref;
 use vector::VectorOwned;
 use vector::vect::VectOwned;
 
 #[derive(Debug, Clone, Copy)]
-#[repr(i64)]
-pub enum BuildPhase {
-    Initializing = 1,
-    InternalBuild = 2,
-    ExternalBuild = 3,
-    Build = 4,
-    Inserting = 5,
-    Compacting = 6,
+#[repr(u16)]
+pub enum BuildPhaseCode {
+    Initializing = 0,
+    InternalBuild = 1,
+    ExternalBuild = 2,
+    Build = 3,
+    Inserting = 4,
+    Compacting = 5,
 }
 
-impl TryFrom<NonZero<i64>> for BuildPhase {
-    type Error = ();
-
-    fn try_from(value: NonZero<i64>) -> Result<Self, Self::Error> {
-        const INITIALIZING: NonZero<i64> = NonZero::new(BuildPhase::Initializing as _).unwrap();
-        const INTERNAL_BUILD: NonZero<i64> = NonZero::new(BuildPhase::InternalBuild as _).unwrap();
-        const EXTERNAL_BUILD: NonZero<i64> = NonZero::new(BuildPhase::ExternalBuild as _).unwrap();
-        const BUILD: NonZero<i64> = NonZero::new(BuildPhase::Build as _).unwrap();
-        const INSERTING: NonZero<i64> = NonZero::new(BuildPhase::Inserting as _).unwrap();
-        const COMPACTING: NonZero<i64> = NonZero::new(BuildPhase::Compacting as _).unwrap();
-        match value {
-            INITIALIZING => Ok(BuildPhase::Initializing),
-            INTERNAL_BUILD => Ok(BuildPhase::InternalBuild),
-            EXTERNAL_BUILD => Ok(BuildPhase::ExternalBuild),
-            BUILD => Ok(BuildPhase::Build),
-            INSERTING => Ok(BuildPhase::Inserting),
-            COMPACTING => Ok(BuildPhase::Compacting),
-            _ => Err(()),
-        }
-    }
-}
+pub struct BuildPhase(BuildPhaseCode, u16);
 
 impl BuildPhase {
-    fn name(self) -> &'static CStr {
-        match self {
-            Self::Initializing => c"initializing",
-            Self::InternalBuild => c"initializing index, by internal build",
-            Self::ExternalBuild => c"initializing index, by external build",
-            Self::Build => c"initializing index",
-            Self::Inserting => c"inserting tuples from table to index",
-            Self::Compacting => c"compacting tuples in index",
+    pub const fn new(code: BuildPhaseCode, k: u16) -> Option<Self> {
+        match (code, k) {
+            (BuildPhaseCode::Initializing, 0) => Some(BuildPhase(code, k)),
+            (BuildPhaseCode::InternalBuild, 0..102) => Some(BuildPhase(code, k)),
+            (BuildPhaseCode::ExternalBuild, 0) => Some(BuildPhase(code, k)),
+            (BuildPhaseCode::Build, 0) => Some(BuildPhase(code, k)),
+            (BuildPhaseCode::Inserting, 0) => Some(BuildPhase(code, k)),
+            (BuildPhaseCode::Compacting, 0) => Some(BuildPhase(code, k)),
+            _ => None,
         }
+    }
+    pub const fn name(self) -> &'static CStr {
+        match self {
+            BuildPhase(BuildPhaseCode::Initializing, k) => {
+                static RAW: [&CStr; 1] = [c"initializing"];
+                RAW[k as usize]
+            }
+            BuildPhase(BuildPhaseCode::InternalBuild, k) => {
+                static RAWS: [&[&CStr]; 2] = [
+                    &[c"initializing index, by internal build"],
+                    seq_macro::seq!(
+                        N in 0..=100 {
+                            &[#(
+                                const {
+                                    let bytes = concat!("initializing index, by internal build (", N, " %)\0").as_bytes();
+                                    if let Ok(cstr) = CStr::from_bytes_with_nul(bytes) {
+                                        cstr
+                                    } else {
+                                        panic!("")
+                                    }
+                                },
+                            )*]
+                        }
+                    ),
+                ];
+                static RAW: [&CStr; 102] = {
+                    let mut result = [c""; 102];
+                    let mut offset = 0_usize;
+                    let mut i = 0_usize;
+                    while i < RAWS.len() {
+                        let mut j = 0_usize;
+                        while j < RAWS[i].len() {
+                            {
+                                result[offset] = RAWS[i][j];
+                                offset += 1;
+                            }
+                            j += 1;
+                        }
+                        i += 1;
+                    }
+                    assert!(offset == result.len());
+                    result
+                };
+                RAW[k as usize]
+            }
+            BuildPhase(BuildPhaseCode::ExternalBuild, k) => {
+                static RAW: [&CStr; 1] = [c"initializing index, by external build"];
+                RAW[k as usize]
+            }
+            BuildPhase(BuildPhaseCode::Build, k) => {
+                static RAW: [&CStr; 1] = [c"initializing index"];
+                RAW[k as usize]
+            }
+            BuildPhase(BuildPhaseCode::Inserting, k) => {
+                static RAW: [&CStr; 1] = [c"inserting tuples from table to index"];
+                RAW[k as usize]
+            }
+            BuildPhase(BuildPhaseCode::Compacting, k) => {
+                static RAW: [&CStr; 1] = [c"compacting tuples in index"];
+                RAW[k as usize]
+            }
+        }
+    }
+    pub const fn from_code(code: BuildPhaseCode) -> Self {
+        Self(code, 0)
+    }
+    pub const fn from_value(value: u32) -> Option<Self> {
+        const INITIALIZING: u16 = BuildPhaseCode::Initializing as _;
+        const INTERNAL_BUILD: u16 = BuildPhaseCode::InternalBuild as _;
+        const EXTERNAL_BUILD: u16 = BuildPhaseCode::ExternalBuild as _;
+        const BUILD: u16 = BuildPhaseCode::Build as _;
+        const INSERTING: u16 = BuildPhaseCode::Inserting as _;
+        const COMPACTING: u16 = BuildPhaseCode::Compacting as _;
+        let k = value as u16;
+        match (value >> 16) as u16 {
+            INITIALIZING => Self::new(BuildPhaseCode::Initializing, k),
+            INTERNAL_BUILD => Self::new(BuildPhaseCode::InternalBuild, k),
+            EXTERNAL_BUILD => Self::new(BuildPhaseCode::ExternalBuild, k),
+            BUILD => Self::new(BuildPhaseCode::Build, k),
+            INSERTING => Self::new(BuildPhaseCode::Inserting, k),
+            COMPACTING => Self::new(BuildPhaseCode::Compacting, k),
+            _ => None,
+        }
+    }
+    pub const fn into_value(self) -> u32 {
+        (self.0 as u32) << 16 | (self.1 as u32)
     }
 }
 
 #[pgrx::pg_guard]
 pub extern "C" fn ambuildphasename(x: i64) -> *mut core::ffi::c_char {
-    if let Some(x) = NonZero::new(x).and_then(|x| BuildPhase::try_from(x).ok()) {
-        x.name().as_ptr().cast_mut()
+    if let Ok(x) = u32::try_from(x.wrapping_sub(1)) {
+        if let Some(x) = BuildPhase::from_value(x) {
+            x.name().as_ptr().cast_mut()
+        } else {
+            std::ptr::null_mut()
+        }
     } else {
         std::ptr::null_mut()
     }
@@ -139,7 +209,7 @@ impl PostgresReporter {
         unsafe {
             pgrx::pg_sys::pgstat_progress_update_param(
                 pgrx::pg_sys::PROGRESS_CREATEIDX_SUBPHASE as _,
-                phase as _,
+                (phase.into_value() as i64) + 1,
             );
         }
     }
@@ -192,13 +262,13 @@ pub unsafe extern "C" fn ambuild(
     let mut reporter = PostgresReporter {};
     let structures = match vchordrq_options.build.source.clone() {
         VchordrqBuildSourceOptions::External(external_build) => {
-            reporter.phase(BuildPhase::ExternalBuild);
+            reporter.phase(BuildPhase::from_code(BuildPhaseCode::ExternalBuild));
             let reltuples = unsafe { (*(*index_relation).rd_rel).reltuples };
             reporter.tuples_total(reltuples as u64);
             make_external_build(vector_options.clone(), opfamily, external_build.clone())
         }
         VchordrqBuildSourceOptions::Internal(internal_build) => {
-            reporter.phase(BuildPhase::InternalBuild);
+            reporter.phase(BuildPhase::from_code(BuildPhaseCode::InternalBuild));
             let mut tuples_total = 0_u64;
             let samples = 'a: {
                 let mut rand = rand::rng();
@@ -235,17 +305,22 @@ pub unsafe extern "C" fn ambuild(
                 samples
             };
             reporter.tuples_total(tuples_total);
-            make_internal_build(vector_options.clone(), internal_build.clone(), samples)
+            make_internal_build(
+                vector_options.clone(),
+                internal_build.clone(),
+                samples,
+                &mut reporter,
+            )
         }
     };
-    reporter.phase(BuildPhase::Build);
+    reporter.phase(BuildPhase::from_code(BuildPhaseCode::Build));
     crate::index::algorithm::build(
         vector_options,
         vchordrq_options.index,
         index.clone(),
         structures,
     );
-    reporter.phase(BuildPhase::Inserting);
+    reporter.phase(BuildPhase::from_code(BuildPhaseCode::Inserting));
     let cache = if vchordrq_options.build.pin {
         let mut trace = algorithm::cache(index.clone());
         trace.sort();
@@ -319,7 +394,7 @@ pub unsafe extern "C" fn ambuild(
     let check = || {
         pgrx::check_for_interrupts!();
     };
-    reporter.phase(BuildPhase::Compacting);
+    reporter.phase(BuildPhase::from_code(BuildPhaseCode::Compacting));
     crate::index::algorithm::maintain(opfamily, index, check);
     unsafe { pgrx::pgbox::PgBox::<pgrx::pg_sys::IndexBuildResult>::alloc0().into_pg() }
 }
@@ -882,10 +957,11 @@ unsafe fn options(
     (vector, rabitq)
 }
 
-pub fn make_internal_build(
+fn make_internal_build(
     vector_options: VectorOptions,
     internal_build: VchordrqInternalBuildOptions,
     mut samples: Vec<Vec<f32>>,
+    reporter: &mut PostgresReporter,
 ) -> Vec<Structure<Vec<f32>>> {
     use std::iter::once;
     k_means::preprocess(internal_build.build_threads as _, &mut samples, |sample| {
@@ -903,6 +979,13 @@ pub fn make_internal_build(
         let num_dims = vector_options.dims as usize;
         let num_lists = w as usize;
         let num_iterations = internal_build.kmeans_iterations as _;
+        if result.is_empty() {
+            let percentage = 0;
+            let default = BuildPhase::from_code(BuildPhaseCode::InternalBuild);
+            let phase =
+                BuildPhase::new(BuildPhaseCode::InternalBuild, 1 + percentage).unwrap_or(default);
+            reporter.phase(phase);
+        }
         if num_lists > 1 {
             pgrx::info!(
                 "clustering: starting, using {num_threads} threads, clustering {num_points} vectors of {num_dims} dimension into {num_lists} clusters, in {num_iterations} iterations"
@@ -912,6 +995,14 @@ pub fn make_internal_build(
             num_threads,
             |i| {
                 pgrx::check_for_interrupts!();
+                if result.is_empty() {
+                    let percentage =
+                        ((i as f64 / num_iterations as f64) * 100.0).clamp(0.0, 100.0) as u16;
+                    let default = BuildPhase::from_code(BuildPhaseCode::InternalBuild);
+                    let phase = BuildPhase::new(BuildPhaseCode::InternalBuild, 1 + percentage)
+                        .unwrap_or(default);
+                    reporter.phase(phase);
+                }
                 if num_lists > 1 {
                     pgrx::info!("clustering: iteration {}", i + 1);
                 }
@@ -922,6 +1013,13 @@ pub fn make_internal_build(
             internal_build.spherical_centroids,
             num_iterations,
         );
+        if result.is_empty() {
+            let percentage = 100;
+            let default = BuildPhase::from_code(BuildPhaseCode::InternalBuild);
+            let phase =
+                BuildPhase::new(BuildPhaseCode::InternalBuild, 1 + percentage).unwrap_or(default);
+            reporter.phase(phase);
+        }
         if num_lists > 1 {
             pgrx::info!("clustering: finished");
         }
@@ -944,7 +1042,7 @@ pub fn make_internal_build(
 }
 
 #[allow(clippy::collapsible_else_if)]
-pub fn make_external_build(
+fn make_external_build(
     vector_options: VectorOptions,
     _opfamily: Opfamily,
     external_build: VchordrqExternalBuildOptions,

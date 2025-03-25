@@ -33,6 +33,7 @@ paste.workspace = true
 pgrx = { version = "=0.13.1", default-features = false, features = ["cshim"] }
 pgrx-catalog = "0.1.1"
 rand.workspace = true
+seq-macro = "0.3.6"
 serde.workspace = true
 toml = "0.8.20"
 validator.workspace = true

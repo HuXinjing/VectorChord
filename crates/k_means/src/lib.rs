@@ -21,7 +21,7 @@ pub fn preprocess<T: Send>(num_threads: usize, x: &mut [T], f: impl Fn(&mut T) +
 
 pub fn k_means(
     num_threads: usize,
-    check: impl Fn(usize),
+    mut check: impl FnMut(usize),
     c: usize,
     dims: usize,
     samples: &[Vec<f32>],

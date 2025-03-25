@@ -12,6 +12,8 @@ use std::num::NonZeroU64;
 use std::ptr::NonNull;
 use std::sync::OnceLock;
 
+use super::gucs::prererank_filtering;
+
 #[repr(C)]
 struct Reloption {
     vl_len_: i32,
@@ -307,7 +309,11 @@ pub unsafe extern "C" fn amrescan(
                     (*scan).indexRelation,
                     (*scan).heapRelation,
                     (*scan).xs_snapshot,
-                    hack,
+                    if let Some(hack) = hack {
+                        hack.as_ptr()
+                    } else {
+                        std::ptr::null_mut()
+                    },
                 )
             })
         };
@@ -404,7 +410,7 @@ struct HeapFetcher {
     slot: *mut pgrx::pg_sys::TupleTableSlot,
     values: [Datum; 32],
     is_nulls: [bool; 32],
-    hack: Option<NonNull<pgrx::pg_sys::IndexScanState>>,
+    hack: *mut pgrx::pg_sys::IndexScanState,
 }
 
 impl HeapFetcher {
@@ -412,7 +418,7 @@ impl HeapFetcher {
         index_relation: pgrx::pg_sys::Relation,
         heap_relation: pgrx::pg_sys::Relation,
         snapshot: pgrx::pg_sys::Snapshot,
-        hack: Option<NonNull<pgrx::pg_sys::IndexScanState>>,
+        hack: *mut pgrx::pg_sys::IndexScanState,
     ) -> Self {
         unsafe {
             let index_info = pgrx::pg_sys::BuildIndexInfo(index_relation);
@@ -447,7 +453,6 @@ impl Drop for HeapFetcher {
 impl SearchFetcher for HeapFetcher {
     fn fetch(&mut self, mut ctid: ItemPointerData) -> Option<(&[Datum; 32], &[bool; 32])> {
         unsafe {
-            // perform operation
             let table_am = (*self.heap_relation).rd_tableam;
             let fetch_row_version = (*table_am)
                 .tuple_fetch_row_version
@@ -455,20 +460,20 @@ impl SearchFetcher for HeapFetcher {
             if !fetch_row_version(self.heap_relation, &mut ctid, self.snapshot, self.slot) {
                 return None;
             }
-            if let Some(hack) = self.hack {
-                if let Some(qual) = NonNull::new(hack.as_ref().ss.ps.qual) {
+            if !self.hack.is_null() && prererank_filtering() {
+                if let Some(qual) = NonNull::new((*self.hack).ss.ps.qual) {
                     use pgrx::datum::FromDatum;
                     use pgrx::memcxt::PgMemoryContexts;
                     assert!(qual.as_ref().flags & pgrx::pg_sys::EEO_FLAG_IS_QUAL as u8 != 0);
                     let evalfunc = qual.as_ref().evalfunc.expect("no evalfunc for qual");
-                    if let Some(mut econtext) = NonNull::new(hack.as_ref().ss.ps.ps_ExprContext) {
-                        econtext.as_mut().ecxt_scantuple = self.slot;
-                        pgrx::pg_sys::MemoryContextReset(econtext.as_ref().ecxt_per_tuple_memory);
-                        let result = PgMemoryContexts::For(econtext.as_ref().ecxt_per_tuple_memory)
+                    if !(*self.hack).ss.ps.ps_ExprContext.is_null() {
+                        let econtext = (*self.hack).ss.ps.ps_ExprContext;
+                        (*econtext).ecxt_scantuple = self.slot;
+                        pgrx::pg_sys::MemoryContextReset((*econtext).ecxt_per_tuple_memory);
+                        let result = PgMemoryContexts::For((*econtext).ecxt_per_tuple_memory)
                             .switch_to(|_| {
                                 let mut is_null = true;
-                                let datum =
-                                    evalfunc(qual.as_ptr(), econtext.as_mut(), &mut is_null);
+                                let datum = evalfunc(qual.as_ptr(), econtext, &mut is_null);
                                 bool::from_datum(datum, is_null)
                             });
                         if result != Some(true) {
