@@ -95,7 +95,7 @@ jobs:
           fi
 
       - name: Set up Sccache
-        uses: mozilla-actions/sccache-action@v0.0.7
+        uses: mozilla-actions/sccache-action@v0.0.9
 
       - name: Checkout
         uses: actions/checkout@v4
@@ -158,7 +158,7 @@ jobs:
           curl -fsSL https://github.com/risinglightdb/sqllogictest-rs/releases/download/v0.26.4/sqllogictest-bin-v0.26.4-$(uname -m)-unknown-linux-musl.tar.gz | tar -xOzf - ./sqllogictest | install -m 755 /dev/stdin /usr/local/bin/sqllogictest
 
       - name: Set up Sccache
-        uses: mozilla-actions/sccache-action@v0.0.7
+        uses: mozilla-actions/sccache-action@v0.0.9
 
       - name: Checkout
         uses: actions/checkout@v4

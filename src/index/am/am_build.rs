@@ -1091,7 +1091,7 @@ fn make_external_build(
         }
     });
     if parents.len() >= 2 && parents.values().all(|x| x.is_none()) {
-        // if there are more than one vertexs and no edges,
+        // if there are more than one vertex and no edges,
         // assume there is an implicit root
         let n = parents.len();
         let mut result = Vec::new();
