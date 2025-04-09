@@ -125,7 +125,7 @@ pub fn default_search<O: Operator>(
         })
     };
     for i in (1..height_of_root).rev() {
-        state = step(state).take(probes[i as usize - 1] as usize).collect();
+        state = step(state).take(probes[i as usize - 1] as _).collect();
     }
 
     let mut results = LinkedVec::new();
@@ -142,7 +142,7 @@ pub fn default_search<O: Operator>(
         let jump_bytes = jump_guard.get(1).expect("data corruption");
         let jump_tuple = JumpTuple::deserialize_ref(jump_bytes);
         let mut callback = |(rough, err), mean, payload| {
-            let lowerbound = Distance::from_f32(rough - err * 1.9);
+            let lowerbound = Distance::from_f32(rough - err * epsilon);
             results.push((
                 Reverse(lowerbound),
                 AlwaysEqual(()),
@@ -173,7 +173,7 @@ pub fn maxsim_search<O: Operator>(
     vector: O::Vector,
     probes: Vec<u32>,
     epsilon: f32,
-    mut t: u32,
+    mut threshold: u32,
 ) -> (Vec<Result<Distance>>, Distance) {
     let meta_guard = index.read(0);
     let meta_bytes = meta_guard.get(1).expect("data corruption");
@@ -277,22 +277,10 @@ pub fn maxsim_search<O: Operator>(
             Some((first, mean, distance))
         })
     };
-    for i in (2..height_of_root).rev() {
-        state = step(state)
-            .map(|(x, y, _)| (x, y))
-            .take(probes[i as usize - 1] as usize)
-            .collect();
-    }
-    let mut iter: Box<dyn Iterator<Item = (u32, Distance)>>;
-    if height_of_root > 1 {
-        let mut it = step(state);
-        state = std::iter::from_fn(|| it.next())
-            .map(|(x, y, _)| (x, y))
-            .take(probes[0] as usize)
-            .collect();
-        iter = Box::new(it.map(|(x, _, z)| (x, z)));
-    } else {
-        iter = Box::new(std::iter::empty());
+    let mut it = None;
+    for i in (1..height_of_root).rev() {
+        let it = it.insert(step(state)).map(|(first, mean, _)| (first, mean));
+        state = it.take(probes[i as usize - 1] as _).collect();
     }
 
     let mut results = LinkedVec::new();
@@ -332,25 +320,20 @@ pub fn maxsim_search<O: Operator>(
             &mut callback,
             |_| (),
         );
-        t = t.saturating_sub(jump_tuple.tuples().min(u32::MAX as _) as u32);
+        threshold = threshold.saturating_sub(jump_tuple.tuples().min(u32::MAX as _) as _);
     }
-    let mut estimation = f32::NAN;
-    loop {
-        if t != 0 {
-            if let Some((first, distance)) = iter.next() {
-                let jump_guard = index.read(first);
-                let jump_bytes = jump_guard.get(1).expect("data corruption");
-                let jump_tuple = JumpTuple::deserialize_ref(jump_bytes);
-                t = t.saturating_sub(jump_tuple.tuples().min(u32::MAX as _) as u32);
-                estimation = distance.to_f32();
-            } else {
-                break;
-            }
-        } else {
+    let mut estimation_by_threshold = Distance::NEG_INFINITY;
+    for (first, _, distance) in it.into_iter().flatten() {
+        if threshold == 0 {
             break;
         }
+        let jump_guard = index.read(first);
+        let jump_bytes = jump_guard.get(1).expect("data corruption");
+        let jump_tuple = JumpTuple::deserialize_ref(jump_bytes);
+        threshold = threshold.saturating_sub(jump_tuple.tuples().min(u32::MAX as _) as _);
+        estimation_by_threshold = distance;
     }
-    (results.into_vec(), Distance::from_f32(estimation))
+    (results.into_vec(), estimation_by_threshold)
 }
 
 fn pop_if<T: Ord>(
