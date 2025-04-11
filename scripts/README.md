@@ -31,7 +31,7 @@ cargo build --lib --features pg$VERSION --release
 mkdir -p ./build/zip
 cp -a ./sql/upgrade/. ./build/zip/
 cp ./sql/install/vchord--$SEMVER.sql ./build/zip/vchord--$SEMVER.sql
-sed -e "s/@CARGO_VERSION@/$SEMVER/g" < ./vchord.control > ./build/zip/vchord.control
+cp ./vchord.control ./build/zip/vchord.control
 cp ./target/release/libvchord.so ./build/zip/vchord.so
 zip ./build/postgresql-${VERSION}-vchord_${SEMVER}_${ARCH}-linux-gnu.zip -j ./build/zip/*
 

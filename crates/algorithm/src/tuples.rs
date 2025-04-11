@@ -8,7 +8,7 @@ use zerocopy::{FromBytes, FromZeros, Immutable, IntoBytes, KnownLayout};
 pub const ALIGN: usize = 8;
 pub type Tag = u64;
 const MAGIC: u64 = u64::from_ne_bytes(*b"vchordrq");
-const VERSION: u64 = 4;
+const VERSION: u64 = 5;
 
 pub trait Tuple: 'static {
     fn serialize(&self) -> Vec<u8>;

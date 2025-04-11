@@ -71,6 +71,12 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Check
+        env:
+          SEMVER: ${{ needs.semver.outputs.SEMVER }}
+        run: |
+          grep -q "default_version = '${SEMVER}'" vchord.control || exit 1
+
       - name: Build
         env:
           SEMVER: ${{ needs.semver.outputs.SEMVER }}
@@ -83,7 +89,7 @@ jobs:
           mkdir -p ./build/zip
           cp -a ./sql/upgrade/. ./build/zip/
           cp ./sql/install/vchord--$SEMVER.sql ./build/zip/vchord--$SEMVER.sql
-          sed -e "s/@CARGO_VERSION@/$SEMVER/g" < ./vchord.control > ./build/zip/vchord.control
+          cp ./vchord.control ./build/zip/vchord.control
           cp ./target/release/libvchord.so ./build/zip/vchord.so
           zip ./build/postgresql-${VERSION}-vchord_${SEMVER}_${ARCH}-linux-gnu.zip -j ./build/zip/*
 
@@ -187,7 +193,7 @@ jobs:
             PG_VERSION=${{ matrix.version }}
             SEMVER=${{ env.SEMVER }}
             PGVECTOR=0.8.0
-  
+
   create-manifests:
     runs-on: ubuntu-latest
     needs: ["semver", "build", "docker"]
