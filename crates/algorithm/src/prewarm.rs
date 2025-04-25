@@ -1,11 +1,12 @@
+use crate::closure_lifetime_binder::{id_0, id_1, id_2};
 use crate::operator::{FunctionalAccessor, Operator};
 use crate::tuples::*;
 use crate::{Page, RelationRead, tape, vectors};
 use std::error::Error;
 use std::fmt::Write;
 
-pub fn prewarm<O: Operator>(
-    index: impl RelationRead,
+pub fn prewarm<R: RelationRead, O: Operator>(
+    index: R,
     height: i32,
     check: impl Fn(),
 ) -> Result<String, Box<dyn Error>> {
@@ -13,7 +14,8 @@ pub fn prewarm<O: Operator>(
     let meta_bytes = meta_guard.get(1).expect("data corruption");
     let meta_tuple = MetaTuple::deserialize_ref(meta_bytes);
     let height_of_root = meta_tuple.height_of_root();
-    let root_mean = meta_tuple.root_mean();
+    let root_prefetch = meta_tuple.root_prefetch().to_vec();
+    let root_head = meta_tuple.root_head();
     let root_first = meta_tuple.root_first();
     drop(meta_guard);
 
@@ -27,7 +29,8 @@ pub fn prewarm<O: Operator>(
     let mut state: State = {
         let mut results = Vec::new();
         {
-            vectors::read_for_h1_tuple::<O, _>(index.clone(), root_mean, ());
+            let list = root_prefetch.into_iter().map(|id| index.read(id));
+            vectors::read_for_h1_tuple::<R, O, _>(root_head, list, ());
             results.push(root_first);
         }
         writeln!(message, "------------------------")?;
@@ -42,16 +45,11 @@ pub fn prewarm<O: Operator>(
             tape::read_h1_tape(
                 index.clone(),
                 first,
-                || {
-                    fn push<T>(_: &mut (), _: &[T]) {}
-                    fn finish<T>(_: (), _: (&T, &T, &T, &T)) -> [(); 32] {
-                        [(); 32]
-                    }
-                    FunctionalAccessor::new((), push, finish)
-                },
-                |(), mean, first| {
+                || FunctionalAccessor::new((), id_0(|_, _| ()), id_1(|_, _| [(); 32])),
+                |(), head, first, prefetch| {
+                    let list = prefetch.iter().map(|&id| index.read(id));
+                    vectors::read_for_h1_tuple::<R, O, _>(head, list, ());
                     results.push(first);
-                    vectors::read_for_h1_tuple::<O, _>(index.clone(), mean, ());
                 },
                 |_| {
                     check();
@@ -77,16 +75,10 @@ pub fn prewarm<O: Operator>(
             tape::read_frozen_tape(
                 index.clone(),
                 jump_tuple.frozen_first(),
-                || {
-                    fn push<T>(_: &mut (), _: &[T]) {}
-                    fn finish<T>(_: (), _: (&T, &T, &T, &T)) -> [(); 32] {
-                        [(); 32]
-                    }
-                    FunctionalAccessor::new((), push, finish)
-                },
-                |(), _, _| {
+                || FunctionalAccessor::new((), id_0(|_, _| ()), id_1(|_, _| [(); 32])),
+                id_2(|_, _, _, _| {
                     results.push(());
-                },
+                }),
                 |_| {
                     check();
                     counter += 1;
@@ -96,9 +88,9 @@ pub fn prewarm<O: Operator>(
                 index.clone(),
                 jump_tuple.appendable_first(),
                 |_| (),
-                |(), _, _| {
+                id_2(|_, _, _, _| {
                     results.push(());
-                },
+                }),
                 |_| {
                     check();
                     counter += 1;

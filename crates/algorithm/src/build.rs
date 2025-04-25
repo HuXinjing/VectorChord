@@ -2,7 +2,7 @@ use crate::operator::{Accessor2, Operator, Vector};
 use crate::tape::TapeWriter;
 use crate::tuples::*;
 use crate::types::*;
-use crate::{Branch, IndexPointer, RelationWrite};
+use crate::{Branch, RelationWrite};
 use simd::fast_scan::{any_pack, padding_pack};
 use vector::VectorOwned;
 
@@ -21,28 +21,35 @@ pub fn build<O: Operator>(
     assert_eq!(meta.first(), 0);
     let freepage = TapeWriter::<_, FreepageTuple>::create(&index, false);
     let mut vectors = TapeWriter::<_, VectorTuple<O::Vector>>::create(&index, true);
-    let mut pointer_of_means = Vec::<Vec<IndexPointer>>::new();
+    let mut pointer_of_means = Vec::<Vec<(Vec<u32>, u16)>>::new();
     for i in 0..structures.len() {
         let mut level = Vec::new();
         for j in 0..structures[i].len() {
             let vector = structures[i].means[j].as_borrowed();
             let (slices, metadata) = O::Vector::split(vector);
             let mut chain = Ok(metadata);
+            let mut prefetch = Vec::new();
             for i in (0..slices.len()).rev() {
-                chain = Err(vectors.push(match chain {
+                let (id, head) = vectors.push(match chain {
                     Ok(metadata) => VectorTuple::_0 {
                         payload: None,
                         elements: slices[i].to_vec(),
                         metadata,
                     },
-                    Err(pointer) => VectorTuple::_1 {
+                    Err(head) => VectorTuple::_1 {
                         payload: None,
                         elements: slices[i].to_vec(),
-                        pointer,
+                        head,
                     },
-                }));
+                });
+                chain = Err(head);
+                prefetch.push(id);
             }
-            level.push(chain.expect_err("internal error: 0-dimensional vector"));
+            prefetch.reverse();
+            level.push((
+                prefetch,
+                chain.expect_err("internal error: 0-dimensional vector"),
+            ));
         }
         pointer_of_means.push(level);
     }
@@ -61,7 +68,7 @@ pub fn build<O: Operator>(
                 });
                 level.push(jump.first());
             } else {
-                let mut tape = H1TapeWriter::create(&index, false);
+                let mut tape = H1TapeWriter::create(&index, O::Vector::count(dims as _), false);
                 let h2_mean = structures[i].means[j].as_borrowed();
                 let h2_children = structures[i].children[j].as_slice();
                 for child in h2_children.iter().copied() {
@@ -77,35 +84,39 @@ pub fn build<O: Operator>(
                         O::Vector::code(h1_mean)
                     };
                     tape.push(Branch {
-                        mean: pointer_of_means[i - 1][child as usize],
+                        head: pointer_of_means[i - 1][child as usize].1,
                         dis_u_2: code.dis_u_2,
                         factor_ppc: code.factor_ppc,
                         factor_ip: code.factor_ip,
                         factor_err: code.factor_err,
                         signs: code.signs,
+                        prefetch: pointer_of_means[i - 1][child as usize].0.clone(),
                         extra: pointer_of_firsts[i - 1][child as usize],
                     });
                 }
-                let (mut tape, branches) = tape.into_inner();
-                if !branches.is_empty() {
+                let (mut tape, chunk) = tape.into_inner();
+                if !chunk.is_empty() {
                     let mut remain =
-                        padding_pack(branches.iter().map(|x| rabitq::pack_to_u4(&x.signs)));
+                        padding_pack(chunk.iter().map(|x| rabitq::pack_to_u4(&x.signs)));
                     loop {
                         let freespace = tape.freespace();
-                        if H1Tuple::estimate_size_0(remain.len()) <= freespace as usize {
+                        if H1Tuple::estimate_size_0(O::Vector::count(dims as _), remain.len())
+                            <= freespace as usize
+                        {
                             tape.tape_put(H1Tuple::_0 {
-                                mean: any_pack(branches.iter().map(|x| x.mean)),
-                                dis_u_2: any_pack(branches.iter().map(|x| x.dis_u_2)),
-                                factor_ppc: any_pack(branches.iter().map(|x| x.factor_ppc)),
-                                factor_ip: any_pack(branches.iter().map(|x| x.factor_ip)),
-                                factor_err: any_pack(branches.iter().map(|x| x.factor_err)),
-                                first: any_pack(branches.iter().map(|x| x.extra)),
-                                len: branches.len() as _,
+                                head: any_pack(chunk.iter().map(|x| x.head)),
+                                dis_u_2: any_pack(chunk.iter().map(|x| x.dis_u_2)),
+                                factor_ppc: any_pack(chunk.iter().map(|x| x.factor_ppc)),
+                                factor_ip: any_pack(chunk.iter().map(|x| x.factor_ip)),
+                                factor_err: any_pack(chunk.iter().map(|x| x.factor_err)),
+                                first: any_pack(chunk.iter().map(|x| x.extra)),
+                                prefetch: fix(chunk.iter().map(|x| x.prefetch.as_slice())),
+                                len: chunk.len() as _,
                                 elements: remain,
                             });
                             break;
                         }
-                        if let Some(w) = H1Tuple::fit_1(freespace) {
+                        if let Some(w) = H1Tuple::fit_1(O::Vector::count(dims as _), freespace) {
                             let (left, right) = remain.split_at(std::cmp::min(w, remain.len()));
                             tape.tape_put(H1Tuple::_1 {
                                 elements: left.to_vec(),
@@ -127,14 +138,20 @@ pub fn build<O: Operator>(
         is_residual,
         rerank_in_heap: vchordrq_options.rerank_in_table,
         vectors_first: vectors.first(),
-        root_mean: pointer_of_means
+        root_prefetch: pointer_of_means
             .last()
-            .expect("internal error: empty structure")[0],
+            .expect("internal error: empty structure")[0]
+            .0
+            .clone(),
+        root_head: pointer_of_means
+            .last()
+            .expect("internal error: empty structure")[0]
+            .1,
         root_first: pointer_of_firsts
             .last()
             .expect("internal error: empty structure")[0],
         freepage_first: freepage.first(),
-        cells: std::array::from_fn(|i| structures.get(i).map(|s| s.len() as _).unwrap_or_default()),
+        cells: structures.iter().map(|s| s.len() as _).collect(),
     });
 }
 
@@ -144,16 +161,18 @@ where
 {
     tape: TapeWriter<'a, R, H1Tuple>,
     branches: Vec<Branch<u32>>,
+    prefetch: usize,
 }
 
 impl<'a, R> H1TapeWriter<'a, R>
 where
     R: RelationWrite + 'a,
 {
-    fn create(index: &'a R, tracking_freespace: bool) -> Self {
+    fn create(index: &'a R, prefetch: usize, tracking_freespace: bool) -> Self {
         Self {
             tape: TapeWriter::create(index, tracking_freespace),
             branches: Vec::new(),
+            prefetch,
         }
     }
     fn push(&mut self, branch: Branch<u32>) {
@@ -162,20 +181,21 @@ where
             let mut remain = padding_pack(chunk.iter().map(|x| rabitq::pack_to_u4(&x.signs)));
             loop {
                 let freespace = self.tape.freespace();
-                if H1Tuple::estimate_size_0(remain.len()) <= freespace as usize {
+                if H1Tuple::estimate_size_0(self.prefetch, remain.len()) <= freespace as usize {
                     self.tape.tape_put(H1Tuple::_0 {
-                        mean: chunk.each_ref().map(|x| x.mean),
+                        head: chunk.each_ref().map(|x| x.head),
                         dis_u_2: chunk.each_ref().map(|x| x.dis_u_2),
                         factor_ppc: chunk.each_ref().map(|x| x.factor_ppc),
                         factor_ip: chunk.each_ref().map(|x| x.factor_ip),
                         factor_err: chunk.each_ref().map(|x| x.factor_err),
                         first: chunk.each_ref().map(|x| x.extra),
+                        prefetch: fix(chunk.each_ref().map(|x| x.prefetch.as_slice())),
                         len: chunk.len() as _,
                         elements: remain,
                     });
                     break;
                 }
-                if let Some(w) = H1Tuple::fit_1(freespace) {
+                if let Some(w) = H1Tuple::fit_1(self.prefetch, freespace) {
                     let (left, right) = remain.split_at(std::cmp::min(w, remain.len()));
                     self.tape.tape_put(H1Tuple::_1 {
                         elements: left.to_vec(),
@@ -191,4 +211,17 @@ where
     fn into_inner(self) -> (TapeWriter<'a, R, H1Tuple>, Vec<Branch<u32>>) {
         (self.tape, self.branches)
     }
+}
+
+fn fix<'a>(into_iter: impl IntoIterator<Item = &'a [u32]>) -> Vec<[u32; 32]> {
+    use std::array::from_fn;
+    let mut iter = into_iter.into_iter();
+    let mut array: [_; 32] = from_fn(|_| iter.next().map(<[u32]>::to_vec).unwrap_or_default());
+    if iter.next().is_some() {
+        panic!("too many slices");
+    }
+    let step = array.iter().map(Vec::len).max().unwrap_or_default();
+    array.iter_mut().for_each(|x| x.resize(step, u32::MAX));
+    let flat = array.into_iter().flatten().collect::<Vec<_>>();
+    (0..step).map(|i| from_fn(|j| flat[i * 32 + j])).collect()
 }

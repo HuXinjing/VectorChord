@@ -39,8 +39,8 @@ toml = "0.8.20"
 validator.workspace = true
 zerocopy.workspace = true
 
-[target.'cfg(all(any(target_arch = "x86_64", target_arch = "aarch64"), any(target_os = "linux", target_os = "macos", target_os = "windows")))'.dependencies]
-mimalloc = { version = "*", features = ["local_dynamic_tls"] }
+[target.'cfg(all(any(target_arch = "x86_64", target_arch = "aarch64"), target_os = "linux"))'.dependencies]
+jemallocator = { version = "0.5.4", features = ["disable_initial_exec_tls"] }
 
 [lints]
 workspace = true
@@ -56,7 +56,7 @@ edition = "2024"
 [workspace.dependencies]
 half = { version = "2.6.0", features = ["zerocopy"] }
 paste = "1"
-rand = "0.9.0"
+rand = "0.9.1"
 serde = { version = "1", features = ["derive"] }
 validator = { version = "0.20.0", features = ["derive"] }
 zerocopy = { version = "0.8.24", features = ["derive"] }

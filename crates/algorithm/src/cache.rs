@@ -1,3 +1,4 @@
+use crate::closure_lifetime_binder::{id_0, id_1};
 use crate::operator::FunctionalAccessor;
 use crate::tuples::{MetaTuple, WithReader};
 use crate::{Page, RelationRead, tape};
@@ -18,14 +19,8 @@ pub fn cache(index: impl RelationRead) -> Vec<u32> {
             tape::read_h1_tape(
                 index.clone(),
                 first,
-                || {
-                    fn push<T>(_: &mut (), _: &[T]) {}
-                    fn finish<T>(_: (), _: (&T, &T, &T, &T)) -> [(); 32] {
-                        [(); 32]
-                    }
-                    FunctionalAccessor::new((), push, finish)
-                },
-                |(), _, first| {
+                || FunctionalAccessor::new((), id_0(|_, _| ()), id_1(|_, _| [(); 32])),
+                |(), _, first, _| {
                     results.push(first);
                 },
                 |id| {

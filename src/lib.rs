@@ -1,5 +1,6 @@
 #![allow(unsafe_code)]
-#![feature(lazy_get)]
+#![feature(let_chains)]
+#![feature(abort_unwind)]
 
 mod datatype;
 mod index;
@@ -26,7 +27,8 @@ extern "C-unwind" fn _PG_init() {
 #[cfg(not(target_endian = "little"))]
 compile_error!("Target architecture is not supported.");
 
+#[cfg(not(miri))]
 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
-#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+#[cfg(target_os = "linux")]
 #[global_allocator]
-static GLOBAL_ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
+static GLOBAL_ALLOCATOR: jemallocator::Jemalloc = jemallocator::Jemalloc;

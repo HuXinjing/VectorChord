@@ -4,7 +4,7 @@ use crate::index::opclass::{Opfamily, opfamily};
 use crate::index::storage::{PostgresPage, PostgresRelation};
 use crate::index::types::*;
 use algorithm::types::*;
-use algorithm::{PageGuard, RelationRead, RelationWrite};
+use algorithm::{PageGuard, Relation, RelationRead, RelationWrite};
 use half::f16;
 use pgrx::pg_sys::{Datum, ItemPointerData};
 use rand::Rng;
@@ -1274,9 +1274,11 @@ impl<G: Deref> Deref for CachingRelationReadGuard<'_, G> {
     }
 }
 
-impl<R: RelationRead<Page = PostgresPage>> RelationRead for CachingRelation<'_, R> {
+impl<R: Relation> Relation for CachingRelation<'_, R> {
     type Page = R::Page;
+}
 
+impl<R: RelationRead<Page = PostgresPage>> RelationRead for CachingRelation<'_, R> {
     type ReadGuard<'a>
         = CachingRelationReadGuard<'a, R::ReadGuard<'a>>
     where

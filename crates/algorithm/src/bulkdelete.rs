@@ -1,10 +1,11 @@
+use crate::closure_lifetime_binder::{id_0, id_1};
 use crate::operator::{FunctionalAccessor, Operator};
 use crate::tuples::*;
-use crate::{Page, RelationWrite, tape};
+use crate::{Page, RelationRead, RelationWrite, tape};
 use std::num::NonZero;
 
 pub fn bulkdelete<O: Operator>(
-    index: impl RelationWrite,
+    index: impl RelationRead + RelationWrite,
     check: impl Fn(),
     callback: impl Fn(NonZero<u64>) -> bool,
 ) {
@@ -24,14 +25,8 @@ pub fn bulkdelete<O: Operator>(
                 tape::read_h1_tape(
                     index.clone(),
                     first,
-                    || {
-                        fn push<T>(_: &mut (), _: &[T]) {}
-                        fn finish<T>(_: (), _: (&T, &T, &T, &T)) -> [(); 32] {
-                            [(); 32]
-                        }
-                        FunctionalAccessor::new((), push, finish)
-                    },
-                    |(), _, first| results.push(first),
+                    || FunctionalAccessor::new((), id_0(|_, _| ()), id_1(|_, _| [(); 32])),
+                    |(), _, first, _| results.push(first),
                     |_| check(),
                 );
             }

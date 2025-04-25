@@ -1,7 +1,9 @@
+use crate::closure_lifetime_binder::id_2;
 use crate::linked_vec::LinkedVec;
 use crate::operator::*;
+use crate::prefetcher::Prefetcher;
 use crate::tuples::*;
-use crate::{IndexPointer, Page, RelationRead, tape, vectors};
+use crate::{Bump, Page, RelationRead, tape, vectors};
 use always_equal::AlwaysEqual;
 use distance::Distance;
 use std::cmp::Reverse;
@@ -9,19 +11,21 @@ use std::collections::BinaryHeap;
 use std::num::NonZero;
 use vector::{VectorBorrowed, VectorOwned};
 
-type Result<T> = (
+type Item<'b> = (
     Reverse<Distance>,
-    AlwaysEqual<T>,
-    AlwaysEqual<NonZero<u64>>,
-    AlwaysEqual<IndexPointer>,
+    AlwaysEqual<&'b mut (u32, u16, &'b mut [u32])>,
 );
 
-pub fn default_search<O: Operator>(
-    index: impl RelationRead,
+type Extra<'b> = &'b mut (NonZero<u64>, u16, &'b mut [u32]);
+
+pub fn default_search<'b, R: RelationRead, O: Operator, P: Prefetcher<R = R, Item = Item<'b>>>(
+    index: R,
     vector: O::Vector,
     probes: Vec<u32>,
     epsilon: f32,
-) -> Vec<Result<()>> {
+    bump: &'b impl Bump,
+    mut prefetch: impl FnMut(Vec<Item<'b>>) -> P,
+) -> Vec<((Reverse<Distance>, AlwaysEqual<()>), AlwaysEqual<Extra<'b>>)> {
     let meta_guard = index.read(0);
     let meta_bytes = meta_guard.get(1).expect("data corruption");
     let meta_tuple = MetaTuple::deserialize_ref(meta_bytes);
@@ -36,7 +40,8 @@ pub fn default_search<O: Operator>(
             probes.len()
         );
     }
-    let root_mean = meta_tuple.root_mean();
+    let root_prefetch = meta_tuple.root_prefetch().to_vec();
+    let root_head = meta_tuple.root_head();
     let root_first = meta_tuple.root_first();
     drop(meta_guard);
 
@@ -48,22 +53,22 @@ pub fn default_search<O: Operator>(
 
     type State<O> = Vec<(u32, Option<<O as Operator>::Vector>)>;
     let mut state: State<O> = vec![{
-        let mean = root_mean;
         if is_residual {
-            let residual_u = vectors::read_for_h1_tuple::<O, _>(
-                index.clone(),
-                mean,
+            let list = root_prefetch.into_iter().map(|id| index.read(id));
+            let residual = vectors::read_for_h1_tuple::<R, O, _>(
+                root_head,
+                list,
                 LAccess::new(
                     O::Vector::unpack(vector.as_borrowed()),
                     O::ResidualAccessor::default(),
                 ),
             );
-            (root_first, Some(residual_u))
+            (root_first, Some(residual))
         } else {
             (root_first, None)
         }
     }];
-    let step = |state: State<O>| {
+    let mut step = |state: State<O>| {
         let mut results = LinkedVec::new();
         for (first, residual) in state {
             let block_lut = if let Some(residual) = residual {
@@ -77,27 +82,27 @@ pub fn default_search<O: Operator>(
                 index.clone(),
                 first,
                 || RAccess::new((&block_lut.1, block_lut.0), O::BlockAccessor::default()),
-                |(rough, err), mean, first| {
+                |(rough, err), head, first, prefetch| {
                     let lowerbound = Distance::from_f32(rough - err * epsilon);
-                    results.push((Reverse(lowerbound), AlwaysEqual(first), AlwaysEqual(mean)));
+                    results.push((
+                        Reverse(lowerbound),
+                        AlwaysEqual(bump.alloc((first, head, bump.alloc_slice(prefetch)))),
+                    ));
                 },
                 |_| (),
             );
         }
-        let mut heap = BinaryHeap::from(results.into_vec());
+        let mut heap = (prefetch)(results.into_vec());
         let mut cache = BinaryHeap::<(Reverse<Distance>, _, _)>::new();
-        let index = index.clone();
         let vector = vector.as_borrowed();
         std::iter::from_fn(move || {
-            while let Some((Reverse(_), AlwaysEqual(first), AlwaysEqual(mean))) =
-                pop_if(&mut heap, |(d, ..)| {
-                    Some(*d) > cache.peek().map(|(d, ..)| *d)
-                })
+            while let Some(((Reverse(_), AlwaysEqual(&mut (first, head, ..))), list)) =
+                heap.pop_if(|(d, ..)| Some(*d) > cache.peek().map(|(d, ..)| *d))
             {
                 if is_residual {
-                    let (dis_u, residual_u) = vectors::read_for_h1_tuple::<O, _>(
-                        index.clone(),
-                        mean,
+                    let (distance, residual) = vectors::read_for_h1_tuple::<R, O, _>(
+                        head,
+                        list.into_iter(),
                         LAccess::new(
                             O::Vector::unpack(vector),
                             (
@@ -107,17 +112,17 @@ pub fn default_search<O: Operator>(
                         ),
                     );
                     cache.push((
-                        Reverse(dis_u),
+                        Reverse(distance),
                         AlwaysEqual(first),
-                        AlwaysEqual(Some(residual_u)),
+                        AlwaysEqual(Some(residual)),
                     ));
                 } else {
-                    let dis_u = vectors::read_for_h1_tuple::<O, _>(
-                        index.clone(),
-                        mean,
+                    let distance = vectors::read_for_h1_tuple::<R, O, _>(
+                        head,
+                        list.into_iter(),
                         LAccess::new(O::Vector::unpack(vector), O::DistanceAccessor::default()),
                     );
-                    cache.push((Reverse(dis_u), AlwaysEqual(first), AlwaysEqual(None)));
+                    cache.push((Reverse(distance), AlwaysEqual(first), AlwaysEqual(None)));
                 }
             }
             let (_, AlwaysEqual(first), AlwaysEqual(mean)) = cache.pop()?;
@@ -141,15 +146,13 @@ pub fn default_search<O: Operator>(
         let jump_guard = index.read(first);
         let jump_bytes = jump_guard.get(1).expect("data corruption");
         let jump_tuple = JumpTuple::deserialize_ref(jump_bytes);
-        let mut callback = |(rough, err), mean, payload| {
+        let mut callback = id_2(|(rough, err), mean, payload, prefetch| {
             let lowerbound = Distance::from_f32(rough - err * epsilon);
             results.push((
-                Reverse(lowerbound),
-                AlwaysEqual(()),
-                AlwaysEqual(payload),
-                AlwaysEqual(mean),
+                (Reverse(lowerbound), AlwaysEqual(())),
+                AlwaysEqual(bump.alloc((payload, mean, bump.alloc_slice(prefetch)))),
             ));
-        };
+        });
         tape::read_frozen_tape(
             index.clone(),
             jump_tuple.frozen_first(),
@@ -168,13 +171,21 @@ pub fn default_search<O: Operator>(
     results.into_vec()
 }
 
-pub fn maxsim_search<O: Operator>(
-    index: impl RelationRead,
+pub fn maxsim_search<'b, R: RelationRead, O: Operator, P: Prefetcher<R = R, Item = Item<'b>>>(
+    index: R,
     vector: O::Vector,
     probes: Vec<u32>,
     epsilon: f32,
     mut threshold: u32,
-) -> (Vec<Result<Distance>>, Distance) {
+    bump: &'b impl Bump,
+    mut prefetch: impl FnMut(Vec<Item<'b>>) -> P,
+) -> (
+    Vec<(
+        (Reverse<Distance>, AlwaysEqual<Distance>),
+        AlwaysEqual<Extra<'b>>,
+    )>,
+    Distance,
+) {
     let meta_guard = index.read(0);
     let meta_bytes = meta_guard.get(1).expect("data corruption");
     let meta_tuple = MetaTuple::deserialize_ref(meta_bytes);
@@ -189,7 +200,8 @@ pub fn maxsim_search<O: Operator>(
             probes.len()
         );
     }
-    let root_mean = meta_tuple.root_mean();
+    let root_prefetch = meta_tuple.root_prefetch().to_vec();
+    let root_head = meta_tuple.root_head();
     let root_first = meta_tuple.root_first();
     drop(meta_guard);
 
@@ -201,22 +213,22 @@ pub fn maxsim_search<O: Operator>(
 
     type State<O> = Vec<(u32, Option<<O as Operator>::Vector>)>;
     let mut state: State<O> = vec![{
-        let mean = root_mean;
         if is_residual {
-            let residual_u = vectors::read_for_h1_tuple::<O, _>(
-                index.clone(),
-                mean,
+            let list = root_prefetch.into_iter().map(|id| index.read(id));
+            let residual = vectors::read_for_h1_tuple::<R, O, _>(
+                root_head,
+                list,
                 LAccess::new(
                     O::Vector::unpack(vector.as_borrowed()),
                     O::ResidualAccessor::default(),
                 ),
             );
-            (root_first, Some(residual_u))
+            (root_first, Some(residual))
         } else {
             (root_first, None)
         }
     }];
-    let step = |state: State<O>| {
+    let mut step = |state: State<O>| {
         let mut results = LinkedVec::new();
         for (first, residual) in state {
             let block_lut = if let Some(residual) = residual {
@@ -230,27 +242,27 @@ pub fn maxsim_search<O: Operator>(
                 index.clone(),
                 first,
                 || RAccess::new((&block_lut.1, block_lut.0), O::BlockAccessor::default()),
-                |(rough, err), mean, first| {
+                |(rough, err), head, first, prefetch| {
                     let lowerbound = Distance::from_f32(rough - err * epsilon);
-                    results.push((Reverse(lowerbound), AlwaysEqual(first), AlwaysEqual(mean)));
+                    results.push((
+                        Reverse(lowerbound),
+                        AlwaysEqual(bump.alloc((first, head, bump.alloc_slice(prefetch)))),
+                    ));
                 },
                 |_| (),
             );
         }
-        let mut heap = BinaryHeap::from(results.into_vec());
+        let mut heap = (prefetch)(results.into_vec());
         let mut cache = BinaryHeap::<(Reverse<Distance>, _, _)>::new();
-        let index = index.clone();
         let vector = vector.as_borrowed();
         std::iter::from_fn(move || {
-            while let Some((Reverse(_), AlwaysEqual(first), AlwaysEqual(mean))) =
-                pop_if(&mut heap, |(d, ..)| {
-                    Some(*d) > cache.peek().map(|(d, ..)| *d)
-                })
+            while let Some(((Reverse(_), AlwaysEqual(&mut (first, head, ..))), list)) =
+                heap.pop_if(|(d, ..)| Some(*d) > cache.peek().map(|(d, ..)| *d))
             {
                 if is_residual {
-                    let (dis_u, residual_u) = vectors::read_for_h1_tuple::<O, _>(
-                        index.clone(),
-                        mean,
+                    let (distance, residual) = vectors::read_for_h1_tuple::<R, O, _>(
+                        head,
+                        list.into_iter(),
                         LAccess::new(
                             O::Vector::unpack(vector),
                             (
@@ -260,17 +272,17 @@ pub fn maxsim_search<O: Operator>(
                         ),
                     );
                     cache.push((
-                        Reverse(dis_u),
+                        Reverse(distance),
                         AlwaysEqual(first),
-                        AlwaysEqual(Some(residual_u)),
+                        AlwaysEqual(Some(residual)),
                     ));
                 } else {
-                    let dis_u = vectors::read_for_h1_tuple::<O, _>(
-                        index.clone(),
-                        mean,
+                    let distance = vectors::read_for_h1_tuple::<R, O, _>(
+                        head,
+                        list.into_iter(),
                         LAccess::new(O::Vector::unpack(vector), O::DistanceAccessor::default()),
                     );
-                    cache.push((Reverse(dis_u), AlwaysEqual(first), AlwaysEqual(None)));
+                    cache.push((Reverse(distance), AlwaysEqual(first), AlwaysEqual(None)));
                 }
             }
             let (Reverse(distance), AlwaysEqual(first), AlwaysEqual(mean)) = cache.pop()?;
@@ -296,16 +308,14 @@ pub fn maxsim_search<O: Operator>(
         let jump_guard = index.read(first);
         let jump_bytes = jump_guard.get(1).expect("data corruption");
         let jump_tuple = JumpTuple::deserialize_ref(jump_bytes);
-        let mut callback = |(rough, err), mean, payload| {
+        let mut callback = id_2(|(rough, err), mean, payload, prefetch| {
             let lowerbound = Distance::from_f32(rough - err * epsilon);
             let rough = Distance::from_f32(rough);
             results.push((
-                Reverse(lowerbound),
-                AlwaysEqual(rough),
-                AlwaysEqual(payload),
-                AlwaysEqual(mean),
+                (Reverse(lowerbound), AlwaysEqual(rough)),
+                AlwaysEqual(bump.alloc((payload, mean, bump.alloc_slice(prefetch)))),
             ));
-        };
+        });
         tape::read_frozen_tape(
             index.clone(),
             jump_tuple.frozen_first(),
@@ -334,17 +344,4 @@ pub fn maxsim_search<O: Operator>(
         estimation_by_threshold = distance;
     }
     (results.into_vec(), estimation_by_threshold)
-}
-
-fn pop_if<T: Ord>(
-    heap: &mut BinaryHeap<T>,
-    mut predicate: impl FnMut(&mut T) -> bool,
-) -> Option<T> {
-    use std::collections::binary_heap::PeekMut;
-    let mut peek = heap.peek_mut()?;
-    if predicate(&mut peek) {
-        Some(PeekMut::pop(peek))
-    } else {
-        None
-    }
 }

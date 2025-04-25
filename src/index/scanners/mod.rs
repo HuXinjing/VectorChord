@@ -2,12 +2,23 @@ mod default;
 mod maxsim;
 
 use super::opclass::Opfamily;
-use algorithm::RelationRead;
+use crate::index::lazy_cell::LazyCell;
+use algorithm::{Bump, RelationPrefetch, RelationReadStream};
 use pgrx::pg_sys::Datum;
-use std::cell::LazyCell;
 
 pub use default::DefaultBuilder;
 pub use maxsim::MaxsimBuilder;
+
+#[derive(Debug, Clone, Copy)]
+pub enum SearchIo {
+    ReadBuffer,
+    PrefetchBuffer,
+    #[cfg_attr(
+        any(feature = "pg13", feature = "pg14", feature = "pg15", feature = "pg16"),
+        expect(dead_code)
+    )]
+    ReadStream,
+}
 
 #[derive(Debug)]
 pub struct SearchOptions {
@@ -16,6 +27,7 @@ pub struct SearchOptions {
     pub max_scan_tuples: Option<u32>,
     pub maxsim_refine: u32,
     pub maxsim_threshold: u32,
+    pub io_rerank: SearchIo,
 }
 
 pub trait SearchBuilder: 'static {
@@ -25,9 +37,10 @@ pub trait SearchBuilder: 'static {
 
     fn build<'a>(
         self,
-        relation: impl RelationRead + 'a,
+        relation: &'a (impl RelationPrefetch + RelationReadStream),
         options: SearchOptions,
         fetcher: impl SearchFetcher + 'a,
+        bump: &'a impl Bump,
     ) -> Box<dyn Iterator<Item = (f32, [u16; 3], bool)> + 'a>;
 }
 

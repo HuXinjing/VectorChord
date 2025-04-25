@@ -1,18 +1,19 @@
 pub mod am_build;
 
+use super::algorithm::BumpAlloc;
+use super::gucs::prererank_filtering;
 use crate::index::gucs;
+use crate::index::lazy_cell::LazyCell;
 use crate::index::opclass::{Opfamily, opfamily};
 use crate::index::scanners::*;
 use crate::index::storage::PostgresRelation;
+use algorithm::Bump;
 use pgrx::datum::Internal;
 use pgrx::pg_sys::{BlockIdData, Datum, ItemPointerData};
-use std::cell::LazyCell;
 use std::ffi::CStr;
 use std::num::NonZero;
 use std::ptr::NonNull;
 use std::sync::OnceLock;
-
-use super::gucs::prererank_filtering;
 
 #[repr(C)]
 struct Reloption {
@@ -204,7 +205,7 @@ pub unsafe extern "C-unwind" fn amcostestimate(
             let node_count = {
                 let tuples = (*index_opt_info).tuples as u32;
                 let mut count = 0.0;
-                let r = cost.cells.iter().copied().rev().map(NonZero::get);
+                let r = cost.cells.iter().copied().rev();
                 let numerator = std::iter::once(1).chain(probes.clone());
                 let denumerator = r.clone();
                 let scale = r.skip(1).chain(std::iter::once(tuples));
@@ -221,7 +222,7 @@ pub unsafe extern "C-unwind" fn amcostestimate(
                     let x = opfamily.vector_kind().element_size() * cost.dims;
                     x.div_ceil(3840 * x.div_ceil(5120).min(2)) as f64
                 };
-                pages += cost.cells[0].get() as f64;
+                pages += cost.cells[0] as f64;
                 pages
             };
             let next_count =
@@ -352,6 +353,7 @@ pub unsafe extern "C-unwind" fn ambeginscan(
     let scanner: Scanner = Scanner {
         hack: None,
         scanning: LazyCell::new(Box::new(|| Box::new(std::iter::empty()))),
+        bump: Box::new(BumpAlloc::new()),
     };
     unsafe {
         (*scan).opaque = CurrentMemoryContext.leak_and_drop_on_delete(scanner).cast();
@@ -380,6 +382,9 @@ pub unsafe extern "C-unwind" fn amrescan(
                 "vector search with no WHERE clause and no ORDER BY clause is not supported"
             );
         }
+        let scanner = &mut *(*scan).opaque.cast::<Scanner>();
+        scanner.scanning = LazyCell::new(Box::new(|| Box::new(std::iter::empty())));
+        scanner.bump.reset();
         let opfamily = opfamily((*scan).indexRelation);
         let index = PostgresRelation::new((*scan).indexRelation);
         let options = SearchOptions {
@@ -388,8 +393,8 @@ pub unsafe extern "C-unwind" fn amrescan(
             max_scan_tuples: gucs::max_scan_tuples(),
             maxsim_refine: gucs::maxsim_refine(),
             maxsim_threshold: gucs::maxsim_threshold(),
+            io_rerank: gucs::io_rerank(),
         };
-        let scanner = &mut *(*scan).opaque.cast::<Scanner>();
         let fetcher = {
             let hack = scanner.hack;
             LazyCell::new(move || {
@@ -405,6 +410,8 @@ pub unsafe extern "C-unwind" fn amrescan(
                 )
             })
         };
+        // PAY ATTENTATION: `scanning` references `bump`, so `scanning` must be dropped before `bump`.
+        let bump = scanner.bump.as_ref();
         scanner.scanning = match opfamily {
             Opfamily::VectorL2
             | Opfamily::VectorIp
@@ -425,7 +432,11 @@ pub unsafe extern "C-unwind" fn amrescan(
                     let is_null = ((*data).sk_flags & pgrx::pg_sys::SK_ISNULL as i32) != 0;
                     builder.add((*data).sk_strategy, (!is_null).then_some(value));
                 }
-                LazyCell::new(Box::new(move || builder.build(index, options, fetcher)))
+                LazyCell::new(Box::new(move || {
+                    // only do this since `PostgresRelation` has no destructor
+                    let index = bump.alloc(index.clone());
+                    builder.build(index, options, fetcher, bump)
+                }))
             }
             Opfamily::VectorMaxsim | Opfamily::HalfvecMaxsim => {
                 let mut builder = MaxsimBuilder::new(opfamily);
@@ -441,7 +452,11 @@ pub unsafe extern "C-unwind" fn amrescan(
                     let is_null = ((*data).sk_flags & pgrx::pg_sys::SK_ISNULL as i32) != 0;
                     builder.add((*data).sk_strategy, (!is_null).then_some(value));
                 }
-                LazyCell::new(Box::new(move || builder.build(index, options, fetcher)))
+                LazyCell::new(Box::new(move || {
+                    // only do this since `PostgresRelation` has no destructor
+                    let index = bump.alloc(index.clone());
+                    builder.build(index, options, fetcher, bump)
+                }))
             }
         };
     }
@@ -480,6 +495,7 @@ pub unsafe extern "C-unwind" fn amgettuple(
 pub unsafe extern "C-unwind" fn amendscan(scan: pgrx::pg_sys::IndexScanDesc) {
     let scanner = unsafe { &mut *(*scan).opaque.cast::<Scanner>() };
     scanner.scanning = LazyCell::new(Box::new(|| Box::new(std::iter::empty())));
+    scanner.bump.reset();
 }
 
 type Iter = Box<dyn Iterator<Item = (f32, [u16; 3], bool)>>;
@@ -487,6 +503,7 @@ type Iter = Box<dyn Iterator<Item = (f32, [u16; 3], bool)>>;
 pub struct Scanner {
     pub hack: Option<NonNull<pgrx::pg_sys::IndexScanState>>,
     scanning: LazyCell<Iter, Box<dyn FnOnce() -> Iter>>,
+    bump: Box<BumpAlloc>,
 }
 
 struct HeapFetcher {

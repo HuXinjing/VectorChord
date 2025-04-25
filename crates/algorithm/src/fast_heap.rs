@@ -1,3 +1,4 @@
+use crate::Heap;
 use std::collections::BinaryHeap;
 use std::num::NonZero;
 
@@ -12,12 +13,12 @@ impl<T> SortHeap<T> {
     }
 }
 
-pub enum SelectHeap<T> {
+pub enum FastHeap<T> {
     Sorted(SortHeap<T>),
     Binary(BinaryHeap<T>),
 }
 
-impl<T: Ord> SelectHeap<T> {
+impl<T: Ord> FastHeap<T> {
     pub fn from_vec(vec: Vec<T>) -> Self {
         let n = vec.len();
         if let Some(t) = NonZero::new(n / 384) {
@@ -32,23 +33,47 @@ impl<T: Ord> SelectHeap<T> {
     }
     pub fn pop(&mut self) -> Option<T> {
         match self {
-            SelectHeap::Sorted(SortHeap { inner, t }) => {
+            FastHeap::Sorted(SortHeap { inner, t }) => {
                 let Some(k) = inner.pop() else { unreachable!() };
                 if let Some(value) = NonZero::new(t.get() - 1) {
                     *t = value;
                 } else {
-                    *self = SelectHeap::Binary(std::mem::take(inner).into());
+                    *self = FastHeap::Binary(std::mem::take(inner).into());
                 }
                 Some(k)
             }
-            SelectHeap::Binary(x) => x.pop(),
+            FastHeap::Binary(x) => x.pop(),
         }
     }
     pub fn peek(&self) -> Option<&T> {
         match self {
-            SelectHeap::Sorted(x) => x.peek(),
-            SelectHeap::Binary(x) => x.peek(),
+            FastHeap::Sorted(x) => x.peek(),
+            FastHeap::Binary(x) => x.peek(),
         }
+    }
+}
+
+impl<T: Ord> IntoIterator for FastHeap<T> {
+    type Item = T;
+
+    type IntoIter = std::vec::IntoIter<T>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        match self {
+            FastHeap::Sorted(sort_heap) => sort_heap.inner.into_iter(),
+            FastHeap::Binary(binary_heap) => binary_heap.into_vec().into_iter(),
+        }
+    }
+}
+
+impl<T: Ord> Heap for FastHeap<T> {
+    fn make(this: Vec<Self::Item>) -> Self {
+        Self::from_vec(this)
+    }
+
+    fn pop_if(&mut self, predicate: impl FnOnce(&Self::Item) -> bool) -> Option<Self::Item> {
+        let first = self.peek()?;
+        if predicate(first) { self.pop() } else { None }
     }
 }
 
@@ -64,7 +89,7 @@ fn test_select_heap() {
             x
         };
         let result = {
-            let mut x = SelectHeap::from_vec(sequence.clone());
+            let mut x = FastHeap::from_vec(sequence.clone());
             std::iter::from_fn(|| x.pop()).collect::<Vec<_>>()
         };
         assert_eq!(answer, result);
@@ -73,7 +98,7 @@ fn test_select_heap() {
 
 #[test]
 fn test_issue_209() {
-    let mut heap = SelectHeap::from_vec(vec![0]);
+    let mut heap = FastHeap::from_vec(vec![0]);
     assert_eq!(heap.pop(), Some(0));
     assert_eq!(heap.pop(), None);
 }

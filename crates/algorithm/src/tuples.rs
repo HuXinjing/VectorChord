@@ -1,4 +1,3 @@
-use crate::IndexPointer;
 use crate::operator::Vector;
 use rabitq::binary::BinaryCode;
 use std::marker::PhantomData;
@@ -7,8 +6,8 @@ use zerocopy::{FromBytes, FromZeros, Immutable, IntoBytes, KnownLayout};
 
 pub const ALIGN: usize = 8;
 pub type Tag = u64;
-const MAGIC: u64 = u64::from_ne_bytes(*b"vchordrq");
-const VERSION: u64 = 6;
+const MAGIC: Tag = Tag::from_ne_bytes(*b"vchordrq");
+const VERSION: u64 = 7;
 
 pub trait Tuple: 'static {
     fn serialize(&self) -> Vec<u8>;
@@ -27,7 +26,6 @@ pub trait WithWriter: Tuple {
 #[repr(C, align(8))]
 #[derive(Debug, Clone, PartialEq, FromBytes, IntoBytes, Immutable, KnownLayout)]
 struct MetaTupleHeader {
-    magic: u64,
     version: u64,
     dims: u32,
     height_of_root: u32,
@@ -36,12 +34,17 @@ struct MetaTupleHeader {
     _padding_0: [ZeroU8; 2],
     vectors_first: u32,
     // raw vector
-    root_mean: IndexPointer,
+    root_prefetch_s: u16,
+    root_prefetch_e: u16,
+    root_head: u16,
+    _padding_1: [ZeroU8; 2],
     // for meta tuple, it's pointers to next level
     root_first: u32,
     freepage_first: u32,
     // statistics
-    cells: [u32; 8],
+    cells_s: u16,
+    cells_e: u16,
+    _padding_2: [ZeroU8; 4],
 }
 
 pub struct MetaTuple {
@@ -50,59 +53,103 @@ pub struct MetaTuple {
     pub is_residual: bool,
     pub rerank_in_heap: bool,
     pub vectors_first: u32,
-    pub root_mean: IndexPointer,
+    pub root_prefetch: Vec<u32>,
+    pub root_head: u16,
     pub root_first: u32,
     pub freepage_first: u32,
-    pub cells: [u32; 8],
+    pub cells: Vec<u32>,
 }
 
 impl Tuple for MetaTuple {
+    #[allow(clippy::match_single_binding)]
     fn serialize(&self) -> Vec<u8> {
-        MetaTupleHeader {
-            magic: MAGIC,
-            version: VERSION,
-            dims: self.dims,
-            height_of_root: self.height_of_root,
-            is_residual: self.is_residual.into(),
-            rerank_in_heap: self.rerank_in_heap.into(),
-            _padding_0: Default::default(),
-            vectors_first: self.vectors_first,
-            root_mean: self.root_mean,
-            root_first: self.root_first,
-            freepage_first: self.freepage_first,
-            cells: self.cells,
+        let mut buffer = Vec::<u8>::new();
+        match self {
+            MetaTuple {
+                dims,
+                height_of_root,
+                is_residual,
+                rerank_in_heap,
+                vectors_first,
+                root_prefetch,
+                root_head,
+                root_first,
+                freepage_first,
+                cells,
+            } => {
+                buffer.extend((MAGIC as Tag).to_ne_bytes());
+                buffer.extend(std::iter::repeat_n(0, size_of::<MetaTupleHeader>()));
+                let root_prefetch_s = buffer.len() as u16;
+                buffer.extend(root_prefetch.as_bytes());
+                let root_prefetch_e = buffer.len() as u16;
+                while buffer.len() % ALIGN != 0 {
+                    buffer.push(0);
+                }
+                let cells_s = buffer.len() as u16;
+                buffer.extend(cells.as_bytes());
+                let cells_e = buffer.len() as u16;
+                while buffer.len() % ALIGN != 0 {
+                    buffer.push(0);
+                }
+                buffer[size_of::<Tag>()..][..size_of::<MetaTupleHeader>()].copy_from_slice(
+                    MetaTupleHeader {
+                        version: VERSION,
+                        dims: *dims,
+                        height_of_root: *height_of_root,
+                        is_residual: (*is_residual).into(),
+                        rerank_in_heap: (*rerank_in_heap).into(),
+                        _padding_0: Default::default(),
+                        vectors_first: *vectors_first,
+                        root_prefetch_s,
+                        root_prefetch_e,
+                        root_head: *root_head,
+                        _padding_1: Default::default(),
+                        root_first: *root_first,
+                        freepage_first: *freepage_first,
+                        cells_s,
+                        cells_e,
+                        _padding_2: Default::default(),
+                    }
+                    .as_bytes(),
+                );
+            }
         }
-        .as_bytes()
-        .to_vec()
+        buffer
     }
 }
 
 impl WithReader for MetaTuple {
     type Reader<'a> = MetaTupleReader<'a>;
     fn deserialize_ref(source: &[u8]) -> MetaTupleReader<'_> {
-        if source.len() < 16 {
-            panic!("deserialization: bad bytes")
+        let tag = Tag::from_ne_bytes(std::array::from_fn(|i| source[i]));
+        match tag {
+            MAGIC => {
+                let checker = RefChecker::new(source);
+                if VERSION != *checker.prefix::<u64>(size_of::<Tag>()) {
+                    panic!("deserialization: bad version number");
+                }
+                let header: &MetaTupleHeader = checker.prefix(size_of::<Tag>());
+                let root_prefetch = checker.bytes(header.root_prefetch_s, header.root_prefetch_e);
+                let cells = checker.bytes(header.cells_s, header.cells_e);
+                MetaTupleReader {
+                    header,
+                    root_prefetch,
+                    cells,
+                }
+            }
+            _ => panic!("deserialization: bad magic number"),
         }
-        let magic = u64::from_ne_bytes(std::array::from_fn(|i| source[i + 0]));
-        if magic != MAGIC {
-            panic!("deserialization: bad magic number");
-        }
-        let version = u64::from_ne_bytes(std::array::from_fn(|i| source[i + 8]));
-        if version != VERSION {
-            panic!("deserialization: bad version number");
-        }
-        let checker = RefChecker::new(source);
-        let header = checker.prefix(0);
-        MetaTupleReader { header }
     }
 }
 
 #[derive(Debug, Clone, Copy)]
 pub struct MetaTupleReader<'a> {
     header: &'a MetaTupleHeader,
+    root_prefetch: &'a [u32],
+    cells: &'a [u32],
 }
 
-impl MetaTupleReader<'_> {
+impl<'a> MetaTupleReader<'a> {
     pub fn dims(self) -> u32 {
         self.header.dims
     }
@@ -118,8 +165,11 @@ impl MetaTupleReader<'_> {
     pub fn vectors_first(self) -> u32 {
         self.header.vectors_first
     }
-    pub fn root_mean(self) -> IndexPointer {
-        self.header.root_mean
+    pub fn root_prefetch(self) -> &'a [u32] {
+        self.root_prefetch
+    }
+    pub fn root_head(self) -> u16 {
+        self.header.root_head
     }
     pub fn root_first(self) -> u32 {
         self.header.root_first
@@ -127,8 +177,8 @@ impl MetaTupleReader<'_> {
     pub fn freepage_first(self) -> u32 {
         self.header.freepage_first
     }
-    pub fn cells(self) -> [u32; 8] {
-        self.header.cells
+    pub fn cells(self) -> &'a [u32] {
+        self.cells
     }
 }
 
@@ -164,7 +214,7 @@ impl WithWriter for FreepageTuple {
 
     fn deserialize_mut(source: &mut [u8]) -> FreepageTupleWriter<'_> {
         let mut checker = MutChecker::new(source);
-        let header = checker.prefix(0);
+        let header = checker.prefix(0_u16);
         FreepageTupleWriter { header }
     }
 }
@@ -212,20 +262,20 @@ impl FreepageTupleWriter<'_> {
 #[derive(Debug, Clone, PartialEq, FromBytes, IntoBytes, Immutable, KnownLayout)]
 struct VectorTupleHeader0 {
     payload: Option<NonZero<u64>>,
-    metadata_s: usize,
-    elements_s: usize,
-    elements_e: usize,
-    #[cfg(target_pointer_width = "32")]
-    _padding_0: [ZeroU8; 4],
+    metadata_s: u16,
+    elements_s: u16,
+    elements_e: u16,
+    _padding_0: [ZeroU8; 2],
 }
 
 #[repr(C, align(8))]
 #[derive(Debug, Clone, PartialEq, FromBytes, IntoBytes, Immutable, KnownLayout)]
 struct VectorTupleHeader1 {
     payload: Option<NonZero<u64>>,
-    pointer: IndexPointer,
-    elements_s: usize,
-    elements_e: usize,
+    head: u16,
+    elements_s: u16,
+    elements_e: u16,
+    _padding_0: [ZeroU8; 2],
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -237,7 +287,7 @@ pub enum VectorTuple<V: Vector> {
     },
     _1 {
         payload: Option<NonZero<u64>>,
-        pointer: IndexPointer,
+        head: u16,
         elements: Vec<V::Element>,
     },
 }
@@ -253,14 +303,14 @@ impl<V: Vector> Tuple for VectorTuple<V> {
             } => {
                 buffer.extend((0 as Tag).to_ne_bytes());
                 buffer.extend(std::iter::repeat_n(0, size_of::<VectorTupleHeader0>()));
-                let metadata_s = buffer.len();
+                let metadata_s = buffer.len() as u16;
                 buffer.extend(metadata.as_bytes());
                 while buffer.len() % ALIGN != 0 {
                     buffer.push(0);
                 }
-                let elements_s = buffer.len();
+                let elements_s = buffer.len() as u16;
                 buffer.extend(elements.as_bytes());
-                let elements_e = buffer.len();
+                let elements_e = buffer.len() as u16;
                 while buffer.len() % ALIGN != 0 {
                     buffer.push(0);
                 }
@@ -270,7 +320,6 @@ impl<V: Vector> Tuple for VectorTuple<V> {
                         metadata_s,
                         elements_s,
                         elements_e,
-                        #[cfg(target_pointer_width = "32")]
                         _padding_0: Default::default(),
                     }
                     .as_bytes(),
@@ -278,23 +327,24 @@ impl<V: Vector> Tuple for VectorTuple<V> {
             }
             VectorTuple::_1 {
                 payload,
-                pointer,
+                head,
                 elements,
             } => {
                 buffer.extend((1 as Tag).to_ne_bytes());
                 buffer.extend(std::iter::repeat_n(0, size_of::<VectorTupleHeader1>()));
-                let elements_s = buffer.len();
+                let elements_s = buffer.len() as u16;
                 buffer.extend(elements.as_bytes());
-                let elements_e = buffer.len();
+                let elements_e = buffer.len() as u16;
                 while buffer.len() % ALIGN != 0 {
                     buffer.push(0);
                 }
                 buffer[size_of::<Tag>()..][..size_of::<VectorTupleHeader1>()].copy_from_slice(
                     VectorTupleHeader1 {
                         payload: *payload,
-                        pointer: *pointer,
+                        head: *head,
                         elements_s,
                         elements_e,
+                        _padding_0: Default::default(),
                     }
                     .as_bytes(),
                 );
@@ -370,10 +420,10 @@ impl<'a, V: Vector> VectorTupleReader<'a, V> {
             VectorTupleReader::_1(this) => this.elements,
         }
     }
-    pub fn metadata_or_pointer(self) -> Result<V::Metadata, IndexPointer> {
+    pub fn metadata_or_head(self) -> Result<V::Metadata, u16> {
         match self {
             VectorTupleReader::_0(this) => Ok(*this.metadata),
-            VectorTupleReader::_1(this) => Err(this.header.pointer),
+            VectorTupleReader::_1(this) => Err(this.header.head),
         }
     }
 }
@@ -381,35 +431,39 @@ impl<'a, V: Vector> VectorTupleReader<'a, V> {
 #[repr(C, align(8))]
 #[derive(Debug, Clone, PartialEq, FromBytes, IntoBytes, Immutable, KnownLayout)]
 struct H1TupleHeader0 {
-    mean: [IndexPointer; 32],
+    head: [u16; 32],
     dis_u_2: [f32; 32],
     factor_ppc: [f32; 32],
     factor_ip: [f32; 32],
     factor_err: [f32; 32],
     first: [u32; 32],
+    prefetch_s: u16,
+    prefetch_e: u16,
     len: u32,
+    elements_s: u16,
+    elements_e: u16,
     _padding_0: [ZeroU8; 4],
-    elements_s: usize,
-    elements_e: usize,
 }
 
 #[repr(C, align(8))]
 #[derive(Debug, Clone, PartialEq, FromBytes, IntoBytes, Immutable, KnownLayout)]
 struct H1TupleHeader1 {
-    elements_s: usize,
-    elements_e: usize,
+    elements_s: u16,
+    elements_e: u16,
+    _padding_0: [ZeroU8; 4],
 }
 
 #[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, PartialEq)]
 pub enum H1Tuple {
     _0 {
-        mean: [IndexPointer; 32],
+        head: [u16; 32],
         dis_u_2: [f32; 32],
         factor_ppc: [f32; 32],
         factor_ip: [f32; 32],
         factor_err: [f32; 32],
         first: [u32; 32],
+        prefetch: Vec<[u32; 32]>,
         len: u32,
         elements: Vec<[u8; 16]>,
     },
@@ -419,17 +473,19 @@ pub enum H1Tuple {
 }
 
 impl H1Tuple {
-    pub fn estimate_size_0(elements: usize) -> usize {
+    pub fn estimate_size_0(prefetch: usize, elements: usize) -> usize {
         let mut size = 0_usize;
         size += size_of::<Tag>();
         size += size_of::<H1TupleHeader0>();
-        size += elements * size_of::<[u8; 16]>();
+        size += (prefetch * size_of::<[u32; 32]>()).next_multiple_of(ALIGN);
+        size += (elements * size_of::<[u8; 16]>()).next_multiple_of(ALIGN);
         size
     }
-    pub fn fit_1(freespace: u16) -> Option<usize> {
+    pub fn fit_1(prefetch: usize, freespace: u16) -> Option<usize> {
         let mut freespace = freespace as isize;
         freespace -= size_of::<Tag>() as isize;
         freespace -= size_of::<H1TupleHeader1>() as isize;
+        freespace -= (prefetch * size_of::<[u32; 32]>()).next_multiple_of(ALIGN) as isize;
         if freespace >= 0 {
             Some(freespace as usize / size_of::<[u8; 16]>())
         } else {
@@ -443,32 +499,44 @@ impl Tuple for H1Tuple {
         let mut buffer = Vec::<u8>::new();
         match self {
             Self::_0 {
-                mean,
+                head,
                 dis_u_2,
                 factor_ppc,
                 factor_ip,
                 factor_err,
                 first,
+                prefetch,
                 len,
                 elements,
             } => {
                 buffer.extend((0 as Tag).to_ne_bytes());
                 buffer.extend(std::iter::repeat_n(0, size_of::<H1TupleHeader0>()));
-                let elements_s = buffer.len();
+                let prefetch_s = buffer.len() as u16;
+                buffer.extend(prefetch.as_bytes());
+                let prefetch_e = buffer.len() as u16;
+                while buffer.len() % ALIGN != 0 {
+                    buffer.push(0);
+                }
+                let elements_s = buffer.len() as u16;
                 buffer.extend(elements.as_bytes());
-                let elements_e = buffer.len();
+                let elements_e = buffer.len() as u16;
+                while buffer.len() % ALIGN != 0 {
+                    buffer.push(0);
+                }
                 buffer[size_of::<Tag>()..][..size_of::<H1TupleHeader0>()].copy_from_slice(
                     H1TupleHeader0 {
-                        mean: *mean,
+                        head: *head,
                         dis_u_2: *dis_u_2,
                         factor_ppc: *factor_ppc,
                         factor_ip: *factor_ip,
                         factor_err: *factor_err,
                         first: *first,
                         len: *len,
-                        _padding_0: Default::default(),
+                        prefetch_s,
+                        prefetch_e,
                         elements_s,
                         elements_e,
+                        _padding_0: Default::default(),
                     }
                     .as_bytes(),
                 );
@@ -476,13 +544,17 @@ impl Tuple for H1Tuple {
             Self::_1 { elements } => {
                 buffer.extend((1 as Tag).to_ne_bytes());
                 buffer.extend(std::iter::repeat_n(0, size_of::<H1TupleHeader1>()));
-                let elements_s = buffer.len();
+                let elements_s = buffer.len() as u16;
                 buffer.extend(elements.as_bytes());
-                let elements_e = buffer.len();
+                let elements_e = buffer.len() as u16;
+                while buffer.len() % ALIGN != 0 {
+                    buffer.push(0);
+                }
                 buffer[size_of::<Tag>()..][..size_of::<H1TupleHeader1>()].copy_from_slice(
                     H1TupleHeader1 {
                         elements_s,
                         elements_e,
+                        _padding_0: Default::default(),
                     }
                     .as_bytes(),
                 );
@@ -501,8 +573,13 @@ impl WithReader for H1Tuple {
             0 => {
                 let checker = RefChecker::new(source);
                 let header: &H1TupleHeader0 = checker.prefix(size_of::<Tag>());
+                let prefetch = checker.bytes(header.prefetch_s, header.prefetch_e);
                 let elements = checker.bytes(header.elements_s, header.elements_e);
-                H1TupleReader::_0(H1TupleReader0 { header, elements })
+                H1TupleReader::_0(H1TupleReader0 {
+                    header,
+                    prefetch,
+                    elements,
+                })
             }
             1 => {
                 let checker = RefChecker::new(source);
@@ -524,6 +601,7 @@ pub enum H1TupleReader<'a> {
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct H1TupleReader0<'a> {
     header: &'a H1TupleHeader0,
+    prefetch: &'a [[u32; 32]],
     elements: &'a [[u8; 16]],
 }
 
@@ -537,8 +615,8 @@ impl<'a> H1TupleReader0<'a> {
     pub fn len(self) -> u32 {
         self.header.len
     }
-    pub fn mean(self) -> &'a [IndexPointer] {
-        &self.header.mean[..self.header.len as usize]
+    pub fn head(self) -> &'a [u16] {
+        &self.header.head[..self.header.len as usize]
     }
     pub fn metadata(self) -> (&'a [f32; 32], &'a [f32; 32], &'a [f32; 32], &'a [f32; 32]) {
         (
@@ -550,6 +628,9 @@ impl<'a> H1TupleReader0<'a> {
     }
     pub fn first(self) -> &'a [u32] {
         &self.header.first[..self.header.len as usize]
+    }
+    pub fn prefetch(self) -> &'a [[u32; 32]] {
+        self.prefetch
     }
     pub fn elements(&self) -> &'a [[u8; 16]] {
         self.elements
@@ -593,7 +674,7 @@ impl WithReader for JumpTuple {
     type Reader<'a> = JumpTupleReader<'a>;
     fn deserialize_ref(source: &[u8]) -> JumpTupleReader<'_> {
         let checker = RefChecker::new(source);
-        let header: &JumpTupleHeader = checker.prefix(0);
+        let header: &JumpTupleHeader = checker.prefix(0_u16);
         JumpTupleReader { header }
     }
 }
@@ -602,7 +683,7 @@ impl WithWriter for JumpTuple {
     type Writer<'a> = JumpTupleWriter<'a>;
     fn deserialize_mut(source: &mut [u8]) -> JumpTupleWriter<'_> {
         let mut checker = MutChecker::new(source);
-        let header: &mut JumpTupleHeader = checker.prefix(0);
+        let header: &mut JumpTupleHeader = checker.prefix(0_u16);
         JumpTupleWriter { header }
     }
 }
@@ -644,33 +725,37 @@ impl JumpTupleWriter<'_> {
 #[repr(C, align(8))]
 #[derive(Debug, Clone, PartialEq, FromBytes, IntoBytes, Immutable, KnownLayout)]
 struct FrozenTupleHeader0 {
-    mean: [IndexPointer; 32],
+    head: [u16; 32],
     dis_u_2: [f32; 32],
     factor_ppc: [f32; 32],
     factor_ip: [f32; 32],
     factor_err: [f32; 32],
     payload: [Option<NonZero<u64>>; 32],
-    elements_s: usize,
-    elements_e: usize,
+    prefetch_s: u16,
+    prefetch_e: u16,
+    elements_s: u16,
+    elements_e: u16,
 }
 
 #[repr(C, align(8))]
 #[derive(Debug, Clone, PartialEq, FromBytes, IntoBytes, Immutable, KnownLayout)]
 struct FrozenTupleHeader1 {
-    elements_s: usize,
-    elements_e: usize,
+    elements_s: u16,
+    elements_e: u16,
+    _padding_0: [ZeroU8; 4],
 }
 
 #[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, PartialEq)]
 pub enum FrozenTuple {
     _0 {
-        mean: [IndexPointer; 32],
+        head: [u16; 32],
         dis_u_2: [f32; 32],
         factor_ppc: [f32; 32],
         factor_ip: [f32; 32],
         factor_err: [f32; 32],
         payload: [Option<NonZero<u64>>; 32],
+        prefetch: Vec<[u32; 32]>,
         elements: Vec<[u8; 16]>,
     },
     _1 {
@@ -679,17 +764,19 @@ pub enum FrozenTuple {
 }
 
 impl FrozenTuple {
-    pub fn estimate_size_0(elements: usize) -> usize {
+    pub fn estimate_size_0(prefetch: usize, elements: usize) -> usize {
         let mut size = 0_usize;
         size += size_of::<Tag>();
         size += size_of::<FrozenTupleHeader0>();
-        size += elements * size_of::<[u8; 16]>();
+        size += (prefetch * size_of::<[u32; 32]>()).next_multiple_of(ALIGN);
+        size += (elements * size_of::<[u8; 16]>()).next_multiple_of(ALIGN);
         size
     }
-    pub fn fit_1(freespace: u16) -> Option<usize> {
+    pub fn fit_1(prefetch: usize, freespace: u16) -> Option<usize> {
         let mut freespace = freespace as isize;
         freespace -= size_of::<Tag>() as isize;
         freespace -= size_of::<FrozenTupleHeader1>() as isize;
+        freespace -= (prefetch * size_of::<[u32; 32]>()).next_multiple_of(ALIGN) as isize;
         if freespace >= 0 {
             Some(freespace as usize / size_of::<[u8; 16]>())
         } else {
@@ -703,22 +790,32 @@ impl Tuple for FrozenTuple {
         let mut buffer = Vec::<u8>::new();
         match self {
             FrozenTuple::_0 {
-                mean,
+                head,
                 dis_u_2,
                 factor_ppc,
                 factor_ip,
                 factor_err,
                 payload,
+                prefetch,
                 elements,
             } => {
                 buffer.extend((0 as Tag).to_ne_bytes());
                 buffer.extend(std::iter::repeat_n(0, size_of::<FrozenTupleHeader0>()));
-                let elements_s = buffer.len();
+                let prefetch_s = buffer.len() as u16;
+                buffer.extend(prefetch.as_bytes());
+                let prefetch_e = buffer.len() as u16;
+                while buffer.len() % ALIGN != 0 {
+                    buffer.push(0);
+                }
+                let elements_s = buffer.len() as u16;
                 buffer.extend(elements.as_bytes());
-                let elements_e = buffer.len();
+                let elements_e = buffer.len() as u16;
+                while buffer.len() % ALIGN != 0 {
+                    buffer.push(0);
+                }
                 buffer[size_of::<Tag>()..][..size_of::<FrozenTupleHeader0>()].copy_from_slice(
                     FrozenTupleHeader0 {
-                        mean: *mean,
+                        head: *head,
                         dis_u_2: *dis_u_2,
                         factor_ppc: *factor_ppc,
                         factor_ip: *factor_ip,
@@ -726,6 +823,8 @@ impl Tuple for FrozenTuple {
                         payload: *payload,
                         elements_s,
                         elements_e,
+                        prefetch_s,
+                        prefetch_e,
                     }
                     .as_bytes(),
                 );
@@ -733,13 +832,17 @@ impl Tuple for FrozenTuple {
             Self::_1 { elements } => {
                 buffer.extend((1 as Tag).to_ne_bytes());
                 buffer.extend(std::iter::repeat_n(0, size_of::<FrozenTupleHeader1>()));
-                let elements_s = buffer.len();
+                let elements_s = buffer.len() as u16;
                 buffer.extend(elements.as_bytes());
-                let elements_e = buffer.len();
+                let elements_e = buffer.len() as u16;
+                while buffer.len() % ALIGN != 0 {
+                    buffer.push(0);
+                }
                 buffer[size_of::<Tag>()..][..size_of::<FrozenTupleHeader1>()].copy_from_slice(
                     FrozenTupleHeader1 {
                         elements_s,
                         elements_e,
+                        _padding_0: Default::default(),
                     }
                     .as_bytes(),
                 );
@@ -758,8 +861,13 @@ impl WithReader for FrozenTuple {
             0 => {
                 let checker = RefChecker::new(source);
                 let header: &FrozenTupleHeader0 = checker.prefix(size_of::<Tag>());
+                let prefetch = checker.bytes(header.prefetch_s, header.prefetch_e);
                 let elements = checker.bytes(header.elements_s, header.elements_e);
-                FrozenTupleReader::_0(FrozenTupleReader0 { header, elements })
+                FrozenTupleReader::_0(FrozenTupleReader0 {
+                    header,
+                    prefetch,
+                    elements,
+                })
             }
             1 => {
                 let checker = RefChecker::new(source);
@@ -804,12 +912,13 @@ pub enum FrozenTupleReader<'a> {
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct FrozenTupleReader0<'a> {
     header: &'a FrozenTupleHeader0,
+    prefetch: &'a [[u32; 32]],
     elements: &'a [[u8; 16]],
 }
 
 impl<'a> FrozenTupleReader0<'a> {
-    pub fn mean(self) -> &'a [IndexPointer; 32] {
-        &self.header.mean
+    pub fn mean(self) -> &'a [u16; 32] {
+        &self.header.head
     }
     pub fn metadata(self) -> (&'a [f32; 32], &'a [f32; 32], &'a [f32; 32], &'a [f32; 32]) {
         (
@@ -824,6 +933,9 @@ impl<'a> FrozenTupleReader0<'a> {
     }
     pub fn payload(self) -> &'a [Option<NonZero<u64>>; 32] {
         &self.header.payload
+    }
+    pub fn prefetch(self) -> &'a [[u32; 32]] {
+        self.prefetch
     }
 }
 
@@ -870,24 +982,28 @@ impl FrozenTupleWriter0<'_> {
 #[repr(C, align(8))]
 #[derive(Debug, Clone, PartialEq, FromBytes, IntoBytes, Immutable, KnownLayout)]
 struct AppendableTupleHeader {
-    mean: IndexPointer,
+    head: u16,
+    _padding_0: [ZeroU8; 6],
     dis_u_2: f32,
     factor_ppc: f32,
     factor_ip: f32,
     factor_err: f32,
     payload: Option<NonZero<u64>>,
-    elements_s: usize,
-    elements_e: usize,
+    prefetch_s: u16,
+    prefetch_e: u16,
+    elements_s: u16,
+    elements_e: u16,
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct AppendableTuple {
-    pub mean: IndexPointer,
+    pub head: u16,
     pub dis_u_2: f32,
     pub factor_ppc: f32,
     pub factor_ip: f32,
     pub factor_err: f32,
     pub payload: Option<NonZero<u64>>,
+    pub prefetch: Vec<u32>,
     pub elements: Vec<u64>,
 }
 
@@ -895,17 +1011,29 @@ impl Tuple for AppendableTuple {
     fn serialize(&self) -> Vec<u8> {
         let mut buffer = Vec::<u8>::new();
         buffer.extend(std::iter::repeat_n(0, size_of::<AppendableTupleHeader>()));
-        let elements_s = buffer.len();
+        let prefetch_s = buffer.len() as u16;
+        buffer.extend(self.prefetch.as_bytes());
+        let prefetch_e = buffer.len() as u16;
+        while buffer.len() % ALIGN != 0 {
+            buffer.push(0);
+        }
+        let elements_s = buffer.len() as u16;
         buffer.extend(self.elements.as_bytes());
-        let elements_e = buffer.len();
+        let elements_e = buffer.len() as u16;
+        while buffer.len() % ALIGN != 0 {
+            buffer.push(0);
+        }
         buffer[..size_of::<AppendableTupleHeader>()].copy_from_slice(
             AppendableTupleHeader {
-                mean: self.mean,
+                head: self.head,
+                _padding_0: Default::default(),
                 dis_u_2: self.dis_u_2,
                 factor_ppc: self.factor_ppc,
                 factor_ip: self.factor_ip,
                 factor_err: self.factor_err,
                 payload: self.payload,
+                prefetch_s,
+                prefetch_e,
                 elements_s,
                 elements_e,
             }
@@ -920,9 +1048,14 @@ impl WithReader for AppendableTuple {
 
     fn deserialize_ref(source: &[u8]) -> AppendableTupleReader<'_> {
         let checker = RefChecker::new(source);
-        let header: &AppendableTupleHeader = checker.prefix(0);
+        let header: &AppendableTupleHeader = checker.prefix(0_u16);
+        let prefetch = checker.bytes(header.prefetch_s, header.prefetch_e);
         let elements = checker.bytes(header.elements_s, header.elements_e);
-        AppendableTupleReader { header, elements }
+        AppendableTupleReader {
+            header,
+            prefetch,
+            elements,
+        }
     }
 }
 
@@ -931,7 +1064,7 @@ impl WithWriter for AppendableTuple {
 
     fn deserialize_mut(source: &mut [u8]) -> AppendableTupleWriter<'_> {
         let mut checker = MutChecker::new(source);
-        let header: &mut AppendableTupleHeader = checker.prefix(0);
+        let header: &mut AppendableTupleHeader = checker.prefix(0_u16);
         let elements = checker.bytes(header.elements_s, header.elements_e);
         AppendableTupleWriter { header, elements }
     }
@@ -940,12 +1073,13 @@ impl WithWriter for AppendableTuple {
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct AppendableTupleReader<'a> {
     header: &'a AppendableTupleHeader,
+    prefetch: &'a [u32],
     elements: &'a [u64],
 }
 
 impl<'a> AppendableTupleReader<'a> {
-    pub fn mean(self) -> IndexPointer {
-        self.header.mean
+    pub fn head(self) -> u16 {
+        self.header.head
     }
     pub fn code(self) -> BinaryCode<'a> {
         (
@@ -958,6 +1092,9 @@ impl<'a> AppendableTupleReader<'a> {
     }
     pub fn payload(self) -> Option<NonZero<u64>> {
         self.header.payload
+    }
+    pub fn prefetch(self) -> &'a [u32] {
+        self.prefetch
     }
 }
 
@@ -972,27 +1109,6 @@ impl AppendableTupleWriter<'_> {
     pub fn payload(&mut self) -> &mut Option<NonZero<u64>> {
         &mut self.header.payload
     }
-}
-
-pub const fn pointer_to_pair(pointer: IndexPointer) -> (u32, u16) {
-    let value = pointer.0;
-    (((value >> 16) & 0xffffffff) as u32, (value & 0xffff) as u16)
-}
-
-pub const fn pair_to_pointer(pair: (u32, u16)) -> IndexPointer {
-    let mut value = 0;
-    value |= (pair.0 as u64) << 16;
-    value |= pair.1 as u64;
-    IndexPointer(value)
-}
-
-#[test]
-const fn soundness_check() {
-    let a = (111, 222);
-    let b = pair_to_pointer(a);
-    let c = pointer_to_pair(b);
-    assert!(a.0 == c.0);
-    assert!(a.1 == c.1);
 }
 
 #[repr(transparent)]
@@ -1057,20 +1173,20 @@ impl<'a> RefChecker<'a> {
     }
     pub fn prefix<T: FromBytes + IntoBytes + KnownLayout + Immutable + Sized>(
         &self,
-        s: usize,
+        s: impl Into<usize> + Copy,
     ) -> &'a T {
-        let start = s;
-        let end = s + size_of::<T>();
+        let start = Into::<usize>::into(s);
+        let end = Into::<usize>::into(s) + size_of::<T>();
         let bytes = &self.bytes[start..end];
         FromBytes::ref_from_bytes(bytes).expect("deserialization: bad bytes")
     }
     pub fn bytes<T: FromBytes + IntoBytes + KnownLayout + Immutable + ?Sized>(
         &self,
-        s: usize,
-        e: usize,
+        s: impl Into<usize> + Copy,
+        e: impl Into<usize> + Copy,
     ) -> &'a T {
-        let start = s;
-        let end = e;
+        let start = Into::<usize>::into(s);
+        let end = Into::<usize>::into(e);
         let bytes = &self.bytes[start..end];
         FromBytes::ref_from_bytes(bytes).expect("deserialization: bad bytes")
     }
@@ -1092,10 +1208,10 @@ impl<'a> MutChecker<'a> {
     }
     pub fn prefix<T: FromBytes + IntoBytes + KnownLayout + Sized>(
         &mut self,
-        s: usize,
+        s: impl Into<usize> + Copy,
     ) -> &'a mut T {
-        let start = s;
-        let end = s + size_of::<T>();
+        let start = Into::<usize>::into(s);
+        let end = Into::<usize>::into(s) + size_of::<T>();
         if !(start <= end && end <= self.bytes.len()) {
             panic!("deserialization: bad bytes");
         }
@@ -1112,11 +1228,11 @@ impl<'a> MutChecker<'a> {
     }
     pub fn bytes<T: FromBytes + IntoBytes + KnownLayout + ?Sized>(
         &mut self,
-        s: usize,
-        e: usize,
+        s: impl Into<usize> + Copy,
+        e: impl Into<usize> + Copy,
     ) -> &'a mut T {
-        let start = s;
-        let end = e;
+        let start = Into::<usize>::into(s);
+        let end = Into::<usize>::into(e);
         if !(start <= end && end <= self.bytes.len()) {
             panic!("deserialization: bad bytes");
         }
@@ -1148,20 +1264,25 @@ fn aliasing_test() {
     #[repr(C, align(8))]
     #[derive(Debug, Clone, PartialEq, FromBytes, IntoBytes, Immutable, KnownLayout)]
     struct ExampleHeader {
-        elements_s: usize,
-        elements_e: usize,
+        elements_s: u16,
+        elements_e: u16,
+        _padding_0: [ZeroU8; 4],
     }
     let serialized = {
         let elements = (0u32..1111).collect::<Vec<u32>>();
         let mut buffer = Vec::<u8>::new();
         buffer.extend(std::iter::repeat_n(0, size_of::<ExampleHeader>()));
-        let elements_s = buffer.len();
+        let elements_s = buffer.len() as u16;
         buffer.extend(elements.as_bytes());
-        let elements_e = buffer.len();
+        let elements_e = buffer.len() as u16;
+        while buffer.len() % ALIGN != 0 {
+            buffer.push(0);
+        }
         buffer[..size_of::<ExampleHeader>()].copy_from_slice(
             ExampleHeader {
                 elements_s,
                 elements_e,
+                _padding_0: Default::default(),
             }
             .as_bytes(),
         );
@@ -1171,7 +1292,7 @@ fn aliasing_test() {
     source.as_mut_bytes()[..serialized.len()].copy_from_slice(&serialized);
     let deserialized = {
         let mut checker = MutChecker::new(source.as_mut_bytes());
-        let header: &mut ExampleHeader = checker.prefix(0);
+        let header: &mut ExampleHeader = checker.prefix(0_u16);
         let elements: &mut [u32] = checker.bytes(header.elements_s, header.elements_e);
         (header, elements)
     };

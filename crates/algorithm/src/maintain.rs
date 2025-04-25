@@ -1,11 +1,12 @@
-use crate::operator::{FunctionalAccessor, Operator};
+use crate::closure_lifetime_binder::{id_0, id_1, id_2, id_3};
+use crate::operator::{FunctionalAccessor, Operator, Vector};
 use crate::tape::{self, TapeWriter};
 use crate::tuples::*;
-use crate::{Branch, Page, RelationRead, RelationWrite, freepages};
+use crate::{Branch, Page, Relation, RelationRead, RelationWrite, freepages};
 use simd::fast_scan::{padding_pack, unpack};
 use std::num::NonZero;
 
-pub fn maintain<O: Operator>(index: impl RelationWrite, check: impl Fn()) {
+pub fn maintain<O: Operator, R: RelationRead + RelationWrite>(index: R, check: impl Fn()) {
     let meta_guard = index.read(0);
     let meta_bytes = meta_guard.get(1).expect("data corruption");
     let meta_tuple = MetaTuple::deserialize_ref(meta_bytes);
@@ -24,14 +25,8 @@ pub fn maintain<O: Operator>(index: impl RelationWrite, check: impl Fn()) {
                 tape::read_h1_tape(
                     index.clone(),
                     first,
-                    || {
-                        fn push<T>(_: &mut (), _: &[T]) {}
-                        fn finish<T>(_: (), _: (&T, &T, &T, &T)) -> [(); 32] {
-                            [(); 32]
-                        }
-                        FunctionalAccessor::new((), push, finish)
-                    },
-                    |(), _, first| results.push(first),
+                    || FunctionalAccessor::new((), id_0(|_, _| ()), id_1(|_, _| [(); 32])),
+                    |(), _, first, _| results.push(first),
                     |_| check(),
                 );
             }
@@ -48,25 +43,41 @@ pub fn maintain<O: Operator>(index: impl RelationWrite, check: impl Fn()) {
         let jump_bytes = jump_guard.get_mut(1).expect("data corruption");
         let mut jump_tuple = JumpTuple::deserialize_mut(jump_bytes);
 
-        let hooked_index = RelationHooked(index.clone(), hooked_extend(freepage_first));
+        let hooked_index = RelationHooked(
+            index.clone(),
+            id_3(move |index: &R, tracking_freespace: bool| {
+                if !tracking_freespace {
+                    if let Some(id) = freepages::fetch(index.clone(), freepage_first) {
+                        let mut write = index.write(id, false);
+                        write.clear();
+                        write
+                    } else {
+                        index.extend(false)
+                    }
+                } else {
+                    index.extend(true)
+                }
+            }),
+        );
 
-        let mut tape = FrozenTapeWriter::create(&hooked_index, false);
+        let mut tape = FrozenTapeWriter::create(&hooked_index, O::Vector::count(dims as _), false);
 
         let mut trace = Vec::new();
 
         let mut tuples = 0_u64;
-        let mut callback = |code: (_, _, _, _, _), mean, payload| {
+        let mut callback = id_2(|code: (_, _, _, _, _), head, payload, prefetch: &[_]| {
             tape.push(Branch {
-                mean,
+                head,
                 dis_u_2: code.0,
                 factor_ppc: code.1,
                 factor_ip: code.2,
                 factor_err: code.3,
                 signs: code.4,
+                prefetch: prefetch.to_vec(),
                 extra: payload,
             });
             tuples += 1;
-        };
+        });
         let mut step = |id| {
             check();
             trace.push(id);
@@ -113,12 +124,13 @@ pub fn maintain<O: Operator>(index: impl RelationWrite, check: impl Fn()) {
 
         for branch in branches {
             appendable_tape.push(AppendableTuple {
-                mean: branch.mean,
+                head: branch.head,
                 dis_u_2: branch.dis_u_2,
                 factor_ppc: branch.factor_ppc,
                 factor_ip: branch.factor_ip,
                 factor_err: branch.factor_err,
                 payload: Some(branch.extra),
+                prefetch: branch.prefetch,
                 elements: rabitq::pack_to_u64(&branch.signs),
             });
         }
@@ -139,16 +151,18 @@ where
 {
     tape: TapeWriter<'a, R, FrozenTuple>,
     branches: Vec<Branch<NonZero<u64>>>,
+    prefetch: usize,
 }
 
 impl<'a, R> FrozenTapeWriter<'a, R>
 where
     R: RelationWrite + 'a,
 {
-    fn create(index: &'a R, tracking_freespace: bool) -> Self {
+    fn create(index: &'a R, prefetch: usize, tracking_freespace: bool) -> Self {
         Self {
             tape: TapeWriter::create(index, tracking_freespace),
             branches: Vec::new(),
+            prefetch,
         }
     }
     fn push(&mut self, branch: Branch<NonZero<u64>>) {
@@ -157,19 +171,20 @@ where
             let mut remain = padding_pack(chunk.iter().map(|x| rabitq::pack_to_u4(&x.signs)));
             loop {
                 let freespace = self.tape.freespace();
-                if FrozenTuple::estimate_size_0(remain.len()) <= freespace as usize {
+                if FrozenTuple::estimate_size_0(self.prefetch, remain.len()) <= freespace as usize {
                     self.tape.tape_put(FrozenTuple::_0 {
-                        mean: chunk.each_ref().map(|x| x.mean),
+                        head: chunk.each_ref().map(|x| x.head),
                         dis_u_2: chunk.each_ref().map(|x| x.dis_u_2),
                         factor_ppc: chunk.each_ref().map(|x| x.factor_ppc),
                         factor_ip: chunk.each_ref().map(|x| x.factor_ip),
                         factor_err: chunk.each_ref().map(|x| x.factor_err),
                         payload: chunk.each_ref().map(|x| Some(x.extra)),
+                        prefetch: fix(chunk.each_ref().map(|x| x.prefetch.as_slice())),
                         elements: remain,
                     });
                     break;
                 }
-                if let Some(w) = FrozenTuple::fit_1(freespace) {
+                if let Some(w) = FrozenTuple::fit_1(self.prefetch, freespace) {
                     let (left, right) = remain.split_at(std::cmp::min(w, remain.len()));
                     self.tape.tape_put(FrozenTuple::_1 {
                         elements: left.to_vec(),
@@ -190,13 +205,19 @@ where
 #[derive(Clone)]
 struct RelationHooked<R, E>(R, E);
 
+impl<R, E> Relation for RelationHooked<R, E>
+where
+    R: Relation,
+    E: Clone,
+{
+    type Page = R::Page;
+}
+
 impl<R, E> RelationRead for RelationHooked<R, E>
 where
     R: RelationRead,
     E: Clone,
 {
-    type Page = R::Page;
-
     type ReadGuard<'a>
         = R::ReadGuard<'a>
     where
@@ -230,23 +251,15 @@ where
     }
 }
 
-fn hooked_extend<R>(
-    freepage_first: u32,
-) -> impl Clone + for<'a> Fn(&'a R, bool) -> R::WriteGuard<'a>
-where
-    R: RelationWrite,
-{
-    move |index, tracking_freespace| {
-        if !tracking_freespace {
-            if let Some(id) = freepages::fetch(index.clone(), freepage_first) {
-                let mut write = index.write(id, false);
-                write.clear();
-                write
-            } else {
-                index.extend(false)
-            }
-        } else {
-            index.extend(true)
-        }
+fn fix<'a>(into_iter: impl IntoIterator<Item = &'a [u32]>) -> Vec<[u32; 32]> {
+    use std::array::from_fn;
+    let mut iter = into_iter.into_iter();
+    let mut array: [_; 32] = from_fn(|_| iter.next().map(<[u32]>::to_vec).unwrap_or_default());
+    if iter.next().is_some() {
+        panic!("too many slices");
     }
+    let step = array.iter().map(Vec::len).max().unwrap_or_default();
+    array.iter_mut().for_each(|x| x.resize(step, u32::MAX));
+    let flat = array.into_iter().flatten().collect::<Vec<_>>();
+    (0..step).map(|i| from_fn(|j| flat[i * 32 + j])).collect()
 }

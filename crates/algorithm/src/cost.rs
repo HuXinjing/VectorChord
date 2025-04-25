@@ -1,11 +1,10 @@
 use crate::tuples::{MetaTuple, WithReader};
 use crate::{Page, RelationRead};
-use std::num::NonZero;
 
 pub struct Cost {
     pub dims: u32,
     pub is_residual: bool,
-    pub cells: Vec<NonZero<u32>>,
+    pub cells: Vec<u32>,
 }
 
 #[must_use]
@@ -15,12 +14,12 @@ pub fn cost(index: impl RelationRead) -> Cost {
     let meta_tuple = MetaTuple::deserialize_ref(meta_bytes);
     let dims = meta_tuple.dims();
     let is_residual = meta_tuple.is_residual();
-    let cells = meta_tuple.cells();
+    let cells = meta_tuple.cells().to_vec();
     drop(meta_guard);
 
     Cost {
         dims,
         is_residual,
-        cells: cells.into_iter().map_while(NonZero::new).collect(),
+        cells,
     }
 }

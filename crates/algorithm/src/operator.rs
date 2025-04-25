@@ -451,6 +451,8 @@ pub trait Vector: VectorOwned {
 
     fn split(vector: Self::Borrowed<'_>) -> (Vec<&[Self::Element]>, Self::Metadata);
 
+    fn count(n: usize) -> usize;
+
     fn unpack(vector: Self::Borrowed<'_>) -> (&[Self::Element], Self::Metadata);
 
     fn block_preprocess(vector: Self::Borrowed<'_>) -> BlockLut;
@@ -476,6 +478,15 @@ impl Vector for VectOwned<f32> {
             },
             (),
         )
+    }
+
+    fn count(n: usize) -> usize {
+        match n {
+            0 => unreachable!(),
+            1..=960 => 1,
+            961..=1280 => 2,
+            1281.. => n.div_ceil(1920),
+        }
     }
 
     fn unpack(vector: Self::Borrowed<'_>) -> (&[Self::Element], Self::Metadata) {
@@ -511,6 +522,15 @@ impl Vector for VectOwned<f16> {
             },
             (),
         )
+    }
+
+    fn count(n: usize) -> usize {
+        match n {
+            0 => unreachable!(),
+            1..=1920 => 1,
+            1921..=2560 => 2,
+            2561.. => n.div_ceil(3840),
+        }
     }
 
     fn unpack(vector: Self::Borrowed<'_>) -> (&[Self::Element], Self::Metadata) {

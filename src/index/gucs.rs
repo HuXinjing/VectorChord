@@ -1,5 +1,16 @@
+use super::scanners::SearchIo;
+use pgrx::PostgresGucEnum;
 use pgrx::guc::{GucContext, GucFlags, GucRegistry, GucSetting};
 use std::ffi::CStr;
+
+#[allow(non_camel_case_types)]
+#[derive(Debug, Clone, Copy, PostgresGucEnum)]
+pub enum Io {
+    read_buffer,
+    prefetch_buffer,
+    #[cfg(feature = "pg17")]
+    read_stream,
+}
 
 static PREWARM_DIM: GucSetting<Option<&CStr>> =
     GucSetting::<Option<&CStr>>::new(Some(c"64,128,256,384,512,768,1024,1536"));
@@ -12,6 +23,13 @@ static MAXSIM_REFINE: GucSetting<i32> = GucSetting::<i32>::new(0);
 static MAXSIM_THRESHOLD: GucSetting<i32> = GucSetting::<i32>::new(0);
 
 static PRERERANK_FILTERING: GucSetting<bool> = GucSetting::<bool>::new(false);
+
+static IO_RERANK: GucSetting<Io> = GucSetting::<Io>::new(
+    #[cfg(any(feature = "pg13", feature = "pg14", feature = "pg15", feature = "pg16"))]
+    Io::prefetch_buffer,
+    #[cfg(feature = "pg17")]
+    Io::read_stream,
+);
 
 pub fn init() {
     GucRegistry::define_string_guc(
@@ -75,6 +93,14 @@ pub fn init() {
         "`prererank_filtering` argument of vchordrq.",
         "`prererank_filtering` argument of vchordrq.",
         &PRERERANK_FILTERING,
+        GucContext::Userset,
+        GucFlags::default(),
+    );
+    GucRegistry::define_enum_guc(
+        "vchordrq.io_rerank",
+        "`io_rerank` argument of vchordrq.",
+        "`io_rerank` argument of vchordrq.",
+        &IO_RERANK,
         GucContext::Userset,
         GucFlags::default(),
     );
@@ -154,4 +180,13 @@ pub fn prewarm_dim() -> Vec<u32> {
 
 pub fn prererank_filtering() -> bool {
     PRERERANK_FILTERING.get()
+}
+
+pub fn io_rerank() -> SearchIo {
+    match IO_RERANK.get() {
+        Io::read_buffer => SearchIo::ReadBuffer,
+        Io::prefetch_buffer => SearchIo::PrefetchBuffer,
+        #[cfg(feature = "pg17")]
+        Io::read_stream => SearchIo::ReadStream,
+    }
 }

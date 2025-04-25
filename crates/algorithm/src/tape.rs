@@ -1,6 +1,6 @@
 use crate::operator::Accessor1;
 use crate::tuples::*;
-use crate::{IndexPointer, Page, PageGuard, RelationRead, RelationWrite};
+use crate::{Page, PageGuard, RelationRead, RelationWrite};
 use rabitq::binary::BinaryCode;
 use std::marker::PhantomData;
 use std::num::NonZero;
@@ -53,25 +53,25 @@ where
     R: RelationWrite + 'a,
     T: Tuple,
 {
-    pub fn push(&mut self, x: T) -> IndexPointer {
+    pub fn push(&mut self, x: T) -> (u32, u16) {
         let bytes = T::serialize(&x);
         if let Some(i) = self.head.alloc(&bytes) {
-            pair_to_pointer((self.head.id(), i))
+            (self.head.id(), i)
         } else {
             let next = self.index.extend(self.tracking_freespace);
             self.head.get_opaque_mut().next = next.id();
             self.head = next;
             if let Some(i) = self.head.alloc(&bytes) {
-                pair_to_pointer((self.head.id(), i))
+                (self.head.id(), i)
             } else {
                 panic!("implementation: a free page cannot accommodate a single tuple")
             }
         }
     }
-    pub fn tape_put(&mut self, x: T) -> IndexPointer {
+    pub fn tape_put(&mut self, x: T) -> (u32, u16) {
         let bytes = T::serialize(&x);
         if let Some(i) = self.head.alloc(&bytes) {
-            pair_to_pointer((self.head.id(), i))
+            (self.head.id(), i)
         } else {
             panic!("implementation: a free page cannot accommodate a single tuple")
         }
@@ -82,7 +82,7 @@ pub fn read_h1_tape<A, T>(
     index: impl RelationRead,
     first: u32,
     accessor: impl Fn() -> A,
-    mut callback: impl FnMut(T, IndexPointer, u32),
+    mut callback: impl for<'a> FnMut(T, u16, u32, &'a [u32]),
     mut step: impl FnMut(u32),
 ) where
     A: for<'a> Accessor1<
@@ -105,9 +105,10 @@ pub fn read_h1_tape<A, T>(
                     let mut x = x.take().unwrap_or_else(&accessor);
                     x.push(tuple.elements());
                     let values = x.finish(tuple.metadata());
+                    let prefetch: [_; 32] = fix_0(tuple.prefetch());
                     for (j, value) in values.into_iter().enumerate() {
                         if j < tuple.len() as usize {
-                            callback(value, tuple.mean()[j], tuple.first()[j]);
+                            callback(value, tuple.head()[j], tuple.first()[j], fix_1(prefetch[j]));
                         }
                     }
                 }
@@ -124,7 +125,7 @@ pub fn read_frozen_tape<A, T>(
     index: impl RelationRead,
     first: u32,
     accessor: impl Fn() -> A,
-    mut callback: impl FnMut(T, IndexPointer, NonZero<u64>),
+    mut callback: impl for<'a> FnMut(T, u16, NonZero<u64>, &'a [u32]),
     mut step: impl FnMut(u32),
 ) where
     A: for<'a> Accessor1<
@@ -147,9 +148,10 @@ pub fn read_frozen_tape<A, T>(
                     let mut x = x.take().unwrap_or_else(&accessor);
                     x.push(tuple.elements());
                     let values = x.finish(tuple.metadata());
+                    let prefetch: [_; 32] = fix_0(tuple.prefetch());
                     for (j, value) in values.into_iter().enumerate() {
                         if let Some(payload) = tuple.payload()[j] {
-                            callback(value, tuple.mean()[j], payload);
+                            callback(value, tuple.mean()[j], payload, fix_1(prefetch[j]));
                         }
                     }
                 }
@@ -166,7 +168,7 @@ pub fn read_appendable_tape<T>(
     index: impl RelationRead,
     first: u32,
     mut access: impl for<'a> FnMut(BinaryCode<'a>) -> T,
-    mut callback: impl FnMut(T, IndexPointer, NonZero<u64>),
+    mut callback: impl for<'a> FnMut(T, u16, NonZero<u64>, &'a [u32]),
     mut step: impl FnMut(u32),
 ) {
     assert!(first != u32::MAX);
@@ -179,7 +181,7 @@ pub fn read_appendable_tape<T>(
             let tuple = AppendableTuple::deserialize_ref(bytes);
             if let Some(payload) = tuple.payload() {
                 let value = access(tuple.code());
-                callback(value, tuple.mean(), payload);
+                callback(value, tuple.head(), payload, tuple.prefetch());
             }
         }
         current = guard.get_opaque().next;
@@ -188,11 +190,11 @@ pub fn read_appendable_tape<T>(
 
 #[allow(clippy::collapsible_else_if)]
 pub fn append(
-    index: impl RelationWrite,
+    index: impl RelationRead + RelationWrite,
     first: u32,
     bytes: &[u8],
     tracking_freespace: bool,
-) -> IndexPointer {
+) -> (u32, u16) {
     assert!(first != u32::MAX);
     let mut current = first;
     loop {
@@ -202,7 +204,7 @@ pub fn append(
             let mut write = index.write(current, tracking_freespace);
             if write.get_opaque().next == u32::MAX {
                 if let Some(i) = write.alloc(bytes) {
-                    return pair_to_pointer((current, i));
+                    return (current, i);
                 }
                 let mut extend = index.extend(tracking_freespace);
                 write.get_opaque_mut().next = extend.id();
@@ -212,7 +214,7 @@ pub fn append(
                     drop(extend);
                     let mut past = index.write(first, tracking_freespace);
                     past.get_opaque_mut().skip = fresh.max(past.get_opaque().skip);
-                    return pair_to_pointer((fresh, i));
+                    return (fresh, i);
                 } else {
                     panic!("implementation: a clear page cannot accommodate a single tuple");
                 }
@@ -229,5 +231,19 @@ pub fn append(
                 current = read.get_opaque().next;
             }
         }
+    }
+}
+
+fn fix_0<T>(x: &[[T; 32]]) -> [&[T]; 32] {
+    let step = x.len();
+    let flat = x.as_flattened();
+    std::array::from_fn(|i| &flat[i * step..][..step])
+}
+
+fn fix_1(x: &[u32]) -> &[u32] {
+    if let Some(i) = x.iter().position(|&x| x == u32::MAX) {
+        &x[..i]
+    } else {
+        x
     }
 }

@@ -1,21 +1,19 @@
+use crate::closure_lifetime_binder::id_4;
 use crate::operator::*;
+use crate::prefetcher::Prefetcher;
 use crate::tuples::{MetaTuple, WithReader};
-use crate::{IndexPointer, Page, RelationRead, RerankMethod, vectors};
+use crate::{Page, RelationRead, RerankMethod, vectors};
 use always_equal::AlwaysEqual;
 use distance::Distance;
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
+use std::marker::PhantomData;
 use std::num::NonZero;
 use vector::VectorOwned;
 
-type Result<T> = (
-    Reverse<Distance>,
-    AlwaysEqual<T>,
-    AlwaysEqual<NonZero<u64>>,
-    AlwaysEqual<IndexPointer>,
-);
+type Extra<'b> = &'b mut (NonZero<u64>, u16, &'b mut [u32]);
 
-type Rerank = (Reverse<Distance>, AlwaysEqual<NonZero<u64>>);
+type Result = (Reverse<Distance>, AlwaysEqual<NonZero<u64>>);
 
 pub fn how(index: impl RelationRead) -> RerankMethod {
     let meta_guard = index.read(0);
@@ -29,92 +27,97 @@ pub fn how(index: impl RelationRead) -> RerankMethod {
     }
 }
 
-pub struct Reranker<T, F> {
-    heap: BinaryHeap<Result<T>>,
-    cache: BinaryHeap<(Reverse<Distance>, AlwaysEqual<NonZero<u64>>)>,
+pub struct Reranker<T, F, P> {
+    prefetcher: P,
+    cache: BinaryHeap<Result>,
     f: F,
+    _phantom: PhantomData<fn(T) -> T>,
 }
 
-impl<T, F: FnMut(IndexPointer, NonZero<u64>) -> Option<Distance>> Iterator for Reranker<T, F> {
+impl<'b, T, F, P> Iterator for Reranker<T, F, P>
+where
+    F: FnMut(NonZero<u64>, Vec<<P::R as RelationRead>::ReadGuard<'_>>, u16) -> Option<Distance>,
+    P: Prefetcher<Item = ((Reverse<Distance>, AlwaysEqual<T>), AlwaysEqual<Extra<'b>>)>,
+{
     type Item = (Distance, NonZero<u64>);
 
     fn next(&mut self) -> Option<Self::Item> {
-        while let Some((Reverse(_), AlwaysEqual(_), AlwaysEqual(pay_u), AlwaysEqual(mean))) =
-            pop_if(&mut self.heap, |(d, ..)| {
-                Some(*d) > self.cache.peek().map(|(d, ..)| *d)
-            })
+        while let Some(((_, AlwaysEqual(&mut (payload, head, ..))), list)) = self
+            .prefetcher
+            .pop_if(|((d, _), ..)| Some(*d) > self.cache.peek().map(|(d, ..)| *d))
         {
-            if let Some(dis_u) = (self.f)(mean, pay_u) {
-                self.cache.push((Reverse(dis_u), AlwaysEqual(pay_u)));
+            if let Some(distance) = (self.f)(payload, list, head) {
+                self.cache.push((Reverse(distance), AlwaysEqual(payload)));
             };
         }
-        let (Reverse(dis_u), AlwaysEqual(pay_u)) = self.cache.pop()?;
-        Some((dis_u, pay_u))
+        let (Reverse(distance), AlwaysEqual(payload)) = self.cache.pop()?;
+        Some((distance, payload))
     }
 }
 
-impl<T, F> Reranker<T, F> {
-    pub fn finish(
-        self,
-    ) -> (
-        impl Iterator<Item = Result<T>>,
-        impl Iterator<Item = Rerank>,
-    ) {
-        (self.heap.into_iter(), self.cache.into_iter())
+impl<T, F, P> Reranker<T, F, P> {
+    pub fn finish(self) -> (P, impl Iterator<Item = Result>) {
+        (self.prefetcher, self.cache.into_iter())
     }
 }
 
-pub fn rerank_index<O: Operator, T>(
-    index: impl RelationRead,
+pub fn rerank_index<
+    'b,
+    O: Operator,
+    T,
+    P: Prefetcher<Item = ((Reverse<Distance>, AlwaysEqual<T>), AlwaysEqual<Extra<'b>>)>,
+>(
     vector: O::Vector,
-    results: Vec<Result<T>>,
-) -> Reranker<T, impl FnMut(IndexPointer, NonZero<u64>) -> Option<Distance>> {
+    prefetcher: P,
+) -> Reranker<
+    T,
+    impl FnMut(NonZero<u64>, Vec<<P::R as RelationRead>::ReadGuard<'_>>, u16) -> Option<Distance>,
+    P,
+> {
     Reranker {
-        heap: BinaryHeap::from(results),
-        cache: BinaryHeap::<(Reverse<Distance>, _)>::new(),
-        f: move |mean, pay_u| {
-            vectors::read_for_h0_tuple::<O, _>(
-                index.clone(),
-                mean,
-                pay_u,
+        prefetcher,
+        cache: BinaryHeap::new(),
+        f: id_4::<_, P::R, _, _, _>(move |payload, list, head| {
+            vectors::read_for_h0_tuple::<P::R, O, _>(
+                head,
+                list.into_iter(),
+                payload,
                 LTryAccess::new(
                     O::Vector::unpack(vector.as_borrowed()),
                     O::DistanceAccessor::default(),
                 ),
             )
-        },
+        }),
+        _phantom: PhantomData,
     }
 }
 
-pub fn rerank_heap<O: Operator, T>(
+pub fn rerank_heap<
+    'b,
+    O: Operator,
+    T,
+    P: Prefetcher<Item = ((Reverse<Distance>, AlwaysEqual<T>), AlwaysEqual<Extra<'b>>)>,
+>(
     vector: O::Vector,
-    results: Vec<Result<T>>,
-    mut fetch: impl FnMut(NonZero<u64>) -> Option<O::Vector>,
-) -> Reranker<T, impl FnMut(IndexPointer, NonZero<u64>) -> Option<Distance>> {
+    prefetcher: P,
+    mut fetch: impl FnMut(NonZero<u64>) -> Option<O::Vector> + 'b,
+) -> Reranker<
+    T,
+    impl FnMut(NonZero<u64>, Vec<<P::R as RelationRead>::ReadGuard<'_>>, u16) -> Option<Distance>,
+    P,
+> {
     Reranker {
-        heap: BinaryHeap::from(results),
-        cache: BinaryHeap::<(Reverse<Distance>, _)>::new(),
-        f: move |_: IndexPointer, pay_u| {
+        prefetcher,
+        cache: BinaryHeap::new(),
+        f: id_4::<_, P::R, _, _, _>(move |payload, _, _| {
+            let unpack = O::Vector::unpack(vector.as_borrowed());
+            let vector = fetch(payload)?;
             let vector = O::Vector::unpack(vector.as_borrowed());
-            let vec_u = fetch(pay_u)?;
-            let vec_u = O::Vector::unpack(vec_u.as_borrowed());
             let mut accessor = O::DistanceAccessor::default();
-            accessor.push(vector.0, vec_u.0);
-            let dis_u = accessor.finish(vector.1, vec_u.1);
-            Some(dis_u)
-        },
-    }
-}
-
-fn pop_if<T: Ord>(
-    heap: &mut BinaryHeap<T>,
-    mut predicate: impl FnMut(&mut T) -> bool,
-) -> Option<T> {
-    use std::collections::binary_heap::PeekMut;
-    let mut peek = heap.peek_mut()?;
-    if predicate(&mut peek) {
-        Some(PeekMut::pop(peek))
-    } else {
-        None
+            accessor.push(unpack.0, vector.0);
+            let distance = accessor.finish(unpack.1, vector.1);
+            Some(distance)
+        }),
+        _phantom: PhantomData,
     }
 }
