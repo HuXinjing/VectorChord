@@ -342,7 +342,8 @@ mod reduce_sum_of_xy {
             xy = _mm256_fmadd_ps(x, y, xy);
         }
         let mut xy = emulate_mm256_reduce_add_ps(xy);
-        while n > 0 {
+        // this hint is used to disable loop unrolling
+        while std::hint::black_box(n) > 0 {
             let x = unsafe { a.read().as_f32() };
             let y = unsafe { b.read().as_f32() };
             a = unsafe { a.add(1) };
@@ -620,7 +621,8 @@ mod reduce_sum_of_d2 {
             d2 = _mm256_fmadd_ps(d, d, d2);
         }
         let mut d2 = emulate_mm256_reduce_add_ps(d2);
-        while n > 0 {
+        // this hint is used to disable loop unrolling
+        while std::hint::black_box(n) > 0 {
             let x = unsafe { a.read().as_f32() };
             let y = unsafe { b.read().as_f32() };
             a = unsafe { a.add(1) };
