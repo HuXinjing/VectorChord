@@ -15,7 +15,7 @@ pub fn preprocess(vector: &[f32]) -> BlockLut {
     let qvector_sum = if vector.len() <= 4369 {
         simd::u8::reduce_sum_of_x_as_u16(&qvector) as f32
     } else {
-        simd::u8::reduce_sum_of_x(&qvector) as f32
+        simd::u8::reduce_sum_of_x_as_u32(&qvector) as f32
     };
     ((dis_v_2, b, k, qvector_sum), compress(qvector))
 }
@@ -25,7 +25,7 @@ pub fn process_l2(
     (dis_u_2, factor_ppc, factor_ip, factor_err, t): BlockCode<'_>,
 ) -> [(f32, f32); 32] {
     let &((dis_v_2, b, k, qvector_sum), ref s) = lut;
-    let r = simd::fast_scan::scan(t, s);
+    let r = simd::fast_scan::fast_scan(t, s);
     std::array::from_fn(|i| {
         let rough = dis_u_2[i]
             + dis_v_2
@@ -41,7 +41,7 @@ pub fn process_dot(
     (_, factor_ppc, factor_ip, factor_err, t): BlockCode<'_>,
 ) -> [(f32, f32); 32] {
     let &((dis_v_2, b, k, qvector_sum), ref s) = lut;
-    let r = simd::fast_scan::scan(t, s);
+    let r = simd::fast_scan::fast_scan(t, s);
     std::array::from_fn(|i| {
         let rough =
             0.5 * b * factor_ppc[i] + 0.5 * ((2.0 * r[i] as f32) - qvector_sum) * factor_ip[i] * k;

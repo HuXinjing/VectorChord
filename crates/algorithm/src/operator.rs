@@ -296,7 +296,7 @@ impl
     type Output = [(f32, f32); 32];
 
     fn push(&mut self, input: &[[u8; 16]], target: &[[u8; 16]]) {
-        let t = simd::fast_scan::scan(input, target);
+        let t = simd::fast_scan::fast_scan(input, target);
         for i in 0..32 {
             self.0[i] += t[i];
         }
@@ -334,7 +334,7 @@ impl
     type Output = [(f32, f32); 32];
 
     fn push(&mut self, input: &[[u8; 16]], target: &[[u8; 16]]) {
-        let t = simd::fast_scan::scan(input, target);
+        let t = simd::fast_scan::fast_scan(input, target);
         for i in 0..32 {
             self.0[i] += t[i];
         }

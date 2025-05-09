@@ -1,8 +1,9 @@
 use crate::linked_vec::LinkedVec;
 use crate::operator::*;
+use crate::tape::by_next;
 use crate::tuples::*;
 use crate::vectors::{self};
-use crate::{Bump, Page, Prefetcher, RelationRead, RelationWrite, tape};
+use crate::{Bump, Page, Prefetcher, PrefetcherHeapFamily, RelationRead, RelationWrite, tape};
 use always_equal::AlwaysEqual;
 use distance::Distance;
 use std::cmp::Reverse;
@@ -15,17 +16,12 @@ type Item<'b> = (
     AlwaysEqual<&'b mut (u32, u16, &'b mut [u32])>,
 );
 
-pub fn insert<
-    'b,
-    R: RelationRead + RelationWrite,
-    O: Operator,
-    P: Prefetcher<R = R, Item = Item<'b>>,
->(
-    index: R,
+pub fn insert<'r, 'b: 'r, R: RelationRead + RelationWrite, O: Operator>(
+    index: &'r R,
     payload: NonZero<u64>,
     vector: O::Vector,
     bump: &'b impl Bump,
-    mut prefetch: impl FnMut(Vec<Item<'b>>) -> P,
+    mut prefetch_h1_vectors: impl PrefetcherHeapFamily<'r, R>,
 ) {
     let meta_guard = index.read(0);
     let meta_bytes = meta_guard.get(1).expect("data corruption");
@@ -48,7 +44,7 @@ pub fn insert<
     };
 
     let (list, head) = if !rerank_in_heap {
-        vectors::append::<O>(index.clone(), vectors_first, vector.as_borrowed(), payload)
+        vectors::append::<O>(index, vectors_first, vector.as_borrowed(), payload)
     } else {
         (Vec::new(), 0)
     };
@@ -81,9 +77,8 @@ pub fn insert<
             } else {
                 unreachable!()
             };
-            tape::read_h1_tape(
-                index.clone(),
-                first,
+            tape::read_h1_tape::<R, _, _>(
+                by_next(index, first),
                 || RAccess::new((&block_lut.1, block_lut.0), O::BlockAccessor::default()),
                 |(rough, err), head, first, prefetch| {
                     let lowerbound = Distance::from_f32(rough - err * 1.9);
@@ -92,14 +87,13 @@ pub fn insert<
                         AlwaysEqual(bump.alloc((first, head, bump.alloc_slice(prefetch)))),
                     ));
                 },
-                |_| (),
             );
         }
-        let mut heap = (prefetch)(results.into_vec());
+        let mut heap = prefetch_h1_vectors.prefetch(results.into_vec());
         let mut cache = BinaryHeap::<(Reverse<Distance>, _, _)>::new();
         {
             while let Some(((Reverse(_), AlwaysEqual(&mut (first, head, ..))), list)) =
-                heap.pop_if(|(d, _)| Some(*d) > cache.peek().map(|(d, ..)| *d))
+                heap.next_if(|(d, _)| Some(*d) > cache.peek().map(|(d, ..)| *d))
             {
                 if is_residual {
                     let (distance, residual) = vectors::read_for_h1_tuple::<R, O, _>(
@@ -161,5 +155,5 @@ pub fn insert<
     let jump_bytes = jump_guard.get(1).expect("data corruption");
     let jump_tuple = JumpTuple::deserialize_ref(jump_bytes);
 
-    tape::append(index.clone(), jump_tuple.appendable_first(), &bytes, false);
+    tape::append(index, jump_tuple.appendable_first(), &bytes, false);
 }

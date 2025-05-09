@@ -314,15 +314,10 @@ pub unsafe extern "C-unwind" fn ambuild(
         }
     };
     reporter.phase(BuildPhase::from_code(BuildPhaseCode::Build));
-    crate::index::algorithm::build(
-        vector_options,
-        vchordrq_options.index,
-        index.clone(),
-        structures,
-    );
+    crate::index::algorithm::build(vector_options, vchordrq_options.index, &index, structures);
     reporter.phase(BuildPhase::from_code(BuildPhaseCode::Inserting));
     let cache = if vchordrq_options.build.pin {
-        let mut trace = algorithm::cache(index.clone());
+        let mut trace = algorithm::cache(&index);
         trace.sort();
         trace.dedup();
         if let Some(max) = trace.last().copied() {
@@ -384,7 +379,7 @@ pub unsafe extern "C-unwind" fn ambuild(
             for (vector, extra) in store {
                 let key = ctid_to_key(ctid);
                 let payload = kv_to_pointer((key, extra));
-                crate::index::algorithm::insert(opfamily, index.clone(), payload, vector);
+                crate::index::algorithm::insert(opfamily, &index, payload, vector);
             }
             indtuples += 1;
             reporter.tuples_done(indtuples);
@@ -395,7 +390,7 @@ pub unsafe extern "C-unwind" fn ambuild(
         pgrx::check_for_interrupts!();
     };
     reporter.phase(BuildPhase::from_code(BuildPhaseCode::Compacting));
-    crate::index::algorithm::maintain(opfamily, index, check);
+    crate::index::algorithm::maintain(opfamily, &index, check);
     unsafe { pgrx::pgbox::PgBox::<pgrx::pg_sys::IndexBuildResult>::alloc0().into_pg() }
 }
 
@@ -866,7 +861,7 @@ unsafe fn parallel_build(
                 for (vector, extra) in store {
                     let key = ctid_to_key(ctid);
                     let payload = kv_to_pointer((key, extra));
-                    crate::index::algorithm::insert(opfamily, index.clone(), payload, vector);
+                    crate::index::algorithm::insert(opfamily, &index, payload, vector);
                 }
                 unsafe {
                     let indtuples;
@@ -889,7 +884,7 @@ unsafe fn parallel_build(
                 for (vector, extra) in store {
                     let key = ctid_to_key(ctid);
                     let payload = kv_to_pointer((key, extra));
-                    crate::index::algorithm::insert(opfamily, index.clone(), payload, vector);
+                    crate::index::algorithm::insert(opfamily, &index, payload, vector);
                 }
                 unsafe {
                     let indtuples;

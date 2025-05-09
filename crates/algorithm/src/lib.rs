@@ -15,6 +15,7 @@ mod prewarm;
 mod rerank;
 mod search;
 mod tape;
+mod tape_writer;
 mod tuples;
 mod vectors;
 
@@ -29,12 +30,13 @@ pub use cost::cost;
 pub use fast_heap::FastHeap;
 pub use insert::insert;
 pub use maintain::maintain;
-pub use prefetcher::{PlainPrefetcher, Prefetcher, SimplePrefetcher, StreamPrefetcher};
+pub use prefetcher::*;
 pub use prewarm::prewarm;
 pub use rerank::{how, rerank_heap, rerank_index};
 pub use search::{default_search, maxsim_search};
 
 use std::collections::BinaryHeap;
+use std::iter::Peekable;
 use std::ops::{Deref, DerefMut};
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
@@ -72,27 +74,41 @@ pub trait PageGuard {
     fn id(&self) -> u32;
 }
 
-pub trait ReadStream<T> {
+pub trait ReadStream<'s> {
     type Relation: RelationRead;
-    type Inner: Iterator<Item = T>;
+    type Item;
+    type Inner: Iterator<Item = Self::Item>;
+    fn next(
+        &mut self,
+    ) -> Option<(
+        Self::Item,
+        Vec<<Self::Relation as RelationRead>::ReadGuard<'s>>,
+    )>;
     fn next_if(
         &mut self,
-        predicate: impl FnOnce(&T) -> bool,
-    ) -> Option<(T, Vec<<Self::Relation as RelationRead>::ReadGuard<'_>>)>;
+        predicate: impl FnOnce(&Self::Item) -> bool,
+    ) -> Option<(
+        Self::Item,
+        Vec<<Self::Relation as RelationRead>::ReadGuard<'s>>,
+    )>;
     fn into_inner(self) -> Self::Inner;
 }
 
-pub trait WriteStream<T> {
+pub trait WriteStream<'s> {
     type Relation: RelationWrite;
-    type Inner: Iterator<Item = T>;
+    type Item;
+    type Inner: Iterator<Item = Self::Item>;
     fn next_if(
         &mut self,
-        predicate: impl FnOnce(&T) -> bool,
-    ) -> Option<(T, Vec<<Self::Relation as RelationWrite>::WriteGuard<'_>>)>;
+        predicate: impl FnOnce(&Self::Item) -> bool,
+    ) -> Option<(
+        Self::Item,
+        Vec<<Self::Relation as RelationWrite>::WriteGuard<'s>>,
+    )>;
     fn into_inner(self) -> Self::Inner;
 }
 
-pub trait Relation: Clone {
+pub trait Relation {
     type Page: Page;
 }
 
@@ -116,22 +132,34 @@ pub trait RelationPrefetch: Relation {
     fn prefetch(&self, id: u32);
 }
 
+#[derive(Debug, Default, Clone)]
+pub struct Hints {
+    pub full: bool,
+}
+
+impl Hints {
+    #[allow(clippy::needless_update)]
+    pub fn full(self, full: bool) -> Self {
+        Self { full, ..self }
+    }
+}
+
 pub trait RelationReadStream: RelationRead {
-    type ReadStream<'s, I: Iterator>: ReadStream<I::Item, Relation = Self>
+    type ReadStream<'s, I: Iterator>: ReadStream<'s, Item = I::Item, Relation = Self>
     where
         I::Item: Fetch,
         Self: 's;
-    fn read_stream<I: Iterator>(&self, iter: I) -> Self::ReadStream<'_, I>
+    fn read_stream<I: Iterator>(&self, iter: I, hints: Hints) -> Self::ReadStream<'_, I>
     where
         I::Item: Fetch;
 }
 
 pub trait RelationWriteStream: RelationWrite {
-    type WriteStream<'s, I: Iterator>: WriteStream<I::Item, Relation = Self>
+    type WriteStream<'s, I: Iterator>: WriteStream<'s, Item = I::Item, Relation = Self>
     where
         I::Item: Fetch,
         Self: 's;
-    fn write_stream<I: Iterator>(&self, iter: I) -> Self::WriteStream<'_, I>
+    fn write_stream<I: Iterator>(&self, iter: I, hints: Hints) -> Self::WriteStream<'_, I>
     where
         I::Item: Fetch;
 }
@@ -153,8 +181,21 @@ pub(crate) struct Branch<T> {
     pub extra: T,
 }
 
+pub trait Bump: 'static {
+    #[allow(clippy::mut_from_ref)]
+    fn alloc<T>(&self, value: T) -> &mut T;
+    #[allow(clippy::mut_from_ref)]
+    fn alloc_slice<T: Copy>(&self, slice: &[T]) -> &mut [T];
+}
+
 pub trait Fetch {
     fn fetch(&self) -> &[u32];
+}
+
+impl Fetch for u32 {
+    fn fetch(&self) -> &[u32] {
+        std::slice::from_ref(self)
+    }
 }
 
 impl<'b, T, A, B> Fetch for (T, AlwaysEqual<&'b mut (A, B, &'b mut [u32])>) {
@@ -164,24 +205,39 @@ impl<'b, T, A, B> Fetch for (T, AlwaysEqual<&'b mut (A, B, &'b mut [u32])>) {
     }
 }
 
-pub trait Bump: 'static {
-    #[allow(clippy::mut_from_ref)]
-    fn alloc<T>(&self, value: T) -> &mut T;
-    #[allow(clippy::mut_from_ref)]
-    fn alloc_slice<T: Copy>(&self, slice: &[T]) -> &mut [T];
+pub trait Sequence {
+    type Item;
+    type Inner: Iterator<Item = Self::Item>;
+    fn next(&mut self) -> Option<Self::Item>;
+    fn next_if(&mut self, predicate: impl FnOnce(&Self::Item) -> bool) -> Option<Self::Item>;
+    fn into_inner(self) -> Self::Inner;
 }
 
-pub trait Heap: IntoIterator {
-    fn make(this: Vec<Self::Item>) -> Self;
-    fn pop_if(&mut self, predicate: impl FnOnce(&Self::Item) -> bool) -> Option<Self::Item>;
-}
-
-impl<T: Ord> Heap for BinaryHeap<T> {
-    fn make(this: Vec<T>) -> Self {
-        Self::from(this)
+impl<T: Ord> Sequence for BinaryHeap<T> {
+    type Item = T;
+    type Inner = std::vec::IntoIter<T>;
+    fn next(&mut self) -> Option<T> {
+        self.pop()
     }
-    fn pop_if(&mut self, predicate: impl FnOnce(&T) -> bool) -> Option<T> {
+    fn next_if(&mut self, predicate: impl FnOnce(&T) -> bool) -> Option<T> {
         let peek = self.peek()?;
         if predicate(peek) { self.pop() } else { None }
+    }
+    fn into_inner(self) -> Self::Inner {
+        self.into_vec().into_iter()
+    }
+}
+
+impl<I: Iterator> Sequence for Peekable<I> {
+    type Item = I::Item;
+    type Inner = Peekable<I>;
+    fn next(&mut self) -> Option<I::Item> {
+        Iterator::next(self)
+    }
+    fn next_if(&mut self, predicate: impl FnOnce(&I::Item) -> bool) -> Option<I::Item> {
+        Peekable::next_if(self, predicate)
+    }
+    fn into_inner(self) -> Self::Inner {
+        self
     }
 }

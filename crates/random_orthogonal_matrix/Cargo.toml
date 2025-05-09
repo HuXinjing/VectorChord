@@ -2,6 +2,7 @@
 name = "random_orthogonal_matrix"
 version.workspace = true
 edition.workspace = true
+publish = false
 
 [dependencies]
 # lock algebra version forever so that the QR decomposition never changes for same input

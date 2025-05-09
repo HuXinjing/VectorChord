@@ -15,7 +15,7 @@ type Extra<'b> = &'b mut (NonZero<u64>, u16, &'b mut [u32]);
 
 type Result = (Reverse<Distance>, AlwaysEqual<NonZero<u64>>);
 
-pub fn how(index: impl RelationRead) -> RerankMethod {
+pub fn how(index: &impl RelationRead) -> RerankMethod {
     let meta_guard = index.read(0);
     let meta_bytes = meta_guard.get(1).expect("data corruption");
     let meta_tuple = MetaTuple::deserialize_ref(meta_bytes);
@@ -34,17 +34,17 @@ pub struct Reranker<T, F, P> {
     _phantom: PhantomData<fn(T) -> T>,
 }
 
-impl<'b, T, F, P> Iterator for Reranker<T, F, P>
+impl<'r, 'b, T, F, P> Iterator for Reranker<T, F, P>
 where
-    F: FnMut(NonZero<u64>, Vec<<P::R as RelationRead>::ReadGuard<'_>>, u16) -> Option<Distance>,
-    P: Prefetcher<Item = ((Reverse<Distance>, AlwaysEqual<T>), AlwaysEqual<Extra<'b>>)>,
+    F: FnMut(NonZero<u64>, Vec<<P::R as RelationRead>::ReadGuard<'r>>, u16) -> Option<Distance>,
+    P: Prefetcher<'r, Item = ((Reverse<Distance>, AlwaysEqual<T>), AlwaysEqual<Extra<'b>>)>,
 {
     type Item = (Distance, NonZero<u64>);
 
     fn next(&mut self) -> Option<Self::Item> {
         while let Some(((_, AlwaysEqual(&mut (payload, head, ..))), list)) = self
             .prefetcher
-            .pop_if(|((d, _), ..)| Some(*d) > self.cache.peek().map(|(d, ..)| *d))
+            .next_if(|((d, _), ..)| Some(*d) > self.cache.peek().map(|(d, ..)| *d))
         {
             if let Some(distance) = (self.f)(payload, list, head) {
                 self.cache.push((Reverse(distance), AlwaysEqual(payload)));
@@ -62,10 +62,11 @@ impl<T, F, P> Reranker<T, F, P> {
 }
 
 pub fn rerank_index<
+    'r,
     'b,
     O: Operator,
     T,
-    P: Prefetcher<Item = ((Reverse<Distance>, AlwaysEqual<T>), AlwaysEqual<Extra<'b>>)>,
+    P: Prefetcher<'r, Item = ((Reverse<Distance>, AlwaysEqual<T>), AlwaysEqual<Extra<'b>>)>,
 >(
     vector: O::Vector,
     prefetcher: P,
@@ -93,10 +94,11 @@ pub fn rerank_index<
 }
 
 pub fn rerank_heap<
+    'r,
     'b,
     O: Operator,
     T,
-    P: Prefetcher<Item = ((Reverse<Distance>, AlwaysEqual<T>), AlwaysEqual<Extra<'b>>)>,
+    P: Prefetcher<'r, Item = ((Reverse<Distance>, AlwaysEqual<T>), AlwaysEqual<Extra<'b>>)>,
 >(
     vector: O::Vector,
     prefetcher: P,

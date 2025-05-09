@@ -1,9 +1,9 @@
 #![allow(clippy::just_underscores_and_digits)]
-mod reduce_sum_of_xy {
+mod reduce_sum_of_x_as_u32_y_as_u32 {
     #[inline]
     #[cfg(target_arch = "x86_64")]
     #[crate::target_cpu(enable = "v4")]
-    fn reduce_sum_of_xy_v4(lhs: &[u8], rhs: &[u8]) -> u32 {
+    fn reduce_sum_of_x_as_u32_y_as_u32_v4(lhs: &[u8], rhs: &[u8]) -> u32 {
         use core::arch::x86_64::*;
         assert_eq!(lhs.len(), rhs.len());
         let mut n = lhs.len();
@@ -54,7 +54,7 @@ mod reduce_sum_of_xy {
 
     #[cfg(all(target_arch = "x86_64", test, not(miri)))]
     #[test]
-    fn reduce_sum_of_xy_v4_test() {
+    fn reduce_sum_of_x_as_u32_y_as_u32_v4_test() {
         use rand::Rng;
         if !crate::is_cpu_detected!("v4") {
             println!("test {} ... skipped (v4)", module_path!());
@@ -68,7 +68,7 @@ mod reduce_sum_of_xy {
             for z in 3984..4016 {
                 let lhs = &lhs[..z];
                 let rhs = &rhs[..z];
-                let specialized = unsafe { reduce_sum_of_xy_v4(lhs, rhs) };
+                let specialized = unsafe { reduce_sum_of_x_as_u32_y_as_u32_v4(lhs, rhs) };
                 let fallback = fallback(lhs, rhs);
                 assert!(
                     specialized == fallback,
@@ -81,7 +81,7 @@ mod reduce_sum_of_xy {
     #[inline]
     #[cfg(target_arch = "x86_64")]
     #[crate::target_cpu(enable = "v3")]
-    fn reduce_sum_of_xy_v3(lhs: &[u8], rhs: &[u8]) -> u32 {
+    fn reduce_sum_of_x_as_u32_y_as_u32_v3(lhs: &[u8], rhs: &[u8]) -> u32 {
         use crate::emulate::emulate_mm256_reduce_add_epi32;
         use core::arch::x86_64::*;
         assert_eq!(lhs.len(), rhs.len());
@@ -129,7 +129,7 @@ mod reduce_sum_of_xy {
 
     #[cfg(all(target_arch = "x86_64", test))]
     #[test]
-    fn reduce_sum_of_xy_v3_test() {
+    fn reduce_sum_of_x_as_u32_y_as_u32_v3_test() {
         use rand::Rng;
         if !crate::is_cpu_detected!("v3") {
             println!("test {} ... skipped (v3)", module_path!());
@@ -143,7 +143,7 @@ mod reduce_sum_of_xy {
             for z in 3984..4016 {
                 let lhs = &lhs[..z];
                 let rhs = &rhs[..z];
-                let specialized = unsafe { reduce_sum_of_xy_v3(lhs, rhs) };
+                let specialized = unsafe { reduce_sum_of_x_as_u32_y_as_u32_v3(lhs, rhs) };
                 let fallback = fallback(lhs, rhs);
                 assert!(
                     specialized == fallback,
@@ -156,7 +156,7 @@ mod reduce_sum_of_xy {
     #[inline]
     #[cfg(target_arch = "x86_64")]
     #[crate::target_cpu(enable = "v2")]
-    fn reduce_sum_of_xy_v2(lhs: &[u8], rhs: &[u8]) -> u32 {
+    fn reduce_sum_of_x_as_u32_y_as_u32_v2(lhs: &[u8], rhs: &[u8]) -> u32 {
         use crate::emulate::emulate_mm_reduce_add_epi32;
         use core::arch::x86_64::*;
         assert_eq!(lhs.len(), rhs.len());
@@ -204,7 +204,7 @@ mod reduce_sum_of_xy {
 
     #[cfg(all(target_arch = "x86_64", test))]
     #[test]
-    fn reduce_sum_of_xy_v2_test() {
+    fn reduce_sum_of_x_as_u32_y_as_u32_v2_test() {
         use rand::Rng;
         if !crate::is_cpu_detected!("v2") {
             println!("test {} ... skipped (v2)", module_path!());
@@ -218,7 +218,7 @@ mod reduce_sum_of_xy {
             for z in 3984..4016 {
                 let lhs = &lhs[..z];
                 let rhs = &rhs[..z];
-                let specialized = unsafe { reduce_sum_of_xy_v2(lhs, rhs) };
+                let specialized = unsafe { reduce_sum_of_x_as_u32_y_as_u32_v2(lhs, rhs) };
                 let fallback = fallback(lhs, rhs);
                 assert!(
                     specialized == fallback,
@@ -231,7 +231,7 @@ mod reduce_sum_of_xy {
     #[inline]
     #[cfg(target_arch = "aarch64")]
     #[crate::target_cpu(enable = "a2")]
-    fn reduce_sum_of_xy_a2(lhs: &[u8], rhs: &[u8]) -> u32 {
+    fn reduce_sum_of_x_as_u32_y_as_u32_a2(lhs: &[u8], rhs: &[u8]) -> u32 {
         use core::arch::aarch64::*;
         assert_eq!(lhs.len(), rhs.len());
         let mut n = lhs.len();
@@ -274,7 +274,7 @@ mod reduce_sum_of_xy {
 
     #[cfg(all(target_arch = "aarch64", test, not(miri)))]
     #[test]
-    fn reduce_sum_of_xy_a2_test() {
+    fn reduce_sum_of_x_as_u32_y_as_u32_a2_test() {
         use rand::Rng;
         if !crate::is_cpu_detected!("a2") {
             println!("test {} ... skipped (a2)", module_path!());
@@ -288,7 +288,7 @@ mod reduce_sum_of_xy {
             for z in 3984..4016 {
                 let lhs = &lhs[..z];
                 let rhs = &rhs[..z];
-                let specialized = unsafe { reduce_sum_of_xy_a2(lhs, rhs) };
+                let specialized = unsafe { reduce_sum_of_x_as_u32_y_as_u32_a2(lhs, rhs) };
                 let fallback = fallback(lhs, rhs);
                 assert!(
                     specialized == fallback,
@@ -299,7 +299,7 @@ mod reduce_sum_of_xy {
     }
 
     #[crate::multiversion(@"v4", @"v3", @"v2", @"a2")]
-    pub fn reduce_sum_of_xy(s: &[u8], t: &[u8]) -> u32 {
+    pub fn reduce_sum_of_x_as_u32_y_as_u32(s: &[u8], t: &[u8]) -> u32 {
         assert_eq!(s.len(), t.len());
         let n = s.len();
         let mut result = 0;
@@ -311,8 +311,8 @@ mod reduce_sum_of_xy {
 }
 
 #[inline(always)]
-pub fn reduce_sum_of_xy(s: &[u8], t: &[u8]) -> u32 {
-    reduce_sum_of_xy::reduce_sum_of_xy(s, t)
+pub fn reduce_sum_of_x_as_u32_y_as_u32(s: &[u8], t: &[u8]) -> u32 {
+    reduce_sum_of_x_as_u32_y_as_u32::reduce_sum_of_x_as_u32_y_as_u32(s, t)
 }
 
 mod reduce_sum_of_x_as_u16 {
@@ -520,11 +520,11 @@ pub fn reduce_sum_of_x_as_u16(vector: &[u8]) -> u16 {
     reduce_sum_of_x_as_u16::reduce_sum_of_x_as_u16(vector)
 }
 
-mod reduce_sum_of_x {
+mod reduce_sum_of_x_as_u32 {
     #[inline]
     #[cfg(target_arch = "x86_64")]
     #[crate::target_cpu(enable = "v4")]
-    fn reduce_sum_of_x_v4(this: &[u8]) -> u32 {
+    fn reduce_sum_of_x_as_u32_v4(this: &[u8]) -> u32 {
         use std::arch::x86_64::*;
         let us = _mm512_set1_epi32(255);
         let mut n = this.len();
@@ -546,7 +546,7 @@ mod reduce_sum_of_x {
 
     #[cfg(all(target_arch = "x86_64", test, not(miri)))]
     #[test]
-    fn reduce_sum_of_x_v4_test() {
+    fn reduce_sum_of_x_as_u32_v4_test() {
         use rand::Rng;
         if !crate::is_cpu_detected!("v4") {
             println!("test {} ... skipped (v4)", module_path!());
@@ -558,7 +558,7 @@ mod reduce_sum_of_x {
             let this = (0..n).map(|_| rng.random_range(0..16)).collect::<Vec<_>>();
             for z in 3984..4016 {
                 let this = &this[..z];
-                let specialized = unsafe { reduce_sum_of_x_v4(this) };
+                let specialized = unsafe { reduce_sum_of_x_as_u32_v4(this) };
                 let fallback = fallback(this);
                 assert_eq!(specialized, fallback);
             }
@@ -568,7 +568,7 @@ mod reduce_sum_of_x {
     #[inline]
     #[cfg(target_arch = "x86_64")]
     #[crate::target_cpu(enable = "v3")]
-    fn reduce_sum_of_x_v3(this: &[u8]) -> u32 {
+    fn reduce_sum_of_x_as_u32_v3(this: &[u8]) -> u32 {
         use crate::emulate::emulate_mm256_reduce_add_epi32;
         use std::arch::x86_64::*;
         let us = _mm256_set1_epi32(255);
@@ -594,7 +594,7 @@ mod reduce_sum_of_x {
 
     #[cfg(all(target_arch = "x86_64", test))]
     #[test]
-    fn reduce_sum_of_x_v3_test() {
+    fn reduce_sum_of_x_as_u32_v3_test() {
         use rand::Rng;
         if !crate::is_cpu_detected!("v3") {
             println!("test {} ... skipped (v3)", module_path!());
@@ -606,7 +606,7 @@ mod reduce_sum_of_x {
             let this = (0..n).map(|_| rng.random_range(0..16)).collect::<Vec<_>>();
             for z in 3984..4016 {
                 let this = &this[..z];
-                let specialized = unsafe { reduce_sum_of_x_v3(this) };
+                let specialized = unsafe { reduce_sum_of_x_as_u32_v3(this) };
                 let fallback = fallback(this);
                 assert_eq!(specialized, fallback);
             }
@@ -616,7 +616,7 @@ mod reduce_sum_of_x {
     #[inline]
     #[cfg(target_arch = "x86_64")]
     #[crate::target_cpu(enable = "v2")]
-    fn reduce_sum_of_x_v2(this: &[u8]) -> u32 {
+    fn reduce_sum_of_x_as_u32_v2(this: &[u8]) -> u32 {
         use crate::emulate::emulate_mm_reduce_add_epi32;
         use std::arch::x86_64::*;
         let us = _mm_set1_epi32(255);
@@ -642,7 +642,7 @@ mod reduce_sum_of_x {
 
     #[cfg(all(target_arch = "x86_64", test))]
     #[test]
-    fn reduce_sum_of_x_v2_test() {
+    fn reduce_sum_of_x_as_u32_v2_test() {
         use rand::Rng;
         if !crate::is_cpu_detected!("v2") {
             println!("test {} ... skipped (v2)", module_path!());
@@ -654,7 +654,7 @@ mod reduce_sum_of_x {
             let this = (0..n).map(|_| rng.random_range(0..16)).collect::<Vec<_>>();
             for z in 3984..4016 {
                 let this = &this[..z];
-                let specialized = unsafe { reduce_sum_of_x_v2(this) };
+                let specialized = unsafe { reduce_sum_of_x_as_u32_v2(this) };
                 let fallback = fallback(this);
                 assert_eq!(specialized, fallback);
             }
@@ -664,7 +664,7 @@ mod reduce_sum_of_x {
     #[inline]
     #[cfg(target_arch = "aarch64")]
     #[crate::target_cpu(enable = "a2")]
-    fn reduce_sum_of_x_a2(this: &[u8]) -> u32 {
+    fn reduce_sum_of_x_as_u32_a2(this: &[u8]) -> u32 {
         use std::arch::aarch64::*;
         let mut n = this.len();
         let mut a = this.as_ptr();
@@ -690,7 +690,7 @@ mod reduce_sum_of_x {
 
     #[cfg(all(target_arch = "aarch64", test))]
     #[test]
-    fn reduce_sum_of_x_a2_test() {
+    fn reduce_sum_of_x_as_u32_a2_test() {
         use rand::Rng;
         if !crate::is_cpu_detected!("a2") {
             println!("test {} ... skipped (a2)", module_path!());
@@ -702,7 +702,7 @@ mod reduce_sum_of_x {
             let this = (0..n).map(|_| rng.random_range(0..16)).collect::<Vec<_>>();
             for z in 3984..4016 {
                 let this = &this[..z];
-                let specialized = unsafe { reduce_sum_of_x_a2(this) };
+                let specialized = unsafe { reduce_sum_of_x_as_u32_a2(this) };
                 let fallback = fallback(this);
                 assert_eq!(specialized, fallback);
             }
@@ -710,7 +710,7 @@ mod reduce_sum_of_x {
     }
 
     #[crate::multiversion(@"v4", @"v3", @"v2", @"a2")]
-    pub fn reduce_sum_of_x(this: &[u8]) -> u32 {
+    pub fn reduce_sum_of_x_as_u32(this: &[u8]) -> u32 {
         let n = this.len();
         let mut sum = 0;
         for i in 0..n {
@@ -721,6 +721,6 @@ mod reduce_sum_of_x {
 }
 
 #[inline(always)]
-pub fn reduce_sum_of_x(vector: &[u8]) -> u32 {
-    reduce_sum_of_x::reduce_sum_of_x(vector)
+pub fn reduce_sum_of_x_as_u32(vector: &[u8]) -> u32 {
+    reduce_sum_of_x_as_u32::reduce_sum_of_x_as_u32(vector)
 }

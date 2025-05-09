@@ -1,9 +1,10 @@
 use crate::closure_lifetime_binder::id_2;
 use crate::linked_vec::LinkedVec;
 use crate::operator::*;
-use crate::prefetcher::Prefetcher;
+use crate::prefetcher::{Prefetcher, PrefetcherSequenceFamily};
+use crate::tape::{by_directory, by_next};
 use crate::tuples::*;
-use crate::{Bump, Page, RelationRead, tape, vectors};
+use crate::{Bump, Page, PrefetcherHeapFamily, RelationRead, tape, vectors};
 use always_equal::AlwaysEqual;
 use distance::Distance;
 use std::cmp::Reverse;
@@ -11,20 +12,17 @@ use std::collections::BinaryHeap;
 use std::num::NonZero;
 use vector::{VectorBorrowed, VectorOwned};
 
-type Item<'b> = (
-    Reverse<Distance>,
-    AlwaysEqual<&'b mut (u32, u16, &'b mut [u32])>,
-);
-
 type Extra<'b> = &'b mut (NonZero<u64>, u16, &'b mut [u32]);
 
-pub fn default_search<'b, R: RelationRead, O: Operator, P: Prefetcher<R = R, Item = Item<'b>>>(
-    index: R,
+#[allow(clippy::too_many_arguments)]
+pub fn default_search<'r, 'b: 'r, R: RelationRead, O: Operator>(
+    index: &'r R,
     vector: O::Vector,
     probes: Vec<u32>,
     epsilon: f32,
     bump: &'b impl Bump,
-    mut prefetch: impl FnMut(Vec<Item<'b>>) -> P,
+    mut prefetch_h1_vectors: impl PrefetcherHeapFamily<'r, R>,
+    mut prefetch_h0_tuples: impl PrefetcherSequenceFamily<'r, R>,
 ) -> Vec<((Reverse<Distance>, AlwaysEqual<()>), AlwaysEqual<Extra<'b>>)> {
     let meta_guard = index.read(0);
     let meta_bytes = meta_guard.get(1).expect("data corruption");
@@ -78,9 +76,8 @@ pub fn default_search<'b, R: RelationRead, O: Operator, P: Prefetcher<R = R, Ite
             } else {
                 unreachable!()
             };
-            tape::read_h1_tape(
-                index.clone(),
-                first,
+            tape::read_h1_tape::<R, _, _>(
+                by_next(index, first),
                 || RAccess::new((&block_lut.1, block_lut.0), O::BlockAccessor::default()),
                 |(rough, err), head, first, prefetch| {
                     let lowerbound = Distance::from_f32(rough - err * epsilon);
@@ -89,15 +86,14 @@ pub fn default_search<'b, R: RelationRead, O: Operator, P: Prefetcher<R = R, Ite
                         AlwaysEqual(bump.alloc((first, head, bump.alloc_slice(prefetch)))),
                     ));
                 },
-                |_| (),
             );
         }
-        let mut heap = (prefetch)(results.into_vec());
+        let mut heap = prefetch_h1_vectors.prefetch(results.into_vec());
         let mut cache = BinaryHeap::<(Reverse<Distance>, _, _)>::new();
         let vector = vector.as_borrowed();
         std::iter::from_fn(move || {
             while let Some(((Reverse(_), AlwaysEqual(&mut (first, head, ..))), list)) =
-                heap.pop_if(|(d, ..)| Some(*d) > cache.peek().map(|(d, ..)| *d))
+                heap.next_if(|(d, ..)| Some(*d) > cache.peek().map(|(d, ..)| *d))
             {
                 if is_residual {
                     let (distance, residual) = vectors::read_for_h1_tuple::<R, O, _>(
@@ -153,32 +149,32 @@ pub fn default_search<'b, R: RelationRead, O: Operator, P: Prefetcher<R = R, Ite
                 AlwaysEqual(bump.alloc((payload, mean, bump.alloc_slice(prefetch)))),
             ));
         });
-        tape::read_frozen_tape(
-            index.clone(),
-            jump_tuple.frozen_first(),
+        let directory =
+            tape::read_directory_tape::<R>(by_next(index, jump_tuple.directory_first()));
+        tape::read_frozen_tape::<R, _, _>(
+            by_directory(&mut prefetch_h0_tuples, directory),
             || RAccess::new((&block_lut.1, block_lut.0), O::BlockAccessor::default()),
             &mut callback,
-            |_| (),
         );
-        tape::read_appendable_tape(
-            index.clone(),
-            jump_tuple.appendable_first(),
+        tape::read_appendable_tape::<R, _>(
+            by_next(index, jump_tuple.appendable_first()),
             |code| O::binary_process(binary_lut, code),
             &mut callback,
-            |_| (),
         );
     }
     results.into_vec()
 }
 
-pub fn maxsim_search<'b, R: RelationRead, O: Operator, P: Prefetcher<R = R, Item = Item<'b>>>(
-    index: R,
+#[allow(clippy::too_many_arguments)]
+pub fn maxsim_search<'r, 'b: 'r, R: RelationRead, O: Operator>(
+    index: &'r R,
     vector: O::Vector,
     probes: Vec<u32>,
     epsilon: f32,
     mut threshold: u32,
     bump: &'b impl Bump,
-    mut prefetch: impl FnMut(Vec<Item<'b>>) -> P,
+    mut prefetch_h1_vectors: impl PrefetcherHeapFamily<'r, R>,
+    mut prefetch_h0_tuples: impl PrefetcherSequenceFamily<'r, R>,
 ) -> (
     Vec<(
         (Reverse<Distance>, AlwaysEqual<Distance>),
@@ -238,9 +234,8 @@ pub fn maxsim_search<'b, R: RelationRead, O: Operator, P: Prefetcher<R = R, Item
             } else {
                 unreachable!()
             };
-            tape::read_h1_tape(
-                index.clone(),
-                first,
+            tape::read_h1_tape::<R, _, _>(
+                by_next(index, first),
                 || RAccess::new((&block_lut.1, block_lut.0), O::BlockAccessor::default()),
                 |(rough, err), head, first, prefetch| {
                     let lowerbound = Distance::from_f32(rough - err * epsilon);
@@ -249,15 +244,14 @@ pub fn maxsim_search<'b, R: RelationRead, O: Operator, P: Prefetcher<R = R, Item
                         AlwaysEqual(bump.alloc((first, head, bump.alloc_slice(prefetch)))),
                     ));
                 },
-                |_| (),
             );
         }
-        let mut heap = (prefetch)(results.into_vec());
+        let mut heap = prefetch_h1_vectors.prefetch(results.into_vec());
         let mut cache = BinaryHeap::<(Reverse<Distance>, _, _)>::new();
         let vector = vector.as_borrowed();
         std::iter::from_fn(move || {
             while let Some(((Reverse(_), AlwaysEqual(&mut (first, head, ..))), list)) =
-                heap.pop_if(|(d, ..)| Some(*d) > cache.peek().map(|(d, ..)| *d))
+                heap.next_if(|(d, ..)| Some(*d) > cache.peek().map(|(d, ..)| *d))
             {
                 if is_residual {
                     let (distance, residual) = vectors::read_for_h1_tuple::<R, O, _>(
@@ -316,19 +310,17 @@ pub fn maxsim_search<'b, R: RelationRead, O: Operator, P: Prefetcher<R = R, Item
                 AlwaysEqual(bump.alloc((payload, mean, bump.alloc_slice(prefetch)))),
             ));
         });
-        tape::read_frozen_tape(
-            index.clone(),
-            jump_tuple.frozen_first(),
+        let directory =
+            tape::read_directory_tape::<R>(by_next(index, jump_tuple.directory_first()));
+        tape::read_frozen_tape::<R, _, _>(
+            by_directory(&mut prefetch_h0_tuples, directory),
             || RAccess::new((&block_lut.1, block_lut.0), O::BlockAccessor::default()),
             &mut callback,
-            |_| (),
         );
-        tape::read_appendable_tape(
-            index.clone(),
-            jump_tuple.appendable_first(),
+        tape::read_appendable_tape::<R, _>(
+            by_next(index, jump_tuple.appendable_first()),
             |code| O::binary_process(binary_lut, code),
             &mut callback,
-            |_| (),
         );
         threshold = threshold.saturating_sub(jump_tuple.tuples().min(u32::MAX as _) as _);
     }

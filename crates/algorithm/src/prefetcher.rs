@@ -1,94 +1,117 @@
-use crate::{Fetch, Heap, ReadStream, RelationPrefetch, RelationRead, RelationReadStream};
-use std::collections::{BinaryHeap, VecDeque, binary_heap, vec_deque};
+use crate::*;
+use std::collections::{VecDeque, vec_deque};
 use std::iter::Chain;
 
 pub const WINDOW_SIZE: usize = 32;
 const _: () = assert!(WINDOW_SIZE > 0);
 
-pub trait Prefetcher: IntoIterator
+pub trait Prefetcher<'r>: IntoIterator
 where
     Self::Item: Fetch,
 {
-    type R: RelationRead;
-    fn pop_if(
+    type R: RelationRead + 'r;
+
+    fn next(&mut self) -> Option<(Self::Item, Vec<<Self::R as RelationRead>::ReadGuard<'r>>)>;
+    fn next_if(
         &mut self,
         predicate: impl FnOnce(&Self::Item) -> bool,
-    ) -> Option<(Self::Item, Vec<<Self::R as RelationRead>::ReadGuard<'_>>)>;
+    ) -> Option<(Self::Item, Vec<<Self::R as RelationRead>::ReadGuard<'r>>)>;
 }
 
-pub struct PlainPrefetcher<R, H> {
-    relation: R,
-    heap: H,
+pub struct PlainPrefetcher<'r, R, S: Sequence> {
+    relation: &'r R,
+    sequence: S,
 }
 
-impl<R, H: Heap> PlainPrefetcher<R, H> {
-    pub fn new(relation: R, vec: Vec<H::Item>) -> Self {
-        Self {
-            relation,
-            heap: Heap::make(vec),
-        }
+impl<'r, R, S: Sequence> PlainPrefetcher<'r, R, S> {
+    pub fn new(relation: &'r R, sequence: S) -> Self {
+        Self { relation, sequence }
     }
 }
 
-impl<R, H: Heap> IntoIterator for PlainPrefetcher<R, H> {
-    type Item = H::Item;
+impl<'r, R, S: Sequence> IntoIterator for PlainPrefetcher<'r, R, S> {
+    type Item = S::Item;
 
-    type IntoIter = H::IntoIter;
+    type IntoIter = S::Inner;
 
     fn into_iter(self) -> Self::IntoIter {
-        self.heap.into_iter()
+        self.sequence.into_inner()
     }
 }
 
-impl<R: RelationRead, H: Heap> Prefetcher for PlainPrefetcher<R, H>
+impl<'r, R: RelationRead, S: Sequence> Prefetcher<'r> for PlainPrefetcher<'r, R, S>
 where
-    H::Item: Fetch + Ord,
+    S::Item: Fetch,
 {
     type R = R;
-    fn pop_if<'s>(
-        &'s mut self,
+
+    fn next(&mut self) -> Option<(Self::Item, Vec<<Self::R as RelationRead>::ReadGuard<'r>>)> {
+        let e = self.sequence.next()?;
+        let list = e.fetch().iter().map(|&id| self.relation.read(id)).collect();
+        Some((e, list))
+    }
+    fn next_if(
+        &mut self,
         predicate: impl FnOnce(&Self::Item) -> bool,
-    ) -> Option<(H::Item, Vec<R::ReadGuard<'s>>)> {
-        let e = self.heap.pop_if(predicate)?;
+    ) -> Option<(S::Item, Vec<R::ReadGuard<'r>>)> {
+        let e = self.sequence.next_if(predicate)?;
         let list = e.fetch().iter().map(|&id| self.relation.read(id)).collect();
         Some((e, list))
     }
 }
 
-pub struct SimplePrefetcher<R, T> {
-    relation: R,
-    window: VecDeque<T>,
-    heap: BinaryHeap<T>,
+pub struct SimplePrefetcher<'r, R, S: Sequence> {
+    relation: &'r R,
+    window: VecDeque<S::Item>,
+    sequence: S,
 }
 
-impl<R, T: Ord> SimplePrefetcher<R, T> {
-    pub fn new(relation: R, vec: Vec<T>) -> Self {
+impl<'r, R, S: Sequence> SimplePrefetcher<'r, R, S> {
+    pub fn new(relation: &'r R, sequence: S) -> Self {
         Self {
             relation,
             window: VecDeque::new(),
-            heap: BinaryHeap::from(vec),
+            sequence,
         }
     }
 }
 
-impl<R, T> IntoIterator for SimplePrefetcher<R, T> {
-    type Item = T;
+impl<'r, R, S: Sequence> IntoIterator for SimplePrefetcher<'r, R, S> {
+    type Item = S::Item;
 
-    type IntoIter = Chain<vec_deque::IntoIter<T>, binary_heap::IntoIter<T>>;
+    type IntoIter = Chain<vec_deque::IntoIter<S::Item>, S::Inner>;
 
     fn into_iter(self) -> Self::IntoIter {
-        self.window.into_iter().chain(self.heap)
+        self.window.into_iter().chain(self.sequence.into_inner())
     }
 }
 
-impl<R: RelationRead + RelationPrefetch, T: Fetch + Ord> Prefetcher for SimplePrefetcher<R, T> {
+impl<'r, R: RelationRead + RelationPrefetch, S: Sequence> Prefetcher<'r>
+    for SimplePrefetcher<'r, R, S>
+where
+    S::Item: Fetch,
+{
     type R = R;
-    fn pop_if<'s>(
-        &'s mut self,
-        predicate: impl FnOnce(&Self::Item) -> bool,
-    ) -> Option<(T, Vec<R::ReadGuard<'s>>)> {
+
+    fn next(&mut self) -> Option<(Self::Item, Vec<<Self::R as RelationRead>::ReadGuard<'r>>)> {
         while self.window.len() < WINDOW_SIZE
-            && let Some(e) = self.heap.pop()
+            && let Some(e) = self.sequence.next()
+        {
+            for id in e.fetch().iter().copied() {
+                self.relation.prefetch(id);
+            }
+            self.window.push_back(e);
+        }
+        let e = self.window.pop_front()?;
+        let list = e.fetch().iter().map(|&id| self.relation.read(id)).collect();
+        Some((e, list))
+    }
+    fn next_if(
+        &mut self,
+        predicate: impl FnOnce(&S::Item) -> bool,
+    ) -> Option<(S::Item, Vec<R::ReadGuard<'r>>)> {
+        while self.window.len() < WINDOW_SIZE
+            && let Some(e) = self.sequence.next()
         {
             for id in e.fetch().iter().copied() {
                 self.relation.prefetch(id);
@@ -101,51 +124,79 @@ impl<R: RelationRead + RelationPrefetch, T: Fetch + Ord> Prefetcher for SimplePr
     }
 }
 
-pub struct StreamPrefetcherHeap<T>(BinaryHeap<T>);
+pub struct StreamPrefetcherSequence<S>(S);
 
-impl<T: Ord> Iterator for StreamPrefetcherHeap<T> {
-    type Item = T;
+impl<S: Sequence> Iterator for StreamPrefetcherSequence<S> {
+    type Item = S::Item;
     fn next(&mut self) -> Option<Self::Item> {
-        self.0.pop()
+        self.0.next()
     }
 }
 
-pub struct StreamPrefetcher<'r, R, T>
+pub struct StreamPrefetcher<'r, R: RelationReadStream + 'r, S: Sequence>
 where
-    R: RelationReadStream + 'r,
-    T: Fetch + Ord,
+    S::Item: Fetch,
 {
-    stream: R::ReadStream<'r, StreamPrefetcherHeap<T>>,
+    stream: R::ReadStream<'r, StreamPrefetcherSequence<S>>,
 }
 
-impl<'r, R: RelationReadStream, T: Fetch + Ord> StreamPrefetcher<'r, R, T> {
-    pub fn new(relation: &'r R, vec: Vec<T>) -> Self {
-        let stream = relation.read_stream(StreamPrefetcherHeap(BinaryHeap::from(vec)));
+impl<'r, R: RelationReadStream, S: Sequence> StreamPrefetcher<'r, R, S>
+where
+    S::Item: Fetch,
+{
+    pub fn new(relation: &'r R, sequence: S, hints: Hints) -> Self {
+        let stream = relation.read_stream(StreamPrefetcherSequence(sequence), hints);
         Self { stream }
     }
 }
 
-impl<'r, R: RelationReadStream, T: Fetch + Ord> IntoIterator for StreamPrefetcher<'r, R, T> {
-    type Item = T;
+impl<'r, R: RelationReadStream, S: Sequence> IntoIterator for StreamPrefetcher<'r, R, S>
+where
+    S::Item: Fetch,
+{
+    type Item = S::Item;
 
-    type IntoIter = <<R as RelationReadStream>::ReadStream<
-        'r,
-        StreamPrefetcherHeap<T>,
-    > as ReadStream<T>>::Inner;
+    type IntoIter = <R::ReadStream<'r, StreamPrefetcherSequence<S>> as ReadStream<'r>>::Inner;
 
     fn into_iter(self) -> Self::IntoIter {
         self.stream.into_inner()
     }
 }
 
-impl<'r, R: RelationReadStream, T: Fetch + Ord> Prefetcher for StreamPrefetcher<'r, R, T> {
+impl<'r, R: RelationReadStream, S: Sequence> Prefetcher<'r> for StreamPrefetcher<'r, R, S>
+where
+    S::Item: Fetch,
+{
     type R = R;
-    fn pop_if<'s>(
-        &'s mut self,
+    fn next(&mut self) -> Option<(S::Item, Vec<R::ReadGuard<'r>>)> {
+        self.stream.next()
+    }
+    fn next_if(
+        &mut self,
         predicate: impl FnOnce(&Self::Item) -> bool,
-    ) -> Option<(T, Vec<R::ReadGuard<'s>>)> {
+    ) -> Option<(S::Item, Vec<R::ReadGuard<'r>>)> {
         self.stream.next_if(predicate)
     }
+}
+
+pub trait PrefetcherSequenceFamily<'r, R> {
+    type P<S: Sequence>: Prefetcher<'r, R = R, Item = S::Item>
+    where
+        S::Item: Fetch;
+
+    fn prefetch<S: Sequence>(&mut self, seq: S) -> Self::P<S>
+    where
+        S::Item: Fetch;
+}
+
+pub trait PrefetcherHeapFamily<'r, R> {
+    type P<T>: Prefetcher<'r, R = R, Item = T>
+    where
+        T: Ord + Fetch + 'r;
+
+    fn prefetch<T>(&mut self, seq: Vec<T>) -> Self::P<T>
+    where
+        T: Ord + Fetch + 'r;
 }
 
 // Emulate unstable library feature `vec_deque_pop_if`.

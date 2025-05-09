@@ -1,5 +1,6 @@
 pub mod binary;
 pub mod block;
+pub mod packing;
 
 use binary::BinaryLut;
 use block::BlockLut;
@@ -81,7 +82,7 @@ pub fn preprocess(vector: &[f32]) -> (BlockLut, BinaryLut) {
     let qvector_sum = if vector.len() <= 4369 {
         simd::u8::reduce_sum_of_x_as_u16(&qvector) as f32
     } else {
-        simd::u8::reduce_sum_of_x(&qvector) as f32
+        simd::u8::reduce_sum_of_x_as_u32(&qvector) as f32
     };
     let binary = binary::binarize(&qvector);
     let block = block::compress(qvector);

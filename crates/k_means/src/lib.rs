@@ -1,9 +1,9 @@
 use rabitq::block::BlockCode;
+use rabitq::packing::{any_pack, padding_pack};
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 use rayon::iter::{IntoParallelIterator, IntoParallelRefMutIterator, ParallelIterator};
 use simd::Floating;
-use simd::fast_scan::{any_pack, padding_pack};
 
 pub fn preprocess<T: Send>(num_threads: usize, x: &mut [T], f: impl Fn(&mut T) + Sync) {
     rayon::ThreadPoolBuilder::new()

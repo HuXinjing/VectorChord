@@ -2,6 +2,7 @@
 name = "vector"
 version.workspace = true
 edition.workspace = true
+publish = false
 
 [dependencies]
 distance = { path = "../distance" }

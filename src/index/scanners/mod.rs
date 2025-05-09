@@ -3,21 +3,21 @@ mod maxsim;
 
 use super::opclass::Opfamily;
 use crate::index::lazy_cell::LazyCell;
-use algorithm::{Bump, RelationPrefetch, RelationReadStream};
+use algorithm::{Bump, RelationPrefetch, RelationRead, RelationReadStream};
 use pgrx::pg_sys::Datum;
 
 pub use default::DefaultBuilder;
 pub use maxsim::MaxsimBuilder;
 
 #[derive(Debug, Clone, Copy)]
-pub enum SearchIo {
-    ReadBuffer,
-    PrefetchBuffer,
+pub enum Io {
+    Plain,
+    Simple,
     #[cfg_attr(
         any(feature = "pg13", feature = "pg14", feature = "pg15", feature = "pg16"),
         expect(dead_code)
     )]
-    ReadStream,
+    Stream,
 }
 
 #[derive(Debug)]
@@ -27,7 +27,8 @@ pub struct SearchOptions {
     pub max_scan_tuples: Option<u32>,
     pub maxsim_refine: u32,
     pub maxsim_threshold: u32,
-    pub io_rerank: SearchIo,
+    pub io_search: Io,
+    pub io_rerank: Io,
 }
 
 pub trait SearchBuilder: 'static {
@@ -35,13 +36,15 @@ pub trait SearchBuilder: 'static {
 
     unsafe fn add(&mut self, strategy: u16, datum: Option<Datum>);
 
-    fn build<'a>(
+    fn build<'a, R>(
         self,
-        relation: &'a (impl RelationPrefetch + RelationReadStream),
+        relation: &'a R,
         options: SearchOptions,
         fetcher: impl SearchFetcher + 'a,
         bump: &'a impl Bump,
-    ) -> Box<dyn Iterator<Item = (f32, [u16; 3], bool)> + 'a>;
+    ) -> Box<dyn Iterator<Item = (f32, [u16; 3], bool)> + 'a>
+    where
+        R: RelationRead + RelationPrefetch + RelationReadStream;
 }
 
 pub trait SearchFetcher {

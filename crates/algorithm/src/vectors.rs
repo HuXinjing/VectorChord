@@ -65,12 +65,12 @@ pub fn read_for_h0_tuple<
 }
 
 pub fn append<O: Operator>(
-    index: impl RelationRead + RelationWrite,
+    index: &(impl RelationRead + RelationWrite),
     vectors_first: u32,
     vector: <O::Vector as VectorOwned>::Borrowed<'_>,
     payload: NonZero<u64>,
 ) -> (Vec<u32>, u16) {
-    fn append(index: impl RelationRead + RelationWrite, first: u32, bytes: &[u8]) -> (u32, u16) {
+    fn append(index: &(impl RelationRead + RelationWrite), first: u32, bytes: &[u8]) -> (u32, u16) {
         if let Some(mut write) = index.search(bytes.len()) {
             let i = write
                 .alloc(bytes)
@@ -95,7 +95,7 @@ pub fn append<O: Operator>(
                 head,
             },
         });
-        let (id, head) = append(index.clone(), vectors_first, &bytes);
+        let (id, head) = append(index, vectors_first, &bytes);
         chain = Err(head);
         prefetch.push(id);
     }

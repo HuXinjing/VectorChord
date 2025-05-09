@@ -2,6 +2,7 @@
 name = "algorithm"
 version.workspace = true
 edition.workspace = true
+publish = false
 
 [dependencies]
 always_equal = { path = "../always_equal" }
@@ -14,6 +15,7 @@ vector = { path = "../vector" }
 
 half.workspace = true
 paste.workspace = true
+pin-project = "1"
 rand.workspace = true
 serde.workspace = true
 turboselect = { git = "https://github.com/tensorchord/turboselect.git", rev = "d8753c4ffe5b47f28670fea21d56cf3658d51b9b" }

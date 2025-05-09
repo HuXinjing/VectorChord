@@ -2,7 +2,7 @@ use crate::tuples::*;
 use crate::*;
 use std::cmp::Reverse;
 
-pub fn mark(index: impl RelationWrite, freepage_first: u32, values: &[u32]) {
+pub fn mark(index: &impl RelationWrite, freepage_first: u32, values: &[u32]) {
     let mut values = {
         let mut values = values.to_vec();
         values.sort_by_key(|x| Reverse(*x));
@@ -33,7 +33,7 @@ pub fn mark(index: impl RelationWrite, freepage_first: u32, values: &[u32]) {
     }
 }
 
-pub fn fetch(index: impl RelationWrite, freepage_first: u32) -> Option<u32> {
+pub fn fetch(index: &impl RelationWrite, freepage_first: u32) -> Option<u32> {
     let (mut current, mut offset) = (freepage_first, 0_u32);
     loop {
         let mut freespace_guard = index.write(current, false);

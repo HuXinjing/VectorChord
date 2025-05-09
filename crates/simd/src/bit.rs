@@ -1,16 +1,16 @@
 #[inline(always)]
-pub fn sum_of_and(lhs: &[u64], rhs: &[u64]) -> u32 {
-    sum_of_and::sum_of_and(lhs, rhs)
+pub fn reduce_sum_of_and(lhs: &[u64], rhs: &[u64]) -> u32 {
+    reduce_sum_of_and::reduce_sum_of_and(lhs, rhs)
 }
 
-mod sum_of_and {
+mod reduce_sum_of_and {
     // FIXME: add manually-implemented SIMD version for AVX512 and AVX2
 
     #[inline]
     #[cfg(target_arch = "x86_64")]
     #[crate::target_cpu(enable = "v4")]
     #[target_feature(enable = "avx512vpopcntdq")]
-    fn sum_of_and_v4_avx512vpopcntdq(lhs: &[u64], rhs: &[u64]) -> u32 {
+    fn reduce_sum_of_and_v4_avx512vpopcntdq(lhs: &[u64], rhs: &[u64]) -> u32 {
         assert!(lhs.len() == rhs.len());
         use std::arch::x86_64::*;
         let mut and = _mm512_setzero_si512();
@@ -36,7 +36,7 @@ mod sum_of_and {
 
     #[cfg(all(target_arch = "x86_64", test, not(miri)))]
     #[test]
-    fn sum_of_and_v4_avx512vpopcntdq_test() {
+    fn reduce_sum_of_and_v4_avx512vpopcntdq_test() {
         if !crate::is_cpu_detected!("v4") || !crate::is_feature_detected!("avx512vpopcntdq") {
             println!("test {} ... skipped (v4:avx512vpopcntdq)", module_path!());
             return;
@@ -44,14 +44,14 @@ mod sum_of_and {
         for _ in 0..if cfg!(not(miri)) { 256 } else { 1 } {
             let lhs = (0..126).map(|_| rand::random::<u64>()).collect::<Vec<_>>();
             let rhs = (0..126).map(|_| rand::random::<u64>()).collect::<Vec<_>>();
-            let specialized = unsafe { sum_of_and_v4_avx512vpopcntdq(&lhs, &rhs) };
+            let specialized = unsafe { reduce_sum_of_and_v4_avx512vpopcntdq(&lhs, &rhs) };
             let fallback = fallback(&lhs, &rhs);
             assert_eq!(specialized, fallback);
         }
     }
 
     #[crate::multiversion(@"v4:avx512vpopcntdq", "v4", "v3", "v2", "a2")]
-    pub fn sum_of_and(lhs: &[u64], rhs: &[u64]) -> u32 {
+    pub fn reduce_sum_of_and(lhs: &[u64], rhs: &[u64]) -> u32 {
         assert_eq!(lhs.len(), rhs.len());
         let n = lhs.len();
         let mut and = 0;
@@ -63,18 +63,18 @@ mod sum_of_and {
 }
 
 #[inline(always)]
-pub fn sum_of_or(lhs: &[u64], rhs: &[u64]) -> u32 {
-    sum_of_or::sum_of_or(lhs, rhs)
+pub fn reduce_sum_of_or(lhs: &[u64], rhs: &[u64]) -> u32 {
+    reduce_sum_of_or::reduce_sum_of_or(lhs, rhs)
 }
 
-mod sum_of_or {
+mod reduce_sum_of_or {
     // FIXME: add manually-implemented SIMD version for AVX512 and AVX2
 
     #[inline]
     #[cfg(target_arch = "x86_64")]
     #[crate::target_cpu(enable = "v4")]
     #[target_feature(enable = "avx512vpopcntdq")]
-    fn sum_of_or_v4_avx512vpopcntdq(lhs: &[u64], rhs: &[u64]) -> u32 {
+    fn reduce_sum_of_or_v4_avx512vpopcntdq(lhs: &[u64], rhs: &[u64]) -> u32 {
         assert!(lhs.len() == rhs.len());
         use std::arch::x86_64::*;
         let mut or = _mm512_setzero_si512();
@@ -100,7 +100,7 @@ mod sum_of_or {
 
     #[cfg(all(target_arch = "x86_64", test, not(miri)))]
     #[test]
-    fn sum_of_or_v4_avx512vpopcntdq_test() {
+    fn reduce_sum_of_or_v4_avx512vpopcntdq_test() {
         if !crate::is_cpu_detected!("v4") || !crate::is_feature_detected!("avx512vpopcntdq") {
             println!("test {} ... skipped (v4:avx512vpopcntdq)", module_path!());
             return;
@@ -108,14 +108,14 @@ mod sum_of_or {
         for _ in 0..if cfg!(not(miri)) { 256 } else { 1 } {
             let lhs = (0..126).map(|_| rand::random::<u64>()).collect::<Vec<_>>();
             let rhs = (0..126).map(|_| rand::random::<u64>()).collect::<Vec<_>>();
-            let specialized = unsafe { sum_of_or_v4_avx512vpopcntdq(&lhs, &rhs) };
+            let specialized = unsafe { reduce_sum_of_or_v4_avx512vpopcntdq(&lhs, &rhs) };
             let fallback = fallback(&lhs, &rhs);
             assert_eq!(specialized, fallback);
         }
     }
 
     #[crate::multiversion(@"v4:avx512vpopcntdq", "v4", "v3", "v2", "a2")]
-    pub fn sum_of_or(lhs: &[u64], rhs: &[u64]) -> u32 {
+    pub fn reduce_sum_of_or(lhs: &[u64], rhs: &[u64]) -> u32 {
         assert_eq!(lhs.len(), rhs.len());
         let n = lhs.len();
         let mut or = 0;
@@ -127,18 +127,18 @@ mod sum_of_or {
 }
 
 #[inline(always)]
-pub fn sum_of_xor(lhs: &[u64], rhs: &[u64]) -> u32 {
-    sum_of_xor::sum_of_xor(lhs, rhs)
+pub fn reduce_sum_of_xor(lhs: &[u64], rhs: &[u64]) -> u32 {
+    reduce_sum_of_xor::reduce_sum_of_xor(lhs, rhs)
 }
 
-mod sum_of_xor {
+mod reduce_sum_of_xor {
     // FIXME: add manually-implemented SIMD version for AVX512 and AVX2
 
     #[inline]
     #[cfg(target_arch = "x86_64")]
     #[crate::target_cpu(enable = "v4")]
     #[target_feature(enable = "avx512vpopcntdq")]
-    fn sum_of_xor_v4_avx512vpopcntdq(lhs: &[u64], rhs: &[u64]) -> u32 {
+    fn reduce_sum_of_xor_v4_avx512vpopcntdq(lhs: &[u64], rhs: &[u64]) -> u32 {
         assert!(lhs.len() == rhs.len());
         use std::arch::x86_64::*;
         let mut xor = _mm512_setzero_si512();
@@ -164,7 +164,7 @@ mod sum_of_xor {
 
     #[cfg(all(target_arch = "x86_64", test, not(miri)))]
     #[test]
-    fn sum_of_xor_v4_avx512vpopcntdq_test() {
+    fn reduce_sum_of_xor_v4_avx512vpopcntdq_test() {
         if !crate::is_cpu_detected!("v4") || !crate::is_feature_detected!("avx512vpopcntdq") {
             println!("test {} ... skipped (v4:avx512vpopcntdq)", module_path!());
             return;
@@ -172,14 +172,14 @@ mod sum_of_xor {
         for _ in 0..if cfg!(not(miri)) { 256 } else { 1 } {
             let lhs = (0..126).map(|_| rand::random::<u64>()).collect::<Vec<_>>();
             let rhs = (0..126).map(|_| rand::random::<u64>()).collect::<Vec<_>>();
-            let specialized = unsafe { sum_of_xor_v4_avx512vpopcntdq(&lhs, &rhs) };
+            let specialized = unsafe { reduce_sum_of_xor_v4_avx512vpopcntdq(&lhs, &rhs) };
             let fallback = fallback(&lhs, &rhs);
             assert_eq!(specialized, fallback);
         }
     }
 
     #[crate::multiversion(@"v4:avx512vpopcntdq", "v4", "v3", "v2", "a2")]
-    pub fn sum_of_xor(lhs: &[u64], rhs: &[u64]) -> u32 {
+    pub fn reduce_sum_of_xor(lhs: &[u64], rhs: &[u64]) -> u32 {
         assert_eq!(lhs.len(), rhs.len());
         let n = lhs.len();
         let mut xor = 0;
@@ -191,18 +191,18 @@ mod sum_of_xor {
 }
 
 #[inline(always)]
-pub fn sum_of_and_or(lhs: &[u64], rhs: &[u64]) -> (u32, u32) {
-    sum_of_and_or::sum_of_and_or(lhs, rhs)
+pub fn reduce_sum_of_and_or(lhs: &[u64], rhs: &[u64]) -> (u32, u32) {
+    reduce_sum_of_and_or::reduce_sum_of_and_or(lhs, rhs)
 }
 
-mod sum_of_and_or {
+mod reduce_sum_of_and_or {
     // FIXME: add manually-implemented SIMD version for AVX512 and AVX2
 
     #[inline]
     #[cfg(target_arch = "x86_64")]
     #[crate::target_cpu(enable = "v4")]
     #[target_feature(enable = "avx512vpopcntdq")]
-    fn sum_of_and_or_v4_avx512vpopcntdq(lhs: &[u64], rhs: &[u64]) -> (u32, u32) {
+    fn reduce_sum_of_and_or_v4_avx512vpopcntdq(lhs: &[u64], rhs: &[u64]) -> (u32, u32) {
         assert!(lhs.len() == rhs.len());
         use std::arch::x86_64::*;
         let mut and = _mm512_setzero_si512();
@@ -234,7 +234,7 @@ mod sum_of_and_or {
 
     #[cfg(all(target_arch = "x86_64", test, not(miri)))]
     #[test]
-    fn sum_of_xor_v4_avx512vpopcntdq_test() {
+    fn reduce_sum_of_xor_v4_avx512vpopcntdq_test() {
         if !crate::is_cpu_detected!("v4") || !crate::is_feature_detected!("avx512vpopcntdq") {
             println!("test {} ... skipped (v4:avx512vpopcntdq)", module_path!());
             return;
@@ -242,14 +242,14 @@ mod sum_of_and_or {
         for _ in 0..if cfg!(not(miri)) { 256 } else { 1 } {
             let lhs = (0..126).map(|_| rand::random::<u64>()).collect::<Vec<_>>();
             let rhs = (0..126).map(|_| rand::random::<u64>()).collect::<Vec<_>>();
-            let specialized = unsafe { sum_of_and_or_v4_avx512vpopcntdq(&lhs, &rhs) };
+            let specialized = unsafe { reduce_sum_of_and_or_v4_avx512vpopcntdq(&lhs, &rhs) };
             let fallback = fallback(&lhs, &rhs);
             assert_eq!(specialized, fallback);
         }
     }
 
     #[crate::multiversion(@"v4:avx512vpopcntdq", "v4", "v3", "v2", "a2")]
-    pub fn sum_of_and_or(lhs: &[u64], rhs: &[u64]) -> (u32, u32) {
+    pub fn reduce_sum_of_and_or(lhs: &[u64], rhs: &[u64]) -> (u32, u32) {
         assert_eq!(lhs.len(), rhs.len());
         let n = lhs.len();
         let mut and = 0;
@@ -263,18 +263,18 @@ mod sum_of_and_or {
 }
 
 #[inline(always)]
-pub fn sum_of_x(this: &[u64]) -> u32 {
-    sum_of_x::sum_of_x(this)
+pub fn reduce_sum_of_x(this: &[u64]) -> u32 {
+    reduce_sum_of_x::reduce_sum_of_x(this)
 }
 
-mod sum_of_x {
+mod reduce_sum_of_x {
     // FIXME: add manually-implemented SIMD version for AVX512 and AVX2
 
     #[inline]
     #[cfg(target_arch = "x86_64")]
     #[crate::target_cpu(enable = "v4")]
     #[target_feature(enable = "avx512vpopcntdq")]
-    fn sum_of_x_v4_avx512vpopcntdq(this: &[u64]) -> u32 {
+    fn reduce_sum_of_x_v4_avx512vpopcntdq(this: &[u64]) -> u32 {
         use std::arch::x86_64::*;
         let mut and = _mm512_setzero_si512();
         let mut a = this.as_ptr();
@@ -295,21 +295,21 @@ mod sum_of_x {
 
     #[cfg(all(target_arch = "x86_64", test, not(miri)))]
     #[test]
-    fn sum_of_x_v4_avx512vpopcntdq_test() {
+    fn reduce_sum_of_x_v4_avx512vpopcntdq_test() {
         if !crate::is_cpu_detected!("v4") || !crate::is_feature_detected!("avx512vpopcntdq") {
             println!("test {} ... skipped (v4:avx512vpopcntdq)", module_path!());
             return;
         }
         for _ in 0..if cfg!(not(miri)) { 256 } else { 1 } {
             let this = (0..126).map(|_| rand::random::<u64>()).collect::<Vec<_>>();
-            let specialized = unsafe { sum_of_x_v4_avx512vpopcntdq(&this) };
+            let specialized = unsafe { reduce_sum_of_x_v4_avx512vpopcntdq(&this) };
             let fallback = fallback(&this);
             assert_eq!(specialized, fallback);
         }
     }
 
     #[crate::multiversion(@"v4:avx512vpopcntdq", "v4", "v3", "v2", "a2")]
-    pub fn sum_of_x(this: &[u64]) -> u32 {
+    pub fn reduce_sum_of_x(this: &[u64]) -> u32 {
         let n = this.len();
         let mut and = 0;
         for i in 0..n {

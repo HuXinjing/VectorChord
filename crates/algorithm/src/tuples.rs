@@ -430,6 +430,147 @@ impl<'a, V: Vector> VectorTupleReader<'a, V> {
 
 #[repr(C, align(8))]
 #[derive(Debug, Clone, PartialEq, FromBytes, IntoBytes, Immutable, KnownLayout)]
+struct DirectoryTupleHeader0 {
+    elements_s: u16,
+    elements_e: u16,
+    _padding_0: [ZeroU8; 4],
+}
+
+#[repr(C, align(8))]
+#[derive(Debug, Clone, PartialEq, FromBytes, IntoBytes, Immutable, KnownLayout)]
+struct DirectoryTupleHeader1 {
+    elements_s: u16,
+    elements_e: u16,
+    _padding_0: [ZeroU8; 4],
+}
+
+#[allow(clippy::large_enum_variant)]
+#[derive(Debug, Clone, PartialEq)]
+pub enum DirectoryTuple {
+    _0 { elements: Vec<u32> },
+    _1 { elements: Vec<u32> },
+}
+
+impl DirectoryTuple {
+    pub fn estimate_size_0(elements: usize) -> usize {
+        let mut size = 0_usize;
+        size += size_of::<Tag>();
+        size += size_of::<DirectoryTupleHeader0>();
+        size += (elements * size_of::<u32>()).next_multiple_of(ALIGN);
+        size
+    }
+    pub fn fit_1(freespace: u16) -> Option<usize> {
+        let mut freespace = freespace as isize;
+        freespace -= size_of::<Tag>() as isize;
+        freespace -= size_of::<DirectoryTupleHeader1>() as isize;
+        if freespace >= 0 {
+            Some(freespace as usize / size_of::<u32>())
+        } else {
+            None
+        }
+    }
+}
+
+impl Tuple for DirectoryTuple {
+    fn serialize(&self) -> Vec<u8> {
+        let mut buffer = Vec::<u8>::new();
+        match self {
+            Self::_0 { elements } => {
+                buffer.extend((0 as Tag).to_ne_bytes());
+                buffer.extend(std::iter::repeat_n(0, size_of::<DirectoryTupleHeader0>()));
+                let elements_s = buffer.len() as u16;
+                buffer.extend(elements.as_bytes());
+                let elements_e = buffer.len() as u16;
+                while buffer.len() % ALIGN != 0 {
+                    buffer.push(0);
+                }
+                buffer[size_of::<Tag>()..][..size_of::<DirectoryTupleHeader0>()].copy_from_slice(
+                    DirectoryTupleHeader0 {
+                        elements_s,
+                        elements_e,
+                        _padding_0: Default::default(),
+                    }
+                    .as_bytes(),
+                );
+            }
+            Self::_1 { elements } => {
+                buffer.extend((1 as Tag).to_ne_bytes());
+                buffer.extend(std::iter::repeat_n(0, size_of::<DirectoryTupleHeader1>()));
+                let elements_s = buffer.len() as u16;
+                buffer.extend(elements.as_bytes());
+                let elements_e = buffer.len() as u16;
+                while buffer.len() % ALIGN != 0 {
+                    buffer.push(0);
+                }
+                buffer[size_of::<Tag>()..][..size_of::<DirectoryTupleHeader1>()].copy_from_slice(
+                    DirectoryTupleHeader1 {
+                        elements_s,
+                        elements_e,
+                        _padding_0: Default::default(),
+                    }
+                    .as_bytes(),
+                );
+            }
+        }
+        buffer
+    }
+}
+
+impl WithReader for DirectoryTuple {
+    type Reader<'a> = DirectoryTupleReader<'a>;
+
+    fn deserialize_ref(source: &[u8]) -> DirectoryTupleReader<'_> {
+        let tag = Tag::from_ne_bytes(std::array::from_fn(|i| source[i]));
+        match tag {
+            0 => {
+                let checker = RefChecker::new(source);
+                let header: &DirectoryTupleHeader0 = checker.prefix(size_of::<Tag>());
+                let elements = checker.bytes(header.elements_s, header.elements_e);
+                DirectoryTupleReader::_0(DirectoryTupleReader0 { header, elements })
+            }
+            1 => {
+                let checker = RefChecker::new(source);
+                let header: &DirectoryTupleHeader1 = checker.prefix(size_of::<Tag>());
+                let elements = checker.bytes(header.elements_s, header.elements_e);
+                DirectoryTupleReader::_1(DirectoryTupleReader1 { header, elements })
+            }
+            _ => panic!("deserialization: bad bytes"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum DirectoryTupleReader<'a> {
+    _0(DirectoryTupleReader0<'a>),
+    _1(DirectoryTupleReader1<'a>),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct DirectoryTupleReader0<'a> {
+    header: &'a DirectoryTupleHeader0,
+    elements: &'a [u32],
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct DirectoryTupleReader1<'a> {
+    header: &'a DirectoryTupleHeader1,
+    elements: &'a [u32],
+}
+
+impl<'a> DirectoryTupleReader0<'a> {
+    pub fn elements(&self) -> &'a [u32] {
+        self.elements
+    }
+}
+
+impl<'a> DirectoryTupleReader1<'a> {
+    pub fn elements(&self) -> &'a [u32] {
+        self.elements
+    }
+}
+
+#[repr(C, align(8))]
+#[derive(Debug, Clone, PartialEq, FromBytes, IntoBytes, Immutable, KnownLayout)]
 struct H1TupleHeader0 {
     head: [u16; 32],
     dis_u_2: [f32; 32],
@@ -646,14 +787,14 @@ impl<'a> H1TupleReader1<'a> {
 #[repr(C, align(8))]
 #[derive(Debug, Clone, PartialEq, FromBytes, IntoBytes, Immutable, KnownLayout)]
 struct JumpTupleHeader {
-    frozen_first: u32,
+    directory_first: u32,
     appendable_first: u32,
     tuples: u64,
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct JumpTuple {
-    pub frozen_first: u32,
+    pub directory_first: u32,
     pub appendable_first: u32,
     pub tuples: u64,
 }
@@ -661,7 +802,7 @@ pub struct JumpTuple {
 impl Tuple for JumpTuple {
     fn serialize(&self) -> Vec<u8> {
         JumpTupleHeader {
-            frozen_first: self.frozen_first,
+            directory_first: self.directory_first,
             appendable_first: self.appendable_first,
             tuples: self.tuples,
         }
@@ -694,8 +835,8 @@ pub struct JumpTupleReader<'a> {
 }
 
 impl JumpTupleReader<'_> {
-    pub fn frozen_first(self) -> u32 {
-        self.header.frozen_first
+    pub fn directory_first(self) -> u32 {
+        self.header.directory_first
     }
     pub fn appendable_first(self) -> u32 {
         self.header.appendable_first
@@ -711,8 +852,8 @@ pub struct JumpTupleWriter<'a> {
 }
 
 impl JumpTupleWriter<'_> {
-    pub fn frozen_first(&mut self) -> &mut u32 {
-        &mut self.header.frozen_first
+    pub fn directory_first(&mut self) -> &mut u32 {
+        &mut self.header.directory_first
     }
     pub fn appendable_first(&mut self) -> &mut u32 {
         &mut self.header.appendable_first

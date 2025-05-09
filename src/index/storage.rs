@@ -435,6 +435,19 @@ where
         }
         vec_deque_pop_front_if(&mut self.window, predicate)
     }
+    #[allow(dead_code)]
+    pub fn pop_item(&mut self) -> Option<I::Item> {
+        while self.window.is_empty()
+            && let Some(iter) = self.iter.as_mut()
+            && let Some(e) = iter.next()
+        {
+            for id in e.fetch().iter().copied() {
+                self.tail.push_back(id);
+            }
+            self.window.push_back(e);
+        }
+        self.window.pop_front()
+    }
 }
 
 pub struct PostgresReadStream<I: Iterator> {
@@ -444,14 +457,43 @@ pub struct PostgresReadStream<I: Iterator> {
     cache: NonNull<Cache<I>>,
 }
 
-impl<I: Iterator> ReadStream<I::Item> for PostgresReadStream<I>
+#[cfg(feature = "pg17")]
+impl<I: Iterator> PostgresReadStream<I>
+where
+    I::Item: Fetch,
+{
+    fn read(&mut self, fetch: &[u32]) -> impl Iterator<Item = PostgresBufferReadGuard> {
+        fetch.iter().map(|_| unsafe {
+            use pgrx::pg_sys::{
+                BUFFER_LOCK_SHARE, BufferGetPage, LockBuffer, read_stream_next_buffer,
+            };
+            let buf = read_stream_next_buffer(self.raw, core::ptr::null_mut());
+            LockBuffer(buf, BUFFER_LOCK_SHARE as _);
+            let page = NonNull::new(BufferGetPage(buf).cast()).expect("failed to get page");
+            PostgresBufferReadGuard {
+                buf,
+                page,
+                id: pgrx::pg_sys::BufferGetBlockNumber(buf),
+            }
+        })
+    }
+}
+
+impl<'r, I: Iterator> ReadStream<'r> for PostgresReadStream<I>
 where
     I::Item: Fetch,
 {
     type Relation = PostgresRelation;
 
+    type Item = I::Item;
+
     type Inner =
         Chain<std::collections::vec_deque::IntoIter<I::Item>, Flatten<std::option::IntoIter<I>>>;
+
+    #[cfg(any(feature = "pg13", feature = "pg14", feature = "pg15", feature = "pg16"))]
+    fn next(&mut self) -> Option<(I::Item, Vec<PostgresBufferReadGuard>)> {
+        panic!("read_stream is not supported on PostgreSQL versions earlier than 17.");
+    }
 
     #[cfg(any(feature = "pg13", feature = "pg14", feature = "pg15", feature = "pg16"))]
     fn next_if(
@@ -462,28 +504,22 @@ where
     }
 
     #[cfg(feature = "pg17")]
+    fn next(&mut self) -> Option<(I::Item, Vec<PostgresBufferReadGuard>)> {
+        if let Some(e) = unsafe { self.cache.as_mut().pop_item() } {
+            let list = self.read(e.fetch()).collect();
+            Some((e, list))
+        } else {
+            None
+        }
+    }
+
+    #[cfg(feature = "pg17")]
     fn next_if(
         &mut self,
         predicate: impl FnOnce(&I::Item) -> bool,
     ) -> Option<(I::Item, Vec<PostgresBufferReadGuard>)> {
         if let Some(e) = unsafe { self.cache.as_mut().pop_item_if(predicate) } {
-            let list = e
-                .fetch()
-                .iter()
-                .map(|_| unsafe {
-                    use pgrx::pg_sys::{
-                        BUFFER_LOCK_SHARE, BufferGetPage, LockBuffer, read_stream_next_buffer,
-                    };
-                    let buf = read_stream_next_buffer(self.raw, core::ptr::null_mut());
-                    LockBuffer(buf, BUFFER_LOCK_SHARE as _);
-                    let page = NonNull::new(BufferGetPage(buf).cast()).expect("failed to get page");
-                    PostgresBufferReadGuard {
-                        buf,
-                        page,
-                        id: pgrx::pg_sys::BufferGetBlockNumber(buf),
-                    }
-                })
-                .collect::<Vec<_>>();
+            let list = self.read(e.fetch()).collect();
             Some((e, list))
         } else {
             None
@@ -519,7 +555,7 @@ impl RelationReadStream for PostgresRelation {
         I::Item: Fetch;
 
     #[cfg(any(feature = "pg13", feature = "pg14", feature = "pg15", feature = "pg16"))]
-    fn read_stream<I: Iterator>(&self, _iter: I) -> Self::ReadStream<'_, I>
+    fn read_stream<I: Iterator>(&self, _iter: I, _hints: Hints) -> Self::ReadStream<'_, I>
     where
         I::Item: Fetch,
     {
@@ -527,7 +563,7 @@ impl RelationReadStream for PostgresRelation {
     }
 
     #[cfg(feature = "pg17")]
-    fn read_stream<I: Iterator>(&self, iter: I) -> Self::ReadStream<'_, I>
+    fn read_stream<I: Iterator>(&self, iter: I, hints: Hints) -> Self::ReadStream<'_, I>
     where
         I::Item: Fetch,
     {
@@ -552,9 +588,15 @@ impl RelationReadStream for PostgresRelation {
             iter: Some(iter),
         }));
         let raw = unsafe {
-            use pgrx::pg_sys::{ForkNumber, READ_STREAM_DEFAULT, read_stream_begin_relation};
+            use pgrx::pg_sys::{
+                ForkNumber, READ_STREAM_DEFAULT, READ_STREAM_FULL, read_stream_begin_relation,
+            };
+            let mut flags = READ_STREAM_DEFAULT;
+            if hints.full {
+                flags |= READ_STREAM_FULL;
+            }
             read_stream_begin_relation(
-                READ_STREAM_DEFAULT as i32,
+                flags as i32,
                 core::ptr::null_mut(),
                 self.raw,
                 ForkNumber::MAIN_FORKNUM,

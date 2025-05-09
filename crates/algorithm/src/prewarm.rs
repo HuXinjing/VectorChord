@@ -1,14 +1,15 @@
 use crate::closure_lifetime_binder::{id_0, id_1, id_2};
 use crate::operator::{FunctionalAccessor, Operator};
+use crate::tape::{by_directory, by_next};
 use crate::tuples::*;
-use crate::{Page, RelationRead, tape, vectors};
+use crate::{Page, PrefetcherSequenceFamily, RelationRead, tape, vectors};
 use std::error::Error;
 use std::fmt::Write;
 
-pub fn prewarm<R: RelationRead, O: Operator>(
-    index: R,
+pub fn prewarm<'r, R: RelationRead, O: Operator>(
+    index: &'r R,
     height: i32,
-    check: impl Fn(),
+    mut prefetch_h0_tuples: impl PrefetcherSequenceFamily<'r, R>,
 ) -> Result<String, Box<dyn Error>> {
     let meta_guard = index.read(0);
     let meta_bytes = meta_guard.get(1).expect("data corruption");
@@ -42,18 +43,13 @@ pub fn prewarm<R: RelationRead, O: Operator>(
         let mut counter = 0_usize;
         let mut results = Vec::new();
         for first in state {
-            tape::read_h1_tape(
-                index.clone(),
-                first,
+            tape::read_h1_tape::<R, _, _>(
+                by_next(index, first).inspect(|_| counter += 1),
                 || FunctionalAccessor::new((), id_0(|_, _| ()), id_1(|_, _| [(); 32])),
                 |(), head, first, prefetch| {
                     let list = prefetch.iter().map(|&id| index.read(id));
                     vectors::read_for_h1_tuple::<R, O, _>(head, list, ());
                     results.push(first);
-                },
-                |_| {
-                    check();
-                    counter += 1;
                 },
             );
         }
@@ -72,29 +68,21 @@ pub fn prewarm<R: RelationRead, O: Operator>(
             let jump_guard = index.read(first);
             let jump_bytes = jump_guard.get(1).expect("data corruption");
             let jump_tuple = JumpTuple::deserialize_ref(jump_bytes);
-            tape::read_frozen_tape(
-                index.clone(),
-                jump_tuple.frozen_first(),
+            let directory =
+                tape::read_directory_tape::<R>(by_next(index, jump_tuple.directory_first()));
+            tape::read_frozen_tape::<R, _, _>(
+                by_directory(&mut prefetch_h0_tuples, directory).inspect(|_| counter += 1),
                 || FunctionalAccessor::new((), id_0(|_, _| ()), id_1(|_, _| [(); 32])),
                 id_2(|_, _, _, _| {
                     results.push(());
                 }),
-                |_| {
-                    check();
-                    counter += 1;
-                },
             );
-            tape::read_appendable_tape(
-                index.clone(),
-                jump_tuple.appendable_first(),
+            tape::read_appendable_tape::<R, _>(
+                by_next(index, jump_tuple.appendable_first()).inspect(|_| counter += 1),
                 |_| (),
                 id_2(|_, _, _, _| {
                     results.push(());
                 }),
-                |_| {
-                    check();
-                    counter += 1;
-                },
             );
         }
         writeln!(message, "------------------------")?;

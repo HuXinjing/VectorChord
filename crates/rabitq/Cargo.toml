@@ -2,6 +2,7 @@
 name = "rabitq"
 version.workspace = true
 edition.workspace = true
+publish = false
 
 [dependencies]
 distance = { path = "../distance" }

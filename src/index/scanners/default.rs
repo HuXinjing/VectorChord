@@ -1,5 +1,5 @@
-use super::{SearchBuilder, SearchFetcher, SearchIo, SearchOptions};
-use crate::index::algorithm::RandomProject;
+use super::{Io, SearchBuilder, SearchFetcher, SearchOptions};
+use crate::index::algorithm::*;
 use crate::index::am::pointer_to_kv;
 use crate::index::opclass::{Opfamily, Sphere};
 use algorithm::operator::{Dot, L2, Op};
@@ -49,13 +49,16 @@ impl SearchBuilder for DefaultBuilder {
         }
     }
 
-    fn build<'a>(
+    fn build<'a, R>(
         self,
-        relation: &'a (impl RelationPrefetch + RelationReadStream),
+        index: &'a R,
         options: SearchOptions,
         mut fetcher: impl SearchFetcher + 'a,
         bump: &'a impl Bump,
-    ) -> Box<dyn Iterator<Item = (f32, [u16; 3], bool)> + 'a> {
+    ) -> Box<dyn Iterator<Item = (f32, [u16; 3], bool)> + 'a>
+    where
+        R: RelationRead + RelationPrefetch + RelationReadStream,
+    {
         let mut vector = None;
         let mut threshold = None;
         let mut recheck = false;
@@ -77,6 +80,13 @@ impl SearchBuilder for DefaultBuilder {
         let Some(vector) = vector else {
             return Box::new(std::iter::empty()) as Box<dyn Iterator<Item = (f32, [u16; 3], bool)>>;
         };
+        let make_h1_plain_prefetcher = MakeH1PlainPrefetcher { index };
+        let make_h0_plain_prefetcher = MakeH0PlainPrefetcher { index };
+        let make_h0_simple_prefetcher = MakeH0SimplePrefetcher { index };
+        let make_h0_stream_prefetcher = MakeH0StreamPrefetcher {
+            index,
+            hints: Hints::default().full(true),
+        };
         let iter: Box<dyn Iterator<Item = (f32, NonZero<u64>)>> =
             match (opfamily.vector_kind(), opfamily.distance_kind()) {
                 (VectorKind::Vecf32, DistanceKind::L2) => {
@@ -88,19 +98,35 @@ impl SearchBuilder for DefaultBuilder {
                         }
                         .as_borrowed(),
                     );
-                    let results = default_search::<_, Op<VectOwned<f32>, L2>, _>(
-                        relation.clone(),
-                        vector.clone(),
-                        options.probes,
-                        options.epsilon,
-                        bump,
-                        {
-                            let index = relation.clone();
-                            move |results| {
-                                PlainPrefetcher::<_, BinaryHeap<_>>::new(index.clone(), results)
-                            }
-                        },
-                    );
+                    let results = match options.io_search {
+                        Io::Plain => default_search::<_, Op<VectOwned<f32>, L2>>(
+                            index,
+                            vector.clone(),
+                            options.probes,
+                            options.epsilon,
+                            bump,
+                            make_h1_plain_prefetcher,
+                            make_h0_plain_prefetcher,
+                        ),
+                        Io::Simple => default_search::<_, Op<VectOwned<f32>, L2>>(
+                            index,
+                            vector.clone(),
+                            options.probes,
+                            options.epsilon,
+                            bump,
+                            make_h1_plain_prefetcher,
+                            make_h0_simple_prefetcher,
+                        ),
+                        Io::Stream => default_search::<_, Op<VectOwned<f32>, L2>>(
+                            index,
+                            vector.clone(),
+                            options.probes,
+                            options.epsilon,
+                            bump,
+                            make_h1_plain_prefetcher,
+                            make_h0_stream_prefetcher,
+                        ),
+                    };
                     let fetch = move |payload| {
                         let (key, _) = pointer_to_kv(payload);
                         let (datums, is_nulls) = fetcher.fetch(key)?;
@@ -113,11 +139,11 @@ impl SearchBuilder for DefaultBuilder {
                         };
                         Some(RandomProject::project(raw.as_borrowed()))
                     };
-                    let method = how(relation.clone());
+                    let method = how(index);
                     match (method, options.io_rerank) {
-                        (RerankMethod::Index, SearchIo::ReadBuffer) => {
+                        (RerankMethod::Index, Io::Plain) => {
                             let prefetcher =
-                                PlainPrefetcher::<_, BinaryHeap<_>>::new(relation.clone(), results);
+                                PlainPrefetcher::<_, BinaryHeap<_>>::new(index, results.into());
                             Box::new(
                                 rerank_index::<Op<VectOwned<f32>, L2>, _, _>(vector, prefetcher)
                                     .map(move |(distance, payload)| {
@@ -125,8 +151,11 @@ impl SearchBuilder for DefaultBuilder {
                                     }),
                             )
                         }
-                        (RerankMethod::Index, SearchIo::PrefetchBuffer) => {
-                            let prefetcher = SimplePrefetcher::new(relation.clone(), results);
+                        (RerankMethod::Index, Io::Simple) => {
+                            let prefetcher = SimplePrefetcher::<'a, R, BinaryHeap<_>>::new(
+                                index,
+                                results.into(),
+                            );
                             Box::new(
                                 rerank_index::<Op<VectOwned<f32>, L2>, _, _>(vector, prefetcher)
                                     .map(move |(distance, payload)| {
@@ -134,8 +163,12 @@ impl SearchBuilder for DefaultBuilder {
                                     }),
                             )
                         }
-                        (RerankMethod::Index, SearchIo::ReadStream) => {
-                            let prefetcher = StreamPrefetcher::new(relation, results);
+                        (RerankMethod::Index, Io::Stream) => {
+                            let prefetcher = StreamPrefetcher::<_, BinaryHeap<_>>::new(
+                                index,
+                                results.into(),
+                                Hints::default(),
+                            );
                             Box::new(
                                 rerank_index::<Op<VectOwned<f32>, L2>, _, _>(vector, prefetcher)
                                     .map(move |(distance, payload)| {
@@ -145,7 +178,7 @@ impl SearchBuilder for DefaultBuilder {
                         }
                         (RerankMethod::Heap, _) => {
                             let prefetcher =
-                                PlainPrefetcher::<_, BinaryHeap<_>>::new(relation.clone(), results);
+                                PlainPrefetcher::<_, BinaryHeap<_>>::new(index, results.into());
                             Box::new(
                                 rerank_heap::<Op<VectOwned<f32>, L2>, _, _>(
                                     vector, prefetcher, fetch,
@@ -166,19 +199,35 @@ impl SearchBuilder for DefaultBuilder {
                         }
                         .as_borrowed(),
                     );
-                    let results = default_search::<_, Op<VectOwned<f32>, Dot>, _>(
-                        relation.clone(),
-                        vector.clone(),
-                        options.probes,
-                        options.epsilon,
-                        bump,
-                        {
-                            let index = relation.clone();
-                            move |results| {
-                                PlainPrefetcher::<_, BinaryHeap<_>>::new(index.clone(), results)
-                            }
-                        },
-                    );
+                    let results = match options.io_search {
+                        Io::Plain => default_search::<_, Op<VectOwned<f32>, Dot>>(
+                            index,
+                            vector.clone(),
+                            options.probes,
+                            options.epsilon,
+                            bump,
+                            make_h1_plain_prefetcher,
+                            make_h0_plain_prefetcher,
+                        ),
+                        Io::Simple => default_search::<_, Op<VectOwned<f32>, Dot>>(
+                            index,
+                            vector.clone(),
+                            options.probes,
+                            options.epsilon,
+                            bump,
+                            make_h1_plain_prefetcher,
+                            make_h0_simple_prefetcher,
+                        ),
+                        Io::Stream => default_search::<_, Op<VectOwned<f32>, Dot>>(
+                            index,
+                            vector.clone(),
+                            options.probes,
+                            options.epsilon,
+                            bump,
+                            make_h1_plain_prefetcher,
+                            make_h0_stream_prefetcher,
+                        ),
+                    };
                     let fetch = move |payload| {
                         let (key, _) = pointer_to_kv(payload);
                         let (datums, is_nulls) = fetcher.fetch(key)?;
@@ -191,11 +240,11 @@ impl SearchBuilder for DefaultBuilder {
                         };
                         Some(RandomProject::project(raw.as_borrowed()))
                     };
-                    let method = how(relation.clone());
+                    let method = how(index);
                     match (method, options.io_rerank) {
-                        (RerankMethod::Index, SearchIo::ReadBuffer) => {
+                        (RerankMethod::Index, Io::Plain) => {
                             let prefetcher =
-                                PlainPrefetcher::<_, BinaryHeap<_>>::new(relation.clone(), results);
+                                PlainPrefetcher::<_, BinaryHeap<_>>::new(index, results.into());
                             Box::new(
                                 rerank_index::<Op<VectOwned<f32>, Dot>, _, _>(vector, prefetcher)
                                     .map(move |(distance, payload)| {
@@ -203,8 +252,9 @@ impl SearchBuilder for DefaultBuilder {
                                     }),
                             )
                         }
-                        (RerankMethod::Index, SearchIo::PrefetchBuffer) => {
-                            let prefetcher = SimplePrefetcher::new(relation.clone(), results);
+                        (RerankMethod::Index, Io::Simple) => {
+                            let prefetcher =
+                                SimplePrefetcher::<_, BinaryHeap<_>>::new(index, results.into());
                             Box::new(
                                 rerank_index::<Op<VectOwned<f32>, Dot>, _, _>(vector, prefetcher)
                                     .map(move |(distance, payload)| {
@@ -212,8 +262,12 @@ impl SearchBuilder for DefaultBuilder {
                                     }),
                             )
                         }
-                        (RerankMethod::Index, SearchIo::ReadStream) => {
-                            let prefetcher = StreamPrefetcher::new(relation, results);
+                        (RerankMethod::Index, Io::Stream) => {
+                            let prefetcher = StreamPrefetcher::<_, BinaryHeap<_>>::new(
+                                index,
+                                results.into(),
+                                Hints::default(),
+                            );
                             Box::new(
                                 rerank_index::<Op<VectOwned<f32>, Dot>, _, _>(vector, prefetcher)
                                     .map(move |(distance, payload)| {
@@ -223,7 +277,7 @@ impl SearchBuilder for DefaultBuilder {
                         }
                         (RerankMethod::Heap, _) => {
                             let prefetcher =
-                                PlainPrefetcher::<_, BinaryHeap<_>>::new(relation.clone(), results);
+                                PlainPrefetcher::<_, BinaryHeap<_>>::new(index, results.into());
                             Box::new(
                                 rerank_heap::<Op<VectOwned<f32>, Dot>, _, _>(
                                     vector, prefetcher, fetch,
@@ -244,19 +298,35 @@ impl SearchBuilder for DefaultBuilder {
                         }
                         .as_borrowed(),
                     );
-                    let results = default_search::<_, Op<VectOwned<f16>, L2>, _>(
-                        relation.clone(),
-                        vector.clone(),
-                        options.probes,
-                        options.epsilon,
-                        bump,
-                        {
-                            let index = relation.clone();
-                            move |results| {
-                                PlainPrefetcher::<_, BinaryHeap<_>>::new(index.clone(), results)
-                            }
-                        },
-                    );
+                    let results = match options.io_search {
+                        Io::Plain => default_search::<_, Op<VectOwned<f16>, L2>>(
+                            index,
+                            vector.clone(),
+                            options.probes,
+                            options.epsilon,
+                            bump,
+                            make_h1_plain_prefetcher,
+                            make_h0_plain_prefetcher,
+                        ),
+                        Io::Simple => default_search::<_, Op<VectOwned<f16>, L2>>(
+                            index,
+                            vector.clone(),
+                            options.probes,
+                            options.epsilon,
+                            bump,
+                            make_h1_plain_prefetcher,
+                            make_h0_simple_prefetcher,
+                        ),
+                        Io::Stream => default_search::<_, Op<VectOwned<f16>, L2>>(
+                            index,
+                            vector.clone(),
+                            options.probes,
+                            options.epsilon,
+                            bump,
+                            make_h1_plain_prefetcher,
+                            make_h0_stream_prefetcher,
+                        ),
+                    };
                     let fetch = move |payload| {
                         let (key, _) = pointer_to_kv(payload);
                         let (datums, is_nulls) = fetcher.fetch(key)?;
@@ -269,11 +339,11 @@ impl SearchBuilder for DefaultBuilder {
                         };
                         Some(RandomProject::project(raw.as_borrowed()))
                     };
-                    let method = how(relation.clone());
+                    let method = how(index);
                     match (method, options.io_rerank) {
-                        (RerankMethod::Index, SearchIo::ReadBuffer) => {
+                        (RerankMethod::Index, Io::Plain) => {
                             let prefetcher =
-                                PlainPrefetcher::<_, BinaryHeap<_>>::new(relation.clone(), results);
+                                PlainPrefetcher::<_, BinaryHeap<_>>::new(index, results.into());
                             Box::new(
                                 rerank_index::<Op<VectOwned<f16>, L2>, _, _>(vector, prefetcher)
                                     .map(move |(distance, payload)| {
@@ -281,8 +351,9 @@ impl SearchBuilder for DefaultBuilder {
                                     }),
                             )
                         }
-                        (RerankMethod::Index, SearchIo::PrefetchBuffer) => {
-                            let prefetcher = SimplePrefetcher::new(relation.clone(), results);
+                        (RerankMethod::Index, Io::Simple) => {
+                            let prefetcher =
+                                SimplePrefetcher::<_, BinaryHeap<_>>::new(index, results.into());
                             Box::new(
                                 rerank_index::<Op<VectOwned<f16>, L2>, _, _>(vector, prefetcher)
                                     .map(move |(distance, payload)| {
@@ -290,8 +361,12 @@ impl SearchBuilder for DefaultBuilder {
                                     }),
                             )
                         }
-                        (RerankMethod::Index, SearchIo::ReadStream) => {
-                            let prefetcher = StreamPrefetcher::new(relation, results);
+                        (RerankMethod::Index, Io::Stream) => {
+                            let prefetcher = StreamPrefetcher::<_, BinaryHeap<_>>::new(
+                                index,
+                                results.into(),
+                                Hints::default(),
+                            );
                             Box::new(
                                 rerank_index::<Op<VectOwned<f16>, L2>, _, _>(vector, prefetcher)
                                     .map(move |(distance, payload)| {
@@ -301,7 +376,7 @@ impl SearchBuilder for DefaultBuilder {
                         }
                         (RerankMethod::Heap, _) => {
                             let prefetcher =
-                                PlainPrefetcher::<_, BinaryHeap<_>>::new(relation.clone(), results);
+                                PlainPrefetcher::<_, BinaryHeap<_>>::new(index, results.into());
                             Box::new(
                                 rerank_heap::<Op<VectOwned<f16>, L2>, _, _>(
                                     vector, prefetcher, fetch,
@@ -322,19 +397,35 @@ impl SearchBuilder for DefaultBuilder {
                         }
                         .as_borrowed(),
                     );
-                    let results = default_search::<_, Op<VectOwned<f16>, Dot>, _>(
-                        relation.clone(),
-                        vector.clone(),
-                        options.probes,
-                        options.epsilon,
-                        bump,
-                        {
-                            let index = relation.clone();
-                            move |results| {
-                                PlainPrefetcher::<_, BinaryHeap<_>>::new(index.clone(), results)
-                            }
-                        },
-                    );
+                    let results = match options.io_search {
+                        Io::Plain => default_search::<_, Op<VectOwned<f16>, Dot>>(
+                            index,
+                            vector.clone(),
+                            options.probes,
+                            options.epsilon,
+                            bump,
+                            make_h1_plain_prefetcher,
+                            make_h0_plain_prefetcher,
+                        ),
+                        Io::Simple => default_search::<_, Op<VectOwned<f16>, Dot>>(
+                            index,
+                            vector.clone(),
+                            options.probes,
+                            options.epsilon,
+                            bump,
+                            make_h1_plain_prefetcher,
+                            make_h0_simple_prefetcher,
+                        ),
+                        Io::Stream => default_search::<_, Op<VectOwned<f16>, Dot>>(
+                            index,
+                            vector.clone(),
+                            options.probes,
+                            options.epsilon,
+                            bump,
+                            make_h1_plain_prefetcher,
+                            make_h0_stream_prefetcher,
+                        ),
+                    };
                     let fetch = move |payload| {
                         let (key, _) = pointer_to_kv(payload);
                         let (datums, is_nulls) = fetcher.fetch(key)?;
@@ -347,11 +438,11 @@ impl SearchBuilder for DefaultBuilder {
                         };
                         Some(RandomProject::project(raw.as_borrowed()))
                     };
-                    let method = how(relation.clone());
+                    let method = how(index);
                     match (method, options.io_rerank) {
-                        (RerankMethod::Index, SearchIo::ReadBuffer) => {
+                        (RerankMethod::Index, Io::Plain) => {
                             let prefetcher =
-                                PlainPrefetcher::<_, BinaryHeap<_>>::new(relation.clone(), results);
+                                PlainPrefetcher::<_, BinaryHeap<_>>::new(index, results.into());
                             Box::new(
                                 rerank_index::<Op<VectOwned<f16>, Dot>, _, _>(vector, prefetcher)
                                     .map(move |(distance, payload)| {
@@ -359,8 +450,9 @@ impl SearchBuilder for DefaultBuilder {
                                     }),
                             )
                         }
-                        (RerankMethod::Index, SearchIo::PrefetchBuffer) => {
-                            let prefetcher = SimplePrefetcher::new(relation.clone(), results);
+                        (RerankMethod::Index, Io::Simple) => {
+                            let prefetcher =
+                                SimplePrefetcher::<_, BinaryHeap<_>>::new(index, results.into());
                             Box::new(
                                 rerank_index::<Op<VectOwned<f16>, Dot>, _, _>(vector, prefetcher)
                                     .map(move |(distance, payload)| {
@@ -368,8 +460,12 @@ impl SearchBuilder for DefaultBuilder {
                                     }),
                             )
                         }
-                        (RerankMethod::Index, SearchIo::ReadStream) => {
-                            let prefetcher = StreamPrefetcher::new(relation, results);
+                        (RerankMethod::Index, Io::Stream) => {
+                            let prefetcher = StreamPrefetcher::<_, BinaryHeap<_>>::new(
+                                index,
+                                results.into(),
+                                Hints::default(),
+                            );
                             Box::new(
                                 rerank_index::<Op<VectOwned<f16>, Dot>, _, _>(vector, prefetcher)
                                     .map(move |(distance, payload)| {
@@ -379,7 +475,7 @@ impl SearchBuilder for DefaultBuilder {
                         }
                         (RerankMethod::Heap, _) => {
                             let prefetcher =
-                                PlainPrefetcher::<_, BinaryHeap<_>>::new(relation.clone(), results);
+                                PlainPrefetcher::<_, BinaryHeap<_>>::new(index, results.into());
                             Box::new(
                                 rerank_heap::<Op<VectOwned<f16>, Dot>, _, _>(
                                     vector, prefetcher, fetch,

@@ -148,12 +148,12 @@ impl VectorBorrowed for BVectBorrowed<'_> {
 
     #[inline(always)]
     fn norm(&self) -> f32 {
-        (simd::bit::sum_of_x(self.data) as f32).sqrt()
+        (simd::bit::reduce_sum_of_x(self.data) as f32).sqrt()
     }
 
     #[inline(always)]
     fn operator_dot(self, rhs: Self) -> Distance {
-        Distance::from(-(simd::bit::sum_of_and(self.data, rhs.data) as f32))
+        Distance::from(-(simd::bit::reduce_sum_of_and(self.data, rhs.data) as f32))
     }
 
     #[inline(always)]
@@ -168,12 +168,12 @@ impl VectorBorrowed for BVectBorrowed<'_> {
 
     #[inline(always)]
     fn operator_hamming(self, rhs: Self) -> Distance {
-        Distance::from(simd::bit::sum_of_xor(self.data, rhs.data) as f32)
+        Distance::from(simd::bit::reduce_sum_of_xor(self.data, rhs.data) as f32)
     }
 
     #[inline(always)]
     fn operator_jaccard(self, rhs: Self) -> Distance {
-        let (and, or) = simd::bit::sum_of_and_or(self.data, rhs.data);
+        let (and, or) = simd::bit::reduce_sum_of_and_or(self.data, rhs.data);
         Distance::from(1.0 - (and as f32 / or as f32))
     }
 

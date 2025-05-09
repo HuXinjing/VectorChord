@@ -21,9 +21,7 @@ fn _vchordrq_prewarm(indexrelid: Oid, height: i32) -> String {
     let relation = Index::open(indexrelid, pgrx::pg_sys::AccessShareLock as _);
     let opfamily = unsafe { crate::index::opclass::opfamily(relation.raw()) };
     let index = unsafe { PostgresRelation::new(relation.raw()) };
-    crate::index::algorithm::prewarm(opfamily, index, height, || {
-        pgrx::check_for_interrupts!();
-    })
+    crate::index::algorithm::prewarm(opfamily, &index, height)
 }
 
 struct Index {

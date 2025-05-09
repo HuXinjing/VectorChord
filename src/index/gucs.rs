@@ -1,11 +1,11 @@
-use super::scanners::SearchIo;
+use super::scanners::Io;
 use pgrx::PostgresGucEnum;
 use pgrx::guc::{GucContext, GucFlags, GucRegistry, GucSetting};
 use std::ffi::CStr;
 
 #[allow(non_camel_case_types)]
 #[derive(Debug, Clone, Copy, PostgresGucEnum)]
-pub enum Io {
+pub enum PostgresIo {
     read_buffer,
     prefetch_buffer,
     #[cfg(feature = "pg17")]
@@ -24,11 +24,18 @@ static MAXSIM_THRESHOLD: GucSetting<i32> = GucSetting::<i32>::new(0);
 
 static PRERERANK_FILTERING: GucSetting<bool> = GucSetting::<bool>::new(false);
 
-static IO_RERANK: GucSetting<Io> = GucSetting::<Io>::new(
+static IO_SEARCH: GucSetting<PostgresIo> = GucSetting::<PostgresIo>::new(
     #[cfg(any(feature = "pg13", feature = "pg14", feature = "pg15", feature = "pg16"))]
-    Io::prefetch_buffer,
+    PostgresIo::prefetch_buffer,
     #[cfg(feature = "pg17")]
-    Io::read_stream,
+    PostgresIo::read_stream,
+);
+
+static IO_RERANK: GucSetting<PostgresIo> = GucSetting::<PostgresIo>::new(
+    #[cfg(any(feature = "pg13", feature = "pg14", feature = "pg15", feature = "pg16"))]
+    PostgresIo::prefetch_buffer,
+    #[cfg(feature = "pg17")]
+    PostgresIo::read_stream,
 );
 
 pub fn init() {
@@ -93,6 +100,14 @@ pub fn init() {
         "`prererank_filtering` argument of vchordrq.",
         "`prererank_filtering` argument of vchordrq.",
         &PRERERANK_FILTERING,
+        GucContext::Userset,
+        GucFlags::default(),
+    );
+    GucRegistry::define_enum_guc(
+        "vchordrq.io_search",
+        "`io_search` argument of vchordrq.",
+        "`io_search` argument of vchordrq.",
+        &IO_SEARCH,
         GucContext::Userset,
         GucFlags::default(),
     );
@@ -182,11 +197,20 @@ pub fn prererank_filtering() -> bool {
     PRERERANK_FILTERING.get()
 }
 
-pub fn io_rerank() -> SearchIo {
+pub fn io_search() -> Io {
     match IO_RERANK.get() {
-        Io::read_buffer => SearchIo::ReadBuffer,
-        Io::prefetch_buffer => SearchIo::PrefetchBuffer,
+        PostgresIo::read_buffer => Io::Plain,
+        PostgresIo::prefetch_buffer => Io::Simple,
         #[cfg(feature = "pg17")]
-        Io::read_stream => SearchIo::ReadStream,
+        PostgresIo::read_stream => Io::Stream,
+    }
+}
+
+pub fn io_rerank() -> Io {
+    match IO_RERANK.get() {
+        PostgresIo::read_buffer => Io::Plain,
+        PostgresIo::prefetch_buffer => Io::Simple,
+        #[cfg(feature = "pg17")]
+        PostgresIo::read_stream => Io::Stream,
     }
 }

@@ -9,7 +9,6 @@ mod f32;
 
 pub mod bit;
 pub mod fast_scan;
-pub mod packed_u4;
 pub mod quantize;
 pub mod u8;
 

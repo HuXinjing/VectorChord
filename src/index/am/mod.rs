@@ -194,7 +194,7 @@ pub unsafe extern "C-unwind" fn amcostestimate(
             }
             let index = PostgresRelation::new(relation.raw());
             let probes = gucs::probes();
-            let cost = algorithm::cost(index);
+            let cost = algorithm::cost(&index);
             if cost.cells.len() != 1 + probes.len() {
                 panic!(
                     "need {} probes, but {} probes provided",
@@ -287,7 +287,7 @@ unsafe fn aminsertinner(
         for (vector, extra) in store {
             let key = ctid_to_key(ctid);
             let payload = kv_to_pointer((key, extra));
-            crate::index::algorithm::insert(opfamily, index.clone(), payload, vector);
+            crate::index::algorithm::insert(opfamily, &index, payload, vector);
         }
     }
     false
@@ -317,7 +317,7 @@ pub unsafe extern "C-unwind" fn ambulkdelete(
         let mut ctid = key_to_ctid(key);
         unsafe { callback(&mut ctid, callback_state) }
     };
-    crate::index::algorithm::bulkdelete(opfamily, index, check, callback);
+    crate::index::algorithm::bulkdelete(opfamily, &index, check, callback);
     stats
 }
 
@@ -337,7 +337,7 @@ pub unsafe extern "C-unwind" fn amvacuumcleanup(
     let check = || unsafe {
         pgrx::pg_sys::vacuum_delay_point();
     };
-    crate::index::algorithm::maintain(opfamily, index, check);
+    crate::index::algorithm::maintain(opfamily, &index, check);
     stats
 }
 
@@ -393,6 +393,7 @@ pub unsafe extern "C-unwind" fn amrescan(
             max_scan_tuples: gucs::max_scan_tuples(),
             maxsim_refine: gucs::maxsim_refine(),
             maxsim_threshold: gucs::maxsim_threshold(),
+            io_search: gucs::io_search(),
             io_rerank: gucs::io_rerank(),
         };
         let fetcher = {

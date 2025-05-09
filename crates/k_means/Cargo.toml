@@ -2,6 +2,7 @@
 name = "k_means"
 version.workspace = true
 edition.workspace = true
+publish = false
 
 [dependencies]
 rabitq = { path = "../rabitq" }

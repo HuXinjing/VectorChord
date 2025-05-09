@@ -1,6 +1,6 @@
 use crate::operator::Accessor1;
 use crate::tuples::*;
-use crate::{Page, PageGuard, RelationRead, RelationWrite};
+use crate::{Page, PageGuard, PrefetcherSequenceFamily, RelationRead, RelationWrite};
 use rabitq::binary::BinaryCode;
 use std::marker::PhantomData;
 use std::num::NonZero;
@@ -78,25 +78,133 @@ where
     }
 }
 
-pub fn read_h1_tape<A, T>(
-    index: impl RelationRead,
-    first: u32,
+pub fn read_directory_tape<'r, R>(
+    iter: impl Iterator<Item = R::ReadGuard<'r>>,
+) -> impl Iterator<Item = u32>
+where
+    R: RelationRead + 'r,
+{
+    use std::pin::Pin;
+    use std::ptr::NonNull;
+
+    #[pin_project::pin_project]
+    struct State<'r, R: RelationRead + 'r, I> {
+        slice: NonNull<[u32]>,
+        #[pin]
+        now: Option<(R::ReadGuard<'r>, u16)>,
+        iter: I,
+    }
+
+    impl<'r, R: RelationRead + 'r, I: Iterator<Item = R::ReadGuard<'r>>> State<'r, R, I> {
+        fn init(self: Pin<&mut Self>) {
+            let mut this = self.project();
+            let now = this.iter.next().map(|guard| (guard, 0));
+            this.now.set(now);
+        }
+
+        fn next(mut self: Pin<&mut Self>) -> Option<u32> {
+            loop {
+                let mut this = self.as_mut().project();
+                // Safety: If the slice is not empty, the function will return immediately,
+                // so the guard will not be moved or dropped and the slice remains valid. If
+                // the slice is empty, a pointer is trivially never dangling, so it's safe
+                // to use.
+                #[allow(unsafe_code)]
+                if let Some((first, more)) = unsafe { this.slice.as_ref() }.split_first() {
+                    *this.slice = more.into();
+                    return Some(*first);
+                }
+                // Safety: `guard` is never moved in this block
+                #[allow(unsafe_code)]
+                if let Some((guard, i)) = unsafe { this.now.as_mut().get_unchecked_mut() } {
+                    if *i < guard.len() {
+                        *i += 1;
+                        let bytes = guard.get(*i).expect("data corruption");
+                        let tuple = DirectoryTuple::deserialize_ref(bytes);
+                        *this.slice = match tuple {
+                            DirectoryTupleReader::_0(tuple) => tuple.elements(),
+                            DirectoryTupleReader::_1(tuple) => tuple.elements(),
+                        }
+                        .into();
+                        continue;
+                    }
+                } else {
+                    return None;
+                }
+                let now = this.iter.next().map(|guard| (guard, 0));
+                this.now.set(now);
+            }
+        }
+    }
+
+    let mut state = Box::pin(State::<'r, R, _> {
+        slice: NonNull::from(&mut []),
+        now: None,
+        iter,
+    });
+
+    impl<'r, R: RelationRead + 'r, I: Iterator<Item = R::ReadGuard<'r>>> Iterator
+        for Pin<Box<State<'r, R, I>>>
+    {
+        type Item = u32;
+
+        fn next(&mut self) -> Option<u32> {
+            self.as_mut().next()
+        }
+    }
+
+    state.as_mut().init();
+
+    state
+}
+
+pub fn by_directory<'r, R>(
+    p: &mut impl PrefetcherSequenceFamily<'r, R>,
+    iter: impl Iterator<Item = u32>,
+) -> impl Iterator<Item = R::ReadGuard<'r>>
+where
+    R: RelationRead + 'r,
+{
+    let mut t = p.prefetch(iter.peekable());
+    std::iter::from_fn(move || {
+        use crate::prefetcher::Prefetcher;
+        let (_, mut x) = t.next()?;
+        let ret = x.pop().expect("should be at least one element");
+        assert!(x.pop().is_none(), "should be at most one element");
+        Some(ret)
+    })
+}
+
+pub fn by_next<'r, R>(index: &'r R, first: u32) -> impl Iterator<Item = R::ReadGuard<'r>>
+where
+    R: RelationRead + 'r,
+{
+    let mut current = first;
+    std::iter::from_fn(move || {
+        if current != u32::MAX {
+            let guard = index.read(current);
+            current = guard.get_opaque().next;
+            Some(guard)
+        } else {
+            None
+        }
+    })
+}
+
+pub fn read_h1_tape<'r, R, A, T>(
+    iter: impl Iterator<Item = R::ReadGuard<'r>>,
     accessor: impl Fn() -> A,
     mut callback: impl for<'a> FnMut(T, u16, u32, &'a [u32]),
-    mut step: impl FnMut(u32),
 ) where
+    R: RelationRead + 'r,
     A: for<'a> Accessor1<
             [u8; 16],
             (&'a [f32; 32], &'a [f32; 32], &'a [f32; 32], &'a [f32; 32]),
             Output = [T; 32],
         >,
 {
-    assert!(first != u32::MAX);
-    let mut current = first;
     let mut x = None;
-    while current != u32::MAX {
-        step(current);
-        let guard = index.read(current);
+    for guard in iter {
         for i in 1..=guard.len() {
             let bytes = guard.get(i).expect("data corruption");
             let tuple = H1Tuple::deserialize_ref(bytes);
@@ -117,29 +225,23 @@ pub fn read_h1_tape<A, T>(
                 }
             }
         }
-        current = guard.get_opaque().next;
     }
 }
 
-pub fn read_frozen_tape<A, T>(
-    index: impl RelationRead,
-    first: u32,
+pub fn read_frozen_tape<'r, R, A, T>(
+    iter: impl Iterator<Item = R::ReadGuard<'r>>,
     accessor: impl Fn() -> A,
     mut callback: impl for<'a> FnMut(T, u16, NonZero<u64>, &'a [u32]),
-    mut step: impl FnMut(u32),
 ) where
+    R: RelationRead + 'r,
     A: for<'a> Accessor1<
             [u8; 16],
             (&'a [f32; 32], &'a [f32; 32], &'a [f32; 32], &'a [f32; 32]),
             Output = [T; 32],
         >,
 {
-    assert!(first != u32::MAX);
-    let mut current = first;
     let mut x = None;
-    while current != u32::MAX {
-        step(current);
-        let guard = index.read(current);
+    for guard in iter {
         for i in 1..=guard.len() {
             let bytes = guard.get(i).expect("data corruption");
             let tuple = FrozenTuple::deserialize_ref(bytes);
@@ -160,22 +262,17 @@ pub fn read_frozen_tape<A, T>(
                 }
             }
         }
-        current = guard.get_opaque().next;
     }
 }
 
-pub fn read_appendable_tape<T>(
-    index: impl RelationRead,
-    first: u32,
+pub fn read_appendable_tape<'r, R, T>(
+    iter: impl Iterator<Item = R::ReadGuard<'r>>,
     mut access: impl for<'a> FnMut(BinaryCode<'a>) -> T,
     mut callback: impl for<'a> FnMut(T, u16, NonZero<u64>, &'a [u32]),
-    mut step: impl FnMut(u32),
-) {
-    assert!(first != u32::MAX);
-    let mut current = first;
-    while current != u32::MAX {
-        step(current);
-        let guard = index.read(current);
+) where
+    R: RelationRead + 'r,
+{
+    for guard in iter {
         for i in 1..=guard.len() {
             let bytes = guard.get(i).expect("data corruption");
             let tuple = AppendableTuple::deserialize_ref(bytes);
@@ -184,13 +281,12 @@ pub fn read_appendable_tape<T>(
                 callback(value, tuple.head(), payload, tuple.prefetch());
             }
         }
-        current = guard.get_opaque().next;
     }
 }
 
 #[allow(clippy::collapsible_else_if)]
 pub fn append(
-    index: impl RelationRead + RelationWrite,
+    index: &(impl RelationRead + RelationWrite),
     first: u32,
     bytes: &[u8],
     tracking_freespace: bool,

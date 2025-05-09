@@ -1,12 +1,16 @@
 use crate::closure_lifetime_binder::{id_0, id_1, id_2, id_3};
 use crate::operator::{FunctionalAccessor, Operator, Vector};
-use crate::tape::{self, TapeWriter};
+use crate::tape::{self, TapeWriter, by_directory, by_next};
+use crate::tape_writer::{DirectoryTapeWriter, FrozenTapeWriter};
 use crate::tuples::*;
-use crate::{Branch, Page, Relation, RelationRead, RelationWrite, freepages};
-use simd::fast_scan::{padding_pack, unpack};
-use std::num::NonZero;
+use crate::*;
+use rabitq::packing::unpack;
 
-pub fn maintain<O: Operator, R: RelationRead + RelationWrite>(index: R, check: impl Fn()) {
+pub fn maintain<'r, R: RelationRead + RelationWrite, O: Operator>(
+    index: &'r R,
+    mut prefetch_h0_tuples: impl PrefetcherSequenceFamily<'r, R>,
+    check: impl Fn(),
+) {
     let meta_guard = index.read(0);
     let meta_bytes = meta_guard.get(1).expect("data corruption");
     let meta_tuple = MetaTuple::deserialize_ref(meta_bytes);
@@ -22,12 +26,10 @@ pub fn maintain<O: Operator, R: RelationRead + RelationWrite>(index: R, check: i
         let step = |state: State| {
             let mut results = Vec::new();
             for first in state {
-                tape::read_h1_tape(
-                    index.clone(),
-                    first,
+                tape::read_h1_tape::<R, _, _>(
+                    by_next(index, first).inspect(|_| check()),
                     || FunctionalAccessor::new((), id_0(|_, _| ()), id_1(|_, _| [(); 32])),
                     |(), _, first, _| results.push(first),
-                    |_| check(),
                 );
             }
             results
@@ -43,11 +45,10 @@ pub fn maintain<O: Operator, R: RelationRead + RelationWrite>(index: R, check: i
         let jump_bytes = jump_guard.get_mut(1).expect("data corruption");
         let mut jump_tuple = JumpTuple::deserialize_mut(jump_bytes);
 
-        let hooked_index = RelationHooked(
-            index.clone(),
+        let frozen_tape_hooked_index = RelationHooked(index, {
             id_3(move |index: &R, tracking_freespace: bool| {
                 if !tracking_freespace {
-                    if let Some(id) = freepages::fetch(index.clone(), freepage_first) {
+                    if let Some(id) = freepages::fetch(index, freepage_first) {
                         let mut write = index.write(id, false);
                         write.clear();
                         write
@@ -57,12 +58,18 @@ pub fn maintain<O: Operator, R: RelationRead + RelationWrite>(index: R, check: i
                 } else {
                     index.extend(true)
                 }
-            }),
+            })
+        });
+
+        let mut tape = FrozenTapeWriter::create(
+            &frozen_tape_hooked_index,
+            O::Vector::count(dims as _),
+            false,
         );
 
-        let mut tape = FrozenTapeWriter::create(&hooked_index, O::Vector::count(dims as _), false);
-
-        let mut trace = Vec::new();
+        let mut trace_directory = Vec::new();
+        let mut trace_forzen = Vec::new();
+        let mut trace_appendable = Vec::new();
 
         let mut tuples = 0_u64;
         let mut callback = id_2(|code: (_, _, _, _, _), head, payload, prefetch: &[_]| {
@@ -78,13 +85,15 @@ pub fn maintain<O: Operator, R: RelationRead + RelationWrite>(index: R, check: i
             });
             tuples += 1;
         });
-        let mut step = |id| {
-            check();
-            trace.push(id);
-        };
-        tape::read_frozen_tape(
-            index.clone(),
-            *jump_tuple.frozen_first(),
+        let directory = tape::read_directory_tape::<R>(
+            by_next(index, *jump_tuple.directory_first())
+                .inspect(|_| check())
+                .inspect(|guard| trace_directory.push(guard.id())),
+        );
+        tape::read_frozen_tape::<R, _, _>(
+            by_directory(&mut prefetch_h0_tuples, directory)
+                .inspect(|_| check())
+                .inspect(|guard| trace_forzen.push(guard.id())),
             || {
                 FunctionalAccessor::new(
                     Vec::<[u8; 16]>::new(),
@@ -100,11 +109,11 @@ pub fn maintain<O: Operator, R: RelationRead + RelationWrite>(index: R, check: i
                 )
             },
             &mut callback,
-            &mut step,
         );
-        tape::read_appendable_tape(
-            index.clone(),
-            *jump_tuple.appendable_first(),
+        tape::read_appendable_tape::<R, _>(
+            by_next(index, *jump_tuple.appendable_first())
+                .inspect(|_| check())
+                .inspect(|guard| trace_appendable.push(guard.id())),
             |code| {
                 let signs = code
                     .4
@@ -115,11 +124,26 @@ pub fn maintain<O: Operator, R: RelationRead + RelationWrite>(index: R, check: i
                 (code.0, code.1, code.2, code.3, signs)
             },
             &mut callback,
-            &mut step,
         );
 
         let (frozen_tape, branches) = tape.into_inner();
 
+        let hooked_index = RelationHooked(
+            index,
+            id_3(move |index: &R, tracking_freespace: bool| {
+                if !tracking_freespace {
+                    if let Some(id) = freepages::fetch(index, freepage_first) {
+                        let mut write = index.write(id, false);
+                        write.clear();
+                        write
+                    } else {
+                        index.extend(false)
+                    }
+                } else {
+                    index.extend(true)
+                }
+            }),
+        );
         let mut appendable_tape = TapeWriter::create(&hooked_index, false);
 
         for branch in branches {
@@ -135,77 +159,39 @@ pub fn maintain<O: Operator, R: RelationRead + RelationWrite>(index: R, check: i
             });
         }
 
-        *jump_tuple.frozen_first() = { frozen_tape }.first();
+        let frozen_first = { frozen_tape }.first();
+
+        let directory = by_next(index, frozen_first)
+            .inspect(|_| check())
+            .map(|guard| guard.id())
+            .collect::<Vec<_>>();
+
+        let mut directory_tape = DirectoryTapeWriter::create(index, false);
+        directory_tape.push(directory.as_slice());
+        let directory_tape = directory_tape.into_inner();
+
+        *jump_tuple.directory_first() = { directory_tape }.first();
         *jump_tuple.appendable_first() = { appendable_tape }.first();
         *jump_tuple.tuples() = tuples;
 
         drop(jump_guard);
 
-        freepages::mark(index.clone(), freepage_first, &trace);
-    }
-}
+        let trace = {
+            let mut v = Vec::new();
+            v.extend_from_slice(&trace_directory);
+            v.extend_from_slice(&trace_forzen);
+            v.extend_from_slice(&trace_appendable);
+            v
+        };
 
-struct FrozenTapeWriter<'a, R>
-where
-    R: RelationWrite + 'a,
-{
-    tape: TapeWriter<'a, R, FrozenTuple>,
-    branches: Vec<Branch<NonZero<u64>>>,
-    prefetch: usize,
-}
-
-impl<'a, R> FrozenTapeWriter<'a, R>
-where
-    R: RelationWrite + 'a,
-{
-    fn create(index: &'a R, prefetch: usize, tracking_freespace: bool) -> Self {
-        Self {
-            tape: TapeWriter::create(index, tracking_freespace),
-            branches: Vec::new(),
-            prefetch,
-        }
-    }
-    fn push(&mut self, branch: Branch<NonZero<u64>>) {
-        self.branches.push(branch);
-        if let Ok(chunk) = <&[_; 32]>::try_from(self.branches.as_slice()) {
-            let mut remain = padding_pack(chunk.iter().map(|x| rabitq::pack_to_u4(&x.signs)));
-            loop {
-                let freespace = self.tape.freespace();
-                if FrozenTuple::estimate_size_0(self.prefetch, remain.len()) <= freespace as usize {
-                    self.tape.tape_put(FrozenTuple::_0 {
-                        head: chunk.each_ref().map(|x| x.head),
-                        dis_u_2: chunk.each_ref().map(|x| x.dis_u_2),
-                        factor_ppc: chunk.each_ref().map(|x| x.factor_ppc),
-                        factor_ip: chunk.each_ref().map(|x| x.factor_ip),
-                        factor_err: chunk.each_ref().map(|x| x.factor_err),
-                        payload: chunk.each_ref().map(|x| Some(x.extra)),
-                        prefetch: fix(chunk.each_ref().map(|x| x.prefetch.as_slice())),
-                        elements: remain,
-                    });
-                    break;
-                }
-                if let Some(w) = FrozenTuple::fit_1(self.prefetch, freespace) {
-                    let (left, right) = remain.split_at(std::cmp::min(w, remain.len()));
-                    self.tape.tape_put(FrozenTuple::_1 {
-                        elements: left.to_vec(),
-                    });
-                    remain = right.to_vec();
-                } else {
-                    self.tape.tape_move();
-                }
-            }
-            self.branches.clear();
-        }
-    }
-    fn into_inner(self) -> (TapeWriter<'a, R, FrozenTuple>, Vec<Branch<NonZero<u64>>>) {
-        (self.tape, self.branches)
+        freepages::mark(index, freepage_first, trace.as_slice());
     }
 }
 
 #[derive(Clone)]
-struct RelationHooked<R, E>(R, E);
+struct RelationHooked<'r, R, E>(&'r R, E);
 
-impl<R, E> Relation for RelationHooked<R, E>
+impl<'r, R, E> Relation for RelationHooked<'r, R, E>
 where
     R: Relation,
     E: Clone,
@@ -213,7 +199,7 @@ where
     type Page = R::Page;
 }
 
-impl<R, E> RelationRead for RelationHooked<R, E>
+impl<'r, R, E> RelationRead for RelationHooked<'r, R, E>
 where
     R: RelationRead,
     E: Clone,
@@ -228,7 +214,7 @@ where
     }
 }
 
-impl<R, E> RelationWrite for RelationHooked<R, E>
+impl<'r, R, E> RelationWrite for RelationHooked<'r, R, E>
 where
     R: RelationWrite,
     E: Clone + for<'a> Fn(&'a R, bool) -> R::WriteGuard<'a>,
@@ -243,23 +229,10 @@ where
     }
 
     fn extend(&self, tracking_freespace: bool) -> Self::WriteGuard<'_> {
-        (self.1)(&self.0, tracking_freespace)
+        (self.1)(self.0, tracking_freespace)
     }
 
     fn search(&self, freespace: usize) -> Option<Self::WriteGuard<'_>> {
         self.0.search(freespace)
     }
-}
-
-fn fix<'a>(into_iter: impl IntoIterator<Item = &'a [u32]>) -> Vec<[u32; 32]> {
-    use std::array::from_fn;
-    let mut iter = into_iter.into_iter();
-    let mut array: [_; 32] = from_fn(|_| iter.next().map(<[u32]>::to_vec).unwrap_or_default());
-    if iter.next().is_some() {
-        panic!("too many slices");
-    }
-    let step = array.iter().map(Vec::len).max().unwrap_or_default();
-    array.iter_mut().for_each(|x| x.resize(step, u32::MAX));
-    let flat = array.into_iter().flatten().collect::<Vec<_>>();
-    (0..step).map(|i| from_fn(|j| flat[i * 32 + j])).collect()
 }

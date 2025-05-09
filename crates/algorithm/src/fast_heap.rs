@@ -1,4 +1,4 @@
-use crate::Heap;
+use crate::Sequence;
 use std::collections::BinaryHeap;
 use std::num::NonZero;
 
@@ -53,12 +53,23 @@ impl<T: Ord> FastHeap<T> {
     }
 }
 
-impl<T: Ord> IntoIterator for FastHeap<T> {
+impl<T: Ord> From<Vec<T>> for FastHeap<T> {
+    fn from(value: Vec<T>) -> Self {
+        Self::from_vec(value)
+    }
+}
+
+impl<T: Ord> Sequence for FastHeap<T> {
     type Item = T;
-
-    type IntoIter = std::vec::IntoIter<T>;
-
-    fn into_iter(self) -> Self::IntoIter {
+    type Inner = std::vec::IntoIter<T>;
+    fn next(&mut self) -> Option<T> {
+        self.pop()
+    }
+    fn next_if(&mut self, predicate: impl FnOnce(&T) -> bool) -> Option<T> {
+        let first = self.peek()?;
+        if predicate(first) { self.pop() } else { None }
+    }
+    fn into_inner(self) -> Self::Inner {
         match self {
             FastHeap::Sorted(sort_heap) => sort_heap.inner.into_iter(),
             FastHeap::Binary(binary_heap) => binary_heap.into_vec().into_iter(),
@@ -66,19 +77,8 @@ impl<T: Ord> IntoIterator for FastHeap<T> {
     }
 }
 
-impl<T: Ord> Heap for FastHeap<T> {
-    fn make(this: Vec<Self::Item>) -> Self {
-        Self::from_vec(this)
-    }
-
-    fn pop_if(&mut self, predicate: impl FnOnce(&Self::Item) -> bool) -> Option<Self::Item> {
-        let first = self.peek()?;
-        if predicate(first) { self.pop() } else { None }
-    }
-}
-
 #[test]
-fn test_select_heap() {
+fn test_fast_heap() {
     for _ in 0..1000 {
         let sequence = (0..10000)
             .map(|_| rand::random::<i32>())

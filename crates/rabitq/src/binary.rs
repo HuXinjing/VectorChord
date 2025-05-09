@@ -12,7 +12,7 @@ pub fn preprocess(vector: &[f32]) -> BinaryLut {
     let qvector_sum = if vector.len() <= 4369 {
         simd::u8::reduce_sum_of_x_as_u16(&qvector) as f32
     } else {
-        simd::u8::reduce_sum_of_x(&qvector) as f32
+        simd::u8::reduce_sum_of_x_as_u32(&qvector) as f32
     };
     ((dis_v_2, b, k, qvector_sum), binarize(&qvector))
 }
@@ -59,9 +59,9 @@ pub(crate) fn asymmetric_binary_dot_product(
     x: &[u64],
     y: &(Vec<u64>, Vec<u64>, Vec<u64>, Vec<u64>),
 ) -> u32 {
-    let t0 = simd::bit::sum_of_and(x, &y.0);
-    let t1 = simd::bit::sum_of_and(x, &y.1);
-    let t2 = simd::bit::sum_of_and(x, &y.2);
-    let t3 = simd::bit::sum_of_and(x, &y.3);
+    let t0 = simd::bit::reduce_sum_of_and(x, &y.0);
+    let t1 = simd::bit::reduce_sum_of_and(x, &y.1);
+    let t2 = simd::bit::reduce_sum_of_and(x, &y.2);
+    let t3 = simd::bit::reduce_sum_of_and(x, &y.3);
     (t0 << 0) + (t1 << 1) + (t2 << 2) + (t3 << 3)
 }

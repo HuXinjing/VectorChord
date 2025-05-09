@@ -1,11 +1,12 @@
 use crate::closure_lifetime_binder::{id_0, id_1};
 use crate::operator::{FunctionalAccessor, Operator};
+use crate::tape::by_next;
 use crate::tuples::*;
 use crate::{Page, RelationRead, RelationWrite, tape};
 use std::num::NonZero;
 
-pub fn bulkdelete<O: Operator>(
-    index: impl RelationRead + RelationWrite,
+pub fn bulkdelete<R: RelationRead + RelationWrite, O: Operator>(
+    index: &R,
     check: impl Fn(),
     callback: impl Fn(NonZero<u64>) -> bool,
 ) {
@@ -22,12 +23,10 @@ pub fn bulkdelete<O: Operator>(
         let step = |state: State| {
             let mut results = Vec::new();
             for first in state {
-                tape::read_h1_tape(
-                    index.clone(),
-                    first,
+                tape::read_h1_tape::<R, _, _>(
+                    by_next(index, first).inspect(|_| check()),
                     || FunctionalAccessor::new((), id_0(|_, _| ()), id_1(|_, _| [(); 32])),
                     |(), _, first, _| results.push(first),
-                    |_| check(),
                 );
             }
             results
@@ -39,8 +38,11 @@ pub fn bulkdelete<O: Operator>(
             let jump_guard = index.read(first);
             let jump_bytes = jump_guard.get(1).expect("data corruption");
             let jump_tuple = JumpTuple::deserialize_ref(jump_bytes);
+            let mut directory = tape::read_directory_tape::<R>(
+                by_next(index, jump_tuple.directory_first()).inspect(|_| check()),
+            );
             {
-                let mut current = jump_tuple.frozen_first();
+                let mut current = directory.next().unwrap_or(u32::MAX);
                 while current != u32::MAX {
                     check();
                     let read = index.read(current);
@@ -72,10 +74,8 @@ pub fn bulkdelete<O: Operator>(
                                 }
                             }
                         }
-                        current = write.get_opaque().next;
-                    } else {
-                        current = read.get_opaque().next;
                     }
+                    current = directory.next().unwrap_or(u32::MAX);
                 }
             }
             {
