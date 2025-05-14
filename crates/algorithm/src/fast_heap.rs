@@ -76,12 +76,11 @@ impl<T: Ord> From<Vec<T>> for FastHeap<T> {
 impl<T: Ord> Sequence for FastHeap<T> {
     type Item = T;
     type Inner = std::vec::IntoIter<T>;
+    fn peek(&mut self) -> Option<&T> {
+        <FastHeap<T>>::peek(self)
+    }
     fn next(&mut self) -> Option<T> {
         self.pop()
-    }
-    fn next_if(&mut self, predicate: impl FnOnce(&T) -> bool) -> Option<T> {
-        let first = self.peek()?;
-        if predicate(first) { self.pop() } else { None }
     }
     fn into_inner(self) -> Self::Inner {
         match self {
