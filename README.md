@@ -6,7 +6,7 @@
 <div align=center>
 
 
-[Official Site][official-site-link] · [Blog][blog-link] · [Feedback][github-issues-link] · [Contact Us][email-link]
+[Official Site][official-site-link] · [Blog][blog-link] · [Docs][docs-link] · [Feedback][github-issues-link] · [Contact Us][email-link]
 
 <!-- TODO: Add GHCR when 0.3.0 is ready -->
 
@@ -101,6 +101,16 @@ lists = []
 $$);
 ```
 
+> [!NOTE]
+> The `lists` option should be configured based on the number of vectors. Below is a table to assist with your selection.
+
+| vectors Range | List Calculation Formula       | Example Result   |
+| ------------- | ------------------------------ | ---------------- |
+| <128k         | list = 1                       | 1                |
+| ≥128k and <2M | list = (2 * vectors) / 1000    | 256-4000      |
+| ≥2M and <100M | list ∈ [4√vectors, 8√vectors]  | 4000-80000   |
+| ≥100M         | list ∈ [8√vectors, 16√vectors] | 80000-160000 |
+
 And then perform a vector search using `SELECT ... ORDER BY ... LIMIT ...`.
 
 ```SQL
@@ -148,3 +158,4 @@ You may choose either license based on your needs. We welcome any commercial col
 [official-site-link]: https://vectorchord.ai/
 [github-issues-link]: https://github.com/tensorchord/VectorChord/issues
 [email-link]: mailto:support@tensorchord.ai
+[docs-link]: https://docs.vectorchord.ai/vectorchord/
