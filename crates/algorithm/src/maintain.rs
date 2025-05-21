@@ -30,29 +30,28 @@ pub fn maintain<'r, R: RelationRead + RelationWrite, O: Operator>(
     let meta_tuple = MetaTuple::deserialize_ref(meta_bytes);
     let dims = meta_tuple.dims();
     let height_of_root = meta_tuple.height_of_root();
-    let root_first = meta_tuple.root_first();
     let freepage_first = meta_tuple.freepage_first();
+
+    type State = Vec<u32>;
+    let mut state: State = vec![meta_tuple.first()];
+
     drop(meta_guard);
 
-    let state = {
-        type State = Vec<u32>;
-        let mut state: State = vec![root_first];
-        let step = |state: State| {
-            let mut results = Vec::new();
-            for first in state {
-                tape::read_h1_tape::<R, _, _>(
-                    by_next(index, first).inspect(|_| check()),
-                    || FunctionalAccessor::new((), id_0(|_, _| ()), id_1(|_, _| [(); 32])),
-                    |(), _, first, _| results.push(first),
-                );
-            }
-            results
-        };
-        for _ in (1..height_of_root).rev() {
-            state = step(state);
+    let step = |state: State| {
+        let mut results = Vec::new();
+        for first in state {
+            tape::read_h1_tape::<R, _, _>(
+                by_next(index, first).inspect(|_| check()),
+                || FunctionalAccessor::new((), id_0(|_, _| ()), id_1(|_, _| [(); 32])),
+                |(), _, _, first, _| results.push(first),
+            );
         }
-        state
+        results
     };
+
+    for _ in (1..height_of_root).rev() {
+        state = step(state);
+    }
 
     for first in state {
         let mut jump_guard = index.write(first, false);
@@ -86,15 +85,13 @@ pub fn maintain<'r, R: RelationRead + RelationWrite, O: Operator>(
         let mut trace_appendable = Vec::new();
 
         let mut tuples = 0_u64;
-        let mut callback = id_2(|code: (_, _, _, _, _), head, payload, prefetch: &[_]| {
+        let mut callback = id_2(|(code, delta): (_, _), head, payload, prefetch: &[_]| {
             tape.push(Branch {
-                head,
-                dis_u_2: code.0,
-                factor_ppc: code.1,
-                factor_ip: code.2,
-                factor_err: code.3,
-                signs: code.4,
+                code,
+                delta,
                 prefetch: prefetch.to_vec(),
+                head,
+                norm: 0.0,
                 extra: payload,
             });
             tuples += 1;
@@ -112,14 +109,27 @@ pub fn maintain<'r, R: RelationRead + RelationWrite, O: Operator>(
                 FunctionalAccessor::new(
                     Vec::<[u8; 16]>::new(),
                     Vec::<[u8; 16]>::extend_from_slice,
-                    |elements: Vec<_>, input: (&[f32; 32], &[f32; 32], &[f32; 32], &[f32; 32])| {
-                        let unpacked = unpack(&elements);
-                        std::array::from_fn(|i| {
-                            let f = |&x| [x & 1 != 0, x & 2 != 0, x & 4 != 0, x & 8 != 0];
-                            let signs = unpacked[i].iter().flat_map(f).collect::<Vec<_>>();
-                            (input.0[i], input.1[i], input.2[i], input.3[i], signs)
-                        })
-                    },
+                    id_1(
+                        |elements: Vec<_>, (metadata, delta): (&[[f32; 32]; 4], &[f32; 32])| {
+                            let unpacked = unpack(&elements);
+                            std::array::from_fn(|i| {
+                                let f = |&x| [x & 1 != 0, x & 2 != 0, x & 4 != 0, x & 8 != 0];
+                                let signs = unpacked[i].iter().flat_map(f).collect::<Vec<_>>();
+                                (
+                                    (
+                                        rabitq::CodeMetadata {
+                                            dis_u_2: metadata[0][i],
+                                            factor_cnt: metadata[1][i],
+                                            factor_ip: metadata[2][i],
+                                            factor_err: metadata[3][i],
+                                        },
+                                        signs,
+                                    ),
+                                    delta[i],
+                                )
+                            })
+                        },
+                    ),
                 )
             },
             &mut callback,
@@ -128,14 +138,24 @@ pub fn maintain<'r, R: RelationRead + RelationWrite, O: Operator>(
             by_next(index, *jump_tuple.appendable_first())
                 .inspect(|_| check())
                 .inspect(|guard| trace_appendable.push(guard.id())),
-            |code| {
-                let signs = code
-                    .4
+            |metadata, elements, delta| {
+                let signs = elements
                     .iter()
                     .flat_map(|x| std::array::from_fn::<_, 64, _>(|i| *x & (1 << i) != 0))
                     .take(dims as _)
                     .collect::<Vec<_>>();
-                (code.0, code.1, code.2, code.3, signs)
+                (
+                    (
+                        rabitq::CodeMetadata {
+                            dis_u_2: metadata[0],
+                            factor_cnt: metadata[1],
+                            factor_ip: metadata[2],
+                            factor_err: metadata[3],
+                        },
+                        signs,
+                    ),
+                    delta,
+                )
             },
             &mut callback,
         );
@@ -162,14 +182,17 @@ pub fn maintain<'r, R: RelationRead + RelationWrite, O: Operator>(
 
         for branch in branches {
             appendable_tape.push(AppendableTuple {
-                head: branch.head,
-                dis_u_2: branch.dis_u_2,
-                factor_ppc: branch.factor_ppc,
-                factor_ip: branch.factor_ip,
-                factor_err: branch.factor_err,
-                payload: Some(branch.extra),
+                metadata: [
+                    branch.code.0.dis_u_2,
+                    branch.code.0.factor_cnt,
+                    branch.code.0.factor_ip,
+                    branch.code.0.factor_err,
+                ],
+                elements: rabitq::packing::pack_to_u64(&branch.code.1),
+                delta: branch.delta,
                 prefetch: branch.prefetch,
-                elements: rabitq::pack_to_u64(&branch.signs),
+                head: branch.head,
+                payload: Some(branch.extra),
             });
         }
 

@@ -24,9 +24,9 @@ where
 }
 
 #[inline(always)]
-pub fn id_1<F, A: ?Sized, B: ?Sized, R: ?Sized>(f: F) -> F
+pub fn id_1<F, A: ?Sized, B: ?Sized, C: ?Sized, R: ?Sized>(f: F) -> F
 where
-    F: for<'a> FnMut(A, (&'a B, &'a B, &'a B, &'a B)) -> R,
+    F: for<'a> FnMut(A, (&'a B, &'a C)) -> R,
 {
     f
 }

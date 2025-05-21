@@ -100,3 +100,31 @@ pub fn padding_pack(x: impl IntoIterator<Item = impl AsRef<[u8]>>) -> Vec<[u8; 1
 pub fn any_pack<T: Default>(mut x: impl Iterator<Item = T>) -> [T; 32] {
     std::array::from_fn(|_| x.next()).map(|x| x.unwrap_or_default())
 }
+
+pub fn pack_to_u4(signs: &[bool]) -> Vec<u8> {
+    fn f(x: [bool; 4]) -> u8 {
+        x[0] as u8 | (x[1] as u8) << 1 | (x[2] as u8) << 2 | (x[3] as u8) << 3
+    }
+    let mut result = Vec::with_capacity(signs.len().div_ceil(4));
+    for i in 0..signs.len().div_ceil(4) {
+        let x = std::array::from_fn(|j| signs.get(i * 4 + j).copied().unwrap_or_default());
+        result.push(f(x));
+    }
+    result
+}
+
+pub fn pack_to_u64(signs: &[bool]) -> Vec<u64> {
+    fn f(x: [bool; 64]) -> u64 {
+        let mut result = 0_u64;
+        for i in 0..64 {
+            result |= (x[i] as u64) << i;
+        }
+        result
+    }
+    let mut result = Vec::with_capacity(signs.len().div_ceil(64));
+    for i in 0..signs.len().div_ceil(64) {
+        let x = std::array::from_fn(|j| signs.get(i * 64 + j).copied().unwrap_or_default());
+        result.push(f(x));
+    }
+    result
+}

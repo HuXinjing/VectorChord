@@ -14,12 +14,13 @@
 
 use distance::Distance;
 use half::f16;
-use rabitq::binary::{BinaryCode, BinaryLut};
-use rabitq::block::BlockLut;
+use rabitq::CodeMetadata;
+use rabitq::binary::{BinaryLut, BinaryLutMetadata};
+use rabitq::block::{BlockLut, BlockLutMetadata, STEP};
 use simd::Floating;
 use std::fmt::Debug;
 use std::marker::PhantomData;
-use vector::vect::VectOwned;
+use vector::vect::{VectBorrowed, VectOwned};
 use vector::{VectorBorrowed, VectorOwned};
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
@@ -291,79 +292,40 @@ impl<E0, E1, M0, M1, A: Accessor2<E0, E1, M0, M1>> TryAccessor1<E1, M1>
 }
 
 #[derive(Debug)]
-pub struct BlockAccessor<D>([u16; 32], PhantomData<fn(D) -> D>);
+pub struct BlockAccessor<F>([u32; 32], F);
 
-impl<D> Default for BlockAccessor<D> {
-    fn default() -> Self {
-        Self([0u16; 32], PhantomData)
-    }
-}
-
-impl
-    Accessor2<
-        [u8; 16],
-        [u8; 16],
-        (&[f32; 32], &[f32; 32], &[f32; 32], &[f32; 32]),
-        (f32, f32, f32, f32),
-    > for BlockAccessor<L2>
+impl<F: Call<u32, CodeMetadata, f32, BlockLutMetadata>>
+    Accessor2<[u8; 16], [u8; 16], (&[[f32; 32]; 4], &[f32; 32]), BlockLutMetadata>
+    for BlockAccessor<F>
 {
-    type Output = [(f32, f32); 32];
+    type Output = [F::Output; 32];
 
     fn push(&mut self, input: &[[u8; 16]], target: &[[u8; 16]]) {
-        let t = simd::fast_scan::fast_scan(input, target);
-        for i in 0..32 {
-            self.0[i] += t[i];
+        use std::iter::zip;
+
+        for (input, target) in zip(input.chunks(STEP), target.chunks(STEP)) {
+            let delta = simd::fast_scan::scan(input, target);
+            simd::fast_scan::accu(&mut self.0, &delta);
         }
     }
 
     fn finish(
-        self,
-        (dis_u_2, factor_ppc, factor_ip, factor_err): (
-            &[f32; 32],
-            &[f32; 32],
-            &[f32; 32],
-            &[f32; 32],
-        ),
-        (dis_v_2, b, k, qvector_sum): (f32, f32, f32, f32),
+        mut self,
+        (metadata, delta): (&[[f32; 32]; 4], &[f32; 32]),
+        lut: BlockLutMetadata,
     ) -> Self::Output {
         std::array::from_fn(|i| {
-            let rough = dis_u_2[i]
-                + dis_v_2
-                + b * factor_ppc[i]
-                + ((2.0 * self.0[i] as f32) - qvector_sum) * factor_ip[i] * k;
-            let err = factor_err[i] * dis_v_2.sqrt();
-            (rough, err)
-        })
-    }
-}
-
-impl
-    Accessor2<
-        [u8; 16],
-        [u8; 16],
-        (&[f32; 32], &[f32; 32], &[f32; 32], &[f32; 32]),
-        (f32, f32, f32, f32),
-    > for BlockAccessor<Dot>
-{
-    type Output = [(f32, f32); 32];
-
-    fn push(&mut self, input: &[[u8; 16]], target: &[[u8; 16]]) {
-        let t = simd::fast_scan::fast_scan(input, target);
-        for i in 0..32 {
-            self.0[i] += t[i];
-        }
-    }
-
-    fn finish(
-        self,
-        (_, factor_ppc, factor_ip, factor_err): (&[f32; 32], &[f32; 32], &[f32; 32], &[f32; 32]),
-        (dis_v_2, b, k, qvector_sum): (f32, f32, f32, f32),
-    ) -> Self::Output {
-        std::array::from_fn(|i| {
-            let rough = 0.5 * b * factor_ppc[i]
-                + 0.5 * ((2.0 * self.0[i] as f32) - qvector_sum) * factor_ip[i] * k;
-            let err = 0.5 * factor_err[i] * dis_v_2.sqrt();
-            (rough, err)
+            (self.1).call(
+                self.0[i],
+                CodeMetadata {
+                    dis_u_2: metadata[0][i],
+                    factor_cnt: metadata[1][i],
+                    factor_ip: metadata[2][i],
+                    factor_err: metadata[3][i],
+                },
+                delta[i],
+                lut,
+            )
         })
     }
 }
@@ -426,35 +388,23 @@ impl Accessor2<f16, f16, (), ()> for DistanceAccessor<VectOwned<f16>, Dot> {
 }
 
 #[derive(Debug, Clone)]
-pub struct ResidualAccessor<V: Vector>(Vec<V::Element>);
+pub struct CloneAccessor<V: Vector>(Vec<V::Element>);
 
-impl<V: Vector> Default for ResidualAccessor<V> {
+impl<V: Vector> Default for CloneAccessor<V> {
     fn default() -> Self {
         Self(Vec::new())
     }
 }
 
-impl Accessor2<f32, f32, (), ()> for ResidualAccessor<VectOwned<f32>> {
-    type Output = VectOwned<f32>;
+impl<V: Vector> Accessor1<V::Element, V::Metadata> for CloneAccessor<V> {
+    type Output = V;
 
-    fn push(&mut self, target: &[f32], input: &[f32]) {
-        self.0.extend(f32::vector_sub(target, input));
+    fn push(&mut self, input: &[V::Element]) {
+        self.0.extend(input);
     }
 
-    fn finish(self, (): (), (): ()) -> Self::Output {
-        VectOwned::new(self.0)
-    }
-}
-
-impl Accessor2<f16, f16, (), ()> for ResidualAccessor<VectOwned<f16>> {
-    type Output = VectOwned<f16>;
-
-    fn push(&mut self, target: &[f16], input: &[f16]) {
-        self.0.extend(f16::vector_sub(target, input));
-    }
-
-    fn finish(self, (): (), (): ()) -> Self::Output {
-        VectOwned::new(self.0)
+    fn finish(self, metadata: V::Metadata) -> Self::Output {
+        V::pack(self.0, metadata)
     }
 }
 
@@ -469,11 +419,15 @@ pub trait Vector: VectorOwned {
 
     fn unpack(vector: Self::Borrowed<'_>) -> (&[Self::Element], Self::Metadata);
 
+    fn pack(elements: Vec<Self::Element>, metadata: Self::Metadata) -> Self;
+
     fn block_preprocess(vector: Self::Borrowed<'_>) -> BlockLut;
 
     fn preprocess(vector: Self::Borrowed<'_>) -> (BlockLut, BinaryLut);
 
     fn code(vector: Self::Borrowed<'_>) -> rabitq::Code;
+
+    fn squared_norm(vector: Self::Borrowed<'_>) -> f32;
 }
 
 impl Vector for VectOwned<f32> {
@@ -507,6 +461,10 @@ impl Vector for VectOwned<f32> {
         (vector.slice(), ())
     }
 
+    fn pack(elements: Vec<Self::Element>, (): Self::Metadata) -> Self {
+        VectOwned::new(elements)
+    }
+
     fn block_preprocess(vector: Self::Borrowed<'_>) -> BlockLut {
         rabitq::block::preprocess(vector.slice())
     }
@@ -517,6 +475,10 @@ impl Vector for VectOwned<f32> {
 
     fn code(vector: Self::Borrowed<'_>) -> rabitq::Code {
         rabitq::code(vector.dims(), vector.slice())
+    }
+
+    fn squared_norm(vector: Self::Borrowed<'_>) -> f32 {
+        f32::reduce_sum_of_x2(vector.slice())
     }
 }
 
@@ -551,6 +513,10 @@ impl Vector for VectOwned<f16> {
         (vector.slice(), ())
     }
 
+    fn pack(elements: Vec<Self::Element>, (): Self::Metadata) -> Self {
+        VectOwned::new(elements)
+    }
+
     fn block_preprocess(vector: Self::Borrowed<'_>) -> BlockLut {
         rabitq::block::preprocess(&f16::vector_to_f32(vector.slice()))
     }
@@ -561,6 +527,10 @@ impl Vector for VectOwned<f16> {
 
     fn code(vector: Self::Borrowed<'_>) -> rabitq::Code {
         rabitq::code(vector.dims(), &f16::vector_to_f32(vector.slice()))
+    }
+
+    fn squared_norm(vector: Self::Borrowed<'_>) -> f32 {
+        f16::reduce_sum_of_x2(vector.slice())
     }
 }
 
@@ -573,15 +543,6 @@ pub struct Dot;
 pub trait Operator: 'static + Debug + Copy {
     type Vector: Vector;
 
-    type BlockAccessor: Default
-        + for<'a> Accessor2<
-            [u8; 16],
-            [u8; 16],
-            (&'a [f32; 32], &'a [f32; 32], &'a [f32; 32], &'a [f32; 32]),
-            (f32, f32, f32, f32),
-            Output = [(f32, f32); 32],
-        >;
-
     type DistanceAccessor: Default
         + Accessor2<
             <Self::Vector as Vector>::Element,
@@ -591,18 +552,40 @@ pub trait Operator: 'static + Debug + Copy {
             Output = Distance,
         >;
 
-    type ResidualAccessor: Default
-        + Accessor2<
-            <Self::Vector as Vector>::Element,
-            <Self::Vector as Vector>::Element,
-            <Self::Vector as Vector>::Metadata,
-            <Self::Vector as Vector>::Metadata,
-            Output = Self::Vector,
-        >;
+    fn block_access<F: Call<u32, CodeMetadata, f32, BlockLutMetadata>>(
+        lut: &BlockLut,
+        f: F,
+    ) -> impl for<'x> Accessor1<[u8; 16], (&'x [[f32; 32]; 4], &'x [f32; 32]), Output = [F::Output; 32]>;
 
-    const SUPPORTS_RESIDUAL: bool;
+    fn binary_access<F: Call<u32, CodeMetadata, f32, BinaryLutMetadata>>(
+        lut: &BinaryLut,
+        f: F,
+    ) -> impl FnMut([f32; 4], &[u64], f32) -> F::Output;
 
-    fn binary_process(lut: &BinaryLut, code: BinaryCode<'_>) -> (f32, f32);
+    fn block_process(
+        value: u32,
+        code: CodeMetadata,
+        lut: BlockLutMetadata,
+        is_residual: bool,
+        dis_f: f32,
+        delta: f32,
+        norm: f32,
+    ) -> (f32, f32);
+
+    fn binary_process(
+        value: u32,
+        code: CodeMetadata,
+        lut: BinaryLutMetadata,
+        is_residual: bool,
+        dis_f: f32,
+        delta: f32,
+        norm: f32,
+    ) -> (f32, f32);
+
+    fn build(
+        vector: <Self::Vector as VectorOwned>::Borrowed<'_>,
+        centroid: Option<Self::Vector>,
+    ) -> (rabitq::Code, f32);
 }
 
 #[derive(Debug)]
@@ -619,63 +602,377 @@ impl<V, D> Copy for Op<V, D> {}
 impl Operator for Op<VectOwned<f32>, L2> {
     type Vector = VectOwned<f32>;
 
-    type BlockAccessor = BlockAccessor<L2>;
-
     type DistanceAccessor = DistanceAccessor<VectOwned<f32>, L2>;
 
-    type ResidualAccessor = ResidualAccessor<VectOwned<f32>>;
+    fn block_access<F: Call<u32, CodeMetadata, f32, BlockLutMetadata>>(
+        lut: &BlockLut,
+        f: F,
+    ) -> impl for<'x> Accessor1<[u8; 16], (&'x [[f32; 32]; 4], &'x [f32; 32]), Output = [F::Output; 32]>
+    {
+        RAccess::new((&lut.1, lut.0), BlockAccessor([0u32; 32], f))
+    }
 
-    const SUPPORTS_RESIDUAL: bool = true;
+    fn binary_access<F: Call<u32, CodeMetadata, f32, BinaryLutMetadata>>(
+        lut: &BinaryLut,
+        mut f: F,
+    ) -> impl FnMut([f32; 4], &[u64], f32) -> F::Output {
+        move |metadata: [f32; 4], elements: &[u64], delta: f32| {
+            let value = rabitq::binary::asymmetric_binary_dot_product(elements, &lut.1);
+            f.call(
+                value,
+                CodeMetadata {
+                    dis_u_2: metadata[0],
+                    factor_cnt: metadata[1],
+                    factor_ip: metadata[2],
+                    factor_err: metadata[3],
+                },
+                delta,
+                lut.0,
+            )
+        }
+    }
 
-    fn binary_process(lut: &BinaryLut, code: BinaryCode<'_>) -> (f32, f32) {
-        rabitq::binary::process_l2(lut, code)
+    fn block_process(
+        value: u32,
+        code: CodeMetadata,
+        lut: BlockLutMetadata,
+        is_residual: bool,
+        dis_f: f32,
+        delta: f32,
+        _: f32,
+    ) -> (f32, f32) {
+        if !is_residual {
+            rabitq::block::half_process_l2(value, code, lut)
+        } else {
+            rabitq::block::half_process_l2_residual(value, code, lut, dis_f, delta)
+        }
+    }
+
+    fn binary_process(
+        value: u32,
+        code: CodeMetadata,
+        lut: BinaryLutMetadata,
+        is_residual: bool,
+        dis_f: f32,
+        delta: f32,
+        _: f32,
+    ) -> (f32, f32) {
+        if !is_residual {
+            rabitq::binary::half_process_l2(value, code, lut)
+        } else {
+            rabitq::binary::half_process_l2_residual(value, code, lut, dis_f, delta)
+        }
+    }
+
+    fn build(vector: VectBorrowed<'_, f32>, centroid: Option<Self::Vector>) -> (rabitq::Code, f32) {
+        if let Some(centroid) = centroid {
+            let residual = VectOwned::new(f32::vector_sub(vector.slice(), centroid.slice()));
+            let code = Self::Vector::code(residual.as_borrowed());
+            let delta = {
+                use std::iter::zip;
+                let dims = vector.dims();
+                let t = zip(&code.1, centroid.slice())
+                    .map(|(&sign, &num)| std::hint::select_unpredictable(sign, num, -num))
+                    .sum::<f32>()
+                    / (dims as f32).sqrt();
+                let sum_of_x_2 = code.0.dis_u_2;
+                let sum_of_abs_x = sum_of_x_2 / code.0.factor_ip;
+                let dis_u = sum_of_x_2.sqrt();
+                let x_0 = sum_of_abs_x / dis_u / (dims as f32).sqrt();
+                2.0 * dis_u * t / x_0
+            };
+            (code, delta)
+        } else {
+            let code = Self::Vector::code(vector);
+            let delta = 0.0;
+            (code, delta)
+        }
     }
 }
 
 impl Operator for Op<VectOwned<f32>, Dot> {
     type Vector = VectOwned<f32>;
 
-    type BlockAccessor = BlockAccessor<Dot>;
-
     type DistanceAccessor = DistanceAccessor<VectOwned<f32>, Dot>;
 
-    type ResidualAccessor = ResidualAccessor<VectOwned<f32>>;
+    fn block_access<F: Call<u32, CodeMetadata, f32, BlockLutMetadata>>(
+        lut: &BlockLut,
+        f: F,
+    ) -> impl for<'x> Accessor1<[u8; 16], (&'x [[f32; 32]; 4], &'x [f32; 32]), Output = [F::Output; 32]>
+    {
+        RAccess::new((&lut.1, lut.0), BlockAccessor([0u32; 32], f))
+    }
 
-    const SUPPORTS_RESIDUAL: bool = false;
+    fn binary_access<F: Call<u32, CodeMetadata, f32, BinaryLutMetadata>>(
+        lut: &BinaryLut,
+        mut f: F,
+    ) -> impl FnMut([f32; 4], &[u64], f32) -> F::Output {
+        move |metadata: [f32; 4], elements: &[u64], delta: f32| {
+            let value = rabitq::binary::asymmetric_binary_dot_product(elements, &lut.1);
+            f.call(
+                value,
+                CodeMetadata {
+                    dis_u_2: metadata[0],
+                    factor_cnt: metadata[1],
+                    factor_ip: metadata[2],
+                    factor_err: metadata[3],
+                },
+                delta,
+                lut.0,
+            )
+        }
+    }
 
-    fn binary_process(lut: &BinaryLut, code: BinaryCode<'_>) -> (f32, f32) {
-        rabitq::binary::process_dot(lut, code)
+    fn block_process(
+        value: u32,
+        code: CodeMetadata,
+        lut: BlockLutMetadata,
+        is_residual: bool,
+        dis_f: f32,
+        delta: f32,
+        norm: f32,
+    ) -> (f32, f32) {
+        if !is_residual {
+            rabitq::block::half_process_dot(value, code, lut)
+        } else {
+            rabitq::block::half_process_dot_residual(value, code, lut, dis_f, delta, norm)
+        }
+    }
+
+    fn binary_process(
+        value: u32,
+        code: CodeMetadata,
+        lut: BinaryLutMetadata,
+        is_residual: bool,
+        dis_f: f32,
+        delta: f32,
+        norm: f32,
+    ) -> (f32, f32) {
+        if !is_residual {
+            rabitq::binary::half_process_dot(value, code, lut)
+        } else {
+            rabitq::binary::half_process_dot_residual(value, code, lut, dis_f, delta, norm)
+        }
+    }
+
+    fn build(vector: VectBorrowed<'_, f32>, centroid: Option<Self::Vector>) -> (rabitq::Code, f32) {
+        if let Some(centroid) = centroid {
+            let residual = VectOwned::new(f32::vector_sub(vector.slice(), centroid.slice()));
+            let code = Self::Vector::code(residual.as_borrowed());
+            let delta = {
+                use std::iter::zip;
+                let dims = vector.dims();
+                let t = zip(&code.1, centroid.slice())
+                    .map(|(&sign, &num)| std::hint::select_unpredictable(sign, num, -num))
+                    .sum::<f32>()
+                    / (dims as f32).sqrt();
+                let sum_of_x_2 = code.0.dis_u_2;
+                let sum_of_abs_x = sum_of_x_2 / code.0.factor_ip;
+                let dis_u = sum_of_x_2.sqrt();
+                let x_0 = sum_of_abs_x / dis_u / (dims as f32).sqrt();
+                dis_u * t / x_0 - f32::reduce_sum_of_xy(residual.slice(), centroid.slice())
+            };
+            (code, delta)
+        } else {
+            let code = Self::Vector::code(vector);
+            let delta = 0.0;
+            (code, delta)
+        }
     }
 }
 
 impl Operator for Op<VectOwned<f16>, L2> {
     type Vector = VectOwned<f16>;
 
-    type BlockAccessor = BlockAccessor<L2>;
-
     type DistanceAccessor = DistanceAccessor<VectOwned<f16>, L2>;
 
-    type ResidualAccessor = ResidualAccessor<VectOwned<f16>>;
+    fn block_access<F: Call<u32, CodeMetadata, f32, BlockLutMetadata>>(
+        lut: &BlockLut,
+        f: F,
+    ) -> impl for<'x> Accessor1<[u8; 16], (&'x [[f32; 32]; 4], &'x [f32; 32]), Output = [F::Output; 32]>
+    {
+        RAccess::new((&lut.1, lut.0), BlockAccessor([0u32; 32], f))
+    }
 
-    const SUPPORTS_RESIDUAL: bool = true;
+    fn binary_access<F: Call<u32, CodeMetadata, f32, BinaryLutMetadata>>(
+        lut: &BinaryLut,
+        mut f: F,
+    ) -> impl FnMut([f32; 4], &[u64], f32) -> F::Output {
+        move |metadata: [f32; 4], elements: &[u64], delta: f32| {
+            let value = rabitq::binary::asymmetric_binary_dot_product(elements, &lut.1);
+            f.call(
+                value,
+                CodeMetadata {
+                    dis_u_2: metadata[0],
+                    factor_cnt: metadata[1],
+                    factor_ip: metadata[2],
+                    factor_err: metadata[3],
+                },
+                delta,
+                lut.0,
+            )
+        }
+    }
 
-    fn binary_process(lut: &BinaryLut, code: BinaryCode<'_>) -> (f32, f32) {
-        rabitq::binary::process_l2(lut, code)
+    fn block_process(
+        value: u32,
+        code: CodeMetadata,
+        lut: BlockLutMetadata,
+        is_residual: bool,
+        dis_f: f32,
+        delta: f32,
+        _: f32,
+    ) -> (f32, f32) {
+        if !is_residual {
+            rabitq::block::half_process_l2(value, code, lut)
+        } else {
+            rabitq::block::half_process_l2_residual(value, code, lut, dis_f, delta)
+        }
+    }
+
+    fn binary_process(
+        value: u32,
+        code: CodeMetadata,
+        lut: BinaryLutMetadata,
+        is_residual: bool,
+        dis_f: f32,
+        delta: f32,
+        _: f32,
+    ) -> (f32, f32) {
+        if !is_residual {
+            rabitq::binary::half_process_l2(value, code, lut)
+        } else {
+            rabitq::binary::half_process_l2_residual(value, code, lut, dis_f, delta)
+        }
+    }
+
+    fn build(vector: VectBorrowed<'_, f16>, centroid: Option<Self::Vector>) -> (rabitq::Code, f32) {
+        if let Some(centroid) = centroid {
+            let residual = VectOwned::new(f16::vector_sub(vector.slice(), centroid.slice()));
+            let code = Self::Vector::code(residual.as_borrowed());
+            let delta = {
+                use std::iter::zip;
+                let dims = vector.dims();
+                let t = zip(&code.1, centroid.slice())
+                    .map(|(&sign, &num)| std::hint::select_unpredictable(sign, num, -num).to_f32())
+                    .sum::<f32>()
+                    / (dims as f32).sqrt();
+                let sum_of_x_2 = code.0.dis_u_2;
+                let sum_of_abs_x = sum_of_x_2 / code.0.factor_ip;
+                let dis_u = sum_of_x_2.sqrt();
+                let x_0 = sum_of_abs_x / dis_u / (dims as f32).sqrt();
+                2.0 * dis_u * t / x_0
+            };
+            (code, delta)
+        } else {
+            let code = Self::Vector::code(vector);
+            let delta = 0.0;
+            (code, delta)
+        }
     }
 }
 
 impl Operator for Op<VectOwned<f16>, Dot> {
     type Vector = VectOwned<f16>;
 
-    type BlockAccessor = BlockAccessor<Dot>;
-
     type DistanceAccessor = DistanceAccessor<VectOwned<f16>, Dot>;
 
-    type ResidualAccessor = ResidualAccessor<VectOwned<f16>>;
+    fn block_access<F: Call<u32, CodeMetadata, f32, BlockLutMetadata>>(
+        lut: &BlockLut,
+        f: F,
+    ) -> impl for<'x> Accessor1<[u8; 16], (&'x [[f32; 32]; 4], &'x [f32; 32]), Output = [F::Output; 32]>
+    {
+        RAccess::new((&lut.1, lut.0), BlockAccessor([0u32; 32], f))
+    }
 
-    const SUPPORTS_RESIDUAL: bool = false;
+    fn binary_access<F: Call<u32, CodeMetadata, f32, BinaryLutMetadata>>(
+        lut: &BinaryLut,
+        mut f: F,
+    ) -> impl FnMut([f32; 4], &[u64], f32) -> F::Output {
+        move |metadata: [f32; 4], elements: &[u64], delta: f32| {
+            let value = rabitq::binary::asymmetric_binary_dot_product(elements, &lut.1);
+            f.call(
+                value,
+                CodeMetadata {
+                    dis_u_2: metadata[0],
+                    factor_cnt: metadata[1],
+                    factor_ip: metadata[2],
+                    factor_err: metadata[3],
+                },
+                delta,
+                lut.0,
+            )
+        }
+    }
 
-    fn binary_process(lut: &BinaryLut, code: BinaryCode<'_>) -> (f32, f32) {
-        rabitq::binary::process_dot(lut, code)
+    fn block_process(
+        value: u32,
+        code: CodeMetadata,
+        lut: BlockLutMetadata,
+        is_residual: bool,
+        dis_f: f32,
+        delta: f32,
+        norm: f32,
+    ) -> (f32, f32) {
+        if !is_residual {
+            rabitq::block::half_process_dot(value, code, lut)
+        } else {
+            rabitq::block::half_process_dot_residual(value, code, lut, dis_f, delta, norm)
+        }
+    }
+
+    fn binary_process(
+        value: u32,
+        code: CodeMetadata,
+        lut: BinaryLutMetadata,
+        is_residual: bool,
+        dis_f: f32,
+        delta: f32,
+        norm: f32,
+    ) -> (f32, f32) {
+        if !is_residual {
+            rabitq::binary::half_process_dot(value, code, lut)
+        } else {
+            rabitq::binary::half_process_dot_residual(value, code, lut, dis_f, delta, norm)
+        }
+    }
+
+    fn build(vector: VectBorrowed<'_, f16>, centroid: Option<Self::Vector>) -> (rabitq::Code, f32) {
+        if let Some(centroid) = centroid {
+            let residual = VectOwned::new(f16::vector_sub(vector.slice(), centroid.slice()));
+            let code = Self::Vector::code(residual.as_borrowed());
+            let delta = {
+                use std::iter::zip;
+                let dims = vector.dims();
+                let t = zip(&code.1, centroid.slice())
+                    .map(|(&sign, &num)| std::hint::select_unpredictable(sign, num, -num).to_f32())
+                    .sum::<f32>()
+                    / (dims as f32).sqrt();
+                let sum_of_x_2 = code.0.dis_u_2;
+                let sum_of_abs_x = sum_of_x_2 / code.0.factor_ip;
+                let dis_u = sum_of_x_2.sqrt();
+                let x_0 = sum_of_abs_x / dis_u / (dims as f32).sqrt();
+                dis_u * t / x_0 - f16::reduce_sum_of_xy(residual.slice(), centroid.slice())
+            };
+            (code, delta)
+        } else {
+            let code = Self::Vector::code(vector);
+            let delta = 0.0;
+            (code, delta)
+        }
+    }
+}
+
+pub trait Call<A, B, C, D> {
+    type Output;
+
+    fn call(&mut self, a: A, b: B, c: C, d: D) -> Self::Output;
+}
+
+impl<A, B, C, D, F: Fn(A, B, C, D) -> R, R> Call<A, B, C, D> for F {
+    type Output = R;
+
+    fn call(&mut self, a: A, b: B, c: C, d: D) -> R {
+        (self)(a, b, c, d)
     }
 }
