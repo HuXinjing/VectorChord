@@ -430,19 +430,19 @@ pub trait RandomProject {
 impl RandomProject for VectBorrowed<'_, f32> {
     type Output = VectOwned<f32>;
     fn project(self) -> VectOwned<f32> {
-        use crate::index::projection::project;
+        use rabitq::rotate::rotate;
         let input = self.slice();
-        VectOwned::new(project(input))
+        VectOwned::new(rotate(input))
     }
 }
 
 impl RandomProject for VectBorrowed<'_, f16> {
     type Output = VectOwned<f16>;
     fn project(self) -> VectOwned<f16> {
-        use crate::index::projection::project;
+        use rabitq::rotate::rotate;
         use simd::Floating;
         let input = f16::vector_to_f32(self.slice());
-        VectOwned::new(f16::vector_from_f32(&project(&input)))
+        VectOwned::new(f16::vector_from_f32(&rotate(&input)))
     }
 }
 

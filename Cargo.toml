@@ -25,7 +25,7 @@ algorithm = { path = "./crates/algorithm" }
 always_equal = { path = "./crates/always_equal" }
 distance = { path = "./crates/distance" }
 k_means = { path = "./crates/k_means" }
-random_orthogonal_matrix = { path = "./crates/random_orthogonal_matrix" }
+rabitq = { path = "./crates/rabitq" }
 simd = { path = "./crates/simd" }
 vector = { path = "./crates/vector" }
 
@@ -34,7 +34,7 @@ paste.workspace = true
 pgrx = { version = "=0.14.1", default-features = false, features = ["cshim"] }
 pgrx-catalog = "0.2.0"
 rand.workspace = true
-seq-macro = "0.3.6"
+seq-macro.workspace = true
 serde.workspace = true
 toml = "0.8.22"
 validator.workspace = true
@@ -58,6 +58,7 @@ edition = "2024"
 half = { version = "2.6.0", features = ["zerocopy"] }
 paste = "1"
 rand = "0.9.1"
+seq-macro = "0.3.6"
 serde = { version = "1", features = ["derive"] }
 validator = { version = "0.20.0", features = ["derive"] }
 zerocopy = { version = "0.8.25", features = ["derive"] }

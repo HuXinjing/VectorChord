@@ -971,7 +971,7 @@ fn make_internal_build(
 ) -> Vec<Structure<Vec<f32>>> {
     use std::iter::once;
     k_means::preprocess(internal_build.build_threads as _, &mut samples, |sample| {
-        *sample = crate::index::projection::project(sample)
+        *sample = rabitq::rotate::rotate(sample)
     });
     let mut result = Vec::<Structure<Vec<f32>>>::new();
     for w in internal_build.lists.iter().rev().copied().chain(once(1)) {
@@ -1096,10 +1096,7 @@ fn make_external_build(
             if vector_options.dims != vector.as_borrowed().dims() {
                 pgrx::error!("external build: incorrect dimension, id = {id}");
             }
-            vectors.insert(
-                id,
-                crate::index::projection::project(vector.as_borrowed().slice()),
-            );
+            vectors.insert(id, rabitq::rotate::rotate(vector.as_borrowed().slice()));
         }
     });
     if parents.len() >= 2 && parents.values().all(|x| x.is_none()) {

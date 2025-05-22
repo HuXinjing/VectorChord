@@ -8,6 +8,8 @@ publish = false
 simd_macros = { path = "../simd_macros" }
 
 half.workspace = true
+paste.workspace = true
+seq-macro.workspace = true
 zerocopy.workspace = true
 
 [dev-dependencies]

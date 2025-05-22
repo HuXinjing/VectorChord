@@ -18,6 +18,7 @@
 pub mod binary;
 pub mod block;
 pub mod packing;
+pub mod rotate;
 
 use binary::BinaryLut;
 use block::BlockLut;

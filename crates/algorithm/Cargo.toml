@@ -9,7 +9,6 @@ always_equal = { path = "../always_equal" }
 distance = { path = "../distance" }
 k_means = { path = "../k_means" }
 rabitq = { path = "../rabitq" }
-random_orthogonal_matrix = { path = "../random_orthogonal_matrix" }
 simd = { path = "../simd" }
 vector = { path = "../vector" }
 

@@ -26,9 +26,6 @@ pub enum PostgresIo {
     read_stream,
 }
 
-static PREWARM_DIM: GucSetting<Option<&CStr>> =
-    GucSetting::<Option<&CStr>>::new(Some(c"64,128,256,384,512,768,1024,1536"));
-
 static PROBES: GucSetting<Option<&'static CStr>> = GucSetting::<Option<&CStr>>::new(Some(c""));
 static EPSILON: GucSetting<f64> = GucSetting::<f64>::new(1.9);
 static MAX_SCAN_TUPLES: GucSetting<i32> = GucSetting::<i32>::new(-1);
@@ -78,14 +75,6 @@ pub fn init() {
         &MAX_SCAN_TUPLES,
         -1,
         i32::MAX,
-        GucContext::Userset,
-        GucFlags::default(),
-    );
-    GucRegistry::define_string_guc(
-        "vchordrq.prewarm_dim",
-        "prewarm_dim when the extension is loading.",
-        "prewarm_dim when the extension is loading.",
-        &PREWARM_DIM,
         GucContext::Userset,
         GucFlags::default(),
     );
@@ -184,34 +173,6 @@ pub fn maxsim_refine() -> u32 {
 
 pub fn maxsim_threshold() -> u32 {
     MAXSIM_THRESHOLD.get() as u32
-}
-
-pub fn prewarm_dim() -> Vec<u32> {
-    match PREWARM_DIM.get() {
-        None => Vec::new(),
-        Some(probes) => {
-            let mut result = Vec::new();
-            let mut current = None;
-            for &c in probes.to_bytes() {
-                match c {
-                    b' ' => continue,
-                    b',' => result.push(current.take().expect("empty prewarm_dim")),
-                    b'0'..=b'9' => {
-                        if let Some(x) = current.as_mut() {
-                            *x = *x * 10 + (c - b'0') as u32;
-                        } else {
-                            current = Some((c - b'0') as u32);
-                        }
-                    }
-                    c => pgrx::error!("unknown character in prewarm_dim: ASCII = {c}"),
-                }
-            }
-            if let Some(current) = current {
-                result.push(current);
-            }
-            result
-        }
-    }
 }
 
 pub fn prefilter() -> bool {

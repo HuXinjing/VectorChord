@@ -12,19 +12,16 @@
 //
 // Copyright (c) 2025 TensorChord Inc.
 
-pub mod algorithm;
-pub mod am;
-pub mod functions;
-pub mod gucs;
-pub mod hook;
-pub mod lazy_cell;
-pub mod opclass;
-pub mod scanners;
-pub mod storage;
-pub mod types;
+use std::env::var;
+use std::error::Error;
+use std::path::PathBuf;
 
-pub fn init() {
-    am::init();
-    hook::init();
-    gucs::init();
+fn main() -> Result<(), Box<dyn Error>> {
+    use rand::{Rng, SeedableRng};
+    use rand_chacha::ChaCha12Rng;
+    let mut rng = ChaCha12Rng::from_seed([7; 32]);
+    let bits = (0..262144).map(|_| rng.random::<u8>()).collect::<Vec<_>>();
+    let out_dir = var("OUT_DIR")?;
+    std::fs::write(PathBuf::from(out_dir).join("bits"), bits)?;
+    Ok(())
 }

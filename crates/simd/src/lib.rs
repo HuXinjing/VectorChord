@@ -14,6 +14,8 @@
 
 #![cfg_attr(target_arch = "x86_64", feature(avx512_target_feature))]
 #![cfg_attr(target_arch = "x86_64", feature(stdarch_x86_avx512))]
+#![feature(slice_as_chunks)]
+#![feature(select_unpredictable)]
 #![allow(unsafe_code)]
 
 mod aligned;
@@ -23,7 +25,9 @@ mod f32;
 
 pub mod bit;
 pub mod fast_scan;
+pub mod fht;
 pub mod quantize;
+pub mod rotate;
 pub mod u8;
 
 pub trait Floating:
