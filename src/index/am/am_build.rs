@@ -388,7 +388,7 @@ pub unsafe extern "C-unwind" fn ambuild(
             for (vector, extra) in store {
                 let key = ctid_to_key(ctid);
                 let payload = kv_to_pointer((key, extra));
-                crate::index::algorithm::insert(opfamily, &index, payload, vector);
+                crate::index::algorithm::insert(opfamily, &index, payload, vector, true);
             }
             indtuples += 1;
             reporter.tuples_done(indtuples);
@@ -870,7 +870,7 @@ unsafe fn parallel_build(
                 for (vector, extra) in store {
                     let key = ctid_to_key(ctid);
                     let payload = kv_to_pointer((key, extra));
-                    crate::index::algorithm::insert(opfamily, &index, payload, vector);
+                    crate::index::algorithm::insert(opfamily, &index, payload, vector, true);
                 }
                 unsafe {
                     let indtuples;
@@ -893,7 +893,7 @@ unsafe fn parallel_build(
                 for (vector, extra) in store {
                     let key = ctid_to_key(ctid);
                     let payload = kv_to_pointer((key, extra));
-                    crate::index::algorithm::insert(opfamily, &index, payload, vector);
+                    crate::index::algorithm::insert(opfamily, &index, payload, vector, true);
                 }
                 unsafe {
                     let indtuples;

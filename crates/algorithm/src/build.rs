@@ -30,7 +30,8 @@ pub fn build<R: RelationWrite, O: Operator>(
     let is_residual = vchordrq_options.residual_quantization;
     let mut meta = TapeWriter::<_, MetaTuple>::create(index, false);
     assert_eq!(meta.first(), 0);
-    let freepage = TapeWriter::<_, FreepageTuple>::create(index, false);
+    let mut freepages = TapeWriter::<_, FreepagesTuple>::create(index, false);
+    freepages.push(FreepagesTuple {});
     let mut vectors = TapeWriter::<_, VectorTuple<O::Vector>>::create(index, true);
     let mut pointer_of_centroids = Vec::<Vec<(Vec<u32>, u16)>>::new();
     for i in 0..structures.len() {
@@ -127,7 +128,7 @@ pub fn build<R: RelationWrite, O: Operator>(
         first: pointer_of_firsts
             .last()
             .expect("internal error: empty structure")[0],
-        freepage_first: freepage.first(),
+        freepages_first: freepages.first(),
         cells: structures.iter().map(|s| s.len() as _).collect(),
     });
 }

@@ -19,18 +19,25 @@ use crate::tape_writer::{DirectoryTapeWriter, FrozenTapeWriter};
 use crate::tuples::*;
 use crate::*;
 use rabitq::packing::unpack;
+use std::cell::RefCell;
+
+pub struct Maintain {
+    pub number_of_formerly_allocated_pages: usize,
+    pub number_of_freshly_allocated_pages: usize,
+    pub number_of_freed_pages: usize,
+}
 
 pub fn maintain<'r, R: RelationRead + RelationWrite, O: Operator>(
     index: &'r R,
     mut prefetch_h0_tuples: impl PrefetcherSequenceFamily<'r, R>,
     check: impl Fn(),
-) {
+) -> Maintain {
     let meta_guard = index.read(0);
     let meta_bytes = meta_guard.get(1).expect("data corruption");
     let meta_tuple = MetaTuple::deserialize_ref(meta_bytes);
     let dims = meta_tuple.dims();
     let height_of_root = meta_tuple.height_of_root();
-    let freepage_first = meta_tuple.freepage_first();
+    let freepages_first = meta_tuple.freepages_first();
 
     type State = Vec<u32>;
     let mut state: State = vec![meta_tuple.first()];
@@ -53,19 +60,40 @@ pub fn maintain<'r, R: RelationRead + RelationWrite, O: Operator>(
         state = step(state);
     }
 
+    struct Buffers {
+        pages: Vec<u32>,
+        number_of_formerly_allocated_pages: usize,
+        number_of_freshly_allocated_pages: usize,
+    }
+
+    let buffers = RefCell::new(Buffers {
+        pages: Vec::new(),
+        number_of_formerly_allocated_pages: 0,
+        number_of_freshly_allocated_pages: 0,
+    });
+
     for first in state {
         let mut jump_guard = index.write(first, false);
         let jump_bytes = jump_guard.get_mut(1).expect("data corruption");
         let mut jump_tuple = JumpTuple::deserialize_mut(jump_bytes);
 
-        let frozen_tape_hooked_index = RelationHooked(index, {
-            id_3(move |index: &R, tracking_freespace: bool| {
+        let hooked_index = RelationHooked(index, {
+            id_3(|index: &R, tracking_freespace: bool| {
                 if !tracking_freespace {
-                    if let Some(id) = freepages::fetch(index, freepage_first) {
-                        let mut write = index.write(id, false);
-                        write.clear();
-                        write
+                    let mut buffers = buffers.borrow_mut();
+                    if let Some(id) = buffers.pages.pop() {
+                        drop(buffers);
+                        let mut guard = index.write(id, false);
+                        guard.clear();
+                        guard
+                    } else if let Some(mut guard) = freepages::alloc(index, freepages_first) {
+                        buffers.number_of_formerly_allocated_pages += 1;
+                        drop(buffers);
+                        guard.clear();
+                        guard
                     } else {
+                        buffers.number_of_freshly_allocated_pages += 1;
+                        drop(buffers);
                         index.extend(false)
                     }
                 } else {
@@ -74,11 +102,7 @@ pub fn maintain<'r, R: RelationRead + RelationWrite, O: Operator>(
             })
         });
 
-        let mut tape = FrozenTapeWriter::create(
-            &frozen_tape_hooked_index,
-            O::Vector::count(dims as _),
-            false,
-        );
+        let mut tape = FrozenTapeWriter::create(&hooked_index, O::Vector::count(dims as _), false);
 
         let mut trace_directory = Vec::new();
         let mut trace_forzen = Vec::new();
@@ -162,22 +186,6 @@ pub fn maintain<'r, R: RelationRead + RelationWrite, O: Operator>(
 
         let (frozen_tape, branches) = tape.into_inner();
 
-        let hooked_index = RelationHooked(
-            index,
-            id_3(move |index: &R, tracking_freespace: bool| {
-                if !tracking_freespace {
-                    if let Some(id) = freepages::fetch(index, freepage_first) {
-                        let mut write = index.write(id, false);
-                        write.clear();
-                        write
-                    } else {
-                        index.extend(false)
-                    }
-                } else {
-                    index.extend(true)
-                }
-            }),
-        );
         let mut appendable_tape = TapeWriter::create(&hooked_index, false);
 
         for branch in branches {
@@ -203,7 +211,7 @@ pub fn maintain<'r, R: RelationRead + RelationWrite, O: Operator>(
             .map(|guard| guard.id())
             .collect::<Vec<_>>();
 
-        let mut directory_tape = DirectoryTapeWriter::create(index, false);
+        let mut directory_tape = DirectoryTapeWriter::create(&hooked_index, false);
         directory_tape.push(directory.as_slice());
         let directory_tape = directory_tape.into_inner();
 
@@ -213,15 +221,21 @@ pub fn maintain<'r, R: RelationRead + RelationWrite, O: Operator>(
 
         drop(jump_guard);
 
-        let trace = {
-            let mut v = Vec::new();
-            v.extend_from_slice(&trace_directory);
-            v.extend_from_slice(&trace_forzen);
-            v.extend_from_slice(&trace_appendable);
-            v
-        };
+        let mut buffers = buffers.borrow_mut();
+        buffers.pages.extend_from_slice(&trace_directory);
+        buffers.pages.extend_from_slice(&trace_forzen);
+        buffers.pages.extend_from_slice(&trace_appendable);
+    }
 
-        freepages::mark(index, freepage_first, trace.as_slice());
+    let buffers = RefCell::into_inner(buffers);
+    for id in buffers.pages.iter().copied() {
+        freepages::free(index, freepages_first, id);
+    }
+
+    Maintain {
+        number_of_formerly_allocated_pages: buffers.number_of_formerly_allocated_pages,
+        number_of_freshly_allocated_pages: buffers.number_of_freshly_allocated_pages,
+        number_of_freed_pages: buffers.pages.len(),
     }
 }
 

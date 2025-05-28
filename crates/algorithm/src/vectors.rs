@@ -91,7 +91,7 @@ pub fn append<O: Operator>(
                 .expect("implementation: a free page cannot accommodate a single tuple");
             return (write.id(), i);
         }
-        tape::append(index, first, bytes, true)
+        tape::append(index, first, bytes, true, None)
     }
     let (slices, metadata) = O::Vector::split(vector);
     let mut chain = Ok(metadata);

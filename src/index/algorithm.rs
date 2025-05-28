@@ -270,7 +270,7 @@ pub fn bulkdelete(
 
 pub fn maintain(opfamily: Opfamily, index: &(impl RelationRead + RelationWrite), check: impl Fn()) {
     let make_h0_plain_prefetcher = MakeH0PlainPrefetcher { index };
-    match (opfamily.vector_kind(), opfamily.distance_kind()) {
+    let maintain = match (opfamily.vector_kind(), opfamily.distance_kind()) {
         (VectorKind::Vecf32, DistanceKind::L2) => {
             algorithm::maintain::<_, Op<VectOwned<f32>, L2>>(index, make_h0_plain_prefetcher, check)
         }
@@ -291,7 +291,19 @@ pub fn maintain(opfamily: Opfamily, index: &(impl RelationRead + RelationWrite),
                 check,
             )
         }
-    }
+    };
+    pgrx::info!(
+        "maintain: number_of_formerly_allocated_pages = {}",
+        maintain.number_of_formerly_allocated_pages
+    );
+    pgrx::info!(
+        "maintain: number_of_freshly_allocated_pages = {}",
+        maintain.number_of_freshly_allocated_pages
+    );
+    pgrx::info!(
+        "maintain: number_of_freed_pages = {}",
+        maintain.number_of_freed_pages
+    );
 }
 
 pub fn build(
@@ -333,6 +345,7 @@ pub fn insert(
     index: &(impl RelationRead + RelationWrite),
     payload: NonZero<u64>,
     vector: OwnedVector,
+    skip_freespaces: bool,
 ) {
     let bump = BumpAlloc::new();
     let make_h1_plain_prefetcher = MakeH1PlainPrefetcherForInsertion { index };
@@ -352,6 +365,7 @@ pub fn insert(
                 key,
                 &bump,
                 make_h1_plain_prefetcher,
+                skip_freespaces,
             )
         }
         (OwnedVector::Vecf32(vector), DistanceKind::Dot) => {
@@ -369,6 +383,7 @@ pub fn insert(
                 key,
                 &bump,
                 make_h1_plain_prefetcher,
+                skip_freespaces,
             )
         }
         (OwnedVector::Vecf16(vector), DistanceKind::L2) => {
@@ -386,6 +401,7 @@ pub fn insert(
                 key,
                 &bump,
                 make_h1_plain_prefetcher,
+                skip_freespaces,
             )
         }
         (OwnedVector::Vecf16(vector), DistanceKind::Dot) => {
@@ -403,6 +419,7 @@ pub fn insert(
                 key,
                 &bump,
                 make_h1_plain_prefetcher,
+                skip_freespaces,
             )
         }
     }

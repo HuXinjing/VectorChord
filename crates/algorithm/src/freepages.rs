@@ -14,56 +14,30 @@
 
 use crate::tuples::*;
 use crate::*;
-use std::cmp::Reverse;
 
-pub fn mark(index: &impl RelationWrite, freepage_first: u32, values: &[u32]) {
-    let mut values = {
-        let mut values = values.to_vec();
-        values.sort_by_key(|x| Reverse(*x));
-        values.dedup();
-        values
-    };
-    let (mut current, mut offset) = (freepage_first, 0_u32);
-    loop {
-        let mut freespace_guard = index.write(current, false);
-        if freespace_guard.len() == 0 {
-            freespace_guard
-                .alloc(&FreepageTuple::serialize(&FreepageTuple {}))
-                .expect("implementation: a clear page cannot accommodate a single tuple");
-        }
-        let freespace_bytes = freespace_guard.get_mut(1).expect("data corruption");
-        let mut freespace_tuple = FreepageTuple::deserialize_mut(freespace_bytes);
-        while let Some(target) = values.pop_if(|&mut x| x < offset + 32768) {
-            freespace_tuple.mark((target - offset) as usize);
-        }
-        if values.is_empty() {
-            return;
-        }
-        if freespace_guard.get_opaque().next == u32::MAX {
-            let extend = index.extend(false);
-            freespace_guard.get_opaque_mut().next = extend.id();
-        }
-        (current, offset) = (freespace_guard.get_opaque().next, offset + 32768);
+pub fn alloc<R: RelationWrite>(index: &R, freepages_first: u32) -> Option<R::WriteGuard<'_>> {
+    let mut freepages_guard = index.write(freepages_first, false);
+    let freepages_bytes = freepages_guard.get_mut(1).expect("data corruption");
+    let mut freepages_tuple = FreepagesTuple::deserialize_mut(freepages_bytes);
+    let id = *freepages_tuple.first();
+    if id != u32::MAX {
+        let mut guard = index.write(id, false);
+        *freepages_tuple.first() = guard.get_opaque_mut().next;
+        drop(freepages_guard); // write log of freespaces_guard
+        Some(guard)
+    } else {
+        None
     }
 }
 
-pub fn fetch(index: &impl RelationWrite, freepage_first: u32) -> Option<u32> {
-    let (mut current, mut offset) = (freepage_first, 0_u32);
-    loop {
-        let mut freespace_guard = index.write(current, false);
-        if freespace_guard.len() == 0 {
-            freespace_guard
-                .alloc(&FreepageTuple::serialize(&FreepageTuple {}))
-                .expect("implementation: a clear page cannot accommodate a single tuple");
-        }
-        let freespace_bytes = freespace_guard.get_mut(1).expect("data corruption");
-        let mut freespace_tuple = FreepageTuple::deserialize_mut(freespace_bytes);
-        if let Some(x) = freespace_tuple.fetch() {
-            return Some(x as u32 + offset);
-        }
-        if freespace_guard.get_opaque().next == u32::MAX {
-            return None;
-        }
-        (current, offset) = (freespace_guard.get_opaque().next, offset + 32768);
-    }
+// the page must be inaccessible in the graph
+pub fn free<R: RelationWrite>(index: &R, freepages_first: u32, id: u32) {
+    let mut guard = index.write(id, false);
+    let mut freepages_guard = index.write(freepages_first, false);
+    let freepages_bytes = freepages_guard.get_mut(1).expect("data corruption");
+    let mut freepages_tuple = FreepagesTuple::deserialize_mut(freepages_bytes);
+    guard.get_opaque_mut().next = *freepages_tuple.first();
+    drop(guard); // write log of guard
+    *freepages_tuple.first() = id;
+    drop(freepages_guard); // write log of freepages_guard
 }

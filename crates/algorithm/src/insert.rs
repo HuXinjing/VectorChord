@@ -56,6 +56,7 @@ pub fn insert<'r, 'b: 'r, R: RelationRead + RelationWrite, O: Operator>(
     key: (Vec<u32>, u16),
     bump: &'b impl Bump,
     mut prefetch_h1_vectors: impl PrefetcherHeapFamily<'r, R>,
+    skip_freespaces: bool,
 ) {
     let meta_guard = index.read(0);
     let meta_bytes = meta_guard.get(1).expect("data corruption");
@@ -63,6 +64,7 @@ pub fn insert<'r, 'b: 'r, R: RelationRead + RelationWrite, O: Operator>(
     let dims = meta_tuple.dims();
     let is_residual = meta_tuple.is_residual();
     let height_of_root = meta_tuple.height_of_root();
+    let freepages_first = meta_tuple.freepages_first();
     assert_eq!(dims, vector.dims(), "unmatched dimensions");
     let epsilon = 1.9;
 
@@ -167,5 +169,11 @@ pub fn insert<'r, 'b: 'r, R: RelationRead + RelationWrite, O: Operator>(
         elements: rabitq::packing::pack_to_u64(&code.1),
     });
 
-    tape::append(index, jump_tuple.appendable_first(), &serialized, false);
+    tape::append(
+        index,
+        jump_tuple.appendable_first(),
+        &serialized,
+        false,
+        (!skip_freespaces).then_some(freepages_first),
+    );
 }

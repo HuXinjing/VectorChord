@@ -14,7 +14,7 @@
 
 use crate::operator::Accessor1;
 use crate::tuples::*;
-use crate::{Page, PageGuard, PrefetcherSequenceFamily, RelationRead, RelationWrite};
+use crate::{Page, PageGuard, PrefetcherSequenceFamily, RelationRead, RelationWrite, freepages};
 use std::marker::PhantomData;
 use std::num::NonZero;
 
@@ -301,7 +301,9 @@ pub fn append(
     first: u32,
     bytes: &[u8],
     tracking_freespace: bool,
+    freepages_first: Option<u32>,
 ) -> (u32, u16) {
+    assert!(!tracking_freespace || freepages_first.is_none());
     assert!(first != u32::MAX);
     let mut current = first;
     loop {
@@ -313,7 +315,18 @@ pub fn append(
                 if let Some(i) = write.alloc(bytes) {
                     return (current, i);
                 }
-                let mut extend = index.extend(tracking_freespace);
+                let mut extend = {
+                    if let Some(freepages_first) = freepages_first {
+                        if let Some(mut guard) = freepages::alloc(index, freepages_first) {
+                            guard.clear();
+                            guard
+                        } else {
+                            index.extend(tracking_freespace)
+                        }
+                    } else {
+                        index.extend(tracking_freespace)
+                    }
+                };
                 write.get_opaque_mut().next = extend.id();
                 drop(write);
                 let fresh = extend.id();

@@ -15,12 +15,12 @@
 use crate::operator::Vector;
 use std::marker::PhantomData;
 use std::num::NonZero;
-use zerocopy::{FromBytes, FromZeros, Immutable, IntoBytes, KnownLayout};
+use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
 pub const ALIGN: usize = 8;
 pub type Tag = u64;
 const MAGIC: Tag = Tag::from_ne_bytes(*b"vchordrq");
-const VERSION: u64 = 9;
+const VERSION: u64 = 10;
 
 pub trait Tuple: 'static {
     fn serialize(&self) -> Vec<u8>;
@@ -48,7 +48,7 @@ struct MetaTupleHeader {
     cells_e: u16,
     _padding_0: [ZeroU8; 2],
     vectors_first: u32,
-    freepage_first: u32,
+    freepages_first: u32,
     _padding_1: [ZeroU8; 2],
     // tree
     centroid_prefetch_s: u16,
@@ -65,7 +65,7 @@ pub struct MetaTuple {
     pub rerank_in_heap: bool,
     pub cells: Vec<u32>,
     pub vectors_first: u32,
-    pub freepage_first: u32,
+    pub freepages_first: u32,
     pub centroid_prefetch: Vec<u32>,
     pub centroid_head: u16,
     pub centroid_norm: f32,
@@ -84,7 +84,7 @@ impl Tuple for MetaTuple {
                 rerank_in_heap,
                 cells,
                 vectors_first,
-                freepage_first,
+                freepages_first,
                 centroid_prefetch,
                 centroid_head,
                 centroid_norm,
@@ -117,7 +117,7 @@ impl Tuple for MetaTuple {
                         cells_s,
                         cells_e,
                         vectors_first: *vectors_first,
-                        freepage_first: *freepage_first,
+                        freepages_first: *freepages_first,
                         centroid_prefetch_s,
                         centroid_prefetch_e,
                         centroid_head: *centroid_head,
@@ -185,8 +185,8 @@ impl<'a> MetaTupleReader<'a> {
     pub fn vectors_first(self) -> u32 {
         self.header.vectors_first
     }
-    pub fn freepage_first(self) -> u32 {
-        self.header.freepage_first
+    pub fn freepages_first(self) -> u32 {
+        self.header.freepages_first
     }
     pub fn centroid_prefetch(self) -> &'a [u32] {
         self.centroid_prefetch
@@ -204,24 +204,18 @@ impl<'a> MetaTupleReader<'a> {
 
 #[repr(C, align(8))]
 #[derive(Debug, Clone, PartialEq, FromBytes, IntoBytes, Immutable, KnownLayout)]
-struct FreepageTupleHeader {
-    level_0: [u32; 1 << 10],
-    level_1: [u32; 1 << 5],
-    level_2: [u32; 1 << 0],
+struct FreepagesTupleHeader {
+    first: u32,
     _padding_0: [ZeroU8; 4],
 }
 
-const _: () = assert!(size_of::<FreepageTupleHeader>() == 4232);
-
 #[derive(Debug, Clone, PartialEq)]
-pub struct FreepageTuple {}
+pub struct FreepagesTuple {}
 
-impl Tuple for FreepageTuple {
+impl Tuple for FreepagesTuple {
     fn serialize(&self) -> Vec<u8> {
-        FreepageTupleHeader {
-            level_0: FromZeros::new_zeroed(),
-            level_1: FromZeros::new_zeroed(),
-            level_2: FromZeros::new_zeroed(),
+        FreepagesTupleHeader {
+            first: u32::MAX,
             _padding_0: Default::default(),
         }
         .as_bytes()
@@ -229,52 +223,23 @@ impl Tuple for FreepageTuple {
     }
 }
 
-impl WithWriter for FreepageTuple {
-    type Writer<'a> = FreepageTupleWriter<'a>;
+impl WithWriter for FreepagesTuple {
+    type Writer<'a> = FreepagesTupleWriter<'a>;
 
-    fn deserialize_mut(source: &mut [u8]) -> FreepageTupleWriter<'_> {
+    fn deserialize_mut(source: &mut [u8]) -> FreepagesTupleWriter<'_> {
         let mut checker = MutChecker::new(source);
         let header = checker.prefix(0_u16);
-        FreepageTupleWriter { header }
+        FreepagesTupleWriter { header }
     }
 }
 
-pub struct FreepageTupleWriter<'a> {
-    header: &'a mut FreepageTupleHeader,
+pub struct FreepagesTupleWriter<'a> {
+    header: &'a mut FreepagesTupleHeader,
 }
 
-impl FreepageTupleWriter<'_> {
-    pub fn mark(&mut self, i: usize) {
-        assert!(i < 32768, "out of bound: {i}");
-        set(&mut self.header.level_0[i >> 5], (i >> 0) % 32, true);
-        set(&mut self.header.level_1[i >> 10], (i >> 5) % 32, true);
-        set(&mut self.header.level_2[i >> 15], (i >> 10) % 32, true);
-    }
-    fn find(&self) -> Option<usize> {
-        let i_3 = 0_usize;
-        let i_2 = self.header.level_2[i_3 << 0].trailing_zeros() as usize;
-        if i_2 == 32 {
-            return None;
-        }
-        let i_1 = self.header.level_1[i_3 << 5 | i_2 << 0].trailing_zeros() as usize;
-        if i_1 == 32 {
-            panic!("deserialization: bad bytes");
-        }
-        let i_0 = self.header.level_0[i_3 << 10 | i_2 << 5 | i_1 << 0].trailing_zeros() as usize;
-        if i_0 == 32 {
-            panic!("deserialization: bad bytes");
-        }
-        Some(i_3 << 15 | i_2 << 10 | i_1 << 5 | i_0 << 0)
-    }
-    pub fn fetch(&mut self) -> Option<usize> {
-        let i = self.find()?;
-        let x = false;
-        set(&mut self.header.level_0[i >> 5], (i >> 0) % 32, x);
-        let x = self.header.level_0[i >> 5] != 0;
-        set(&mut self.header.level_1[i >> 10], (i >> 5) % 32, x);
-        let x = self.header.level_1[i >> 10] != 0;
-        set(&mut self.header.level_2[i >> 15], (i >> 10) % 32, x);
-        Some(i)
+impl FreepagesTupleWriter<'_> {
+    pub fn first(&mut self) -> &mut u32 {
+        &mut self.header.first
     }
 }
 
@@ -1457,16 +1422,6 @@ impl<'a> MutChecker<'a> {
             std::slice::from_raw_parts_mut((self.bytes as *mut u8).add(start), end - start)
         };
         FromBytes::mut_from_bytes(bytes).expect("deserialization: bad bytes")
-    }
-}
-
-#[inline(always)]
-fn set(a: &mut u32, i: usize, x: bool) {
-    assert!(i < 32, "out of bound: {i}");
-    if x {
-        *a |= 1 << i;
-    } else {
-        *a &= !(1 << i);
     }
 }
 

@@ -15,13 +15,15 @@
 use std::collections::HashMap;
 use std::env::{var, var_os};
 use std::error::Error;
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 fn main() -> Result<(), Box<dyn Error>> {
     if var("CARGO_CFG_TARGET_OS")? == "macos" {
         if let Some(path) = var_os("PGRX_PG_CONFIG_PATH") {
             let map = {
-                let command_output = Command::new(&path).output()?;
+                let mut command = Command::new(&path);
+                command.stderr(Stdio::inherit());
+                let command_output = command.output()?;
                 let command_stdout = String::from_utf8(command_output.stdout)?;
                 let mut map = HashMap::new();
                 for line in command_stdout.lines() {
