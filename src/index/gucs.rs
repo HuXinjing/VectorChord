@@ -12,126 +12,244 @@
 //
 // Copyright (c) 2025 TensorChord Inc.
 
-use super::scanners::Io;
 use pgrx::PostgresGucEnum;
 use pgrx::guc::{GucContext, GucFlags, GucRegistry, GucSetting};
-use std::ffi::CStr;
+use std::ffi::CString;
 
-#[allow(non_camel_case_types)]
+#[cfg(any(feature = "pg13", feature = "pg14", feature = "pg15", feature = "pg16"))]
 #[derive(Debug, Clone, Copy, PostgresGucEnum)]
 pub enum PostgresIo {
-    read_buffer,
-    prefetch_buffer,
-    #[cfg(feature = "pg17")]
-    read_stream,
+    #[name = c"read_buffer"]
+    ReadBuffer,
+    #[name = c"prefetch_buffer"]
+    PrefetchBuffer,
 }
 
-static PROBES: GucSetting<Option<&'static CStr>> = GucSetting::<Option<&CStr>>::new(Some(c""));
-static EPSILON: GucSetting<f64> = GucSetting::<f64>::new(1.9);
-static MAX_SCAN_TUPLES: GucSetting<i32> = GucSetting::<i32>::new(-1);
+#[cfg(any(feature = "pg17", feature = "pg18"))]
+#[derive(Debug, Clone, Copy, PostgresGucEnum)]
+pub enum PostgresIo {
+    #[name = c"read_buffer"]
+    ReadBuffer,
+    #[name = c"prefetch_buffer"]
+    PrefetchBuffer,
+    #[name = c"read_stream"]
+    ReadStream,
+}
 
-static MAXSIM_REFINE: GucSetting<i32> = GucSetting::<i32>::new(0);
-static MAXSIM_THRESHOLD: GucSetting<i32> = GucSetting::<i32>::new(0);
+static VCHORDG_EF_SEARCH: GucSetting<i32> = GucSetting::<i32>::new(64);
 
-static PREFILTER: GucSetting<bool> = GucSetting::<bool>::new(false);
+static VCHORDG_BEAM_SIZE: GucSetting<i32> = GucSetting::<i32>::new(1);
 
-static IO_SEARCH: GucSetting<PostgresIo> = GucSetting::<PostgresIo>::new(
+static VCHORDG_MAX_SCAN_TUPLES: GucSetting<i32> = GucSetting::<i32>::new(-1);
+
+static VCHORDG_IO_SEARCH: GucSetting<PostgresIo> = GucSetting::<PostgresIo>::new(
     #[cfg(any(feature = "pg13", feature = "pg14", feature = "pg15", feature = "pg16"))]
-    PostgresIo::prefetch_buffer,
-    #[cfg(feature = "pg17")]
-    PostgresIo::read_stream,
+    PostgresIo::PrefetchBuffer,
+    #[cfg(any(feature = "pg17", feature = "pg18"))]
+    PostgresIo::ReadStream,
 );
 
-static IO_RERANK: GucSetting<PostgresIo> = GucSetting::<PostgresIo>::new(
+static VCHORDG_IO_RERANK: GucSetting<PostgresIo> = GucSetting::<PostgresIo>::new(
     #[cfg(any(feature = "pg13", feature = "pg14", feature = "pg15", feature = "pg16"))]
-    PostgresIo::prefetch_buffer,
-    #[cfg(feature = "pg17")]
-    PostgresIo::read_stream,
+    PostgresIo::PrefetchBuffer,
+    #[cfg(any(feature = "pg17", feature = "pg18"))]
+    PostgresIo::ReadStream,
+);
+
+static VCHORDRQ_PROBES: GucSetting<Option<CString>> = GucSetting::<Option<CString>>::new(Some(c""));
+
+static VCHORDRQ_EPSILON: GucSetting<f64> = GucSetting::<f64>::new(1.9);
+
+static VCHORDRQ_MAX_SCAN_TUPLES: GucSetting<i32> = GucSetting::<i32>::new(-1);
+
+static VCHORDRQ_MAXSIM_REFINE: GucSetting<i32> = GucSetting::<i32>::new(0);
+
+static VCHORDRQ_MAXSIM_THRESHOLD: GucSetting<i32> = GucSetting::<i32>::new(0);
+
+static VCHORDRQ_PREFILTER: GucSetting<bool> = GucSetting::<bool>::new(false);
+
+static VCHORDRQ_IO_SEARCH: GucSetting<PostgresIo> = GucSetting::<PostgresIo>::new(
+    #[cfg(any(feature = "pg13", feature = "pg14", feature = "pg15", feature = "pg16"))]
+    PostgresIo::PrefetchBuffer,
+    #[cfg(any(feature = "pg17", feature = "pg18"))]
+    PostgresIo::ReadStream,
+);
+
+static VCHORDRQ_IO_RERANK: GucSetting<PostgresIo> = GucSetting::<PostgresIo>::new(
+    #[cfg(any(feature = "pg13", feature = "pg14", feature = "pg15", feature = "pg16"))]
+    PostgresIo::PrefetchBuffer,
+    #[cfg(any(feature = "pg17", feature = "pg18"))]
+    PostgresIo::ReadStream,
 );
 
 pub fn init() {
     GucRegistry::define_string_guc(
-        "vchordrq.probes",
-        "`probes` argument of vchordrq.",
-        "`probes` argument of vchordrq.",
-        &PROBES,
+        c"vchordrq.probes",
+        c"`probes` argument of vchordrq.",
+        c"`probes` argument of vchordrq.",
+        &VCHORDRQ_PROBES,
         GucContext::Userset,
         GucFlags::default(),
     );
     GucRegistry::define_float_guc(
-        "vchordrq.epsilon",
-        "`epsilon` argument of vchordrq.",
-        "`epsilon` argument of vchordrq.",
-        &EPSILON,
+        c"vchordrq.epsilon",
+        c"`epsilon` argument of vchordrq.",
+        c"`epsilon` argument of vchordrq.",
+        &VCHORDRQ_EPSILON,
         0.0,
         4.0,
         GucContext::Userset,
         GucFlags::default(),
     );
     GucRegistry::define_int_guc(
-        "vchordrq.max_scan_tuples",
-        "`max_scan_tuples` argument of vchordrq.",
-        "`max_scan_tuples` argument of vchordrq.",
-        &MAX_SCAN_TUPLES,
+        c"vchordrq.max_scan_tuples",
+        c"`max_scan_tuples` argument of vchordrq.",
+        c"`max_scan_tuples` argument of vchordrq.",
+        &VCHORDRQ_MAX_SCAN_TUPLES,
         -1,
         i32::MAX,
         GucContext::Userset,
         GucFlags::default(),
     );
     GucRegistry::define_int_guc(
-        "vchordrq.maxsim_refine",
-        "`maxsim_refine` argument of vchordrq.",
-        "`maxsim_refine` argument of vchordrq.",
-        &MAXSIM_REFINE,
+        c"vchordrq.maxsim_refine",
+        c"`maxsim_refine` argument of vchordrq.",
+        c"`maxsim_refine` argument of vchordrq.",
+        &VCHORDRQ_MAXSIM_REFINE,
         0,
         i32::MAX,
         GucContext::Userset,
         GucFlags::default(),
     );
     GucRegistry::define_int_guc(
-        "vchordrq.maxsim_threshold",
-        "`maxsim_threshold` argument of vchordrq.",
-        "`maxsim_threshold` argument of vchordrq.",
-        &MAXSIM_THRESHOLD,
+        c"vchordrq.maxsim_threshold",
+        c"`maxsim_threshold` argument of vchordrq.",
+        c"`maxsim_threshold` argument of vchordrq.",
+        &VCHORDRQ_MAXSIM_THRESHOLD,
         0,
         i32::MAX,
         GucContext::Userset,
         GucFlags::default(),
     );
     GucRegistry::define_bool_guc(
-        "vchordrq.prefilter",
-        "`prefilter` argument of vchordrq.",
-        "`prefilter` argument of vchordrq.",
-        &PREFILTER,
+        c"vchordrq.prefilter",
+        c"`prefilter` argument of vchordrq.",
+        c"`prefilter` argument of vchordrq.",
+        &VCHORDRQ_PREFILTER,
         GucContext::Userset,
         GucFlags::default(),
     );
     GucRegistry::define_enum_guc(
-        "vchordrq.io_search",
-        "`io_search` argument of vchordrq.",
-        "`io_search` argument of vchordrq.",
-        &IO_SEARCH,
+        c"vchordrq.io_search",
+        c"`io_search` argument of vchordrq.",
+        c"`io_search` argument of vchordrq.",
+        &VCHORDRQ_IO_SEARCH,
         GucContext::Userset,
         GucFlags::default(),
     );
     GucRegistry::define_enum_guc(
-        "vchordrq.io_rerank",
-        "`io_rerank` argument of vchordrq.",
-        "`io_rerank` argument of vchordrq.",
-        &IO_RERANK,
+        c"vchordrq.io_rerank",
+        c"`io_rerank` argument of vchordrq.",
+        c"`io_rerank` argument of vchordrq.",
+        &VCHORDRQ_IO_RERANK,
         GucContext::Userset,
         GucFlags::default(),
     );
     unsafe {
         #[cfg(any(feature = "pg13", feature = "pg14"))]
         pgrx::pg_sys::EmitWarningsOnPlaceholders(c"vchordrq".as_ptr());
-        #[cfg(any(feature = "pg15", feature = "pg16", feature = "pg17"))]
+        #[cfg(any(feature = "pg15", feature = "pg16", feature = "pg17", feature = "pg18"))]
         pgrx::pg_sys::MarkGUCPrefixReserved(c"vchordrq".as_ptr());
+    }
+    GucRegistry::define_int_guc(
+        c"vchordg.ef_search",
+        c"`ef_search` argument of vchordg.",
+        c"`ef_search` argument of vchordg.",
+        &VCHORDG_EF_SEARCH,
+        1,
+        65535,
+        GucContext::Userset,
+        GucFlags::default(),
+    );
+    GucRegistry::define_int_guc(
+        c"vchordg.beam_search",
+        c"`beam_search` argument of vchordg.",
+        c"`beam_search` argument of vchordg.",
+        &VCHORDG_BEAM_SIZE,
+        1,
+        65535,
+        GucContext::Userset,
+        GucFlags::default(),
+    );
+    GucRegistry::define_int_guc(
+        c"vchordg.max_scan_tuples",
+        c"`max_scan_tuples` argument of vchordg.",
+        c"`max_scan_tuples` argument of vchordg.",
+        &VCHORDG_MAX_SCAN_TUPLES,
+        -1,
+        i32::MAX,
+        GucContext::Userset,
+        GucFlags::default(),
+    );
+    GucRegistry::define_enum_guc(
+        c"vchordg.io_search",
+        c"`io_search` argument of vchordg.",
+        c"`io_search` argument of vchordg.",
+        &VCHORDG_IO_SEARCH,
+        GucContext::Userset,
+        GucFlags::default(),
+    );
+    GucRegistry::define_enum_guc(
+        c"vchordg.io_rerank",
+        c"`io_rerank` argument of vchordg.",
+        c"`io_rerank` argument of vchordg.",
+        &VCHORDG_IO_RERANK,
+        GucContext::Userset,
+        GucFlags::default(),
+    );
+    unsafe {
+        #[cfg(any(feature = "pg13", feature = "pg14"))]
+        pgrx::pg_sys::EmitWarningsOnPlaceholders(c"vchordg".as_ptr());
+        #[cfg(any(feature = "pg15", feature = "pg16", feature = "pg17", feature = "pg18"))]
+        pgrx::pg_sys::MarkGUCPrefixReserved(c"vchordg".as_ptr());
     }
 }
 
-pub fn probes() -> Vec<u32> {
-    match PROBES.get() {
+pub fn vchordg_ef_search() -> u32 {
+    VCHORDG_EF_SEARCH.get() as u32
+}
+
+pub fn vchordg_beam_search() -> u32 {
+    VCHORDG_BEAM_SIZE.get() as u32
+}
+
+pub fn vchordg_max_scan_tuples() -> Option<u32> {
+    let x = VCHORDG_MAX_SCAN_TUPLES.get();
+    if x < 0 { None } else { Some(x as u32) }
+}
+
+pub fn vchordg_io_search() -> crate::index::vchordg::scanners::Io {
+    use crate::index::vchordg::scanners::Io;
+    match VCHORDG_IO_SEARCH.get() {
+        PostgresIo::ReadBuffer => Io::Plain,
+        PostgresIo::PrefetchBuffer => Io::Simple,
+        #[cfg(any(feature = "pg17", feature = "pg18"))]
+        PostgresIo::ReadStream => Io::Stream,
+    }
+}
+
+pub fn vchordg_io_rerank() -> crate::index::vchordg::scanners::Io {
+    use crate::index::vchordg::scanners::Io;
+    match VCHORDG_IO_RERANK.get() {
+        PostgresIo::ReadBuffer => Io::Plain,
+        PostgresIo::PrefetchBuffer => Io::Simple,
+        #[cfg(any(feature = "pg17", feature = "pg18"))]
+        PostgresIo::ReadStream => Io::Stream,
+    }
+}
+
+pub fn vchordrq_probes() -> Vec<u32> {
+    match VCHORDRQ_PROBES.get() {
         None => Vec::new(),
         Some(probes) => {
             let mut result = Vec::new();
@@ -158,41 +276,43 @@ pub fn probes() -> Vec<u32> {
     }
 }
 
-pub fn epsilon() -> f32 {
-    EPSILON.get() as f32
+pub fn vchordrq_epsilon() -> f32 {
+    VCHORDRQ_EPSILON.get() as f32
 }
 
-pub fn max_scan_tuples() -> Option<u32> {
-    let x = MAX_SCAN_TUPLES.get();
+pub fn vchordrq_max_scan_tuples() -> Option<u32> {
+    let x = VCHORDRQ_MAX_SCAN_TUPLES.get();
     if x < 0 { None } else { Some(x as u32) }
 }
 
-pub fn maxsim_refine() -> u32 {
-    MAXSIM_REFINE.get() as u32
+pub fn vchordrq_maxsim_refine() -> u32 {
+    VCHORDRQ_MAXSIM_REFINE.get() as u32
 }
 
-pub fn maxsim_threshold() -> u32 {
-    MAXSIM_THRESHOLD.get() as u32
+pub fn vchordrq_maxsim_threshold() -> u32 {
+    VCHORDRQ_MAXSIM_THRESHOLD.get() as u32
 }
 
-pub fn prefilter() -> bool {
-    PREFILTER.get()
+pub fn vchordrq_prefilter() -> bool {
+    VCHORDRQ_PREFILTER.get()
 }
 
-pub fn io_search() -> Io {
-    match IO_RERANK.get() {
-        PostgresIo::read_buffer => Io::Plain,
-        PostgresIo::prefetch_buffer => Io::Simple,
-        #[cfg(feature = "pg17")]
-        PostgresIo::read_stream => Io::Stream,
+pub fn vchordrq_io_search() -> crate::index::vchordrq::scanners::Io {
+    use crate::index::vchordrq::scanners::Io;
+    match VCHORDRQ_IO_SEARCH.get() {
+        PostgresIo::ReadBuffer => Io::Plain,
+        PostgresIo::PrefetchBuffer => Io::Simple,
+        #[cfg(any(feature = "pg17", feature = "pg18"))]
+        PostgresIo::ReadStream => Io::Stream,
     }
 }
 
-pub fn io_rerank() -> Io {
-    match IO_RERANK.get() {
-        PostgresIo::read_buffer => Io::Plain,
-        PostgresIo::prefetch_buffer => Io::Simple,
-        #[cfg(feature = "pg17")]
-        PostgresIo::read_stream => Io::Stream,
+pub fn vchordrq_io_rerank() -> crate::index::vchordrq::scanners::Io {
+    use crate::index::vchordrq::scanners::Io;
+    match VCHORDRQ_IO_RERANK.get() {
+        PostgresIo::ReadBuffer => Io::Plain,
+        PostgresIo::PrefetchBuffer => Io::Simple,
+        #[cfg(any(feature = "pg17", feature = "pg18"))]
+        PostgresIo::ReadStream => Io::Stream,
     }
 }
