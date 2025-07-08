@@ -96,8 +96,10 @@ pub fn emulate_mm_reduce_add_ps(mut x: std::arch::x86_64::__m128) -> f32 {
 #[crate::target_cpu(enable = "v4")]
 pub fn emulate_mm512_reduce_add_epi16(x: std::arch::x86_64::__m512i) -> i16 {
     use std::arch::x86_64::*;
-    _mm256_reduce_add_epi16(_mm512_castsi512_si256(x))
-        + _mm256_reduce_add_epi16(_mm512_extracti32x8_epi32(x, 1))
+    i16::wrapping_add(
+        _mm256_reduce_add_epi16(_mm512_castsi512_si256(x)),
+        _mm256_reduce_add_epi16(_mm512_extracti32x8_epi32(x, 1)),
+    )
 }
 
 #[inline]
@@ -109,7 +111,7 @@ pub fn emulate_mm256_reduce_add_epi16(mut x: std::arch::x86_64::__m256i) -> i16 
     x = _mm256_hadd_epi16(x, x);
     x = _mm256_hadd_epi16(x, x);
     let x = _mm256_cvtsi256_si32(x);
-    (x as i16) + ((x >> 16) as i16)
+    i16::wrapping_add(x as i16, (x >> 16) as i16)
 }
 
 #[inline]
@@ -120,7 +122,7 @@ pub fn emulate_mm_reduce_add_epi16(mut x: std::arch::x86_64::__m128i) -> i16 {
     x = _mm_hadd_epi16(x, x);
     x = _mm_hadd_epi16(x, x);
     let x = _mm_cvtsi128_si32(x);
-    (x as i16) + ((x >> 16) as i16)
+    i16::wrapping_add(x as i16, (x >> 16) as i16)
 }
 
 #[inline]

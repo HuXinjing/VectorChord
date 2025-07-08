@@ -96,7 +96,8 @@ impl<O: Opaque> Page for PostgresPage<O> {
             pgrx::pg_sys::LP_DEAD => unimplemented!(),
             _ => unreachable!(),
         }
-        assert!(offset_of!(PageHeaderData, pd_linp) <= lp_off && lp_off <= size_of::<Self>());
+        assert!(offset_of!(PageHeaderData, pd_linp) <= lp_off);
+        assert!(lp_off <= size_of::<Self>());
         assert!(lp_len <= size_of::<Self>());
         assert!(lp_off + lp_len <= size_of::<Self>());
         unsafe {
@@ -118,7 +119,15 @@ impl<O: Opaque> Page for PostgresPage<O> {
         let iid = unsafe { self.header.pd_linp.as_ptr().add((i - 1) as _).read() };
         let lp_off = iid.lp_off() as usize;
         let lp_len = iid.lp_len() as usize;
-        assert!(offset_of!(PageHeaderData, pd_linp) <= lp_off && lp_off <= size_of::<Self>());
+        match iid.lp_flags() {
+            pgrx::pg_sys::LP_UNUSED => return None,
+            pgrx::pg_sys::LP_NORMAL => (),
+            pgrx::pg_sys::LP_REDIRECT => unimplemented!(),
+            pgrx::pg_sys::LP_DEAD => unimplemented!(),
+            _ => unreachable!(),
+        }
+        assert!(offset_of!(PageHeaderData, pd_linp) <= lp_off);
+        assert!(lp_off <= size_of::<Self>());
         assert!(lp_len <= size_of::<Self>());
         assert!(lp_off + lp_len <= size_of::<Self>());
         unsafe {
@@ -294,9 +303,8 @@ impl<O: Opaque> RelationWrite for PostgresRelation<O> {
         assert!(id != u32::MAX, "no such page");
         unsafe {
             use pgrx::pg_sys::{
-                BUFFER_LOCK_EXCLUSIVE, ForkNumber, GENERIC_XLOG_FULL_IMAGE,
-                GenericXLogRegisterBuffer, GenericXLogStart, LockBuffer, ReadBufferExtended,
-                ReadBufferMode,
+                BUFFER_LOCK_EXCLUSIVE, ForkNumber, GenericXLogRegisterBuffer, GenericXLogStart,
+                LockBuffer, ReadBufferExtended, ReadBufferMode,
             };
             let buf = ReadBufferExtended(
                 self.raw,
@@ -308,8 +316,7 @@ impl<O: Opaque> RelationWrite for PostgresRelation<O> {
             LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE as _);
             let state = GenericXLogStart(self.raw);
             let page = NonNull::new(
-                GenericXLogRegisterBuffer(state, buf, GENERIC_XLOG_FULL_IMAGE as _)
-                    .cast::<MaybeUninit<PostgresPage<O>>>(),
+                GenericXLogRegisterBuffer(state, buf, 0).cast::<MaybeUninit<PostgresPage<O>>>(),
             )
             .expect("failed to get page");
             PostgresBufferWriteGuard {
@@ -462,10 +469,6 @@ pub struct PostgresReadStream<O: Opaque, I: Iterator> {
 pub struct PostgresReadStreamGuards<O, I, L> {
     #[cfg(any(feature = "pg17", feature = "pg18"))]
     raw: *mut pgrx::pg_sys::ReadStream,
-    #[cfg_attr(
-        any(feature = "pg13", feature = "pg14", feature = "pg15", feature = "pg16"),
-        expect(dead_code)
-    )]
     list: L,
     _phantom: PhantomData<fn(O, I) -> (O, I)>,
 }
@@ -498,6 +501,15 @@ where
             })
         }
     }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        self.list.size_hint()
+    }
+}
+
+impl<O: Opaque, I: Iterator, L> ExactSizeIterator for PostgresReadStreamGuards<O, I, L> where
+    L: ExactSizeIterator<Item = u32>
+{
 }
 
 #[cfg(any(feature = "pg17", feature = "pg18"))]

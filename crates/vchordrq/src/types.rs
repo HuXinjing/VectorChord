@@ -95,10 +95,7 @@ pub struct VectorOptions {
 impl VectorOptions {
     pub fn validate_self(&self) -> Result<(), ValidationError> {
         match (self.v, self.d, self.dims) {
-            (VectorKind::Vecf32, DistanceKind::L2S, 1..=60000) => Ok(()),
-            (VectorKind::Vecf32, DistanceKind::Dot, 1..=60000) => Ok(()),
-            (VectorKind::Vecf16, DistanceKind::L2S, 1..=60000) => Ok(()),
-            (VectorKind::Vecf16, DistanceKind::Dot, 1..=60000) => Ok(()),
+            (_, _, 1..=60000) => Ok(()),
             _ => Err(ValidationError::new("invalid vector options")),
         }
     }

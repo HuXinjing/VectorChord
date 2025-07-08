@@ -38,7 +38,7 @@ pub enum PostgresIo {
 
 static VCHORDG_EF_SEARCH: GucSetting<i32> = GucSetting::<i32>::new(64);
 
-static VCHORDG_BEAM_SIZE: GucSetting<i32> = GucSetting::<i32>::new(1);
+static VCHORDG_BEAM_SIZE: GucSetting<i32> = GucSetting::<i32>::new(8);
 
 static VCHORDG_MAX_SCAN_TUPLES: GucSetting<i32> = GucSetting::<i32>::new(-1);
 

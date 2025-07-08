@@ -42,10 +42,10 @@ impl VamanaIndexOptions {
         1.0
     }
     fn default_ef_construction() -> u32 {
-        500
+        64
     }
     fn default_beam_construction() -> u32 {
-        1
+        8
     }
 }
 
@@ -111,8 +111,7 @@ pub struct VectorOptions {
 impl VectorOptions {
     pub fn validate_self(&self) -> Result<(), ValidationError> {
         match (self.v, self.d, self.dims) {
-            (VectorKind::Vecf32, DistanceKind::L2S, 1..=60000) => Ok(()),
-            (VectorKind::Vecf16, DistanceKind::L2S, 1..=60000) => Ok(()),
+            (_, _, 1..=60000) => Ok(()),
             _ => Err(ValidationError::new("invalid vector options")),
         }
     }

@@ -36,13 +36,19 @@ pub enum Opfamily {
 impl Opfamily {
     fn input(self, vector: BorrowedVector<'_>) -> OwnedVector {
         use {BorrowedVector as B, OwnedVector as O};
-        match (vector, self) {
-            (B::Vecf32(x), Self::VectorL2) => O::Vecf32(x.own()),
-            (B::Vecf32(x), Self::VectorCosine) => O::Vecf32(x.function_normalize()),
-            (B::Vecf32(_), _) => unreachable!(),
-            (B::Vecf16(x), Self::HalfvecL2) => O::Vecf16(x.own()),
-            (B::Vecf16(x), Self::HalfvecCosine) => O::Vecf16(x.function_normalize()),
-            (B::Vecf16(_), _) => unreachable!(),
+        match (self, vector) {
+            (Self::VectorL2, B::Vecf32(x)) => O::Vecf32(x.own()),
+            (Self::VectorL2, _) => unreachable!(),
+            (Self::VectorCosine, B::Vecf32(x)) => O::Vecf32(x.function_normalize()),
+            (Self::VectorCosine, _) => unreachable!(),
+            (Self::VectorIp, B::Vecf32(x)) => O::Vecf32(x.own()),
+            (Self::VectorIp, _) => unreachable!(),
+            (Self::HalfvecL2, B::Vecf16(x)) => O::Vecf16(x.own()),
+            (Self::HalfvecL2, _) => unreachable!(),
+            (Self::HalfvecCosine, B::Vecf16(x)) => O::Vecf16(x.function_normalize()),
+            (Self::HalfvecCosine, _) => unreachable!(),
+            (Self::HalfvecIp, B::Vecf16(x)) => O::Vecf16(x.own()),
+            (Self::HalfvecIp, _) => unreachable!(),
         }
     }
     pub unsafe fn store(self, datum: Datum) -> Option<Vec<(OwnedVector, u16)>> {
