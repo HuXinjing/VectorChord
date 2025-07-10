@@ -6,5 +6,8 @@ publish = false
 
 [dependencies]
 clap = { version = "4.5.38", features = ["derive"] }
-object = { version = "0.37.1", features = ["all"] }
+object = { version = "0.37.1", default-features = false, features = [
+    "read",
+    "wasm",
+] }
 target-triple = "0.1.4"

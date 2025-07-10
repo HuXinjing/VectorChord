@@ -12,6 +12,7 @@
 //
 // Copyright (c) 2025 TensorChord Inc.
 
+use crate::types::DistanceKind;
 use algo::accessor::{Accessor1, Accessor2, DistanceAccessor, Dot, L2S};
 use distance::Distance;
 use half::f16;
@@ -118,6 +119,8 @@ impl Vector for VectOwned<f16> {
 }
 
 pub trait Operator: 'static + Debug + Copy {
+    const DISTANCE: DistanceKind;
+
     type Vector: Vector;
 
     type DistanceAccessor: Default
@@ -148,6 +151,8 @@ impl<V, D> Clone for Op<V, D> {
 impl<V, D> Copy for Op<V, D> {}
 
 impl Operator for Op<VectOwned<f32>, L2S> {
+    const DISTANCE: DistanceKind = DistanceKind::L2S;
+
     type Vector = VectOwned<f32>;
 
     type DistanceAccessor = DistanceAccessor<VectOwned<f32>, L2S>;
@@ -169,6 +174,8 @@ impl Operator for Op<VectOwned<f32>, L2S> {
 }
 
 impl Operator for Op<VectOwned<f32>, Dot> {
+    const DISTANCE: DistanceKind = DistanceKind::Dot;
+
     type Vector = VectOwned<f32>;
 
     type DistanceAccessor = DistanceAccessor<VectOwned<f32>, Dot>;
@@ -190,6 +197,8 @@ impl Operator for Op<VectOwned<f32>, Dot> {
 }
 
 impl Operator for Op<VectOwned<f16>, L2S> {
+    const DISTANCE: DistanceKind = DistanceKind::L2S;
+
     type Vector = VectOwned<f16>;
 
     type DistanceAccessor = DistanceAccessor<VectOwned<f16>, L2S>;
@@ -211,6 +220,8 @@ impl Operator for Op<VectOwned<f16>, L2S> {
 }
 
 impl Operator for Op<VectOwned<f16>, Dot> {
+    const DISTANCE: DistanceKind = DistanceKind::Dot;
+
     type Vector = VectOwned<f16>;
 
     type DistanceAccessor = DistanceAccessor<VectOwned<f16>, Dot>;

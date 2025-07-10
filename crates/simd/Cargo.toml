@@ -16,6 +16,7 @@ rand.workspace = true
 
 [build-dependencies]
 cc = "1.2.27"
+which = "8.0.0"
 
 [lints]
 workspace = true

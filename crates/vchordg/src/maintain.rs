@@ -15,6 +15,7 @@
 use crate::Opaque;
 use crate::operator::{CloneAccessor, Operator};
 use crate::tuples::{MetaTuple, VectorTuple, VertexTuple, WithReader};
+use crate::types::DistanceKind;
 use crate::vectors::{by_read, copy_all, copy_nothing, copy_outs, update};
 use algo::{Page, PageGuard, RelationRead, RelationWrite};
 use always_equal::AlwaysEqual;
@@ -29,7 +30,7 @@ where
     let meta_bytes = meta_guard.get(1).expect("data corruption");
     let meta_tuple = MetaTuple::deserialize_ref(meta_bytes);
     let m = meta_tuple.m();
-    let alpha = meta_tuple.alpha();
+    let max_alpha = meta_tuple.max_alpha();
     let start = meta_tuple.start();
     let link = meta_guard.get_opaque().link;
     drop(meta_guard);
@@ -122,13 +123,14 @@ where
                         }
                         trace
                     };
-                    let outs = crate::prune::robust_prune(
+                    let outs = crate::prune::prune(
                         |x, y| O::distance(x.as_borrowed(), y.as_borrowed()),
                         (pointers_u.to_vec(), u),
                         trace.into_iter(),
                         m,
-                        alpha,
+                        max_alpha,
                         |(_, u)| *u,
+                        O::DISTANCE == DistanceKind::L2S,
                     );
                     if update::<R, O>(
                         (index, pointers_u.as_slice()),

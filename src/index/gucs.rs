@@ -38,7 +38,7 @@ pub enum PostgresIo {
 
 static VCHORDG_EF_SEARCH: GucSetting<i32> = GucSetting::<i32>::new(64);
 
-static VCHORDG_BEAM_SIZE: GucSetting<i32> = GucSetting::<i32>::new(8);
+static VCHORDG_BEAM_SEARCH: GucSetting<i32> = GucSetting::<i32>::new(1);
 
 static VCHORDG_MAX_SCAN_TUPLES: GucSetting<i32> = GucSetting::<i32>::new(-1);
 
@@ -175,7 +175,7 @@ pub fn init() {
         c"vchordg.beam_search",
         c"`beam_search` argument of vchordg.",
         c"`beam_search` argument of vchordg.",
-        &VCHORDG_BEAM_SIZE,
+        &VCHORDG_BEAM_SEARCH,
         1,
         65535,
         GucContext::Userset,
@@ -220,7 +220,7 @@ pub fn vchordg_ef_search() -> u32 {
 }
 
 pub fn vchordg_beam_search() -> u32 {
-    VCHORDG_BEAM_SIZE.get() as u32
+    VCHORDG_BEAM_SEARCH.get() as u32
 }
 
 pub fn vchordg_max_scan_tuples() -> Option<u32> {

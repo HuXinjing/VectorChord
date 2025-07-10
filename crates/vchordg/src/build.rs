@@ -54,7 +54,7 @@ pub fn build<R: RelationWrite, O: Operator>(
     let serialized = MetaTuple::serialize(&MetaTuple {
         dims: vector_options.dims,
         m: index_options.m,
-        alpha: index_options.alpha,
+        max_alpha: index_options.max_alpha,
         ef_construction: index_options.ef_construction,
         beam_construction: index_options.beam_construction,
         start: OptionPointer::NONE,

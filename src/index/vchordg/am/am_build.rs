@@ -186,9 +186,6 @@ pub unsafe extern "C-unwind" fn ambuild(
     if let Err(errors) = Validate::validate(&vchordg_options) {
         pgrx::error!("error while validating options: {}", errors);
     }
-    if !matches!(vector_options.d, DistanceKind::L2S) && vchordg_options.index.alpha != 1.0 {
-        pgrx::error!("alpha must be 1 if L2 metric is not used");
-    }
     let opfamily = unsafe { opfamily(index_relation) };
     let index = unsafe { PostgresRelation::new(index_relation) };
     let heap = Heap {

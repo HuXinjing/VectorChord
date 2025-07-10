@@ -17,6 +17,7 @@ use crate::candidates::Candidates;
 use crate::operator::{CloneAccessor, Operator, Vector};
 use crate::results::Results;
 use crate::tuples::*;
+use crate::types::DistanceKind;
 use crate::vectors::{by_prefetch, by_read, copy_all, copy_nothing, copy_outs, update};
 use crate::visited::Visited;
 use algo::accessor::LAccess;
@@ -45,7 +46,7 @@ pub fn insert<'b, R: RelationRead + RelationWrite, O: Operator>(
     assert_eq!(dims, vector.dims(), "unmatched dimensions");
     let start = meta_tuple.start();
     let m = meta_tuple.m();
-    let alpha = meta_tuple.alpha();
+    let max_alpha = meta_tuple.max_alpha();
     let ef = meta_tuple.ef_construction();
     let beam = meta_tuple.beam_construction();
     let skip = meta_tuple.skip();
@@ -214,13 +215,14 @@ pub fn insert<'b, R: RelationRead + RelationWrite, O: Operator>(
             })
             .collect::<Vec<_>>()
     };
-    let outs = crate::prune::robust_prune(
+    let outs = crate::prune::prune(
         |x, y| O::distance(x.as_borrowed(), y.as_borrowed()),
         (bump.alloc_slice(&pointers_t), t),
         trace.into_iter(),
         m,
-        alpha,
+        max_alpha,
         |(_, u)| *u,
+        O::DISTANCE == DistanceKind::L2S,
     );
     let _ = update::<R, O>(
         (index, pointers_t.as_slice()),
@@ -265,13 +267,14 @@ pub fn insert<'b, R: RelationRead + RelationWrite, O: Operator>(
                     Some(((Reverse(dis_u), AlwaysEqual((pointers_u, u))), vector_u))
                 })
                 .collect::<Vec<_>>();
-            let outs = crate::prune::robust_prune(
+            let outs = crate::prune::prune(
                 |x, y| O::distance(x.as_borrowed(), y.as_borrowed()),
                 (pointers_u.to_vec(), u),
                 trace.into_iter(),
                 m,
-                alpha,
+                max_alpha,
                 |(_, u)| *u,
+                O::DISTANCE == DistanceKind::L2S,
             );
             if update::<R, O>(
                 (index, pointers_u),

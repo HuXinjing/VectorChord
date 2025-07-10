@@ -23,9 +23,9 @@ pub struct VamanaIndexOptions {
     #[serde(default = "VamanaIndexOptions::default_m")]
     #[validate(range(min = 1, max = 512))]
     pub m: u32,
-    #[serde(default = "VamanaIndexOptions::default_alpha")]
+    #[serde(default = "VamanaIndexOptions::default_max_alpha")]
     #[validate(range(min = 1.0, max = 2.0))]
-    pub alpha: f32,
+    pub max_alpha: f32,
     #[serde(default = "VamanaIndexOptions::default_ef_construction")]
     #[validate(range(min = 1, max = 65535))]
     pub ef_construction: u32,
@@ -38,14 +38,14 @@ impl VamanaIndexOptions {
     fn default_m() -> u32 {
         32
     }
-    fn default_alpha() -> f32 {
-        1.0
+    fn default_max_alpha() -> f32 {
+        1.2
     }
     fn default_ef_construction() -> u32 {
         64
     }
     fn default_beam_construction() -> u32 {
-        8
+        1
     }
 }
 
@@ -53,7 +53,7 @@ impl Default for VamanaIndexOptions {
     fn default() -> Self {
         Self {
             m: Self::default_m(),
-            alpha: Self::default_alpha(),
+            max_alpha: Self::default_max_alpha(),
             ef_construction: Self::default_ef_construction(),
             beam_construction: Self::default_beam_construction(),
         }

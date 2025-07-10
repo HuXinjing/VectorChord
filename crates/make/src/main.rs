@@ -13,7 +13,7 @@
 // Copyright (c) 2025 TensorChord Inc.
 
 use clap::{Args, Parser, Subcommand};
-use object::Object;
+use object::{Object, ObjectSymbol};
 use std::collections::{HashMap, HashSet};
 use std::env::var_os;
 use std::error::Error;
@@ -40,6 +40,68 @@ struct BuildArgs {
     profile: String,
     #[arg(long, default_value = target_triple::TARGET)]
     target: String,
+}
+
+struct TargetSpecificInformation {
+    is_macos: bool,
+    is_windows: bool,
+    is_emscripten: bool,
+    is_unix: bool,
+}
+
+impl TargetSpecificInformation {
+    fn dll_prefix(&self) -> Result<&'static str, Box<dyn Error>> {
+        if self.is_macos {
+            Ok("lib")
+        } else if self.is_windows || self.is_emscripten {
+            Ok("")
+        } else if self.is_unix {
+            Ok("lib")
+        } else {
+            Err("unknown operating system".into())
+        }
+    }
+    fn dll_suffix(&self) -> Result<&'static str, Box<dyn Error>> {
+        if self.is_macos {
+            Ok(".dylib")
+        } else if self.is_windows {
+            Ok(".dll")
+        } else if self.is_emscripten {
+            Ok(".wasm")
+        } else if self.is_unix {
+            Ok(".so")
+        } else {
+            Err("unknown operating system".into())
+        }
+    }
+    fn exe_suffix(&self) -> Result<&'static str, Box<dyn Error>> {
+        if self.is_macos {
+            Ok("")
+        } else if self.is_windows {
+            Ok(".exe")
+        } else if self.is_emscripten {
+            Ok(".js")
+        } else if self.is_unix {
+            Ok("")
+        } else {
+            Err("unknown operating system".into())
+        }
+    }
+    fn ext_suffix(&self, fork: &str) -> Result<&'static str, Box<dyn Error>> {
+        if self.is_macos {
+            Ok(if matches!(fork, "pg13" | "pg14" | "pg15") {
+                ".so"
+            } else {
+                ".dylib"
+            })
+        } else if self.is_windows {
+            Ok(".dll")
+        } else if self.is_emscripten || self.is_unix {
+            Ok(".so")
+        } else {
+            Err("unknown operating system".into())
+        }
+    }
 }
 
 fn pg_config(pg_config: impl AsRef<Path>) -> Result<HashMap<String, String>, Box<dyn Error>> {
@@ -72,7 +134,7 @@ fn control_file(path: impl AsRef<Path>) -> Result<HashMap<String, String>, Box<d
     Ok(result)
 }
 
-fn cfgs(target: &str) -> Result<HashSet<String>, Box<dyn Error>> {
+fn target_specific_information(target: &str) -> Result<TargetSpecificInformation, Box<dyn Error>> {
     let mut command = Command::new("rustc");
     command
         .args(["--print", "cfg"])
@@ -81,17 +143,22 @@ fn cfgs(target: &str) -> Result<HashSet<String>, Box<dyn Error>> {
     eprintln!("Running {command:?}");
     let command_output = command.output()?;
     let contents = String::from_utf8(command_output.stdout)?;
-    let mut result = HashSet::new();
+    let mut cfgs = HashSet::new();
     for line in contents.lines() {
-        result.insert(line.to_string());
+        cfgs.insert(line.to_string());
     }
-    Ok(result)
+    Ok(TargetSpecificInformation {
+        is_macos: cfgs.contains("target_os=\"macos\""),
+        is_unix: cfgs.contains("target_family=\"unix\""),
+        is_emscripten: cfgs.contains("target_os=\"emscripten\""),
+        is_windows: cfgs.contains("target_os=\"windows\""),
+    })
 }
 
 fn build(
     pg_config: impl AsRef<Path>,
     pg_version: &str,
-    cfgs: &HashSet<String>,
+    tsi: &TargetSpecificInformation,
     profile: &str,
     target: &str,
 ) -> Result<PathBuf, Box<dyn Error>> {
@@ -112,44 +179,23 @@ fn build(
     let mut result = PathBuf::from("./target");
     result.push(target);
     result.push(if profile != "dev" { profile } else { "debug" });
-    let is_unix = cfgs.contains("target_family=\"unix\"");
-    let is_macos = cfgs.contains("target_os=\"macos\"");
-    let is_windows = cfgs.contains("target_family=\"windows\"");
-    let is_wasm = cfgs.contains("target_family=\"wasm\"");
-    let prefix = if is_unix {
-        "lib"
-    } else if is_windows || is_wasm {
-        ""
-    } else {
-        return Err("unknown operating system".into());
-    };
-    let suffix = if is_unix && !is_macos {
-        ".so"
-    } else if is_macos {
-        ".dylib"
-    } else if is_windows {
-        ".dll"
-    } else if is_wasm {
-        ".wasm"
-    } else {
-        return Err("unknown operating system".into());
-    };
-    result.push(format!("{prefix}vchord{suffix}"));
+    result.push(format!("{}vchord{}", tsi.dll_prefix()?, tsi.dll_suffix()?));
     Ok(result)
 }
 
-fn parse(cfgs: &HashSet<String>, obj: impl AsRef<Path>) -> Result<Vec<String>, Box<dyn Error>> {
+fn parse(
+    tsi: &TargetSpecificInformation,
+    obj: impl AsRef<Path>,
+) -> Result<Vec<String>, Box<dyn Error>> {
     let obj = obj.as_ref();
     eprintln!("Reading {obj:?}");
     let contents = std::fs::read(obj)?;
     let object = object::File::parse(contents.as_slice())?;
-    let is_macos = cfgs.contains("target_os=\"macos\"");
     let exports = object
-        .exports()?
-        .into_iter()
-        .flat_map(|x| str::from_utf8(x.name()))
+        .symbols()
+        .flat_map(|x| x.name().ok())
         .flat_map(|x| {
-            if !is_macos {
+            if !tsi.is_macos {
                 Some(x)
             } else {
                 x.strip_prefix("_")
@@ -164,6 +210,7 @@ fn parse(cfgs: &HashSet<String>, obj: impl AsRef<Path>) -> Result<Vec<String>, B
 fn generate(
     pg_config: impl AsRef<Path>,
     pg_version: &str,
+    tsi: &TargetSpecificInformation,
     profile: &str,
     target: &str,
     exports: Vec<String>,
@@ -193,8 +240,14 @@ fn generate(
     let mut result = PathBuf::from("./target");
     result.push(target);
     result.push(if profile != "dev" { profile } else { "debug" });
-    result.push("pgrx_embed_vchord");
-    let mut command = Command::new(result);
+    result.push(format!("pgrx_embed_vchord{}", tsi.exe_suffix()?));
+    let mut command;
+    if !(tsi.is_unix && tsi.is_emscripten) {
+        command = Command::new(result);
+    } else {
+        command = Command::new("node");
+        command.arg(result);
+    }
     command.stderr(Stdio::inherit());
     eprintln!("Running {command:?}");
     let command_output = command.output()?;
@@ -207,6 +260,7 @@ fn install_by_copying(
     dst: impl AsRef<Path>,
     #[cfg_attr(not(target_family = "unix"), expect(unused_variables))] is_executable: bool,
 ) -> Result<(), Box<dyn Error>> {
+    eprintln!("Copying {:?} to {:?}", src.as_ref(), dst.as_ref());
     std::fs::copy(src, &dst)?;
     #[cfg(target_family = "unix")]
     {
@@ -223,6 +277,7 @@ fn install_by_writing(
     dst: impl AsRef<Path>,
     #[cfg_attr(not(target_family = "unix"), expect(unused_variables))] is_executable: bool,
 ) -> Result<(), Box<dyn Error>> {
+    eprintln!("Writing {:?}", dst.as_ref());
     std::fs::write(&dst, contents)?;
     #[cfg(target_family = "unix")]
     {
@@ -236,11 +291,10 @@ fn install_by_writing(
 
 fn main() -> Result<(), Box<dyn Error>> {
     let cli = Cli::parse();
-    if !std::fs::exists("vchord.control")? {
+    if !std::fs::exists("./vchord.control")? {
         return Err("The script must be run from the VectorChord source directory.".into());
     }
     let path = if let Some(value) = var_os("PGRX_PG_CONFIG_PATH") {
-        eprintln!("Environment variable `PGRX_PG_CONFIG_PATH`: {value:#?}");
         PathBuf::from(value)
     } else {
         return Err("Environment variable `PGRX_PG_CONFIG_PATH` is not set.".into());
@@ -265,8 +319,8 @@ fn main() -> Result<(), Box<dyn Error>> {
             profile,
             target,
         }) => {
-            let cfgs = cfgs(&target)?;
-            let obj = build(&path, &pg_version, &cfgs, &profile, &target)?;
+            let tsi = target_specific_information(&target)?;
+            let obj = build(&path, &pg_version, &tsi, &profile, &target)?;
             let pkglibdir = format!("{output}/pkglibdir");
             let sharedir = format!("{output}/sharedir");
             let sharedir_extension = format!("{sharedir}/extension");
@@ -277,26 +331,13 @@ fn main() -> Result<(), Box<dyn Error>> {
             std::fs::create_dir_all(&pkglibdir)?;
             std::fs::create_dir_all(&sharedir)?;
             std::fs::create_dir_all(&sharedir_extension)?;
-            let is_unix = cfgs.contains("target_family=\"unix\"");
-            let is_macos = cfgs.contains("target_os=\"macos\"");
-            let is_windows = cfgs.contains("target_family=\"windows\"");
-            let is_wasm = cfgs.contains("target_family=\"wasm\"");
-            let suffix = if is_unix
-                && (!is_macos || matches!(pg_version.as_str(), "pg13" | "pg14" | "pg15"))
-            {
-                ".so"
-            } else if is_macos {
-                ".dylib"
-            } else if is_windows {
-                ".dll"
-            } else if is_wasm {
-                ".wasm"
-            } else {
-                return Err("unknown operating system".into());
-            };
-            install_by_copying(&obj, format!("{pkglibdir}/vchord{suffix}"), true)?;
             install_by_copying(
-                "vchord.control",
+                &obj,
+                format!("{pkglibdir}/vchord{}", tsi.ext_suffix(&pg_version)?),
+                true,
+            )?;
+            install_by_copying(
+                "./vchord.control",
                 format!("{sharedir}/extension/vchord.control"),
                 false,
             )?;
@@ -314,9 +355,9 @@ fn main() -> Result<(), Box<dyn Error>> {
                     false,
                 )?;
             } else {
-                let exports = parse(&cfgs, obj)?;
+                let exports = parse(&tsi, obj)?;
                 install_by_writing(
-                    generate(&path, &pg_version, &profile, &target, exports)?,
+                    generate(&path, &pg_version, &tsi, &profile, &target, exports)?,
                     format!("{sharedir_extension}/vchord--0.0.0.sql"),
                     false,
                 )?;

@@ -43,7 +43,7 @@ struct MetaTupleHeader {
     version: u64,
     dims: u32,
     m: u32,
-    alpha: f32,
+    max_alpha: f32,
     ef_construction: u32,
     beam_construction: u32,
     start: OptionPointer,
@@ -53,7 +53,7 @@ struct MetaTupleHeader {
 pub struct MetaTuple {
     pub dims: u32,
     pub m: u32,
-    pub alpha: f32,
+    pub max_alpha: f32,
     pub ef_construction: u32,
     pub beam_construction: u32,
     pub start: OptionPointer,
@@ -68,7 +68,7 @@ impl Tuple for MetaTuple {
             MetaTuple {
                 dims,
                 m,
-                alpha,
+                max_alpha,
                 ef_construction,
                 beam_construction,
                 start,
@@ -82,7 +82,7 @@ impl Tuple for MetaTuple {
                         version: VERSION,
                         dims: *dims,
                         m: *m,
-                        alpha: *alpha,
+                        max_alpha: *max_alpha,
                         ef_construction: *ef_construction,
                         beam_construction: *beam_construction,
                         start: *start,
@@ -126,8 +126,8 @@ impl<'a> MetaTupleReader<'a> {
     pub fn m(self) -> u32 {
         self.header.m
     }
-    pub fn alpha(self) -> f32 {
-        self.header.alpha
+    pub fn max_alpha(self) -> f32 {
+        self.header.max_alpha
     }
     pub fn ef_construction(self) -> u32 {
         self.header.ef_construction
