@@ -150,7 +150,10 @@ pub unsafe fn opfamily(index_relation: pgrx::pg_sys::Relation) -> Opfamily {
     fcinfo.isnull = true;
     fcinfo.nargs = 0;
 
-    let result_datum = unsafe { pgrx::pg_sys::ffi::pg_guard_ffi_boundary(|| fn_addr(&mut fcinfo)) };
+    let result_datum = unsafe {
+        #[allow(ffi_unwind_calls, reason = "protected by pg_guard_ffi_boundary")]
+        pgrx::pg_sys::ffi::pg_guard_ffi_boundary(|| fn_addr(&mut fcinfo))
+    };
 
     let result_option = unsafe { String::from_datum(result_datum, fcinfo.isnull) };
 

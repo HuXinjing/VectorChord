@@ -96,12 +96,16 @@ impl Fetcher for HeapFetcher {
 
     fn fetch(&mut self, key: [u16; 3]) -> Option<Self::Tuple<'_>> {
         unsafe {
+            use pgrx::pg_sys::ffi::pg_guard_ffi_boundary;
             let mut ctid = key_to_ctid(key);
             let table_am = (*self.heap_relation).rd_tableam;
             let fetch_row_version = (*table_am)
                 .tuple_fetch_row_version
                 .expect("unsupported heap access method");
-            if !fetch_row_version(self.heap_relation, &mut ctid, self.snapshot, self.slot) {
+            #[allow(ffi_unwind_calls, reason = "protected by pg_guard_ffi_boundary")]
+            if pg_guard_ffi_boundary(|| {
+                !fetch_row_version(self.heap_relation, &mut ctid, self.snapshot, self.slot)
+            }) {
                 return None;
             }
             Some(HeapTuple { this: self })
@@ -133,6 +137,7 @@ impl Tuple for HeapTuple<'_> {
     #[allow(clippy::collapsible_if)]
     fn filter(&mut self) -> bool {
         unsafe {
+            use pgrx::pg_sys::ffi::pg_guard_ffi_boundary;
             let this = &mut self.this;
             if !this.hack.is_null() {
                 if let Some(qual) = NonNull::new((*this.hack).ss.ps.qual) {
@@ -147,7 +152,13 @@ impl Tuple for HeapTuple<'_> {
                         let result = PgMemoryContexts::For((*econtext).ecxt_per_tuple_memory)
                             .switch_to(|_| {
                                 let mut is_null = true;
-                                let datum = evalfunc(qual.as_ptr(), econtext, &mut is_null);
+                                #[allow(
+                                    ffi_unwind_calls,
+                                    reason = "protected by pg_guard_ffi_boundary"
+                                )]
+                                let datum = pg_guard_ffi_boundary(|| {
+                                    evalfunc(qual.as_ptr(), econtext, &mut is_null)
+                                });
                                 bool::from_datum(datum, is_null)
                             });
                         if result != Some(true) {

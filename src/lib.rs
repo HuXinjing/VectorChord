@@ -14,6 +14,7 @@
 
 #![allow(unsafe_code)]
 #![allow(unused_crate_dependencies)]
+#![warn(ffi_unwind_calls)]
 
 mod datatype;
 mod index;
@@ -50,6 +51,7 @@ unsafe extern "C-unwind" fn _pg_init() {
     if !unsafe { pgrx::pg_sys::process_shared_preload_libraries_in_progress } {
         pgrx::error!("vchord must be loaded via shared_preload_libraries.");
     }
+    IS_MAIN.set(true);
     index::init();
     unsafe {
         #[cfg(any(feature = "pg13", feature = "pg14"))]
@@ -57,6 +59,15 @@ unsafe extern "C-unwind" fn _pg_init() {
         #[cfg(any(feature = "pg15", feature = "pg16", feature = "pg17", feature = "pg18"))]
         pgrx::pg_sys::MarkGUCPrefixReserved(c"vchord".as_ptr());
     }
+}
+
+std::thread_local! {
+    static IS_MAIN: core::cell::Cell<bool> = const { core::cell::Cell::new(false) };
+}
+
+#[must_use]
+fn is_main() -> bool {
+    IS_MAIN.get()
 }
 
 #[cfg(not(panic = "unwind"))]

@@ -12,8 +12,6 @@
 //
 // Copyright (c) 2025 TensorChord Inc.
 
-use std::sync::atomic::AtomicPtr;
-
 #[pgrx::pg_guard]
 unsafe extern "C-unwind" fn rewrite_plan_state(
     node: *mut pgrx::pg_sys::PlanState,
@@ -118,55 +116,30 @@ unsafe extern "C-unwind" fn rewrite_plan_state(
     }
 }
 
-static PREV_EXECUTOR_START: AtomicPtr<()> = AtomicPtr::new(core::ptr::null_mut());
-
-#[cfg(any(
-    feature = "pg13",
-    feature = "pg14",
-    feature = "pg15",
-    feature = "pg16",
-    feature = "pg17"
-))]
-type ExecutorStartReturnType = ();
-
-#[cfg(feature = "pg18")]
-type ExecutorStartReturnType = bool;
+static mut PREV_EXECUTOR_START: pgrx::pg_sys::ExecutorStart_hook_type = None;
 
 #[pgrx::pg_guard]
 unsafe extern "C-unwind" fn executor_start(
     query_desc: *mut pgrx::pg_sys::QueryDesc,
-    eflags: ::std::os::raw::c_int,
-) -> ExecutorStartReturnType {
+    eflags: core::ffi::c_int,
+) {
     unsafe {
-        use core::mem::transmute;
-        use pgrx::pg_sys::ExecutorStart_hook_type;
-        use std::sync::atomic::Ordering;
-        let value = transmute::<*mut (), ExecutorStart_hook_type>(
-            PREV_EXECUTOR_START.load(Ordering::Relaxed),
-        );
-        #[allow(clippy::let_unit_value)]
-        let result = if let Some(prev_executor_start) = value {
-            prev_executor_start(query_desc, eflags)
+        use core::ptr::null_mut;
+        use pgrx::pg_sys::submodules::ffi::pg_guard_ffi_boundary;
+        if let Some(prev_executor_start) = PREV_EXECUTOR_START {
+            #[allow(ffi_unwind_calls, reason = "protected by pg_guard_ffi_boundary")]
+            pg_guard_ffi_boundary(|| prev_executor_start(query_desc, eflags))
         } else {
             pgrx::pg_sys::standard_ExecutorStart(query_desc, eflags)
-        };
-        let planstate = (*query_desc).planstate;
-        let context = core::ptr::null_mut();
-        rewrite_plan_state(planstate, context);
-        result
+        }
+        pg_guard_ffi_boundary(|| rewrite_plan_state((*query_desc).planstate, null_mut()));
     }
 }
 
 pub fn init() {
+    assert!(crate::is_main());
     unsafe {
-        use core::mem::transmute;
-        use std::sync::atomic::Ordering;
-        PREV_EXECUTOR_START.store(
-            transmute::<Option<unsafe extern "C-unwind" fn(*mut _, _) -> _>, *mut ()>(
-                pgrx::pg_sys::ExecutorStart_hook,
-            ),
-            Ordering::Relaxed,
-        );
+        PREV_EXECUTOR_START = pgrx::pg_sys::ExecutorStart_hook;
         pgrx::pg_sys::ExecutorStart_hook = Some(executor_start);
     }
 }

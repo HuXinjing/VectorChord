@@ -320,6 +320,7 @@ pub unsafe extern "C-unwind" fn ambulkdelete(
     callback: pgrx::pg_sys::IndexBulkDeleteCallback,
     callback_state: *mut std::os::raw::c_void,
 ) -> *mut pgrx::pg_sys::IndexBulkDeleteResult {
+    use pgrx::pg_sys::ffi::pg_guard_ffi_boundary;
     let mut stats = stats;
     if stats.is_null() {
         stats = unsafe {
@@ -344,7 +345,10 @@ pub unsafe extern "C-unwind" fn ambulkdelete(
     let callback = |pointer: NonZero<u64>| {
         let (key, _) = pointer_to_kv(pointer);
         let mut ctid = key_to_ctid(key);
-        unsafe { callback(&mut ctid, callback_state) }
+        #[allow(ffi_unwind_calls, reason = "protected by pg_guard_ffi_boundary")]
+        unsafe {
+            pg_guard_ffi_boundary(|| callback(&mut ctid, callback_state))
+        }
     };
     crate::index::vchordrq::algo::bulkdelete(opfamily, &index, check, callback);
     stats

@@ -96,6 +96,7 @@ impl Heap {
         progress: bool,
         callback: F,
     ) {
+        use pgrx::pg_sys::ffi::pg_guard_ffi_boundary;
         pub struct State<'a, F> {
             pub this: &'a Heap,
             pub callback: F,
@@ -124,20 +125,24 @@ impl Heap {
             this: self,
             callback,
         };
+        let index_build_range_scan = table_am.index_build_range_scan.expect("bad table");
         unsafe {
-            table_am.index_build_range_scan.unwrap()(
-                self.heap_relation,
-                self.index_relation,
-                self.index_info,
-                true,
-                false,
-                progress,
-                0,
-                pgrx::pg_sys::InvalidBlockNumber,
-                Some(call::<F>),
-                (&mut state) as *mut State<F> as *mut _,
-                self.scan,
-            );
+            #[allow(ffi_unwind_calls, reason = "protected by pg_guard_ffi_boundary")]
+            pg_guard_ffi_boundary(|| {
+                index_build_range_scan(
+                    self.heap_relation,
+                    self.index_relation,
+                    self.index_info,
+                    true,
+                    false,
+                    progress,
+                    0,
+                    pgrx::pg_sys::InvalidBlockNumber,
+                    Some(call::<F>),
+                    (&mut state) as *mut State<F> as *mut _,
+                    self.scan,
+                )
+            });
         }
     }
 }
