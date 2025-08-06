@@ -105,12 +105,9 @@ pub fn insert<'r, 'b: 'r, R: RelationRead + RelationWrite, O: Operator>(
         let mut results = LinkedVec::<(_, AlwaysEqual<Extra<'b>>)>::new();
         {
             let (Reverse(dis_f), AlwaysEqual(norm), AlwaysEqual(first)) = state;
-            let process = |value, code, delta, lut| {
-                O::block_process(value, code, lut, is_residual, dis_f.to_f32(), delta, norm)
-            };
             tape::read_h1_tape::<R, _, _>(
                 by_next(index, first),
-                || O::block_access(&lut.0, process),
+                || O::block_access(&lut.0, is_residual, dis_f.to_f32(), norm),
                 |(rough, err), head, norm, first, prefetch| {
                     let lowerbound = Distance::from_f32(rough - err * epsilon);
                     results.push((

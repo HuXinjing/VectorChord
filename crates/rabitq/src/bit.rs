@@ -25,6 +25,7 @@ pub struct CodeMetadata {
 }
 
 impl CodeMetadata {
+    #[inline(always)]
     pub fn into_tuple(self) -> (f32, f32, f32, f32) {
         (
             self.dis_u_2,
@@ -33,6 +34,7 @@ impl CodeMetadata {
             self.factor_err,
         )
     }
+    #[inline(always)]
     pub fn into_array(self) -> [f32; 4] {
         [
             self.dis_u_2,
@@ -41,6 +43,7 @@ impl CodeMetadata {
             self.factor_err,
         ]
     }
+    #[inline(always)]
     pub fn from_tuple((dis_u_2, factor_cnt, factor_ip, factor_err): (f32, f32, f32, f32)) -> Self {
         Self {
             dis_u_2,
@@ -49,6 +52,7 @@ impl CodeMetadata {
             factor_err,
         }
     }
+    #[inline(always)]
     pub fn from_array([dis_u_2, factor_cnt, factor_ip, factor_err]: [f32; 4]) -> Self {
         Self {
             dis_u_2,
@@ -140,6 +144,7 @@ pub mod binary {
     pub type BinaryLut = (BinaryLutMetadata, [Vec<u64>; BITS]);
     pub type BinaryCode<'a> = ((f32, f32, f32, f32), &'a [u64]);
 
+    #[inline(always)]
     pub fn preprocess(vector: &[f32]) -> BinaryLut {
         let dis_v_2 = f32::reduce_sum_of_x2(vector);
         preprocess_with_distance(vector, dis_v_2)
@@ -163,6 +168,7 @@ pub mod binary {
         )
     }
 
+    #[inline(always)]
     pub fn accumulate(x: &[u64], y: &[impl AsRef<[u64]>; BITS]) -> u32 {
         let mut result = 0_u32;
         for i in 0..BITS {
@@ -171,6 +177,7 @@ pub mod binary {
         result
     }
 
+    #[inline(always)]
     pub fn half_process_l2(
         sum: u32,
         CodeMetadata {
@@ -192,6 +199,7 @@ pub mod binary {
         (rough, err)
     }
 
+    #[inline(always)]
     pub fn half_process_l2_residual(
         sum: u32,
         CodeMetadata {
@@ -215,6 +223,7 @@ pub mod binary {
         (rough, err)
     }
 
+    #[inline(always)]
     pub fn half_process_dot(
         sum: u32,
         CodeMetadata {
@@ -236,6 +245,7 @@ pub mod binary {
         (rough, err)
     }
 
+    #[inline(always)]
     pub fn half_process_dot_residual(
         sum: u32,
         CodeMetadata {
@@ -260,6 +270,7 @@ pub mod binary {
         (rough, err)
     }
 
+    #[inline(always)]
     pub(crate) fn binarize(vector: &[u8]) -> [Vec<u64>; BITS] {
         let n = vector.len();
         let mut t: [_; BITS] = std::array::from_fn(|_| vec![0_u64; n.div_ceil(64)]);
@@ -296,6 +307,7 @@ pub mod block {
         &'a [[u8; 16]],
     );
 
+    #[inline(always)]
     pub fn preprocess(vector: &[f32]) -> BlockLut {
         let dis_v_2 = f32::reduce_sum_of_x2(vector);
         preprocess_with_distance(vector, dis_v_2)
@@ -315,6 +327,7 @@ pub mod block {
         )
     }
 
+    #[inline(always)]
     pub fn full_process_l2(
         (dis_u_2, _, factor_ip, factor_err, t): BlockCode<'_>,
         lut: &BlockLut,
@@ -334,6 +347,7 @@ pub mod block {
         })
     }
 
+    #[inline(always)]
     pub fn full_process_dot(
         (_, _, factor_ip, factor_err, t): BlockCode<'_>,
         lut: &BlockLut,
@@ -353,6 +367,7 @@ pub mod block {
         })
     }
 
+    #[inline(always)]
     pub fn half_process_l2(
         sum: u32,
         CodeMetadata {
@@ -369,6 +384,7 @@ pub mod block {
         (rough, err)
     }
 
+    #[inline(always)]
     pub fn half_process_l2_residual(
         sum: u32,
         CodeMetadata {
@@ -387,6 +403,7 @@ pub mod block {
         (rough, err)
     }
 
+    #[inline(always)]
     pub fn half_process_dot(
         sum: u32,
         CodeMetadata {
@@ -403,6 +420,7 @@ pub mod block {
         (rough, err)
     }
 
+    #[inline(always)]
     pub fn half_process_dot_residual(
         sum: u32,
         CodeMetadata {

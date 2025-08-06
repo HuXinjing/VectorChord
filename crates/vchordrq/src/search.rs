@@ -85,12 +85,9 @@ where
     let mut step = |state: State| {
         let mut results = LinkedVec::new();
         for (Reverse(dis_f), AlwaysEqual(norm), AlwaysEqual(first)) in state {
-            let process = |value, code, delta, lut| {
-                O::block_process(value, code, lut, is_residual, dis_f.to_f32(), delta, norm)
-            };
             tape::read_h1_tape::<R, _, _>(
                 by_next(index, first),
-                || O::block_access(&lut.0, process),
+                || O::block_access(&lut.0, is_residual, dis_f.to_f32(), norm),
                 |(rough, err), head, norm, first, prefetch| {
                     let lowerbound = Distance::from_f32(rough - err * epsilon);
                     results.push((
@@ -123,12 +120,6 @@ where
 
     let mut results = LinkedVec::new();
     for (Reverse(dis_f), AlwaysEqual(norm), AlwaysEqual(first)) in state {
-        let block_process = |value, code, delta, lut| {
-            O::block_process(value, code, lut, is_residual, dis_f.to_f32(), delta, norm)
-        };
-        let binary_process = |value, code, delta, lut| {
-            O::binary_process(value, code, lut, is_residual, dis_f.to_f32(), delta, norm)
-        };
         let jump_guard = index.read(first);
         let jump_bytes = jump_guard.get(1).expect("data corruption");
         let jump_tuple = JumpTuple::deserialize_ref(jump_bytes);
@@ -144,19 +135,19 @@ where
                 tape::read_directory_tape::<R>(by_next(index, jump_tuple.directory_first()));
             tape::read_frozen_tape::<R, _, _>(
                 by_directory(&mut prefetch_h0_tuples, directory),
-                || O::block_access(&lut.0, block_process),
+                || O::block_access(&lut.0, is_residual, dis_f.to_f32(), norm),
                 &mut callback,
             );
         } else {
             tape::read_frozen_tape::<R, _, _>(
                 by_next(index, jump_tuple.frozen_first()),
-                || O::block_access(&lut.0, block_process),
+                || O::block_access(&lut.0, is_residual, dis_f.to_f32(), norm),
                 &mut callback,
             );
         }
         tape::read_appendable_tape::<R, _>(
             by_next(index, jump_tuple.appendable_first()),
-            O::binary_access(&lut.1, binary_process),
+            O::binary_access(&lut.1, is_residual, dis_f.to_f32(), norm),
             &mut callback,
         );
     }
@@ -225,12 +216,9 @@ where
     let mut step = |state: State| {
         let mut results = LinkedVec::new();
         for (Reverse(dis_f), AlwaysEqual(norm), AlwaysEqual(first)) in state {
-            let process = |value, code, delta, lut| {
-                O::block_process(value, code, lut, is_residual, dis_f.to_f32(), delta, norm)
-            };
             tape::read_h1_tape::<R, _, _>(
                 by_next(index, first),
-                || O::block_access(&lut.0, process),
+                || O::block_access(&lut.0, is_residual, dis_f.to_f32(), norm),
                 |(rough, err), head, norm, first, prefetch| {
                     let lowerbound = Distance::from_f32(rough - err * epsilon);
                     results.push((
@@ -265,12 +253,6 @@ where
 
     let mut results = LinkedVec::new();
     for (Reverse(dis_f), AlwaysEqual(norm), AlwaysEqual(first)) in state {
-        let block_process = |value, code, delta, lut| {
-            O::block_process(value, code, lut, is_residual, dis_f.to_f32(), delta, norm)
-        };
-        let binary_process = |value, code, delta, lut| {
-            O::binary_process(value, code, lut, is_residual, dis_f.to_f32(), delta, norm)
-        };
         let jump_guard = index.read(first);
         let jump_bytes = jump_guard.get(1).expect("data corruption");
         let jump_tuple = JumpTuple::deserialize_ref(jump_bytes);
@@ -287,19 +269,19 @@ where
                 tape::read_directory_tape::<R>(by_next(index, jump_tuple.directory_first()));
             tape::read_frozen_tape::<R, _, _>(
                 by_directory(&mut prefetch_h0_tuples, directory),
-                || O::block_access(&lut.0, block_process),
+                || O::block_access(&lut.0, is_residual, dis_f.to_f32(), norm),
                 &mut callback,
             );
         } else {
             tape::read_frozen_tape::<R, _, _>(
                 by_next(index, jump_tuple.frozen_first()),
-                || O::block_access(&lut.0, block_process),
+                || O::block_access(&lut.0, is_residual, dis_f.to_f32(), norm),
                 &mut callback,
             );
         }
         tape::read_appendable_tape::<R, _>(
             by_next(index, jump_tuple.appendable_first()),
-            O::binary_access(&lut.1, binary_process),
+            O::binary_access(&lut.1, is_residual, dis_f.to_f32(), norm),
             &mut callback,
         );
         threshold = threshold.saturating_sub(jump_tuple.tuples().min(u32::MAX as _) as _);
