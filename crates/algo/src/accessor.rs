@@ -130,6 +130,7 @@ pub struct FunctionalAccessor<T, P, F> {
 }
 
 impl<T, P, F> FunctionalAccessor<T, P, F> {
+    #[inline(always)]
     pub fn new(data: T, p: P, f: F) -> Self {
         Self { data, p, f }
     }

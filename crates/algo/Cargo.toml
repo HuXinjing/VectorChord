@@ -7,6 +7,7 @@ publish = false
 [dependencies]
 always_equal = { path = "../always_equal" }
 distance = { path = "../distance" }
+sbsii = { path = "../sbsii" }
 simd = { path = "../simd" }
 vector = { path = "../vector" }
 

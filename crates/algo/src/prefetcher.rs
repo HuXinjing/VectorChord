@@ -44,6 +44,7 @@ pub struct PlainPrefetcher<'r, R, S: Sequence> {
 }
 
 impl<'r, R, S: Sequence> PlainPrefetcher<'r, R, S> {
+    #[inline]
     pub fn new(relation: &'r R, sequence: S) -> Self {
         Self { relation, sequence }
     }
@@ -54,6 +55,7 @@ impl<'r, R, S: Sequence> IntoIterator for PlainPrefetcher<'r, R, S> {
 
     type IntoIter = S::Inner;
 
+    #[inline]
     fn into_iter(self) -> Self::IntoIter {
         self.sequence.into_inner()
     }
@@ -66,9 +68,10 @@ where
     type R = R;
     type Guards = PlainPrefetcherGuards<'r, R>;
 
+    #[inline]
     fn next(&mut self) -> Option<(Self::Item, PlainPrefetcherGuards<'r, R>)> {
         let e = self.sequence.next()?;
-        let list = e.fetch().into_iter();
+        let list = e.fetch();
         Some((
             e,
             PlainPrefetcherGuards {
@@ -78,6 +81,7 @@ where
         ))
     }
 
+    #[inline]
     fn next_if(
         &mut self,
         predicate: impl FnOnce(&Self::Item) -> bool,
@@ -86,7 +90,7 @@ where
             return None;
         }
         let e = self.sequence.next()?;
-        let list = e.fetch().into_iter();
+        let list = e.fetch();
         Some((
             e,
             PlainPrefetcherGuards {
@@ -99,17 +103,19 @@ where
 
 pub struct PlainPrefetcherGuards<'r, R> {
     relation: &'r R,
-    list: std::vec::IntoIter<u32>,
+    list: crate::OwnedIter,
 }
 
 impl<'r, R: RelationRead> Iterator for PlainPrefetcherGuards<'r, R> {
     type Item = R::ReadGuard<'r>;
 
+    #[inline]
     fn next(&mut self) -> Option<Self::Item> {
         let id = self.list.next()?;
         Some(self.relation.read(id))
     }
 
+    #[inline]
     fn size_hint(&self) -> (usize, Option<usize>) {
         self.list.size_hint()
     }
@@ -124,6 +130,7 @@ pub struct SimplePrefetcher<'r, R, S: Sequence> {
 }
 
 impl<'r, R, S: Sequence> SimplePrefetcher<'r, R, S> {
+    #[inline]
     pub fn new(relation: &'r R, sequence: S) -> Self {
         Self {
             relation,
@@ -138,6 +145,7 @@ impl<'r, R, S: Sequence> IntoIterator for SimplePrefetcher<'r, R, S> {
 
     type IntoIter = Chain<vec_deque::IntoIter<S::Item>, S::Inner>;
 
+    #[inline]
     fn into_iter(self) -> Self::IntoIter {
         self.window.into_iter().chain(self.sequence.into_inner())
     }
@@ -151,17 +159,18 @@ where
     type R = R;
     type Guards = SimplePrefetcherGuards<'r, R>;
 
+    #[inline]
     fn next(&mut self) -> Option<(Self::Item, SimplePrefetcherGuards<'r, R>)> {
         while self.window.len() < WINDOW_SIZE
             && let Some(e) = self.sequence.next()
         {
-            for id in e.fetch().into_iter() {
+            for id in e.fetch() {
                 self.relation.prefetch(id);
             }
             self.window.push_back(e);
         }
         let e = self.window.pop_front()?;
-        let list = e.fetch().into_iter();
+        let list = e.fetch();
         Some((
             e,
             SimplePrefetcherGuards {
@@ -170,6 +179,8 @@ where
             },
         ))
     }
+
+    #[inline]
     fn next_if(
         &mut self,
         predicate: impl FnOnce(&S::Item) -> bool,
@@ -177,13 +188,13 @@ where
         while self.window.len() < WINDOW_SIZE
             && let Some(e) = self.sequence.next()
         {
-            for id in e.fetch().into_iter() {
+            for id in e.fetch() {
                 self.relation.prefetch(id);
             }
             self.window.push_back(e);
         }
         let e = vec_deque_pop_front_if(&mut self.window, predicate)?;
-        let list = e.fetch().into_iter();
+        let list = e.fetch();
         Some((
             e,
             SimplePrefetcherGuards {
@@ -196,17 +207,19 @@ where
 
 pub struct SimplePrefetcherGuards<'r, R> {
     relation: &'r R,
-    list: std::vec::IntoIter<u32>,
+    list: crate::OwnedIter,
 }
 
 impl<'r, R: RelationRead> Iterator for SimplePrefetcherGuards<'r, R> {
     type Item = R::ReadGuard<'r>;
 
+    #[inline]
     fn next(&mut self) -> Option<Self::Item> {
         let id = self.list.next()?;
         Some(self.relation.read(id))
     }
 
+    #[inline]
     fn size_hint(&self) -> (usize, Option<usize>) {
         self.list.size_hint()
     }
@@ -218,6 +231,8 @@ pub struct StreamPrefetcherSequence<S>(S);
 
 impl<S: Sequence> Iterator for StreamPrefetcherSequence<S> {
     type Item = S::Item;
+
+    #[inline]
     fn next(&mut self) -> Option<Self::Item> {
         self.0.next()
     }
@@ -234,6 +249,7 @@ impl<'r, R: RelationReadStream, S: Sequence> StreamPrefetcher<'r, R, S>
 where
     S::Item: Fetch,
 {
+    #[inline]
     pub fn new(relation: &'r R, sequence: S, hints: Hints) -> Self {
         let stream = relation.read_stream(StreamPrefetcherSequence(sequence), hints);
         Self { stream }
@@ -248,6 +264,7 @@ where
 
     type IntoIter = <R::ReadStream<'r, StreamPrefetcherSequence<S>> as ReadStream<'r>>::Inner;
 
+    #[inline]
     fn into_iter(self) -> Self::IntoIter {
         self.stream.into_inner()
     }
@@ -259,10 +276,15 @@ where
     S::Item: Fetch,
 {
     type R = R;
+
     type Guards = <R::ReadStream<'r, StreamPrefetcherSequence<S>> as ReadStream<'r>>::Guards;
+
+    #[inline]
     fn next(&mut self) -> Option<(S::Item, Self::Guards)> {
         self.stream.next()
     }
+
+    #[inline]
     fn next_if(
         &mut self,
         predicate: impl FnOnce(&Self::Item) -> bool,

@@ -27,6 +27,7 @@ always_equal = { path = "./crates/always_equal" }
 distance = { path = "./crates/distance" }
 k_means = { path = "./crates/k_means" }
 rabitq = { path = "./crates/rabitq" }
+sbsii = { path = "./crates/sbsii" }
 simd = { path = "./crates/simd" }
 vchordg = { path = "./crates/vchordg" }
 vchordrq = { path = "./crates/vchordrq" }
@@ -40,7 +41,7 @@ pgrx-catalog = "0.3.1"
 rand.workspace = true
 seq-macro.workspace = true
 serde.workspace = true
-toml = "0.9.4"
+toml = "0.9.5"
 validator.workspace = true
 zerocopy.workspace = true
 

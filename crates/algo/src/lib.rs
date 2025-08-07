@@ -32,6 +32,7 @@ pub trait Page: Sized + 'static {
     #[must_use]
     fn len(&self) -> u16;
     #[must_use]
+    #[inline]
     fn is_empty(&self) -> bool {
         self.len() == 0
     }
@@ -92,6 +93,7 @@ pub trait RelationWrite: RelationWriteTypes {
 
 pub trait RelationLength: Relation {
     fn len(&self) -> u32;
+    #[inline]
     fn is_empty(&self) -> bool {
         self.len() == 0
     }
@@ -108,6 +110,7 @@ pub struct Hints {
 
 impl Hints {
     #[allow(clippy::needless_update)]
+    #[inline]
     pub fn full(self, full: bool) -> Self {
         Self { full, ..self }
     }
@@ -140,60 +143,73 @@ pub trait Bump: 'static {
 }
 
 impl Bump for bumpalo::Bump {
+    #[inline]
     fn alloc<T>(&self, value: T) -> &mut T {
         self.alloc(value)
     }
 
+    #[inline]
     fn alloc_slice<T: Copy>(&self, slice: &[T]) -> &mut [T] {
         self.alloc_slice_copy(slice)
     }
 
+    #[inline]
     fn reset(&mut self) {
         self.reset();
     }
 }
 
+pub type BorrowedIter<'b> = sbsii::borrowed::IntoIter<'b, u32, 1>;
+pub type OwnedIter = sbsii::owned::IntoIter<u32, 1>;
+
 pub trait Fetch {
-    fn fetch(&self) -> Vec<u32>;
+    #[must_use]
+    fn fetch(&self) -> OwnedIter;
 }
 
 impl Fetch for u32 {
-    fn fetch(&self) -> Vec<u32> {
-        std::slice::from_ref(self).to_vec()
+    #[inline(always)]
+    fn fetch(&self) -> OwnedIter {
+        OwnedIter::from_slice(std::slice::from_ref(self))
     }
 }
 
-impl<'b, T, A, B> Fetch for (T, AlwaysEqual<&'b mut (A, B, &'b mut [u32])>) {
-    fn fetch(&self) -> Vec<u32> {
+impl<T, A, B> Fetch for (T, AlwaysEqual<&mut (A, B, OwnedIter)>) {
+    #[inline(always)]
+    fn fetch(&self) -> OwnedIter {
         let (_, AlwaysEqual((.., list))) = self;
-        list.to_vec()
+        list.clone()
     }
 }
 
-impl<'b, T, A, B, C> Fetch for (T, AlwaysEqual<&'b mut (A, B, C, &'b mut [u32])>) {
-    fn fetch(&self) -> Vec<u32> {
+impl<T, A, B, C> Fetch for (T, AlwaysEqual<&mut (A, B, C, OwnedIter)>) {
+    #[inline(always)]
+    fn fetch(&self) -> OwnedIter {
         let (_, AlwaysEqual((.., list))) = self;
-        list.to_vec()
+        list.clone()
     }
 }
 
 impl<T> Fetch for (T, AlwaysEqual<(u32, u16)>) {
-    fn fetch(&self) -> Vec<u32> {
+    #[inline(always)]
+    fn fetch(&self) -> OwnedIter {
         let (_, AlwaysEqual((x, _))) = self;
-        std::slice::from_ref(x).to_vec()
+        OwnedIter::from_slice(std::slice::from_ref(x))
     }
 }
 
 impl Fetch for (u32, u16) {
-    fn fetch(&self) -> Vec<u32> {
-        std::slice::from_ref(&self.0).to_vec()
+    #[inline(always)]
+    fn fetch(&self) -> OwnedIter {
+        OwnedIter::from_slice(std::slice::from_ref(&self.0))
     }
 }
 
 impl<T> Fetch for (T, AlwaysEqual<((u32, u16), (u32, u16))>) {
-    fn fetch(&self) -> Vec<u32> {
+    #[inline(always)]
+    fn fetch(&self) -> OwnedIter {
         let (_, AlwaysEqual(((x, _), _))) = self;
-        std::slice::from_ref(x).to_vec()
+        OwnedIter::from_slice(std::slice::from_ref(x))
     }
 }
 
@@ -202,14 +218,18 @@ pub trait Fetch1 {
 }
 
 impl<T, F: Fetch1> Fetch for (T, AlwaysEqual<&mut [F]>) {
-    fn fetch(&self) -> Vec<u32> {
-        self.1.0.iter().map(|x| x.fetch_1()).collect()
+    #[inline(always)]
+    fn fetch(&self) -> OwnedIter {
+        let vec = self.1.0.iter().map(|x| x.fetch_1()).collect::<Vec<_>>();
+        OwnedIter::from_slice(vec.as_slice())
     }
 }
 
 impl<T, U, F: Fetch1> Fetch for (T, AlwaysEqual<(&mut [F], U)>) {
-    fn fetch(&self) -> Vec<u32> {
-        self.1.0.0.iter().map(|x| x.fetch_1()).collect()
+    #[inline(always)]
+    fn fetch(&self) -> OwnedIter {
+        let vec = self.1.0.0.iter().map(|x| x.fetch_1()).collect::<Vec<_>>();
+        OwnedIter::from_slice(vec.as_slice())
     }
 }
 
@@ -227,12 +247,15 @@ pub trait Sequence {
 impl<T: Ord> Sequence for BinaryHeap<T> {
     type Item = T;
     type Inner = std::vec::IntoIter<T>;
+    #[inline]
     fn next(&mut self) -> Option<T> {
         self.pop()
     }
+    #[inline]
     fn peek(&mut self) -> Option<&T> {
         (self as &Self).peek()
     }
+    #[inline]
     fn into_inner(self) -> Self::Inner {
         self.into_vec().into_iter()
     }
@@ -241,12 +264,15 @@ impl<T: Ord> Sequence for BinaryHeap<T> {
 impl<I: Iterator> Sequence for Peekable<I> {
     type Item = I::Item;
     type Inner = Peekable<I>;
+    #[inline]
     fn next(&mut self) -> Option<I::Item> {
         Iterator::next(self)
     }
+    #[inline]
     fn peek(&mut self) -> Option<&I::Item> {
         self.peek()
     }
+    #[inline]
     fn into_inner(self) -> Self::Inner {
         self
     }
@@ -255,12 +281,15 @@ impl<I: Iterator> Sequence for Peekable<I> {
 impl<T> Sequence for VecDeque<T> {
     type Item = T;
     type Inner = std::collections::vec_deque::IntoIter<T>;
+    #[inline]
     fn next(&mut self) -> Option<T> {
         self.pop_front()
     }
+    #[inline]
     fn peek(&mut self) -> Option<&T> {
         self.front()
     }
+    #[inline]
     fn into_inner(self) -> Self::Inner {
         self.into_iter()
     }

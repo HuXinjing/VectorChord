@@ -20,6 +20,7 @@ use std::hash::Hash;
 pub struct AlwaysEqual<T>(pub T);
 
 impl<T> PartialEq for AlwaysEqual<T> {
+    #[inline(always)]
     fn eq(&self, _: &Self) -> bool {
         true
     }
@@ -27,18 +28,22 @@ impl<T> PartialEq for AlwaysEqual<T> {
 
 impl<T> Eq for AlwaysEqual<T> {}
 
+#[allow(clippy::non_canonical_partial_ord_impl)]
 impl<T> PartialOrd for AlwaysEqual<T> {
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        Some(self.cmp(other))
+    #[inline(always)]
+    fn partial_cmp(&self, _: &Self) -> Option<Ordering> {
+        Some(Ordering::Equal)
     }
 }
 
 impl<T> Ord for AlwaysEqual<T> {
+    #[inline(always)]
     fn cmp(&self, _: &Self) -> Ordering {
         Ordering::Equal
     }
 }
 
 impl<T> Hash for AlwaysEqual<T> {
+    #[inline(always)]
     fn hash<H: std::hash::Hasher>(&self, _: &mut H) {}
 }

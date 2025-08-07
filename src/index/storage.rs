@@ -423,7 +423,7 @@ where
             && let Some(iter) = self.iter.as_mut()
             && let Some(e) = iter.next()
         {
-            for id in e.fetch().iter().copied() {
+            for id in e.fetch() {
                 self.tail.push_back(id);
             }
             self.window.push_back(e);
@@ -436,7 +436,7 @@ where
             && let Some(iter) = self.iter.as_mut()
             && let Some(e) = iter.next()
         {
-            for id in e.fetch().iter().copied() {
+            for id in e.fetch() {
                 self.tail.push_back(id);
             }
             self.window.push_back(e);
@@ -449,7 +449,7 @@ where
             && let Some(iter) = self.iter.as_mut()
             && let Some(e) = iter.next()
         {
-            for id in e.fetch().iter().copied() {
+            for id in e.fetch() {
                 self.tail.push_back(id);
             }
             self.window.push_back(e);
@@ -532,7 +532,7 @@ where
 {
     type Relation = PostgresRelation<O>;
 
-    type Guards = PostgresReadStreamGuards<O, I, std::vec::IntoIter<u32>>;
+    type Guards = PostgresReadStreamGuards<O, I, OwnedIter>;
 
     type Item = I::Item;
 
@@ -555,7 +555,7 @@ where
     #[cfg(any(feature = "pg17", feature = "pg18"))]
     fn next(&mut self) -> Option<(I::Item, Self::Guards)> {
         if let Some(e) = unsafe { self.cache.as_mut().pop_item() } {
-            let list = self.read(e.fetch().into_iter());
+            let list = self.read(e.fetch());
             Some((e, list))
         } else {
             None
@@ -568,7 +568,7 @@ where
         predicate: P,
     ) -> Option<(I::Item, Self::Guards)> {
         if let Some(e) = unsafe { self.cache.as_mut().pop_item_if(predicate) } {
-            let list = self.read(e.fetch().into_iter());
+            let list = self.read(e.fetch());
             Some((e, list))
         } else {
             None

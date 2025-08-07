@@ -486,7 +486,7 @@ impl<T: Ord> std::iter::FusedIterator for IntoIterSorted<T> {}
 #[inline(always)]
 pub fn id_0<F, A: ?Sized, B: ?Sized, C: ?Sized, D: ?Sized, R: ?Sized>(f: F) -> F
 where
-    F: for<'a> FnMut(&(A, AlwaysEqual<&'a mut (B, C, &'a mut D)>)) -> R,
+    F: for<'a> FnMut(&(A, AlwaysEqual<&'a mut (B, C, D)>)) -> R,
 {
     f
 }

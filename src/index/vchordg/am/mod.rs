@@ -315,7 +315,7 @@ pub unsafe extern "C-unwind" fn ambeginscan(
     let scanner: Scanner = Scanner {
         hack: None,
         scanning: LazyCell::new(Box::new(|| Box::new(std::iter::empty()))),
-        bump: Box::new(bumpalo::Bump::new()),
+        bump: Box::new(bumpalo::Bump::with_capacity(2 << 20)),
     };
     unsafe {
         (*scan).opaque = CurrentMemoryContext.leak_and_drop_on_delete(scanner).cast();

@@ -1,0 +1,10 @@
+[package]
+name = "sbsii"
+version.workspace = true
+edition.workspace = true
+publish = false
+
+[dependencies]
+
+[lints]
+workspace = true

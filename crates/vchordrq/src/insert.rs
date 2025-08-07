@@ -20,7 +20,7 @@ use crate::vectors::{self};
 use crate::{Opaque, Page, tape};
 use algo::accessor::{FunctionalAccessor, LAccess};
 use algo::prefetcher::{Prefetcher, PrefetcherHeapFamily};
-use algo::{Bump, RelationRead, RelationWrite};
+use algo::{Bump, OwnedIter, RelationRead, RelationWrite};
 use always_equal::AlwaysEqual;
 use distance::Distance;
 use std::cmp::Reverse;
@@ -28,7 +28,7 @@ use std::collections::BinaryHeap;
 use std::num::NonZero;
 use vector::{VectorBorrowed, VectorOwned};
 
-type Extra<'b> = &'b mut (u32, u16, f32, &'b mut [u32]);
+type Extra1<'b> = &'b mut (u32, f32, u16, OwnedIter);
 
 pub fn insert_vector<R: RelationRead + RelationWrite, O: Operator>(
     index: &R,
@@ -86,12 +86,12 @@ pub fn insert<'r, 'b: 'r, R: RelationRead + RelationWrite, O: Operator>(
             AlwaysEqual(first),
         )
     } else {
-        let prefetch = bump.alloc_slice(meta_tuple.centroid_prefetch());
+        let prefetch = OwnedIter::from_slice(meta_tuple.centroid_prefetch());
         let head = meta_tuple.centroid_head();
         let norm = meta_tuple.centroid_norm();
         let first = meta_tuple.first();
         let distance = vectors::read_for_h1_tuple::<R, O, _>(
-            prefetch.iter().map(|&id| index.read(id)),
+            prefetch.map(|id| index.read(id)),
             head,
             LAccess::new(O::Vector::unpack(vector), O::DistanceAccessor::default()),
         );
@@ -102,7 +102,7 @@ pub fn insert<'r, 'b: 'r, R: RelationRead + RelationWrite, O: Operator>(
     let lut = (O::Vector::block_preprocess(vector),);
 
     let mut step = |state: State| {
-        let mut results = LinkedVec::<(_, AlwaysEqual<Extra<'b>>)>::new();
+        let mut results = LinkedVec::<(_, AlwaysEqual<Extra1<'b>>)>::new();
         {
             let (Reverse(dis_f), AlwaysEqual(norm), AlwaysEqual(first)) = state;
             tape::read_h1_tape::<R, _, _>(
@@ -112,7 +112,12 @@ pub fn insert<'r, 'b: 'r, R: RelationRead + RelationWrite, O: Operator>(
                     let lowerbound = Distance::from_f32(rough - err * epsilon);
                     results.push((
                         Reverse(lowerbound),
-                        AlwaysEqual(bump.alloc((first, head, norm, bump.alloc_slice(prefetch)))),
+                        AlwaysEqual(bump.alloc((
+                            first,
+                            norm,
+                            head,
+                            OwnedIter::from_slice(prefetch),
+                        ))),
                     ));
                 },
             );
@@ -120,7 +125,7 @@ pub fn insert<'r, 'b: 'r, R: RelationRead + RelationWrite, O: Operator>(
         let mut heap = prefetch_h1_vectors.prefetch(results.into_vec());
         let mut cache = BinaryHeap::<(_, _, _)>::new();
         {
-            while let Some(((Reverse(_), AlwaysEqual(&mut (first, head, norm, ..))), prefetch)) =
+            while let Some(((Reverse(_), AlwaysEqual(&mut (first, norm, head, ..))), prefetch)) =
                 heap.next_if(|(d, _)| Some(*d) > cache.peek().map(|(d, ..)| *d))
             {
                 let distance = vectors::read_for_h1_tuple::<R, O, _>(

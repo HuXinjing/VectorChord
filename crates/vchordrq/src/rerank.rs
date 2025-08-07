@@ -27,7 +27,7 @@ use std::marker::PhantomData;
 use std::num::NonZero;
 use vector::VectorOwned;
 
-type Extra<'b> = &'b mut (NonZero<u64>, u16, &'b mut [u32]);
+type Extra0<'b> = &'b mut (NonZero<u64>, u16, algo::OwnedIter);
 
 type Result = (Reverse<Distance>, AlwaysEqual<NonZero<u64>>);
 
@@ -53,7 +53,7 @@ pub struct Reranker<T, F, P> {
 impl<'r, 'b, T, F, P> Iterator for Reranker<T, F, P>
 where
     F: FnMut(NonZero<u64>, P::Guards, u16) -> Option<Distance>,
-    P: Prefetcher<'r, Item = ((Reverse<Distance>, AlwaysEqual<T>), AlwaysEqual<Extra<'b>>)>,
+    P: Prefetcher<'r, Item = ((Reverse<Distance>, AlwaysEqual<T>), AlwaysEqual<Extra0<'b>>)>,
 {
     type Item = (Distance, NonZero<u64>);
 
@@ -82,7 +82,7 @@ pub fn rerank_index<
     'b,
     O: Operator,
     T,
-    P: Prefetcher<'r, Item = ((Reverse<Distance>, AlwaysEqual<T>), AlwaysEqual<Extra<'b>>)>,
+    P: Prefetcher<'r, Item = ((Reverse<Distance>, AlwaysEqual<T>), AlwaysEqual<Extra0<'b>>)>,
 >(
     vector: O::Vector,
     prefetcher: P,
@@ -110,7 +110,7 @@ pub fn rerank_heap<
     'b,
     O: Operator,
     T,
-    P: Prefetcher<'r, Item = ((Reverse<Distance>, AlwaysEqual<T>), AlwaysEqual<Extra<'b>>)>,
+    P: Prefetcher<'r, Item = ((Reverse<Distance>, AlwaysEqual<T>), AlwaysEqual<Extra0<'b>>)>,
 >(
     vector: O::Vector,
     prefetcher: P,

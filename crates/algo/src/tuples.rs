@@ -23,6 +23,7 @@ pub struct RefChecker<'a> {
 }
 
 impl<'a> RefChecker<'a> {
+    #[inline(always)]
     pub fn new(bytes: &'a [u8]) -> Self {
         Self { bytes }
     }
@@ -80,6 +81,7 @@ pub struct MutChecker<'a> {
 }
 
 impl<'a> MutChecker<'a> {
+    #[inline(always)]
     pub fn new(bytes: &'a mut [u8]) -> Self {
         Self {
             flag: 0,
@@ -221,12 +223,14 @@ impl Bool {
 }
 
 impl From<Bool> for bool {
+    #[inline]
     fn from(value: Bool) -> Self {
         value != Bool::FALSE
     }
 }
 
 impl From<bool> for Bool {
+    #[inline]
     fn from(value: bool) -> Self {
         std::hint::select_unpredictable(value, Self::TRUE, Self::FALSE)
     }
