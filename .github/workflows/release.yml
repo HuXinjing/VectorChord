@@ -46,12 +46,12 @@ jobs:
     env:
       CARGO_TERM_COLOR: always
       RUST_BACKTRACE: 1
+      RUSTFLAGS: "-Dwarnings"
 
     steps:
       - name: Set up Environment
         run: |
-          rustup default 1.89-beta
-          rustup component add rustfmt clippy
+          rustup update
 
           sudo apt-get update
 
@@ -87,7 +87,7 @@ jobs:
           ARCH: ${{ matrix.arch }}
           PLATFORM: ${{ matrix.arch == 'x86_64' && 'amd64' || 'arm64' }}
         run: |
-          cargo run -p make -- build -o ./build/raw
+          cargo run -p make -- build -o ./build/raw --profile release
 
           (cd ./build/raw && zip -r ../postgresql-${VERSION}-vchord_${SEMVER}_${ARCH}-linux-gnu.zip .)
 

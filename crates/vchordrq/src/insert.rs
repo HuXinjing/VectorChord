@@ -20,7 +20,7 @@ use crate::vectors::{self};
 use crate::{Opaque, Page, tape};
 use algo::accessor::{FunctionalAccessor, LAccess};
 use algo::prefetcher::{Prefetcher, PrefetcherHeapFamily};
-use algo::{Bump, OwnedIter, RelationRead, RelationWrite};
+use algo::{BorrowedIter, Bump, RelationRead, RelationWrite};
 use always_equal::AlwaysEqual;
 use distance::Distance;
 use std::cmp::Reverse;
@@ -28,7 +28,7 @@ use std::collections::BinaryHeap;
 use std::num::NonZero;
 use vector::{VectorBorrowed, VectorOwned};
 
-type Extra1<'b> = &'b mut (u32, f32, u16, OwnedIter);
+type Extra1<'b> = &'b mut (u32, f32, u16, BorrowedIter<'b>);
 
 pub fn insert_vector<R: RelationRead + RelationWrite, O: Operator>(
     index: &R,
@@ -86,7 +86,8 @@ pub fn insert<'r, 'b: 'r, R: RelationRead + RelationWrite, O: Operator>(
             AlwaysEqual(first),
         )
     } else {
-        let prefetch = OwnedIter::from_slice(meta_tuple.centroid_prefetch());
+        let prefetch =
+            BorrowedIter::from_slice(meta_tuple.centroid_prefetch(), |x| bump.alloc_slice(x));
         let head = meta_tuple.centroid_head();
         let norm = meta_tuple.centroid_norm();
         let first = meta_tuple.first();
@@ -116,7 +117,7 @@ pub fn insert<'r, 'b: 'r, R: RelationRead + RelationWrite, O: Operator>(
                             first,
                             norm,
                             head,
-                            OwnedIter::from_slice(prefetch),
+                            BorrowedIter::from_slice(prefetch, |x| bump.alloc_slice(x)),
                         ))),
                     ));
                 },

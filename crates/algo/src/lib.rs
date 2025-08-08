@@ -160,7 +160,7 @@ impl Bump for bumpalo::Bump {
 }
 
 pub type BorrowedIter<'b> = sbsii::borrowed::IntoIter<'b, u32, 1>;
-pub type OwnedIter = sbsii::owned::IntoIter<u32, 1>;
+pub type OwnedIter = sbsii::owned::IntoIter<u32, 4>;
 
 pub trait Fetch {
     #[must_use]
@@ -174,19 +174,19 @@ impl Fetch for u32 {
     }
 }
 
-impl<T, A, B> Fetch for (T, AlwaysEqual<&mut (A, B, OwnedIter)>) {
+impl<T, A, B> Fetch for (T, AlwaysEqual<&mut (A, B, BorrowedIter<'_>)>) {
     #[inline(always)]
     fn fetch(&self) -> OwnedIter {
         let (_, AlwaysEqual((.., list))) = self;
-        list.clone()
+        OwnedIter::from_slice(list.as_slice())
     }
 }
 
-impl<T, A, B, C> Fetch for (T, AlwaysEqual<&mut (A, B, C, OwnedIter)>) {
+impl<T, A, B, C> Fetch for (T, AlwaysEqual<&mut (A, B, C, BorrowedIter<'_>)>) {
     #[inline(always)]
     fn fetch(&self) -> OwnedIter {
         let (_, AlwaysEqual((.., list))) = self;
-        list.clone()
+        OwnedIter::from_slice(list.as_slice())
     }
 }
 

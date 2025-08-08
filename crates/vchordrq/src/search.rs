@@ -20,7 +20,7 @@ use crate::tuples::*;
 use crate::{Opaque, Page, tape, vectors};
 use algo::accessor::LAccess;
 use algo::prefetcher::{Prefetcher, PrefetcherHeapFamily, PrefetcherSequenceFamily};
-use algo::{Bump, OwnedIter, RelationRead};
+use algo::{BorrowedIter, Bump, RelationRead};
 use always_equal::AlwaysEqual;
 use distance::Distance;
 use std::cmp::Reverse;
@@ -28,8 +28,8 @@ use std::collections::BinaryHeap;
 use std::num::NonZero;
 use vector::{VectorBorrowed, VectorOwned};
 
-type Extra1<'b> = &'b mut (u32, f32, u16, OwnedIter);
-type Extra0<'b> = &'b mut (NonZero<u64>, u16, OwnedIter);
+type Extra1<'b> = &'b mut (u32, f32, u16, BorrowedIter<'b>);
+type Extra0<'b> = &'b mut (NonZero<u64>, u16, BorrowedIter<'b>);
 
 pub fn default_search<'r, 'b: 'r, R: RelationRead, O: Operator>(
     index: &'r R,
@@ -71,7 +71,8 @@ where
             AlwaysEqual(first),
         )]
     } else {
-        let prefetch = OwnedIter::from_slice(meta_tuple.centroid_prefetch());
+        let prefetch =
+            BorrowedIter::from_slice(meta_tuple.centroid_prefetch(), |x| bump.alloc_slice(x));
         let head = meta_tuple.centroid_head();
         let norm = meta_tuple.centroid_norm();
         let first = meta_tuple.first();
@@ -100,7 +101,7 @@ where
                             first,
                             norm,
                             head,
-                            OwnedIter::from_slice(prefetch),
+                            BorrowedIter::from_slice(prefetch, |x| bump.alloc_slice(x)),
                         ))),
                     ));
                 },
@@ -136,7 +137,11 @@ where
             let lowerbound = Distance::from_f32(rough - err * epsilon);
             results.push((
                 (Reverse(lowerbound), AlwaysEqual(())),
-                AlwaysEqual(bump.alloc((payload, head, OwnedIter::from_slice(prefetch)))),
+                AlwaysEqual(bump.alloc((
+                    payload,
+                    head,
+                    BorrowedIter::from_slice(prefetch, |x| bump.alloc_slice(x)),
+                ))),
             ));
         });
         if prefetch_h0_tuples.is_not_plain() {
@@ -207,7 +212,8 @@ where
             AlwaysEqual(first),
         )]
     } else {
-        let prefetch = OwnedIter::from_slice(meta_tuple.centroid_prefetch());
+        let prefetch =
+            BorrowedIter::from_slice(meta_tuple.centroid_prefetch(), |x| bump.alloc_slice(x));
         let head = meta_tuple.centroid_head();
         let norm = meta_tuple.centroid_norm();
         let first = meta_tuple.first();
@@ -236,7 +242,7 @@ where
                             first,
                             norm,
                             head,
-                            OwnedIter::from_slice(prefetch),
+                            BorrowedIter::from_slice(prefetch, |x| bump.alloc_slice(x)),
                         ))),
                     ));
                 },
@@ -275,7 +281,11 @@ where
             let rough = Distance::from_f32(rough);
             results.push((
                 (Reverse(lowerbound), AlwaysEqual(rough)),
-                AlwaysEqual(bump.alloc((payload, head, OwnedIter::from_slice(prefetch)))),
+                AlwaysEqual(bump.alloc((
+                    payload,
+                    head,
+                    BorrowedIter::from_slice(prefetch, |x| bump.alloc_slice(x)),
+                ))),
             ));
         });
         if prefetch_h0_tuples.is_not_plain() {

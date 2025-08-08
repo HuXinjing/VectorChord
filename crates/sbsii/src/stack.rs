@@ -37,6 +37,17 @@ impl<T: Copy, const N: usize> StackIntoIter<T, N> {
             },
         }
     }
+
+    #[inline(always)]
+    pub(crate) fn as_slice(&self) -> &[T] {
+        #[allow(unsafe_code)]
+        unsafe {
+            std::slice::from_raw_parts(
+                self.buffer.as_ptr().add(self.start as _).cast(),
+                (self.end - self.start) as _,
+            )
+        }
+    }
 }
 
 impl<T: Copy, const N: usize> Iterator for StackIntoIter<T, N> {
@@ -44,13 +55,16 @@ impl<T: Copy, const N: usize> Iterator for StackIntoIter<T, N> {
 
     #[inline(always)]
     fn next(&mut self) -> Option<Self::Item> {
-        if self.start == self.end {
-            return None;
-        }
         #[allow(unsafe_code)]
-        let result = unsafe { self.buffer[self.start as usize].assume_init() };
-        self.start += 1;
-        Some(result)
+        unsafe {
+            if self.start < self.end {
+                let r = self.buffer[self.start as usize].assume_init();
+                self.start += 1;
+                Some(r)
+            } else {
+                None
+            }
+        }
     }
 
     #[inline(always)]
@@ -59,3 +73,5 @@ impl<T: Copy, const N: usize> Iterator for StackIntoIter<T, N> {
         (size, Some(size))
     }
 }
+
+impl<T: Copy, const N: usize> ExactSizeIterator for StackIntoIter<T, N> {}

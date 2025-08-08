@@ -13,18 +13,38 @@
 // Copyright (c) 2025 TensorChord Inc.
 
 use crate::stack::StackIntoIter;
+use std::marker::PhantomData;
+use std::ptr::NonNull;
 
 #[derive(Clone)]
-pub struct HeapIntoIter<'a, T> {
-    inner: std::iter::Copied<std::slice::Iter<'a, T>>,
+pub struct HeapIntoIter<'a, T: Copy> {
+    pointer: NonNull<T>,
+    off: u16,
+    len: u16,
+    _phantom: PhantomData<&'a ()>,
 }
 
 impl<'a, T: Copy> HeapIntoIter<'a, T> {
     #[cold]
-    pub(crate) fn from_slice(slice: &[T], alloc: impl Fn(&[T]) -> &'a [T]) -> Self {
+    pub(crate) fn from_slice(slice: &'a [T]) -> Self {
         assert!(slice.len() <= 65535_usize);
+        let c = NonNull::from_ref(slice).cast::<T>();
         Self {
-            inner: alloc(slice).iter().copied(),
+            pointer: c,
+            off: 0,
+            len: slice.len() as u16,
+            _phantom: PhantomData,
+        }
+    }
+
+    #[inline(always)]
+    pub(crate) fn as_slice(&self) -> &[T] {
+        #[allow(unsafe_code)]
+        unsafe {
+            std::slice::from_raw_parts(
+                self.pointer.as_ptr().add(self.off as _),
+                (self.len - self.off) as _,
+            )
         }
     }
 }
@@ -34,9 +54,26 @@ impl<'a, T: Copy> Iterator for HeapIntoIter<'a, T> {
 
     #[inline(always)]
     fn next(&mut self) -> Option<Self::Item> {
-        self.inner.next()
+        #[allow(unsafe_code)]
+        unsafe {
+            if self.off < self.len {
+                let r = self.pointer.as_ptr().add(self.off as _).read();
+                self.off += 1;
+                Some(r)
+            } else {
+                None
+            }
+        }
+    }
+
+    #[inline(always)]
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let size = (self.len - self.off) as usize;
+        (size, Some(size))
     }
 }
+
+impl<'a, T: Copy> ExactSizeIterator for HeapIntoIter<'a, T> {}
 
 #[derive(Clone)]
 pub enum IntoIter<'a, T: Copy, const N: usize> {
@@ -44,14 +81,22 @@ pub enum IntoIter<'a, T: Copy, const N: usize> {
     Heap(HeapIntoIter<'a, T>),
 }
 
-impl<'a, T: Copy, const N: usize> IntoIter<'a, T, N> {
+impl<'a, T: Copy + 'a, const N: usize> IntoIter<'a, T, N> {
     #[inline(always)]
     pub fn from_slice(slice: &[T], alloc: impl Fn(&[T]) -> &'a [T]) -> Self {
         assert!(slice.len() <= 65535);
         if slice.len() <= N && N <= 65535 {
             IntoIter::Stack(StackIntoIter::from_slice(slice))
         } else {
-            IntoIter::Heap(HeapIntoIter::from_slice(slice, alloc))
+            IntoIter::Heap(HeapIntoIter::from_slice(alloc(slice)))
+        }
+    }
+
+    #[inline(always)]
+    pub fn as_slice(&self) -> &[T] {
+        match self {
+            IntoIter::Stack(x) => x.as_slice(),
+            IntoIter::Heap(x) => x.as_slice(),
         }
     }
 }
