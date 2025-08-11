@@ -12,7 +12,7 @@
 //
 // Copyright (c) 2025 TensorChord Inc.
 
-use super::{VectorBorrowed, VectorOwned};
+use crate::{VectorBorrowed, VectorOwned};
 use distance::Distance;
 use simd::Floating;
 use std::cmp::Ordering;

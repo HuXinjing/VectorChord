@@ -32,9 +32,9 @@ pub struct Maintain {
     pub number_of_freed_pages: usize,
 }
 
-pub fn maintain<'r, R: RelationRead + RelationWrite, O: Operator>(
-    index: &'r R,
-    mut prefetch_h0_tuples: impl PrefetcherSequenceFamily<'r, R>,
+pub fn maintain<'b, R: RelationRead + RelationWrite, O: Operator>(
+    index: &'b R,
+    mut prefetch_h0_tuples: impl PrefetcherSequenceFamily<'b, R>,
     check: impl Fn(),
 ) -> Maintain
 where
@@ -249,9 +249,9 @@ where
 }
 
 #[derive(Clone)]
-struct RelationHooked<'r, R, E>(&'r R, E);
+struct RelationHooked<'b, R, E>(&'b R, E);
 
-impl<'r, R, E> Relation for RelationHooked<'r, R, E>
+impl<'b, R, E> Relation for RelationHooked<'b, R, E>
 where
     R: Relation,
     E: Clone,
@@ -259,7 +259,7 @@ where
     type Page = R::Page;
 }
 
-impl<'r, R, E> RelationReadTypes for RelationHooked<'r, R, E>
+impl<'b, R, E> RelationReadTypes for RelationHooked<'b, R, E>
 where
     R: RelationRead,
     E: Clone,
@@ -267,7 +267,7 @@ where
     type ReadGuard<'a> = R::ReadGuard<'a>;
 }
 
-impl<'r, R, E> RelationRead for RelationHooked<'r, R, E>
+impl<'b, R, E> RelationRead for RelationHooked<'b, R, E>
 where
     R: RelationRead,
     E: Clone,
@@ -277,7 +277,7 @@ where
     }
 }
 
-impl<'r, R, E> RelationWriteTypes for RelationHooked<'r, R, E>
+impl<'b, R, E> RelationWriteTypes for RelationHooked<'b, R, E>
 where
     R: RelationWrite,
     E: Clone + for<'a> Fn(&'a R, <Self::Page as Page>::Opaque, bool) -> R::WriteGuard<'a>,
@@ -285,7 +285,7 @@ where
     type WriteGuard<'a> = R::WriteGuard<'a>;
 }
 
-impl<'r, R, E> RelationWrite for RelationHooked<'r, R, E>
+impl<'b, R, E> RelationWrite for RelationHooked<'b, R, E>
 where
     R: RelationWrite,
     E: Clone + for<'a> Fn(&'a R, <Self::Page as Page>::Opaque, bool) -> R::WriteGuard<'a>,

@@ -145,7 +145,7 @@ pub fn insert<'b, R: RelationRead + RelationWrite, O: Operator>(
             return;
         };
         let vertex_tuple = VertexTuple::deserialize_ref(vertex_bytes);
-        let pointers_s = bump.alloc_slice(vertex_tuple.pointers());
+        let pointers_s: &[_] = bump.alloc_slice(vertex_tuple.pointers());
         let score_s = O::process(
             bits,
             dims,
@@ -184,7 +184,7 @@ pub fn insert<'b, R: RelationRead + RelationWrite, O: Operator>(
                     continue;
                 };
                 let vertex_tuple = VertexTuple::deserialize_ref(vertex_bytes);
-                let pointers_v = bump.alloc_slice(vertex_tuple.pointers());
+                let pointers_v: &[_] = bump.alloc_slice(vertex_tuple.pointers());
                 let score_v = O::process(
                     bits,
                     dims,
@@ -229,7 +229,7 @@ pub fn insert<'b, R: RelationRead + RelationWrite, O: Operator>(
     };
     let outs = crate::prune::prune(
         |x, y| O::distance(x.as_borrowed(), y.as_borrowed()),
-        (bump.alloc_slice(&pointers_t), t),
+        (bump.alloc_slice(&pointers_t) as &[_], t),
         trace.into_iter(),
         m,
         &alpha,
@@ -301,11 +301,11 @@ pub fn insert<'b, R: RelationRead + RelationWrite, O: Operator>(
     }
 }
 
-fn append_vertex_tuple<'r, R: RelationRead + RelationWrite>(
-    index: &'r R,
+fn append_vertex_tuple<'b, R: RelationRead + RelationWrite>(
+    index: &'b R,
     first: u32,
     size: usize,
-) -> R::WriteGuard<'r>
+) -> R::WriteGuard<'b>
 where
     R::Page: Page<Opaque = Opaque>,
 {
@@ -350,11 +350,11 @@ where
     }
 }
 
-fn append_vector_tuple<'r, R: RelationRead + RelationWrite>(
-    index: &'r R,
+fn append_vector_tuple<'b, R: RelationRead + RelationWrite>(
+    index: &'b R,
     first: u32,
     size: usize,
-) -> R::WriteGuard<'r>
+) -> R::WriteGuard<'b>
 where
     R::Page: Page<Opaque = Opaque>,
 {

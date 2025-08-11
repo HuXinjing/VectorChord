@@ -27,8 +27,8 @@ always_equal = { path = "./crates/always_equal" }
 distance = { path = "./crates/distance" }
 k_means = { path = "./crates/k_means" }
 rabitq = { path = "./crates/rabitq" }
-sbsii = { path = "./crates/sbsii" }
 simd = { path = "./crates/simd" }
+small_iter = { path = "./crates/small_iter" }
 vchordg = { path = "./crates/vchordg" }
 vchordrq = { path = "./crates/vchordrq" }
 vector = { path = "./crates/vector" }

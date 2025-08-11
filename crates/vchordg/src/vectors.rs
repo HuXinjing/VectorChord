@@ -20,10 +20,10 @@ use distance::Distance;
 use std::collections::VecDeque;
 use std::num::{NonZero, Wrapping};
 
-pub fn by_prefetch<'r, R: RelationRead>(
-    guards: impl ExactSizeIterator<Item = R::ReadGuard<'r>>,
+pub fn by_prefetch<'b, R: RelationRead>(
+    guards: impl ExactSizeIterator<Item = R::ReadGuard<'b>>,
     pointers_u: impl ExactSizeIterator<Item = Pointer>,
-) -> impl ExactSizeIterator<Item = (R::ReadGuard<'r>, u16)> {
+) -> impl ExactSizeIterator<Item = (R::ReadGuard<'b>, u16)> {
     assert!(guards.len() == pointers_u.len() && pointers_u.len() > 0);
     pointers_u
         .map(Pointer::into_inner)
@@ -31,10 +31,10 @@ pub fn by_prefetch<'r, R: RelationRead>(
         .map(|(pointer, guard)| (guard, pointer.1))
 }
 
-pub fn by_read<'r, R: RelationRead>(
-    index: &'r R,
+pub fn by_read<'b, R: RelationRead>(
+    index: &'b R,
     pointers_u: impl ExactSizeIterator<Item = Pointer>,
-) -> impl ExactSizeIterator<Item = (R::ReadGuard<'r>, u16)> {
+) -> impl ExactSizeIterator<Item = (R::ReadGuard<'b>, u16)> {
     assert!(pointers_u.len() > 0);
     pointers_u
         .map(Pointer::into_inner)
@@ -58,13 +58,13 @@ pub fn copy_all(x: &[OptionNeighbour]) -> VecDeque<((u32, u16), Distance)> {
 }
 
 pub fn read<
-    'r,
+    'b,
     R: RelationRead,
     O: Operator,
     A: Accessor1<<O::Vector as Vector>::Element, <O::Vector as Vector>::Metadata>,
     Output,
 >(
-    mut iterator: impl ExactSizeIterator<Item = (R::ReadGuard<'r>, u16)>,
+    mut iterator: impl ExactSizeIterator<Item = (R::ReadGuard<'b>, u16)>,
     accessor: A,
     copy: impl FnOnce(&[OptionNeighbour]) -> Output,
 ) -> Result<(A::Output, Output, Option<NonZero<u64>>, Wrapping<u32>), ()> {

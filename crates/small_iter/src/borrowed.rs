@@ -12,44 +12,33 @@
 //
 // Copyright (c) 2025 TensorChord Inc.
 
-use crate::stack::StackIntoIter;
+use crate::stack::StackIter;
 use std::marker::PhantomData;
 use std::ptr::NonNull;
 
-#[derive(Clone)]
-pub struct HeapIntoIter<'a, T: Copy> {
-    pointer: NonNull<T>,
+#[derive(Clone, Copy)]
+pub struct HeapIter<'a, T: Copy> {
     off: u16,
     len: u16,
-    _phantom: PhantomData<&'a ()>,
+    pointer: NonNull<T>,
+    _phantom: PhantomData<&'a T>,
 }
 
-impl<'a, T: Copy> HeapIntoIter<'a, T> {
+impl<'a, T: Copy> HeapIter<'a, T> {
     #[cold]
     pub(crate) fn from_slice(slice: &'a [T]) -> Self {
         assert!(slice.len() <= 65535_usize);
         let c = NonNull::from_ref(slice).cast::<T>();
         Self {
-            pointer: c,
             off: 0,
             len: slice.len() as u16,
+            pointer: c,
             _phantom: PhantomData,
-        }
-    }
-
-    #[inline(always)]
-    pub(crate) fn as_slice(&self) -> &[T] {
-        #[allow(unsafe_code)]
-        unsafe {
-            std::slice::from_raw_parts(
-                self.pointer.as_ptr().add(self.off as _),
-                (self.len - self.off) as _,
-            )
         }
     }
 }
 
-impl<'a, T: Copy> Iterator for HeapIntoIter<'a, T> {
+impl<'a, T: Copy> Iterator for HeapIter<'a, T> {
     type Item = T;
 
     #[inline(always)]
@@ -73,59 +62,51 @@ impl<'a, T: Copy> Iterator for HeapIntoIter<'a, T> {
     }
 }
 
-impl<'a, T: Copy> ExactSizeIterator for HeapIntoIter<'a, T> {}
+impl<'a, T: Copy> ExactSizeIterator for HeapIter<'a, T> {}
 
-#[derive(Clone)]
-pub enum IntoIter<'a, T: Copy, const N: usize> {
-    Stack(StackIntoIter<T, N>),
-    Heap(HeapIntoIter<'a, T>),
+#[derive(Clone, Copy)]
+pub enum Iter<'a, T: Copy, const N: usize> {
+    Stack(StackIter<T, N>),
+    Heap(HeapIter<'a, T>),
 }
 
-impl<'a, T: Copy + 'a, const N: usize> IntoIter<'a, T, N> {
+impl<'a, T: Copy, const N: usize> Iter<'a, T, N> {
     #[inline(always)]
     pub fn from_slice(slice: &[T], alloc: impl Fn(&[T]) -> &'a [T]) -> Self {
         assert!(slice.len() <= 65535);
         if slice.len() <= N && N <= 65535 {
-            IntoIter::Stack(StackIntoIter::from_slice(slice))
+            Iter::Stack(StackIter::from_slice(slice))
         } else {
-            IntoIter::Heap(HeapIntoIter::from_slice(alloc(slice)))
-        }
-    }
-
-    #[inline(always)]
-    pub fn as_slice(&self) -> &[T] {
-        match self {
-            IntoIter::Stack(x) => x.as_slice(),
-            IntoIter::Heap(x) => x.as_slice(),
+            Iter::Heap(HeapIter::from_slice(alloc(slice)))
         }
     }
 }
 
-impl<'a, T: Copy, const N: usize> Iterator for IntoIter<'a, T, N> {
+impl<'a, T: Copy, const N: usize> Iterator for Iter<'a, T, N> {
     type Item = T;
 
     #[inline(always)]
     fn next(&mut self) -> Option<Self::Item> {
         match self {
-            IntoIter::Stack(iter) => iter.next(),
-            IntoIter::Heap(iter) => iter.next(),
+            Iter::Stack(iter) => iter.next(),
+            Iter::Heap(iter) => iter.next(),
         }
     }
 
     #[inline(always)]
     fn size_hint(&self) -> (usize, Option<usize>) {
         match self {
-            IntoIter::Stack(iter) => iter.size_hint(),
-            IntoIter::Heap(iter) => iter.size_hint(),
+            Iter::Stack(iter) => iter.size_hint(),
+            Iter::Heap(iter) => iter.size_hint(),
         }
     }
 }
 
-impl<'a, T: Copy, const N: usize> ExactSizeIterator for IntoIter<'a, T, N> {}
+impl<'a, T: Copy, const N: usize> ExactSizeIterator for Iter<'a, T, N> {}
 
 #[cfg(target_pointer_width = "64")]
 const _: () = {
-    assert!(size_of::<IntoIter::<'static, u32, 1>>() == 16);
+    assert!(size_of::<Iter::<'static, u32, 1>>() == 16);
 };
 
 #[test]
@@ -137,28 +118,28 @@ fn tests() {
         GLOBAL.lock().expect("failed to lock").push(pointer);
         pointer
     };
-    for x in IntoIter::<u32, 5>::from_slice(&[1; 0], alloc) {
+    for x in Iter::<u32, 5>::from_slice(&[1; 0], alloc) {
         assert_eq!(x, 1);
     }
-    for x in IntoIter::<u32, 5>::from_slice(&[1; 1], alloc) {
+    for x in Iter::<u32, 5>::from_slice(&[1; 1], alloc) {
         assert_eq!(x, 1);
     }
-    for x in IntoIter::<u32, 5>::from_slice(&[1; 2], alloc) {
+    for x in Iter::<u32, 5>::from_slice(&[1; 2], alloc) {
         assert_eq!(x, 1);
     }
-    for x in IntoIter::<u32, 5>::from_slice(&[1; 3], alloc) {
+    for x in Iter::<u32, 5>::from_slice(&[1; 3], alloc) {
         assert_eq!(x, 1);
     }
-    for x in IntoIter::<u32, 5>::from_slice(&[1; 4], alloc) {
+    for x in Iter::<u32, 5>::from_slice(&[1; 4], alloc) {
         assert_eq!(x, 1);
     }
-    for x in IntoIter::<u32, 5>::from_slice(&[1; 5], alloc) {
+    for x in Iter::<u32, 5>::from_slice(&[1; 5], alloc) {
         assert_eq!(x, 1);
     }
-    for x in IntoIter::<u32, 5>::from_slice(&[1; 6], alloc) {
+    for x in Iter::<u32, 5>::from_slice(&[1; 6], alloc) {
         assert_eq!(x, 1);
     }
-    for x in IntoIter::<u32, 5>::from_slice(&[1; 7], alloc) {
+    for x in Iter::<u32, 5>::from_slice(&[1; 7], alloc) {
         assert_eq!(x, 1);
     }
 }

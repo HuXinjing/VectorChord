@@ -397,25 +397,27 @@ impl<O: Opaque> RelationPrefetch for PostgresRelation<O> {
     }
 }
 
-pub struct Cache<I: Iterator> {
+pub struct Cache<'b, I: Iterator> {
     window: VecDeque<I::Item>,
     tail: VecDeque<u32>,
     iter: Option<I>,
+    _phantom: PhantomData<&'b mut ()>,
 }
 
-impl<I: Iterator> Default for Cache<I> {
+impl<'b, I: Iterator> Default for Cache<'b, I> {
     fn default() -> Self {
         Self {
             window: Default::default(),
             tail: Default::default(),
             iter: Default::default(),
+            _phantom: PhantomData,
         }
     }
 }
 
-impl<I: Iterator> Cache<I>
+impl<'b, I: Iterator> Cache<'b, I>
 where
-    I::Item: Fetch,
+    I::Item: Fetch<'b>,
 {
     #[allow(dead_code)]
     pub fn pop_id(&mut self) -> Option<u32> {
@@ -458,11 +460,11 @@ where
     }
 }
 
-pub struct PostgresReadStream<O: Opaque, I: Iterator> {
+pub struct PostgresReadStream<'b, O: Opaque, I: Iterator> {
     #[cfg(any(feature = "pg17", feature = "pg18"))]
     raw: *mut pgrx::pg_sys::ReadStream,
     // Because of `Box`'s special alias rules, `Box` cannot be used here.
-    cache: NonNull<Cache<I>>,
+    cache: NonNull<Cache<'b, I>>,
     _phantom: PhantomData<fn(O) -> O>,
 }
 
@@ -513,9 +515,9 @@ impl<O: Opaque, I: Iterator, L> ExactSizeIterator for PostgresReadStreamGuards<O
 }
 
 #[cfg(any(feature = "pg17", feature = "pg18"))]
-impl<O: Opaque, I: Iterator> PostgresReadStream<O, I>
+impl<'b, O: Opaque, I: Iterator> PostgresReadStream<'b, O, I>
 where
-    I::Item: Fetch,
+    I::Item: Fetch<'b>,
 {
     fn read<L: Iterator<Item = u32>>(&mut self, fetch: L) -> PostgresReadStreamGuards<O, I, L> {
         PostgresReadStreamGuards {
@@ -526,13 +528,13 @@ where
     }
 }
 
-impl<'r, O: Opaque, I: Iterator> ReadStream<'r> for PostgresReadStream<O, I>
+impl<'b, O: Opaque, I: Iterator> ReadStream<'b> for PostgresReadStream<'b, O, I>
 where
-    I::Item: Fetch,
+    I::Item: Fetch<'b>,
 {
     type Relation = PostgresRelation<O>;
 
-    type Guards = PostgresReadStreamGuards<O, I, OwnedIter>;
+    type Guards = PostgresReadStreamGuards<O, I, <I::Item as Fetch<'b>>::Iter>;
 
     type Item = I::Item;
 
@@ -584,7 +586,7 @@ where
     }
 }
 
-impl<O: Opaque, I: Iterator> Drop for PostgresReadStream<O, I> {
+impl<'b, O: Opaque, I: Iterator> Drop for PostgresReadStream<'b, O, I> {
     fn drop(&mut self) {
         unsafe {
             let _ = std::mem::take(self.cache.as_mut());
@@ -598,34 +600,34 @@ impl<O: Opaque, I: Iterator> Drop for PostgresReadStream<O, I> {
 }
 
 impl<O: Opaque> RelationReadStreamTypes for PostgresRelation<O> {
-    type ReadStream<'r, I: Iterator>
-        = PostgresReadStream<O, I>
+    type ReadStream<'b, I: Iterator>
+        = PostgresReadStream<'b, O, I>
     where
-        I::Item: Fetch;
+        I::Item: Fetch<'b>;
 }
 
 impl<O: Opaque> RelationReadStream for PostgresRelation<O> {
     #[cfg(any(feature = "pg13", feature = "pg14", feature = "pg15", feature = "pg16"))]
-    fn read_stream<I: Iterator>(&self, _iter: I, _hints: Hints) -> Self::ReadStream<'_, I>
+    fn read_stream<'b, I: Iterator>(&'b self, _iter: I, _hints: Hints) -> Self::ReadStream<'b, I>
     where
-        I::Item: Fetch,
+        I::Item: Fetch<'b>,
     {
         panic!("read_stream is not supported on PostgreSQL versions earlier than 17.");
     }
 
     #[cfg(any(feature = "pg17", feature = "pg18"))]
-    fn read_stream<I: Iterator>(&self, iter: I, hints: Hints) -> Self::ReadStream<'_, I>
+    fn read_stream<'b, I: Iterator>(&'b self, iter: I, hints: Hints) -> Self::ReadStream<'b, I>
     where
-        I::Item: Fetch,
+        I::Item: Fetch<'b>,
     {
         #[pgrx::pg_guard]
-        unsafe extern "C-unwind" fn callback<I: Iterator>(
+        unsafe extern "C-unwind" fn callback<'b, I: Iterator>(
             _stream: *mut pgrx::pg_sys::ReadStream,
             callback_private_data: *mut core::ffi::c_void,
             _per_buffer_data: *mut core::ffi::c_void,
         ) -> pgrx::pg_sys::BlockNumber
         where
-            I::Item: Fetch,
+            I::Item: Fetch<'b>,
         {
             unsafe {
                 use pgrx::pg_sys::InvalidBlockNumber;
@@ -637,6 +639,7 @@ impl<O: Opaque> RelationReadStream for PostgresRelation<O> {
             window: VecDeque::new(),
             tail: VecDeque::new(),
             iter: Some(iter),
+            _phantom: PhantomData,
         }));
         let raw = unsafe {
             use pgrx::pg_sys::{

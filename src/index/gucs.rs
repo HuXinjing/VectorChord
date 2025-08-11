@@ -12,6 +12,7 @@
 //
 // Copyright (c) 2025 TensorChord Inc.
 
+use crate::index::scanners::Io;
 use pgrx::guc::{GucContext, GucFlags, GucRegistry, GucSetting, PostgresGucEnum};
 use std::ffi::CString;
 
@@ -242,8 +243,7 @@ pub fn vchordg_max_scan_tuples() -> Option<u32> {
     if x < 0 { None } else { Some(x as u32) }
 }
 
-pub fn vchordg_io_search() -> crate::index::vchordg::scanners::Io {
-    use crate::index::vchordg::scanners::Io;
+pub fn vchordg_io_search() -> Io {
     match VCHORDG_IO_SEARCH.get() {
         PostgresIo::ReadBuffer => Io::Plain,
         PostgresIo::PrefetchBuffer => Io::Simple,
@@ -252,8 +252,7 @@ pub fn vchordg_io_search() -> crate::index::vchordg::scanners::Io {
     }
 }
 
-pub fn vchordg_io_rerank() -> crate::index::vchordg::scanners::Io {
-    use crate::index::vchordg::scanners::Io;
+pub fn vchordg_io_rerank() -> Io {
     match VCHORDG_IO_RERANK.get() {
         PostgresIo::ReadBuffer => Io::Plain,
         PostgresIo::PrefetchBuffer => Io::Simple,
@@ -315,8 +314,7 @@ pub fn vchordrq_prefilter() -> bool {
     VCHORDRQ_PREFILTER.get()
 }
 
-pub fn vchordrq_io_search() -> crate::index::vchordrq::scanners::Io {
-    use crate::index::vchordrq::scanners::Io;
+pub fn vchordrq_io_search() -> Io {
     match VCHORDRQ_IO_SEARCH.get() {
         PostgresIo::ReadBuffer => Io::Plain,
         PostgresIo::PrefetchBuffer => Io::Simple,
@@ -325,8 +323,7 @@ pub fn vchordrq_io_search() -> crate::index::vchordrq::scanners::Io {
     }
 }
 
-pub fn vchordrq_io_rerank() -> crate::index::vchordrq::scanners::Io {
-    use crate::index::vchordrq::scanners::Io;
+pub fn vchordrq_io_rerank() -> Io {
     match VCHORDRQ_IO_RERANK.get() {
         PostgresIo::ReadBuffer => Io::Plain,
         PostgresIo::PrefetchBuffer => Io::Simple,

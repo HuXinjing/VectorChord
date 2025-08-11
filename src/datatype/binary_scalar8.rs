@@ -12,7 +12,7 @@
 //
 // Copyright (c) 2025 TensorChord Inc.
 
-use super::memory_scalar8::{Scalar8Input, Scalar8Output};
+use crate::datatype::memory_scalar8::{Scalar8Input, Scalar8Output};
 use pgrx::datum::Internal;
 use pgrx::pg_sys::Oid;
 use vector::VectorBorrowed;

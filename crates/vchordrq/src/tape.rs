@@ -113,24 +113,24 @@ where
     }
 }
 
-pub fn read_directory_tape<'r, R>(
-    iter: impl Iterator<Item = R::ReadGuard<'r>>,
+pub fn read_directory_tape<'b, R>(
+    iter: impl Iterator<Item = R::ReadGuard<'b>>,
 ) -> impl Iterator<Item = u32>
 where
-    R: RelationRead + 'r,
+    R: RelationRead + 'b,
 {
     use std::pin::Pin;
     use std::ptr::NonNull;
 
     #[pin_project::pin_project]
-    struct State<'r, R: RelationRead + 'r, I> {
+    struct State<'b, R: RelationRead + 'b, I> {
         slice: NonNull<[u32]>,
         #[pin]
-        now: Option<(R::ReadGuard<'r>, u16)>,
+        now: Option<(R::ReadGuard<'b>, u16)>,
         iter: I,
     }
 
-    impl<'r, R: RelationRead + 'r, I: Iterator<Item = R::ReadGuard<'r>>> State<'r, R, I> {
+    impl<'b, R: RelationRead + 'b, I: Iterator<Item = R::ReadGuard<'b>>> State<'b, R, I> {
         fn init(self: Pin<&mut Self>) {
             let mut this = self.project();
             let now = this.iter.next().map(|guard| (guard, 0));
@@ -172,14 +172,14 @@ where
         }
     }
 
-    let mut state = Box::pin(State::<'r, R, _> {
+    let mut state = Box::pin(State::<'b, R, _> {
         slice: NonNull::from(&mut []),
         now: None,
         iter,
     });
 
-    impl<'r, R: RelationRead + 'r, I: Iterator<Item = R::ReadGuard<'r>>> Iterator
-        for Pin<Box<State<'r, R, I>>>
+    impl<'b, R: RelationRead + 'b, I: Iterator<Item = R::ReadGuard<'b>>> Iterator
+        for Pin<Box<State<'b, R, I>>>
     {
         type Item = u32;
 
@@ -193,12 +193,12 @@ where
     state
 }
 
-pub fn by_directory<'r, R>(
-    p: &mut impl PrefetcherSequenceFamily<'r, R>,
+pub fn by_directory<'b, R>(
+    p: &mut impl PrefetcherSequenceFamily<'b, R>,
     iter: impl Iterator<Item = u32>,
-) -> impl Iterator<Item = R::ReadGuard<'r>>
+) -> impl Iterator<Item = R::ReadGuard<'b>>
 where
-    R: RelationRead + 'r,
+    R: RelationRead + 'b,
 {
     let mut t = p.prefetch(iter.peekable());
     std::iter::from_fn(move || {
@@ -209,9 +209,9 @@ where
     })
 }
 
-pub fn by_next<'r, R>(index: &'r R, first: u32) -> impl Iterator<Item = R::ReadGuard<'r>>
+pub fn by_next<'b, R>(index: &'b R, first: u32) -> impl Iterator<Item = R::ReadGuard<'b>>
 where
-    R: RelationRead + 'r,
+    R: RelationRead + 'b,
     R::Page: Page<Opaque = Opaque>,
 {
     let mut current = first;
@@ -226,12 +226,12 @@ where
     })
 }
 
-pub fn read_h1_tape<'r, R, A, T>(
-    iter: impl Iterator<Item = R::ReadGuard<'r>>,
+pub fn read_h1_tape<'b, R, A, T>(
+    iter: impl Iterator<Item = R::ReadGuard<'b>>,
     accessor: impl Fn() -> A,
     mut callback: impl for<'a> FnMut(T, u16, f32, u32, &'a [u32]),
 ) where
-    R: RelationRead + 'r,
+    R: RelationRead + 'b,
     A: for<'a> Accessor1<[u8; 16], (&'a [[f32; 32]; 4], &'a [f32; 32]), Output = [T; 32]>,
 {
     let mut x = None;
@@ -265,12 +265,12 @@ pub fn read_h1_tape<'r, R, A, T>(
     }
 }
 
-pub fn read_frozen_tape<'r, R, A, T>(
-    iter: impl Iterator<Item = R::ReadGuard<'r>>,
+pub fn read_frozen_tape<'b, R, A, T>(
+    iter: impl Iterator<Item = R::ReadGuard<'b>>,
     accessor: impl Fn() -> A,
     mut callback: impl for<'a> FnMut(T, u16, NonZero<u64>, &'a [u32]),
 ) where
-    R: RelationRead + 'r,
+    R: RelationRead + 'b,
     A: for<'a> Accessor1<[u8; 16], (&'a [[f32; 32]; 4], &'a [f32; 32]), Output = [T; 32]>,
 {
     let mut x = None;
@@ -298,12 +298,12 @@ pub fn read_frozen_tape<'r, R, A, T>(
     }
 }
 
-pub fn read_appendable_tape<'r, R, T>(
-    iter: impl Iterator<Item = R::ReadGuard<'r>>,
+pub fn read_appendable_tape<'b, R, T>(
+    iter: impl Iterator<Item = R::ReadGuard<'b>>,
     mut access: impl for<'a> FnMut([f32; 4], &'a [u64], f32) -> T,
     mut callback: impl for<'a> FnMut(T, u16, NonZero<u64>, &'a [u32]),
 ) where
-    R: RelationRead + 'r,
+    R: RelationRead + 'b,
 {
     for guard in iter {
         for i in 1..=guard.len() {

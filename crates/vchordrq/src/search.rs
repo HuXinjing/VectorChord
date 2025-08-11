@@ -31,14 +31,14 @@ use vector::{VectorBorrowed, VectorOwned};
 type Extra1<'b> = &'b mut (u32, f32, u16, BorrowedIter<'b>);
 type Extra0<'b> = &'b mut (NonZero<u64>, u16, BorrowedIter<'b>);
 
-pub fn default_search<'r, 'b: 'r, R: RelationRead, O: Operator>(
-    index: &'r R,
+pub fn default_search<'b, R: RelationRead, O: Operator>(
+    index: &'b R,
     vector: <O::Vector as VectorOwned>::Borrowed<'_>,
     probes: Vec<u32>,
     epsilon: f32,
     bump: &'b impl Bump,
-    mut prefetch_h1_vectors: impl PrefetcherHeapFamily<'r, R>,
-    mut prefetch_h0_tuples: impl PrefetcherSequenceFamily<'r, R>,
+    mut prefetch_h1_vectors: impl PrefetcherHeapFamily<'b, R>,
+    mut prefetch_h0_tuples: impl PrefetcherSequenceFamily<'b, R>,
 ) -> Vec<(
     (Reverse<Distance>, AlwaysEqual<()>),
     AlwaysEqual<Extra0<'b>>,
@@ -168,15 +168,15 @@ where
     results.into_vec()
 }
 
-pub fn maxsim_search<'r, 'b: 'r, R: RelationRead, O: Operator>(
-    index: &'r R,
+pub fn maxsim_search<'b, R: RelationRead, O: Operator>(
+    index: &'b R,
     vector: <O::Vector as VectorOwned>::Borrowed<'_>,
     probes: Vec<u32>,
     epsilon: f32,
     mut threshold: u32,
     bump: &'b impl Bump,
-    mut prefetch_h1_vectors: impl PrefetcherHeapFamily<'r, R>,
-    mut prefetch_h0_tuples: impl PrefetcherSequenceFamily<'r, R>,
+    mut prefetch_h1_vectors: impl PrefetcherHeapFamily<'b, R>,
+    mut prefetch_h0_tuples: impl PrefetcherSequenceFamily<'b, R>,
 ) -> (
     Vec<(
         (Reverse<Distance>, AlwaysEqual<Distance>),

@@ -17,6 +17,7 @@ pub mod functions;
 pub mod gucs;
 pub mod hook;
 pub mod opclass;
+pub mod scanners;
 pub mod storage;
 pub mod vchordg;
 pub mod vchordrq;

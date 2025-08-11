@@ -12,11 +12,13 @@
 //
 // Copyright (c) 2025 TensorChord Inc.
 
-use super::{Io, SearchBuilder, SearchOptions, filter};
 use crate::index::fetcher::*;
 use crate::index::opclass::Sphere;
+use crate::index::scanners::{Io, SearchBuilder};
 use crate::index::vchordrq::algo::*;
+use crate::index::vchordrq::filter::filter;
 use crate::index::vchordrq::opclass::Opfamily;
+use crate::index::vchordrq::scanners::SearchOptions;
 use algo::accessor::{Dot, L2S};
 use algo::prefetcher::*;
 use algo::*;
@@ -37,6 +39,10 @@ pub struct DefaultBuilder {
 }
 
 impl SearchBuilder for DefaultBuilder {
+    type Options = SearchOptions;
+
+    type Opfamily = Opfamily;
+
     type Opaque = vchordrq::Opaque;
 
     fn new(opfamily: Opfamily) -> Self {
@@ -70,13 +76,13 @@ impl SearchBuilder for DefaultBuilder {
         }
     }
 
-    fn build<'a, R>(
+    fn build<'b, R>(
         self,
-        index: &'a R,
+        index: &'b R,
         options: SearchOptions,
-        mut fetcher: impl Fetcher + 'a,
-        bump: &'a impl Bump,
-    ) -> Box<dyn Iterator<Item = (f32, [u16; 3], bool)> + 'a>
+        mut fetcher: impl Fetcher + 'b,
+        bump: &'b impl Bump,
+    ) -> Box<dyn Iterator<Item = (f32, [u16; 3], bool)> + 'b>
     where
         R: RelationRead + RelationPrefetch + RelationReadStream,
         R::Page: Page<Opaque = vchordrq::Opaque>,

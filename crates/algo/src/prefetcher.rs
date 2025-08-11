@@ -22,12 +22,12 @@ use std::iter::Chain;
 pub const WINDOW_SIZE: usize = 32;
 const _: () = assert!(WINDOW_SIZE > 0);
 
-pub trait Prefetcher<'r>: IntoIterator
+pub trait Prefetcher<'b>: IntoIterator
 where
-    Self::Item: Fetch,
+    Self::Item: Fetch<'b>,
 {
-    type R: RelationRead + 'r;
-    type Guards: ExactSizeIterator<Item = <Self::R as RelationReadTypes>::ReadGuard<'r>>;
+    type R: RelationRead + 'b;
+    type Guards: ExactSizeIterator<Item = <Self::R as RelationReadTypes>::ReadGuard<'b>>;
 
     #[must_use]
     fn next(&mut self) -> Option<(Self::Item, Self::Guards)>;
@@ -38,19 +38,19 @@ where
     ) -> Option<(Self::Item, Self::Guards)>;
 }
 
-pub struct PlainPrefetcher<'r, R, S: Sequence> {
-    relation: &'r R,
+pub struct PlainPrefetcher<'b, R, S: Sequence> {
+    relation: &'b R,
     sequence: S,
 }
 
-impl<'r, R, S: Sequence> PlainPrefetcher<'r, R, S> {
+impl<'b, R, S: Sequence> PlainPrefetcher<'b, R, S> {
     #[inline]
-    pub fn new(relation: &'r R, sequence: S) -> Self {
+    pub fn new(relation: &'b R, sequence: S) -> Self {
         Self { relation, sequence }
     }
 }
 
-impl<'r, R, S: Sequence> IntoIterator for PlainPrefetcher<'r, R, S> {
+impl<'b, R, S: Sequence> IntoIterator for PlainPrefetcher<'b, R, S> {
     type Item = S::Item;
 
     type IntoIter = S::Inner;
@@ -61,15 +61,20 @@ impl<'r, R, S: Sequence> IntoIterator for PlainPrefetcher<'r, R, S> {
     }
 }
 
-impl<'r, R: RelationRead, S: Sequence> Prefetcher<'r> for PlainPrefetcher<'r, R, S>
+impl<'b, R: RelationRead, S: Sequence> Prefetcher<'b> for PlainPrefetcher<'b, R, S>
 where
-    S::Item: Fetch,
+    S::Item: Fetch<'b>,
 {
     type R = R;
-    type Guards = PlainPrefetcherGuards<'r, R>;
+    type Guards = PlainPrefetcherGuards<'b, R, <S::Item as Fetch<'b>>::Iter>;
 
     #[inline]
-    fn next(&mut self) -> Option<(Self::Item, PlainPrefetcherGuards<'r, R>)> {
+    fn next(
+        &mut self,
+    ) -> Option<(
+        Self::Item,
+        PlainPrefetcherGuards<'b, R, <S::Item as Fetch<'b>>::Iter>,
+    )> {
         let e = self.sequence.next()?;
         let list = e.fetch();
         Some((
@@ -85,7 +90,10 @@ where
     fn next_if(
         &mut self,
         predicate: impl FnOnce(&Self::Item) -> bool,
-    ) -> Option<(S::Item, PlainPrefetcherGuards<'r, R>)> {
+    ) -> Option<(
+        S::Item,
+        PlainPrefetcherGuards<'b, R, <S::Item as Fetch<'b>>::Iter>,
+    )> {
         if !predicate(self.sequence.peek()?) {
             return None;
         }
@@ -101,13 +109,13 @@ where
     }
 }
 
-pub struct PlainPrefetcherGuards<'r, R> {
-    relation: &'r R,
-    list: crate::OwnedIter,
+pub struct PlainPrefetcherGuards<'b, R, L> {
+    relation: &'b R,
+    list: L,
 }
 
-impl<'r, R: RelationRead> Iterator for PlainPrefetcherGuards<'r, R> {
-    type Item = R::ReadGuard<'r>;
+impl<'b, R: RelationRead, L: Iterator<Item = u32>> Iterator for PlainPrefetcherGuards<'b, R, L> {
+    type Item = R::ReadGuard<'b>;
 
     #[inline]
     fn next(&mut self) -> Option<Self::Item> {
@@ -121,17 +129,20 @@ impl<'r, R: RelationRead> Iterator for PlainPrefetcherGuards<'r, R> {
     }
 }
 
-impl<'r, R: RelationRead> ExactSizeIterator for PlainPrefetcherGuards<'r, R> {}
+impl<'b, R: RelationRead, L: Iterator<Item = u32>> ExactSizeIterator
+    for PlainPrefetcherGuards<'b, R, L>
+{
+}
 
-pub struct SimplePrefetcher<'r, R, S: Sequence> {
-    relation: &'r R,
+pub struct SimplePrefetcher<'b, R, S: Sequence> {
+    relation: &'b R,
     window: VecDeque<S::Item>,
     sequence: S,
 }
 
-impl<'r, R, S: Sequence> SimplePrefetcher<'r, R, S> {
+impl<'b, R, S: Sequence> SimplePrefetcher<'b, R, S> {
     #[inline]
-    pub fn new(relation: &'r R, sequence: S) -> Self {
+    pub fn new(relation: &'b R, sequence: S) -> Self {
         Self {
             relation,
             window: VecDeque::new(),
@@ -140,7 +151,7 @@ impl<'r, R, S: Sequence> SimplePrefetcher<'r, R, S> {
     }
 }
 
-impl<'r, R, S: Sequence> IntoIterator for SimplePrefetcher<'r, R, S> {
+impl<'b, R, S: Sequence> IntoIterator for SimplePrefetcher<'b, R, S> {
     type Item = S::Item;
 
     type IntoIter = Chain<vec_deque::IntoIter<S::Item>, S::Inner>;
@@ -151,16 +162,21 @@ impl<'r, R, S: Sequence> IntoIterator for SimplePrefetcher<'r, R, S> {
     }
 }
 
-impl<'r, R: RelationRead + RelationPrefetch, S: Sequence> Prefetcher<'r>
-    for SimplePrefetcher<'r, R, S>
+impl<'b, R: RelationRead + RelationPrefetch, S: Sequence> Prefetcher<'b>
+    for SimplePrefetcher<'b, R, S>
 where
-    S::Item: Fetch,
+    S::Item: Fetch<'b>,
 {
     type R = R;
-    type Guards = SimplePrefetcherGuards<'r, R>;
+    type Guards = SimplePrefetcherGuards<'b, R, <S::Item as Fetch<'b>>::Iter>;
 
     #[inline]
-    fn next(&mut self) -> Option<(Self::Item, SimplePrefetcherGuards<'r, R>)> {
+    fn next(
+        &mut self,
+    ) -> Option<(
+        Self::Item,
+        SimplePrefetcherGuards<'b, R, <S::Item as Fetch<'b>>::Iter>,
+    )> {
         while self.window.len() < WINDOW_SIZE
             && let Some(e) = self.sequence.next()
         {
@@ -184,7 +200,10 @@ where
     fn next_if(
         &mut self,
         predicate: impl FnOnce(&S::Item) -> bool,
-    ) -> Option<(S::Item, SimplePrefetcherGuards<'r, R>)> {
+    ) -> Option<(
+        S::Item,
+        SimplePrefetcherGuards<'b, R, <S::Item as Fetch<'b>>::Iter>,
+    )> {
         while self.window.len() < WINDOW_SIZE
             && let Some(e) = self.sequence.next()
         {
@@ -205,13 +224,13 @@ where
     }
 }
 
-pub struct SimplePrefetcherGuards<'r, R> {
-    relation: &'r R,
-    list: crate::OwnedIter,
+pub struct SimplePrefetcherGuards<'b, R, L> {
+    relation: &'b R,
+    list: L,
 }
 
-impl<'r, R: RelationRead> Iterator for SimplePrefetcherGuards<'r, R> {
-    type Item = R::ReadGuard<'r>;
+impl<'b, R: RelationRead, L: Iterator<Item = u32>> Iterator for SimplePrefetcherGuards<'b, R, L> {
+    type Item = R::ReadGuard<'b>;
 
     #[inline]
     fn next(&mut self) -> Option<Self::Item> {
@@ -225,7 +244,10 @@ impl<'r, R: RelationRead> Iterator for SimplePrefetcherGuards<'r, R> {
     }
 }
 
-impl<'r, R: RelationRead> ExactSizeIterator for SimplePrefetcherGuards<'r, R> {}
+impl<'b, R: RelationRead, L: ExactSizeIterator<Item = u32>> ExactSizeIterator
+    for SimplePrefetcherGuards<'b, R, L>
+{
+}
 
 pub struct StreamPrefetcherSequence<S>(S);
 
@@ -238,31 +260,31 @@ impl<S: Sequence> Iterator for StreamPrefetcherSequence<S> {
     }
 }
 
-pub struct StreamPrefetcher<'r, R: RelationReadStream + 'r, S: Sequence>
+pub struct StreamPrefetcher<'b, R: RelationReadStream + 'b, S: Sequence>
 where
-    S::Item: Fetch,
+    S::Item: Fetch<'b>,
 {
-    stream: R::ReadStream<'r, StreamPrefetcherSequence<S>>,
+    stream: R::ReadStream<'b, StreamPrefetcherSequence<S>>,
 }
 
-impl<'r, R: RelationReadStream, S: Sequence> StreamPrefetcher<'r, R, S>
+impl<'b, R: RelationReadStream, S: Sequence> StreamPrefetcher<'b, R, S>
 where
-    S::Item: Fetch,
+    S::Item: Fetch<'b>,
 {
     #[inline]
-    pub fn new(relation: &'r R, sequence: S, hints: Hints) -> Self {
+    pub fn new(relation: &'b R, sequence: S, hints: Hints) -> Self {
         let stream = relation.read_stream(StreamPrefetcherSequence(sequence), hints);
         Self { stream }
     }
 }
 
-impl<'r, R: RelationReadStream, S: Sequence> IntoIterator for StreamPrefetcher<'r, R, S>
+impl<'b, R: RelationReadStream, S: Sequence> IntoIterator for StreamPrefetcher<'b, R, S>
 where
-    S::Item: Fetch,
+    S::Item: Fetch<'b>,
 {
     type Item = S::Item;
 
-    type IntoIter = <R::ReadStream<'r, StreamPrefetcherSequence<S>> as ReadStream<'r>>::Inner;
+    type IntoIter = <R::ReadStream<'b, StreamPrefetcherSequence<S>> as ReadStream<'b>>::Inner;
 
     #[inline]
     fn into_iter(self) -> Self::IntoIter {
@@ -270,14 +292,14 @@ where
     }
 }
 
-impl<'r, R: RelationRead + RelationReadStream, S: Sequence> Prefetcher<'r>
-    for StreamPrefetcher<'r, R, S>
+impl<'b, R: RelationRead + RelationReadStream, S: Sequence> Prefetcher<'b>
+    for StreamPrefetcher<'b, R, S>
 where
-    S::Item: Fetch,
+    S::Item: Fetch<'b>,
 {
     type R = R;
 
-    type Guards = <R::ReadStream<'r, StreamPrefetcherSequence<S>> as ReadStream<'r>>::Guards;
+    type Guards = <R::ReadStream<'b, StreamPrefetcherSequence<S>> as ReadStream<'b>>::Guards;
 
     #[inline]
     fn next(&mut self) -> Option<(S::Item, Self::Guards)> {
@@ -293,26 +315,26 @@ where
     }
 }
 
-pub trait PrefetcherSequenceFamily<'r, R> {
-    type P<S: Sequence>: Prefetcher<'r, R = R, Item = S::Item>
+pub trait PrefetcherSequenceFamily<'b, R> {
+    type P<S: Sequence>: Prefetcher<'b, R = R, Item = S::Item>
     where
-        S::Item: Fetch;
+        S::Item: Fetch<'b>;
 
     fn prefetch<S: Sequence>(&mut self, seq: S) -> Self::P<S>
     where
-        S::Item: Fetch;
+        S::Item: Fetch<'b>;
 
     fn is_not_plain(&self) -> bool;
 }
 
-pub trait PrefetcherHeapFamily<'r, R> {
-    type P<T>: Prefetcher<'r, R = R, Item = T>
+pub trait PrefetcherHeapFamily<'b, R> {
+    type P<T>: Prefetcher<'b, R = R, Item = T>
     where
-        T: Ord + Fetch + 'r;
+        T: Ord + Fetch<'b>;
 
     fn prefetch<T>(&mut self, seq: Vec<T>) -> Self::P<T>
     where
-        T: Ord + Fetch + 'r;
+        T: Ord + Fetch<'b>;
 
     fn is_not_plain(&self) -> bool;
 }

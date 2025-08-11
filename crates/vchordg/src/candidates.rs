@@ -20,7 +20,7 @@ use std::marker::PhantomData;
 pub struct Candidates<'a, P, F, R>
 where
     P: Prefetcher<'a>,
-    P::Item: Fetch,
+    P::Item: Fetch<'a>,
 {
     beam: usize,
     front: Option<P>,
@@ -32,7 +32,7 @@ where
 impl<'a, P, F, R> Candidates<'a, P, F, R>
 where
     P: Prefetcher<'a, R = R>,
-    P::Item: Fetch + Ord,
+    P::Item: Fetch<'a> + Ord,
     F: PrefetcherSequenceFamily<'a, R, P<VecDeque<P::Item>> = P>,
     R: RelationRead,
 {

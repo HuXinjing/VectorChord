@@ -66,7 +66,7 @@ where
             return Box::new(std::iter::empty());
         };
         let vertex_tuple = VertexTuple::deserialize_ref(vertex_bytes);
-        let pointers_s = bump.alloc_slice(vertex_tuple.pointers());
+        let pointers_s: &[_] = bump.alloc_slice(vertex_tuple.pointers());
         let score_s = O::process(
             bits,
             dims,

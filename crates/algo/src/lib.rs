@@ -52,9 +52,9 @@ pub trait PageGuard {
     fn id(&self) -> u32;
 }
 
-pub trait ReadStream<'r> {
+pub trait ReadStream<'b> {
     type Relation: RelationReadTypes;
-    type Guards: ExactSizeIterator<Item = <Self::Relation as RelationReadTypes>::ReadGuard<'r>>;
+    type Guards: ExactSizeIterator<Item = <Self::Relation as RelationReadTypes>::ReadGuard<'b>>;
     type Item;
     type Inner: Iterator<Item = Self::Item>;
     fn next(&mut self) -> Option<(Self::Item, Self::Guards)>;
@@ -70,7 +70,7 @@ pub trait Relation {
 }
 
 pub trait RelationReadTypes: Relation {
-    type ReadGuard<'r>: PageGuard + Deref<Target = Self::Page>;
+    type ReadGuard<'b>: PageGuard + Deref<Target = Self::Page>;
 }
 
 pub trait RelationRead: RelationReadTypes {
@@ -78,7 +78,7 @@ pub trait RelationRead: RelationReadTypes {
 }
 
 pub trait RelationWriteTypes: Relation {
-    type WriteGuard<'r>: PageGuard + DerefMut<Target = Self::Page>;
+    type WriteGuard<'b>: PageGuard + DerefMut<Target = Self::Page>;
 }
 
 pub trait RelationWrite: RelationWriteTypes {
@@ -117,15 +117,15 @@ impl Hints {
 }
 
 pub trait RelationReadStreamTypes: RelationReadTypes {
-    type ReadStream<'r, I: Iterator>: ReadStream<'r, Item = I::Item, Relation = Self>
+    type ReadStream<'b, I: Iterator>: ReadStream<'b, Item = I::Item, Relation = Self>
     where
-        I::Item: Fetch;
+        I::Item: Fetch<'b>;
 }
 
 pub trait RelationReadStream: RelationReadStreamTypes {
-    fn read_stream<'r, I: Iterator>(&'r self, iter: I, hints: Hints) -> Self::ReadStream<'r, I>
+    fn read_stream<'b, I: Iterator>(&'b self, iter: I, hints: Hints) -> Self::ReadStream<'b, I>
     where
-        I::Item: Fetch;
+        I::Item: Fetch<'b>;
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -136,15 +136,16 @@ pub enum RerankMethod {
 
 pub trait Bump: 'static {
     #[allow(clippy::mut_from_ref)]
-    fn alloc<T>(&self, value: T) -> &mut T;
+    fn alloc<T: Copy>(&self, value: T) -> &mut T;
     #[allow(clippy::mut_from_ref)]
     fn alloc_slice<T: Copy>(&self, slice: &[T]) -> &mut [T];
-    fn reset(&mut self);
+    #[allow(clippy::mut_from_ref)]
+    fn alloc_any<T>(&self, value: T) -> &mut T;
 }
 
 impl Bump for bumpalo::Bump {
     #[inline]
-    fn alloc<T>(&self, value: T) -> &mut T {
+    fn alloc<T: Copy>(&self, value: T) -> &mut T {
         self.alloc(value)
     }
 
@@ -154,62 +155,68 @@ impl Bump for bumpalo::Bump {
     }
 
     #[inline]
-    fn reset(&mut self) {
-        self.reset();
+    fn alloc_any<T>(&self, value: T) -> &mut T {
+        self.alloc(value)
     }
 }
 
-pub type BorrowedIter<'b> = sbsii::borrowed::IntoIter<'b, u32, 1>;
-pub type OwnedIter = sbsii::owned::IntoIter<u32, 4>;
+pub type BorrowedIter<'b> = small_iter::borrowed::Iter<'b, u32, 1>;
 
-pub trait Fetch {
+pub trait Fetch<'b> {
+    type Iter: ExactSizeIterator<Item = u32> + 'b;
     #[must_use]
-    fn fetch(&self) -> OwnedIter;
+    fn fetch(&self) -> Self::Iter;
 }
 
-impl Fetch for u32 {
+impl Fetch<'_> for u32 {
+    type Iter = std::iter::Once<u32>;
     #[inline(always)]
-    fn fetch(&self) -> OwnedIter {
-        OwnedIter::from_slice(std::slice::from_ref(self))
+    fn fetch(&self) -> std::iter::Once<u32> {
+        std::iter::once(*self)
     }
 }
 
-impl<T, A, B> Fetch for (T, AlwaysEqual<&mut (A, B, BorrowedIter<'_>)>) {
+impl<'b, T, A, B> Fetch<'b> for (T, AlwaysEqual<&mut (A, B, BorrowedIter<'b>)>) {
+    type Iter = BorrowedIter<'b>;
     #[inline(always)]
-    fn fetch(&self) -> OwnedIter {
+    fn fetch(&self) -> BorrowedIter<'b> {
         let (_, AlwaysEqual((.., list))) = self;
-        OwnedIter::from_slice(list.as_slice())
+        *list
     }
 }
 
-impl<T, A, B, C> Fetch for (T, AlwaysEqual<&mut (A, B, C, BorrowedIter<'_>)>) {
+impl<'b, T, A, B, C> Fetch<'b> for (T, AlwaysEqual<&mut (A, B, C, BorrowedIter<'b>)>) {
+    type Iter = BorrowedIter<'b>;
     #[inline(always)]
-    fn fetch(&self) -> OwnedIter {
+    fn fetch(&self) -> BorrowedIter<'b> {
         let (_, AlwaysEqual((.., list))) = self;
-        OwnedIter::from_slice(list.as_slice())
+        *list
     }
 }
 
-impl<T> Fetch for (T, AlwaysEqual<(u32, u16)>) {
+impl<T> Fetch<'_> for (T, AlwaysEqual<(u32, u16)>) {
+    type Iter = std::iter::Once<u32>;
     #[inline(always)]
-    fn fetch(&self) -> OwnedIter {
+    fn fetch(&self) -> std::iter::Once<u32> {
         let (_, AlwaysEqual((x, _))) = self;
-        OwnedIter::from_slice(std::slice::from_ref(x))
+        std::iter::once(*x)
     }
 }
 
-impl Fetch for (u32, u16) {
+impl Fetch<'_> for (u32, u16) {
+    type Iter = std::iter::Once<u32>;
     #[inline(always)]
-    fn fetch(&self) -> OwnedIter {
-        OwnedIter::from_slice(std::slice::from_ref(&self.0))
+    fn fetch(&self) -> std::iter::Once<u32> {
+        std::iter::once(self.0)
     }
 }
 
-impl<T> Fetch for (T, AlwaysEqual<((u32, u16), (u32, u16))>) {
+impl<T> Fetch<'_> for (T, AlwaysEqual<((u32, u16), (u32, u16))>) {
+    type Iter = std::iter::Once<u32>;
     #[inline(always)]
-    fn fetch(&self) -> OwnedIter {
+    fn fetch(&self) -> std::iter::Once<u32> {
         let (_, AlwaysEqual(((x, _), _))) = self;
-        OwnedIter::from_slice(std::slice::from_ref(x))
+        std::iter::once(*x)
     }
 }
 
@@ -217,19 +224,47 @@ pub trait Fetch1 {
     fn fetch_1(&self) -> u32;
 }
 
-impl<T, F: Fetch1> Fetch for (T, AlwaysEqual<&mut [F]>) {
+#[repr(transparent)]
+pub struct Fetch1Iter<I> {
+    iter: I,
+}
+
+impl<I: Iterator> Iterator for Fetch1Iter<I>
+where
+    I::Item: Fetch1,
+{
+    type Item = u32;
+
     #[inline(always)]
-    fn fetch(&self) -> OwnedIter {
-        let vec = self.1.0.iter().map(|x| x.fetch_1()).collect::<Vec<_>>();
-        OwnedIter::from_slice(vec.as_slice())
+    fn next(&mut self) -> Option<Self::Item> {
+        self.iter.next().map(|x| x.fetch_1())
+    }
+
+    #[inline(always)]
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        self.iter.size_hint()
     }
 }
 
-impl<T, U, F: Fetch1> Fetch for (T, AlwaysEqual<(&mut [F], U)>) {
+impl<I: ExactSizeIterator> ExactSizeIterator for Fetch1Iter<I> where I::Item: Fetch1 {}
+
+impl<'b, T, F: Fetch1 + Copy> Fetch<'b> for (T, AlwaysEqual<&'b [F]>) {
+    type Iter = Fetch1Iter<std::iter::Copied<std::slice::Iter<'b, F>>>;
     #[inline(always)]
-    fn fetch(&self) -> OwnedIter {
-        let vec = self.1.0.0.iter().map(|x| x.fetch_1()).collect::<Vec<_>>();
-        OwnedIter::from_slice(vec.as_slice())
+    fn fetch(&self) -> Self::Iter {
+        Fetch1Iter {
+            iter: self.1.0.iter().copied(),
+        }
+    }
+}
+
+impl<'b, T, U, F: Fetch1 + Copy> Fetch<'b> for (T, AlwaysEqual<(&'b [F], U)>) {
+    type Iter = Fetch1Iter<std::iter::Copied<std::slice::Iter<'b, F>>>;
+    #[inline(always)]
+    fn fetch(&self) -> Self::Iter {
+        Fetch1Iter {
+            iter: self.1.0.0.iter().copied(),
+        }
     }
 }
 

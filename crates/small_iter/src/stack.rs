@@ -14,20 +14,20 @@
 
 use std::mem::MaybeUninit;
 
-#[derive(Clone)]
-pub struct StackIntoIter<T: Copy, const N: usize> {
-    start: u16,
-    end: u16,
+#[derive(Clone, Copy)]
+pub struct StackIter<T: Copy, const N: usize> {
+    off: u16,
+    len: u16,
     buffer: [MaybeUninit<T>; N],
 }
 
-impl<T: Copy, const N: usize> StackIntoIter<T, N> {
+impl<T: Copy, const N: usize> StackIter<T, N> {
     #[inline(always)]
     pub(crate) fn from_slice(slice: &[T]) -> Self {
         assert!(slice.len() <= N && N <= 65535);
         Self {
-            start: 0,
-            end: slice.len() as u16,
+            off: 0,
+            len: slice.len() as u16,
             buffer: {
                 let mut buffer = [const { MaybeUninit::uninit() }; N];
                 for i in 0..slice.len() {
@@ -37,29 +37,18 @@ impl<T: Copy, const N: usize> StackIntoIter<T, N> {
             },
         }
     }
-
-    #[inline(always)]
-    pub(crate) fn as_slice(&self) -> &[T] {
-        #[allow(unsafe_code)]
-        unsafe {
-            std::slice::from_raw_parts(
-                self.buffer.as_ptr().add(self.start as _).cast(),
-                (self.end - self.start) as _,
-            )
-        }
-    }
 }
 
-impl<T: Copy, const N: usize> Iterator for StackIntoIter<T, N> {
+impl<T: Copy, const N: usize> Iterator for StackIter<T, N> {
     type Item = T;
 
     #[inline(always)]
     fn next(&mut self) -> Option<Self::Item> {
         #[allow(unsafe_code)]
         unsafe {
-            if self.start < self.end {
-                let r = self.buffer[self.start as usize].assume_init();
-                self.start += 1;
+            if self.off < self.len {
+                let r = self.buffer[self.off as usize].assume_init();
+                self.off += 1;
                 Some(r)
             } else {
                 None
@@ -69,9 +58,9 @@ impl<T: Copy, const N: usize> Iterator for StackIntoIter<T, N> {
 
     #[inline(always)]
     fn size_hint(&self) -> (usize, Option<usize>) {
-        let size = (self.end - self.start) as usize;
+        let size = (self.len - self.off) as usize;
         (size, Some(size))
     }
 }
 
-impl<T: Copy, const N: usize> ExactSizeIterator for StackIntoIter<T, N> {}
+impl<T: Copy, const N: usize> ExactSizeIterator for StackIter<T, N> {}

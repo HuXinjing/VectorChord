@@ -16,6 +16,7 @@ pub mod am_build;
 
 use crate::index::fetcher::*;
 use crate::index::gucs;
+use crate::index::scanners::SearchBuilder;
 use crate::index::storage::PostgresRelation;
 use crate::index::vchordg::opclass::opfamily;
 use crate::index::vchordg::scanners::*;

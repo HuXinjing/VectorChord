@@ -197,25 +197,25 @@ impl RandomProject for VectBorrowed<'_, f16> {
 }
 
 #[derive(Debug)]
-pub struct MakePlainPrefetcher<'r, R> {
-    pub index: &'r R,
+pub struct MakePlainPrefetcher<'b, R> {
+    pub index: &'b R,
 }
 
-impl<'r, R> Clone for MakePlainPrefetcher<'r, R> {
+impl<'b, R> Clone for MakePlainPrefetcher<'b, R> {
     fn clone(&self) -> Self {
         Self { index: self.index }
     }
 }
 
-impl<'r, R: RelationRead> PrefetcherSequenceFamily<'r, R> for MakePlainPrefetcher<'r, R> {
+impl<'b, R: RelationRead> PrefetcherSequenceFamily<'b, R> for MakePlainPrefetcher<'b, R> {
     type P<S: Sequence>
-        = PlainPrefetcher<'r, R, S>
+        = PlainPrefetcher<'b, R, S>
     where
-        S::Item: Fetch;
+        S::Item: Fetch<'b>;
 
     fn prefetch<S: Sequence>(&mut self, seq: S) -> Self::P<S>
     where
-        S::Item: Fetch,
+        S::Item: Fetch<'b>,
     {
         PlainPrefetcher::new(self.index, seq)
     }
@@ -226,27 +226,27 @@ impl<'r, R: RelationRead> PrefetcherSequenceFamily<'r, R> for MakePlainPrefetche
 }
 
 #[derive(Debug)]
-pub struct MakeSimplePrefetcher<'r, R> {
-    pub index: &'r R,
+pub struct MakeSimplePrefetcher<'b, R> {
+    pub index: &'b R,
 }
 
-impl<'r, R> Clone for MakeSimplePrefetcher<'r, R> {
+impl<'b, R> Clone for MakeSimplePrefetcher<'b, R> {
     fn clone(&self) -> Self {
         Self { index: self.index }
     }
 }
 
-impl<'r, R: RelationRead + RelationPrefetch> PrefetcherSequenceFamily<'r, R>
-    for MakeSimplePrefetcher<'r, R>
+impl<'b, R: RelationRead + RelationPrefetch> PrefetcherSequenceFamily<'b, R>
+    for MakeSimplePrefetcher<'b, R>
 {
     type P<S: Sequence>
-        = SimplePrefetcher<'r, R, S>
+        = SimplePrefetcher<'b, R, S>
     where
-        S::Item: Fetch;
+        S::Item: Fetch<'b>;
 
     fn prefetch<S: Sequence>(&mut self, seq: S) -> Self::P<S>
     where
-        S::Item: Fetch,
+        S::Item: Fetch<'b>,
     {
         SimplePrefetcher::new(self.index, seq)
     }
@@ -257,12 +257,12 @@ impl<'r, R: RelationRead + RelationPrefetch> PrefetcherSequenceFamily<'r, R>
 }
 
 #[derive(Debug)]
-pub struct MakeStreamPrefetcher<'r, R> {
-    pub index: &'r R,
+pub struct MakeStreamPrefetcher<'b, R> {
+    pub index: &'b R,
     pub hints: Hints,
 }
 
-impl<'r, R> Clone for MakeStreamPrefetcher<'r, R> {
+impl<'b, R> Clone for MakeStreamPrefetcher<'b, R> {
     fn clone(&self) -> Self {
         Self {
             index: self.index,
@@ -271,17 +271,17 @@ impl<'r, R> Clone for MakeStreamPrefetcher<'r, R> {
     }
 }
 
-impl<'r, R: RelationRead + RelationReadStream> PrefetcherSequenceFamily<'r, R>
-    for MakeStreamPrefetcher<'r, R>
+impl<'b, R: RelationRead + RelationReadStream> PrefetcherSequenceFamily<'b, R>
+    for MakeStreamPrefetcher<'b, R>
 {
     type P<S: Sequence>
-        = StreamPrefetcher<'r, R, S>
+        = StreamPrefetcher<'b, R, S>
     where
-        S::Item: Fetch;
+        S::Item: Fetch<'b>;
 
     fn prefetch<S: Sequence>(&mut self, seq: S) -> Self::P<S>
     where
-        S::Item: Fetch,
+        S::Item: Fetch<'b>,
     {
         StreamPrefetcher::new(self.index, seq, self.hints.clone())
     }

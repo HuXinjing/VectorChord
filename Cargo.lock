@@ -19,8 +19,8 @@ dependencies = [
  "bumpalo",
  "distance",
  "half 2.6.0",
- "sbsii",
  "simd",
+ "small_iter",
  "vector",
  "zerocopy",
 ]
@@ -1191,10 +1191,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "sbsii"
-version = "0.0.0"
-
-[[package]]
 name = "seahash"
 version = "4.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1293,6 +1289,10 @@ dependencies = [
  "quote",
  "syn",
 ]
+
+[[package]]
+name = "small_iter"
+version = "0.0.0"
 
 [[package]]
 name = "smallvec"
@@ -1585,10 +1585,10 @@ dependencies = [
  "pgrx-catalog",
  "rabitq",
  "rand",
- "sbsii",
  "seq-macro",
  "serde",
  "simd",
+ "small_iter",
  "toml 0.9.5",
  "validator",
  "vchordg",

@@ -12,11 +12,12 @@
 //
 // Copyright (c) 2025 TensorChord Inc.
 
-use super::{Fetcher, Io, SearchBuilder, SearchOptions};
-use crate::index::fetcher::pointer_to_kv;
+use crate::index::fetcher::{Fetcher, pointer_to_kv};
 use crate::index::opclass::Sphere;
+use crate::index::scanners::{Io, SearchBuilder};
 use crate::index::vchordg::algo::*;
 use crate::index::vchordg::opclass::Opfamily;
+use crate::index::vchordg::scanners::SearchOptions;
 use algo::accessor::{Dot, L2S};
 use algo::*;
 use distance::Distance;
@@ -35,6 +36,10 @@ pub struct DefaultBuilder {
 }
 
 impl SearchBuilder for DefaultBuilder {
+    type Options = SearchOptions;
+
+    type Opfamily = Opfamily;
+
     type Opaque = vchordg::Opaque;
 
     fn new(opfamily: Opfamily) -> Self {
@@ -68,13 +73,13 @@ impl SearchBuilder for DefaultBuilder {
         }
     }
 
-    fn build<'a, R>(
+    fn build<'b, R>(
         self,
-        index: &'a R,
+        index: &'b R,
         options: SearchOptions,
-        _fetcher: impl Fetcher + 'a,
-        bump: &'a impl Bump,
-    ) -> Box<dyn Iterator<Item = (f32, [u16; 3], bool)> + 'a>
+        _fetcher: impl Fetcher + 'b,
+        bump: &'b impl Bump,
+    ) -> Box<dyn Iterator<Item = (f32, [u16; 3], bool)> + 'b>
     where
         R: RelationRead + RelationPrefetch + RelationReadStream,
         R::Page: Page<Opaque = vchordg::Opaque>,
@@ -117,11 +122,12 @@ impl SearchBuilder for DefaultBuilder {
                 (VectorKind::Vecf32, DistanceKind::L2S) => {
                     type Op = operator::Op<VectOwned<f32>, L2S>;
                     let unprojected = if let OwnedVector::Vecf32(vector) = vector {
-                        bump.alloc(vector)
+                        bump.alloc_any(vector)
                     } else {
                         unreachable!()
                     };
-                    let projected = bump.alloc(RandomProject::project(unprojected.as_borrowed()));
+                    let projected =
+                        bump.alloc_any(RandomProject::project(unprojected.as_borrowed()));
                     match (options.io_search, options.io_rerank) {
                         (Io::Plain, Io::Plain) => search::<_, Op>(
                             index,
@@ -209,11 +215,12 @@ impl SearchBuilder for DefaultBuilder {
                 (VectorKind::Vecf16, DistanceKind::L2S) => {
                     type Op = operator::Op<VectOwned<f16>, L2S>;
                     let unprojected = if let OwnedVector::Vecf16(vector) = vector {
-                        bump.alloc(vector)
+                        bump.alloc_any(vector)
                     } else {
                         unreachable!()
                     };
-                    let projected = bump.alloc(RandomProject::project(unprojected.as_borrowed()));
+                    let projected =
+                        bump.alloc_any(RandomProject::project(unprojected.as_borrowed()));
                     match (options.io_search, options.io_rerank) {
                         (Io::Plain, Io::Plain) => search::<_, Op>(
                             index,
@@ -301,11 +308,12 @@ impl SearchBuilder for DefaultBuilder {
                 (VectorKind::Vecf32, DistanceKind::Dot) => {
                     type Op = operator::Op<VectOwned<f32>, Dot>;
                     let unprojected = if let OwnedVector::Vecf32(vector) = vector {
-                        bump.alloc(vector)
+                        bump.alloc_any(vector)
                     } else {
                         unreachable!()
                     };
-                    let projected = bump.alloc(RandomProject::project(unprojected.as_borrowed()));
+                    let projected =
+                        bump.alloc_any(RandomProject::project(unprojected.as_borrowed()));
                     match (options.io_search, options.io_rerank) {
                         (Io::Plain, Io::Plain) => search::<_, Op>(
                             index,
@@ -393,11 +401,12 @@ impl SearchBuilder for DefaultBuilder {
                 (VectorKind::Vecf16, DistanceKind::Dot) => {
                     type Op = operator::Op<VectOwned<f16>, Dot>;
                     let unprojected = if let OwnedVector::Vecf16(vector) = vector {
-                        bump.alloc(vector)
+                        bump.alloc_any(vector)
                     } else {
                         unreachable!()
                     };
-                    let projected = bump.alloc(RandomProject::project(unprojected.as_borrowed()));
+                    let projected =
+                        bump.alloc_any(RandomProject::project(unprojected.as_borrowed()));
                     match (options.io_search, options.io_rerank) {
                         (Io::Plain, Io::Plain) => search::<_, Op>(
                             index,

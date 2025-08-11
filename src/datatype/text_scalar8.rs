@@ -12,8 +12,7 @@
 //
 // Copyright (c) 2025 TensorChord Inc.
 
-use super::memory_scalar8::Scalar8Output;
-use crate::datatype::memory_scalar8::Scalar8Input;
+use crate::datatype::memory_scalar8::{Scalar8Input, Scalar8Output};
 use pgrx::pg_sys::Oid;
 use std::ffi::{CStr, CString};
 use vector::scalar8::Scalar8Borrowed;

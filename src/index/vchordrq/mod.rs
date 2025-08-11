@@ -14,6 +14,7 @@
 
 pub mod algo;
 pub mod am;
+pub mod filter;
 pub mod opclass;
 pub mod scanners;
 pub mod types;

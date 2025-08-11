@@ -55,13 +55,13 @@ where
     }
 }
 
-pub fn insert<'r, 'b: 'r, R: RelationRead + RelationWrite, O: Operator>(
-    index: &'r R,
+pub fn insert<'b, R: RelationRead + RelationWrite, O: Operator>(
+    index: &'b R,
     payload: NonZero<u64>,
     vector: <O::Vector as VectorOwned>::Borrowed<'_>,
     key: (Vec<u32>, u16),
     bump: &'b impl Bump,
-    mut prefetch_h1_vectors: impl PrefetcherHeapFamily<'r, R>,
+    mut prefetch_h1_vectors: impl PrefetcherHeapFamily<'b, R>,
     skip_freespaces: bool,
 ) where
     R::Page: Page<Opaque = Opaque>,

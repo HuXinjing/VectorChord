@@ -50,10 +50,10 @@ pub struct Reranker<T, F, P> {
     _phantom: PhantomData<fn(T) -> T>,
 }
 
-impl<'r, 'b, T, F, P> Iterator for Reranker<T, F, P>
+impl<'b, T, F, P> Iterator for Reranker<T, F, P>
 where
     F: FnMut(NonZero<u64>, P::Guards, u16) -> Option<Distance>,
-    P: Prefetcher<'r, Item = ((Reverse<Distance>, AlwaysEqual<T>), AlwaysEqual<Extra0<'b>>)>,
+    P: Prefetcher<'b, Item = ((Reverse<Distance>, AlwaysEqual<T>), AlwaysEqual<Extra0<'b>>)>,
 {
     type Item = (Distance, NonZero<u64>);
 
@@ -78,11 +78,10 @@ impl<T, F, P> Reranker<T, F, P> {
 }
 
 pub fn rerank_index<
-    'r,
     'b,
     O: Operator,
     T,
-    P: Prefetcher<'r, Item = ((Reverse<Distance>, AlwaysEqual<T>), AlwaysEqual<Extra0<'b>>)>,
+    P: Prefetcher<'b, Item = ((Reverse<Distance>, AlwaysEqual<T>), AlwaysEqual<Extra0<'b>>)>,
 >(
     vector: O::Vector,
     prefetcher: P,
@@ -106,11 +105,10 @@ pub fn rerank_index<
 }
 
 pub fn rerank_heap<
-    'r,
     'b,
     O: Operator,
     T,
-    P: Prefetcher<'r, Item = ((Reverse<Distance>, AlwaysEqual<T>), AlwaysEqual<Extra0<'b>>)>,
+    P: Prefetcher<'b, Item = ((Reverse<Distance>, AlwaysEqual<T>), AlwaysEqual<Extra0<'b>>)>,
 >(
     vector: O::Vector,
     prefetcher: P,

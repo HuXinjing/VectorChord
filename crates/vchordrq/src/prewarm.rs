@@ -22,10 +22,10 @@ use algo::accessor::FunctionalAccessor;
 use algo::prefetcher::PrefetcherSequenceFamily;
 use std::fmt::Write;
 
-pub fn prewarm<'r, R: RelationRead, O: Operator>(
-    index: &'r R,
+pub fn prewarm<'b, R: RelationRead, O: Operator>(
+    index: &'b R,
     height: i32,
-    mut prefetch_h0_tuples: impl PrefetcherSequenceFamily<'r, R>,
+    mut prefetch_h0_tuples: impl PrefetcherSequenceFamily<'b, R>,
 ) -> String
 where
     R::Page: Page<Opaque = Opaque>,
@@ -45,7 +45,7 @@ where
     type State = Vec<u32>;
     let mut state: State = {
         let mut results = Vec::new();
-        let prefetch = algo::OwnedIter::from_slice(meta_tuple.centroid_prefetch());
+        let prefetch = meta_tuple.centroid_prefetch().to_vec().into_iter();
         let head = meta_tuple.centroid_head();
         let first = meta_tuple.first();
         vectors::read_for_h1_tuple::<R, O, _>(prefetch.map(|id| index.read(id)), head, ());
