@@ -117,7 +117,7 @@ where
     R: RelationRead + RelationWrite + RelationReadStream,
     R::Page: Page<Opaque = Opaque>,
 {
-    let bump = bumpalo::Bump::with_capacity(2 << 20);
+    let bump = bumpalo::Bump::new();
     let make_vertex_plain_prefetcher = MakePlainPrefetcher { index };
     let make_vector_plain_prefetcher = MakePlainPrefetcher { index };
     match (vector, opfamily.distance_kind()) {

@@ -26,8 +26,7 @@ use std::num::NonZero;
 use vchordg::operator::{self};
 use vchordg::types::{DistanceKind, OwnedVector, VectorKind};
 use vchordg::*;
-use vector::VectorOwned;
-use vector::vect::VectOwned;
+use vector::vect::{VectBorrowed, VectOwned};
 
 pub struct DefaultBuilder {
     opfamily: Opfamily,
@@ -122,16 +121,18 @@ impl SearchBuilder for DefaultBuilder {
                 (VectorKind::Vecf32, DistanceKind::L2S) => {
                     type Op = operator::Op<VectOwned<f32>, L2S>;
                     let unprojected = if let OwnedVector::Vecf32(vector) = vector {
-                        bump.alloc_any(vector)
+                        VectBorrowed::new(bump.alloc_slice(vector.slice()))
                     } else {
                         unreachable!()
                     };
-                    let projected =
-                        bump.alloc_any(RandomProject::project(unprojected.as_borrowed()));
+                    let projected = {
+                        let projected = RandomProject::project(unprojected);
+                        VectBorrowed::new(bump.alloc_slice(projected.slice()))
+                    };
                     match (options.io_search, options.io_rerank) {
                         (Io::Plain, Io::Plain) => search::<_, Op>(
                             index,
-                            projected.as_borrowed(),
+                            projected,
                             options.ef_search,
                             options.beam_search,
                             bump,
@@ -140,7 +141,7 @@ impl SearchBuilder for DefaultBuilder {
                         ),
                         (Io::Plain, Io::Simple) => search::<_, Op>(
                             index,
-                            projected.as_borrowed(),
+                            projected,
                             options.ef_search,
                             options.beam_search,
                             bump,
@@ -149,7 +150,7 @@ impl SearchBuilder for DefaultBuilder {
                         ),
                         (Io::Plain, Io::Stream) => search::<_, Op>(
                             index,
-                            projected.as_borrowed(),
+                            projected,
                             options.ef_search,
                             options.beam_search,
                             bump,
@@ -158,7 +159,7 @@ impl SearchBuilder for DefaultBuilder {
                         ),
                         (Io::Simple, Io::Plain) => search::<_, Op>(
                             index,
-                            projected.as_borrowed(),
+                            projected,
                             options.ef_search,
                             options.beam_search,
                             bump,
@@ -167,7 +168,7 @@ impl SearchBuilder for DefaultBuilder {
                         ),
                         (Io::Simple, Io::Simple) => search::<_, Op>(
                             index,
-                            projected.as_borrowed(),
+                            projected,
                             options.ef_search,
                             options.beam_search,
                             bump,
@@ -176,7 +177,7 @@ impl SearchBuilder for DefaultBuilder {
                         ),
                         (Io::Simple, Io::Stream) => search::<_, Op>(
                             index,
-                            projected.as_borrowed(),
+                            projected,
                             options.ef_search,
                             options.beam_search,
                             bump,
@@ -185,7 +186,7 @@ impl SearchBuilder for DefaultBuilder {
                         ),
                         (Io::Stream, Io::Plain) => search::<_, Op>(
                             index,
-                            projected.as_borrowed(),
+                            projected,
                             options.ef_search,
                             options.beam_search,
                             bump,
@@ -194,7 +195,7 @@ impl SearchBuilder for DefaultBuilder {
                         ),
                         (Io::Stream, Io::Simple) => search::<_, Op>(
                             index,
-                            projected.as_borrowed(),
+                            projected,
                             options.ef_search,
                             options.beam_search,
                             bump,
@@ -203,7 +204,7 @@ impl SearchBuilder for DefaultBuilder {
                         ),
                         (Io::Stream, Io::Stream) => search::<_, Op>(
                             index,
-                            projected.as_borrowed(),
+                            projected,
                             options.ef_search,
                             options.beam_search,
                             bump,
@@ -215,16 +216,18 @@ impl SearchBuilder for DefaultBuilder {
                 (VectorKind::Vecf16, DistanceKind::L2S) => {
                     type Op = operator::Op<VectOwned<f16>, L2S>;
                     let unprojected = if let OwnedVector::Vecf16(vector) = vector {
-                        bump.alloc_any(vector)
+                        VectBorrowed::new(bump.alloc_slice(vector.slice()))
                     } else {
                         unreachable!()
                     };
-                    let projected =
-                        bump.alloc_any(RandomProject::project(unprojected.as_borrowed()));
+                    let projected = {
+                        let projected = RandomProject::project(unprojected);
+                        VectBorrowed::new(bump.alloc_slice(projected.slice()))
+                    };
                     match (options.io_search, options.io_rerank) {
                         (Io::Plain, Io::Plain) => search::<_, Op>(
                             index,
-                            projected.as_borrowed(),
+                            projected,
                             options.ef_search,
                             options.beam_search,
                             bump,
@@ -233,7 +236,7 @@ impl SearchBuilder for DefaultBuilder {
                         ),
                         (Io::Plain, Io::Simple) => search::<_, Op>(
                             index,
-                            projected.as_borrowed(),
+                            projected,
                             options.ef_search,
                             options.beam_search,
                             bump,
@@ -242,7 +245,7 @@ impl SearchBuilder for DefaultBuilder {
                         ),
                         (Io::Plain, Io::Stream) => search::<_, Op>(
                             index,
-                            projected.as_borrowed(),
+                            projected,
                             options.ef_search,
                             options.beam_search,
                             bump,
@@ -251,7 +254,7 @@ impl SearchBuilder for DefaultBuilder {
                         ),
                         (Io::Simple, Io::Plain) => search::<_, Op>(
                             index,
-                            projected.as_borrowed(),
+                            projected,
                             options.ef_search,
                             options.beam_search,
                             bump,
@@ -260,7 +263,7 @@ impl SearchBuilder for DefaultBuilder {
                         ),
                         (Io::Simple, Io::Simple) => search::<_, Op>(
                             index,
-                            projected.as_borrowed(),
+                            projected,
                             options.ef_search,
                             options.beam_search,
                             bump,
@@ -269,7 +272,7 @@ impl SearchBuilder for DefaultBuilder {
                         ),
                         (Io::Simple, Io::Stream) => search::<_, Op>(
                             index,
-                            projected.as_borrowed(),
+                            projected,
                             options.ef_search,
                             options.beam_search,
                             bump,
@@ -278,7 +281,7 @@ impl SearchBuilder for DefaultBuilder {
                         ),
                         (Io::Stream, Io::Plain) => search::<_, Op>(
                             index,
-                            projected.as_borrowed(),
+                            projected,
                             options.ef_search,
                             options.beam_search,
                             bump,
@@ -287,7 +290,7 @@ impl SearchBuilder for DefaultBuilder {
                         ),
                         (Io::Stream, Io::Simple) => search::<_, Op>(
                             index,
-                            projected.as_borrowed(),
+                            projected,
                             options.ef_search,
                             options.beam_search,
                             bump,
@@ -296,7 +299,7 @@ impl SearchBuilder for DefaultBuilder {
                         ),
                         (Io::Stream, Io::Stream) => search::<_, Op>(
                             index,
-                            projected.as_borrowed(),
+                            projected,
                             options.ef_search,
                             options.beam_search,
                             bump,
@@ -308,16 +311,18 @@ impl SearchBuilder for DefaultBuilder {
                 (VectorKind::Vecf32, DistanceKind::Dot) => {
                     type Op = operator::Op<VectOwned<f32>, Dot>;
                     let unprojected = if let OwnedVector::Vecf32(vector) = vector {
-                        bump.alloc_any(vector)
+                        VectBorrowed::new(bump.alloc_slice(vector.slice()))
                     } else {
                         unreachable!()
                     };
-                    let projected =
-                        bump.alloc_any(RandomProject::project(unprojected.as_borrowed()));
+                    let projected = {
+                        let projected = RandomProject::project(unprojected);
+                        VectBorrowed::new(bump.alloc_slice(projected.slice()))
+                    };
                     match (options.io_search, options.io_rerank) {
                         (Io::Plain, Io::Plain) => search::<_, Op>(
                             index,
-                            projected.as_borrowed(),
+                            projected,
                             options.ef_search,
                             options.beam_search,
                             bump,
@@ -326,7 +331,7 @@ impl SearchBuilder for DefaultBuilder {
                         ),
                         (Io::Plain, Io::Simple) => search::<_, Op>(
                             index,
-                            projected.as_borrowed(),
+                            projected,
                             options.ef_search,
                             options.beam_search,
                             bump,
@@ -335,7 +340,7 @@ impl SearchBuilder for DefaultBuilder {
                         ),
                         (Io::Plain, Io::Stream) => search::<_, Op>(
                             index,
-                            projected.as_borrowed(),
+                            projected,
                             options.ef_search,
                             options.beam_search,
                             bump,
@@ -344,7 +349,7 @@ impl SearchBuilder for DefaultBuilder {
                         ),
                         (Io::Simple, Io::Plain) => search::<_, Op>(
                             index,
-                            projected.as_borrowed(),
+                            projected,
                             options.ef_search,
                             options.beam_search,
                             bump,
@@ -353,7 +358,7 @@ impl SearchBuilder for DefaultBuilder {
                         ),
                         (Io::Simple, Io::Simple) => search::<_, Op>(
                             index,
-                            projected.as_borrowed(),
+                            projected,
                             options.ef_search,
                             options.beam_search,
                             bump,
@@ -362,7 +367,7 @@ impl SearchBuilder for DefaultBuilder {
                         ),
                         (Io::Simple, Io::Stream) => search::<_, Op>(
                             index,
-                            projected.as_borrowed(),
+                            projected,
                             options.ef_search,
                             options.beam_search,
                             bump,
@@ -371,7 +376,7 @@ impl SearchBuilder for DefaultBuilder {
                         ),
                         (Io::Stream, Io::Plain) => search::<_, Op>(
                             index,
-                            projected.as_borrowed(),
+                            projected,
                             options.ef_search,
                             options.beam_search,
                             bump,
@@ -380,7 +385,7 @@ impl SearchBuilder for DefaultBuilder {
                         ),
                         (Io::Stream, Io::Simple) => search::<_, Op>(
                             index,
-                            projected.as_borrowed(),
+                            projected,
                             options.ef_search,
                             options.beam_search,
                             bump,
@@ -389,7 +394,7 @@ impl SearchBuilder for DefaultBuilder {
                         ),
                         (Io::Stream, Io::Stream) => search::<_, Op>(
                             index,
-                            projected.as_borrowed(),
+                            projected,
                             options.ef_search,
                             options.beam_search,
                             bump,
@@ -401,16 +406,18 @@ impl SearchBuilder for DefaultBuilder {
                 (VectorKind::Vecf16, DistanceKind::Dot) => {
                     type Op = operator::Op<VectOwned<f16>, Dot>;
                     let unprojected = if let OwnedVector::Vecf16(vector) = vector {
-                        bump.alloc_any(vector)
+                        VectBorrowed::new(bump.alloc_slice(vector.slice()))
                     } else {
                         unreachable!()
                     };
-                    let projected =
-                        bump.alloc_any(RandomProject::project(unprojected.as_borrowed()));
+                    let projected = {
+                        let projected = RandomProject::project(unprojected);
+                        VectBorrowed::new(bump.alloc_slice(projected.slice()))
+                    };
                     match (options.io_search, options.io_rerank) {
                         (Io::Plain, Io::Plain) => search::<_, Op>(
                             index,
-                            projected.as_borrowed(),
+                            projected,
                             options.ef_search,
                             options.beam_search,
                             bump,
@@ -419,7 +426,7 @@ impl SearchBuilder for DefaultBuilder {
                         ),
                         (Io::Plain, Io::Simple) => search::<_, Op>(
                             index,
-                            projected.as_borrowed(),
+                            projected,
                             options.ef_search,
                             options.beam_search,
                             bump,
@@ -428,7 +435,7 @@ impl SearchBuilder for DefaultBuilder {
                         ),
                         (Io::Plain, Io::Stream) => search::<_, Op>(
                             index,
-                            projected.as_borrowed(),
+                            projected,
                             options.ef_search,
                             options.beam_search,
                             bump,
@@ -437,7 +444,7 @@ impl SearchBuilder for DefaultBuilder {
                         ),
                         (Io::Simple, Io::Plain) => search::<_, Op>(
                             index,
-                            projected.as_borrowed(),
+                            projected,
                             options.ef_search,
                             options.beam_search,
                             bump,
@@ -446,7 +453,7 @@ impl SearchBuilder for DefaultBuilder {
                         ),
                         (Io::Simple, Io::Simple) => search::<_, Op>(
                             index,
-                            projected.as_borrowed(),
+                            projected,
                             options.ef_search,
                             options.beam_search,
                             bump,
@@ -455,7 +462,7 @@ impl SearchBuilder for DefaultBuilder {
                         ),
                         (Io::Simple, Io::Stream) => search::<_, Op>(
                             index,
-                            projected.as_borrowed(),
+                            projected,
                             options.ef_search,
                             options.beam_search,
                             bump,
@@ -464,7 +471,7 @@ impl SearchBuilder for DefaultBuilder {
                         ),
                         (Io::Stream, Io::Plain) => search::<_, Op>(
                             index,
-                            projected.as_borrowed(),
+                            projected,
                             options.ef_search,
                             options.beam_search,
                             bump,
@@ -473,7 +480,7 @@ impl SearchBuilder for DefaultBuilder {
                         ),
                         (Io::Stream, Io::Simple) => search::<_, Op>(
                             index,
-                            projected.as_borrowed(),
+                            projected,
                             options.ef_search,
                             options.beam_search,
                             bump,
@@ -482,7 +489,7 @@ impl SearchBuilder for DefaultBuilder {
                         ),
                         (Io::Stream, Io::Stream) => search::<_, Op>(
                             index,
-                            projected.as_borrowed(),
+                            projected,
                             options.ef_search,
                             options.beam_search,
                             bump,

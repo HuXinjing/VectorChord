@@ -158,7 +158,7 @@ pub fn insert<R>(
     R: RelationRead + RelationWrite,
     R::Page: Page<Opaque = Opaque>,
 {
-    let bump = bumpalo::Bump::with_capacity(2 << 20);
+    let bump = bumpalo::Bump::new();
     let make_h1_plain_prefetcher = MakeH1PlainPrefetcherForInsertion { index };
     match (vector, opfamily.distance_kind()) {
         (OwnedVector::Vecf32(vector), DistanceKind::L2S) => {

@@ -139,8 +139,6 @@ pub trait Bump: 'static {
     fn alloc<T: Copy>(&self, value: T) -> &mut T;
     #[allow(clippy::mut_from_ref)]
     fn alloc_slice<T: Copy>(&self, slice: &[T]) -> &mut [T];
-    #[allow(clippy::mut_from_ref)]
-    fn alloc_any<T>(&self, value: T) -> &mut T;
 }
 
 impl Bump for bumpalo::Bump {
@@ -152,11 +150,6 @@ impl Bump for bumpalo::Bump {
     #[inline]
     fn alloc_slice<T: Copy>(&self, slice: &[T]) -> &mut [T] {
         self.alloc_slice_copy(slice)
-    }
-
-    #[inline]
-    fn alloc_any<T>(&self, value: T) -> &mut T {
-        self.alloc(value)
     }
 }
 
