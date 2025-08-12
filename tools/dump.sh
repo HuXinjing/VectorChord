@@ -31,14 +31,15 @@ $(dirname "$0")/dump-codegen.sh | gcc -I $(pg_config --includedir-server) -fPIC 
 
 sql=$(mktemp)
 echo "BEGIN;" >> $sql
-echo "CREATE SCHEMA public;" >> $sql
-echo "CREATE EXTENSION vector;" >> $sql
+echo "CREATE SCHEMA vchord;" >> $sql
+echo "SET LOCAL search_path TO vchord,public;" >> $sql
 cat ${f[@]} \
     | grep -v '^\\' \
+    | sed "s|@extschema@|vchord|g" \
     | sed "s|MODULE_PATHNAME|$so|g" \
     >> $sql
 echo "END;" >> $sql
 
 psql -d vchord -f $sql 1>&2
-pg_dump -d vchord
-psql -d vchord -c "DROP SCHEMA IF EXISTS public CASCADE;" 1>&2
+pg_dump -s -d vchord
+psql -d vchord -c "DROP SCHEMA IF EXISTS vchord CASCADE;" 1>&2

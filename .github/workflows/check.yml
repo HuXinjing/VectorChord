@@ -196,6 +196,7 @@ jobs:
           sudo /usr/share/postgresql-common/pgdg/apt.postgresql.org.sh -y
           sudo apt-get install -y postgresql-server-dev-${{ matrix.version }}
           echo PGRX_PG_CONFIG_PATH=pg_config >> $GITHUB_ENV
+          echo PG_CONFIG=pg_config >> $GITHUB_ENV
 
           sudo apt-get install -y postgresql-${{ matrix.version }} postgresql-${{ matrix.version }}-pgvector
           echo "local all all trust" | sudo tee /etc/postgresql/${{ matrix.version }}/main/pg_hba.conf
@@ -219,8 +220,8 @@ jobs:
 
       - name: Install
         run: |
-          cargo run -p make -- build -o ./build/raw --profile dev
-          sudo make PG_CONFIG=${PGRX_PG_CONFIG_PATH} install
+          make PG_CONFIG=$PG_CONFIG PROFILE=dev build
+          sudo make PG_CONFIG=$PG_CONFIG install
 
       - name: Service
         run: |
@@ -280,6 +281,7 @@ jobs:
           $(brew --prefix postgresql@${{ matrix.version }})/bin/psql -c 'ALTER SYSTEM SET shared_preload_libraries = "vchord"'
           brew services stop postgresql@${{ matrix.version }}
           echo PGRX_PG_CONFIG_PATH=$(brew --prefix postgresql@${{ matrix.version }})/bin/pg_config >> $GITHUB_ENV
+          echo PG_CONFIG=$(brew --prefix postgresql@${{ matrix.version }})/bin/pg_config >> $GITHUB_ENV
 
           mkdir ~/pgvector-install
           curl -fsSL https://github.com/pgvector/pgvector/archive/refs/tags/v0.8.0.tar.gz | tar -xz -C ~/pgvector-install
@@ -300,8 +302,8 @@ jobs:
 
       - name: Install
         run: |
-          cargo run -p make -- build -o ./build/raw --profile dev
-          sudo make PG_CONFIG=${PGRX_PG_CONFIG_PATH} install
+          make PG_CONFIG=$PG_CONFIG PROFILE=dev build
+          sudo make PG_CONFIG=$PG_CONFIG install
 
       - name: Service
         run: |
@@ -374,6 +376,7 @@ jobs:
           Invoke-WebRequest -Uri $postgresql_url -OutFile "$env:TEMP\postgresql-install.zip"
           Expand-Archive -Path "$env:TEMP\postgresql-install.zip" -DestinationPath "D:\postgresql-install" -Force
           Add-Content -Path $env:GITHUB_ENV -Value "PGRX_PG_CONFIG_PATH=D:\postgresql-install\pgsql\bin\pg_config.exe"
+          Add-Content -Path $env:GITHUB_ENV -Value "PG_CONFIG=D:\postgresql-install\pgsql\bin\pg_config.exe"
           D:\postgresql-install\pgsql\bin\initdb.exe -D D:\postgresql-install\pgsql\data -U postgres
           D:\postgresql-install\pgsql\bin\pg_ctl.exe start -D D:\postgresql-install\pgsql\data
           D:\postgresql-install\pgsql\bin\createuser.exe -U postgres -s -r $env:USERNAME
@@ -404,8 +407,8 @@ jobs:
 
       - name: Install
         run: |
-          cargo run -p make -- build -o ./build/raw --profile dev
-          make PG_CONFIG="$env:PGRX_PG_CONFIG_PATH" install
+          make PG_CONFIG=$env:PG_CONFIG PROFILE=dev build
+          make PG_CONFIG=$env:PG_CONFIG install
 
       - name: Service
         run: |
@@ -468,6 +471,7 @@ jobs:
           curl https://sh.rustup.rs -sSf | sh -s -- -y --default-toolchain 1.89-beta
 
           echo PGRX_PG_CONFIG_PATH=/usr/libexec/postgresql${{ matrix.version }}/pg_config >> $GITHUB_ENV
+          echo PG_CONFIG=/usr/libexec/postgresql${{ matrix.version }}/pg_config >> $GITHUB_ENV
 
           install --verbose --directory --owner postgres --group postgres --mode 1777 /var/lib/postgresql
           install --verbose --directory --owner postgres --group postgres --mode 1777 /var/lib/postgresql/data
@@ -509,8 +513,8 @@ jobs:
       - name: Install
         run: |
           . "$HOME/.cargo/env"
-          cargo run -p make -- build -o ./build/raw --profile dev
-          make PG_CONFIG=${PGRX_PG_CONFIG_PATH} install
+          make PG_CONFIG=$PG_CONFIG PROFILE=dev build
+          sudo make PG_CONFIG=$PG_CONFIG install
 
       - name: Service
         run: |

@@ -65,6 +65,7 @@ jobs:
           sudo /usr/share/postgresql-common/pgdg/apt.postgresql.org.sh -y
           sudo apt-get install -y postgresql-server-dev-${{ matrix.version }}
           echo PGRX_PG_CONFIG_PATH=pg_config >> $GITHUB_ENV
+          echo PG_CONFIG=pg_config >> $GITHUB_ENV
 
           sudo apt-get install -y postgresql-${{ matrix.version }} postgresql-${{ matrix.version }}-pgvector
 
@@ -87,16 +88,15 @@ jobs:
           ARCH: ${{ matrix.arch }}
           PLATFORM: ${{ matrix.arch == 'x86_64' && 'amd64' || 'arm64' }}
         run: |
-          cargo run -p make -- build -o ./build/raw --profile release
+          make PG_CONFIG=$PG_CONFIG build
 
           (cd ./build/raw && zip -r ../postgresql-${VERSION}-vchord_${SEMVER}_${ARCH}-linux-gnu.zip .)
 
-          mkdir -p ./build/deb
+          make DESTDIR="./build/deb" install
           mkdir -p ./build/deb/DEBIAN
-          mkdir -p ./build/deb$(pg_config --pkglibdir) && cp -r ./build/raw/pkglibdir/. ./build/deb$(pg_config --pkglibdir)
-          mkdir -p ./build/deb$(pg_config --sharedir) && cp -r ./build/raw/sharedir/. ./build/deb$(pg_config --sharedir)
           echo "Package: postgresql-${VERSION}-vchord
           Version: ${SEMVER}-1
+          Depends: postgresql-${VERSION}, libgcc-s1, libc6 (>= 2.35)
           Section: database
           Priority: optional
           Architecture: ${PLATFORM}
