@@ -1,14 +1,17 @@
-ARG PG_VERSION=17
-ARG PGVECTOR=0.8.0
+ARG BASE=17-bookworm
 
-FROM pgvector/pgvector:${PGVECTOR}-pg${PG_VERSION}
+FROM postgres:${BASE}
 
-ARG PG_VERSION
-ARG SEMVER
-ARG TARGETARCH
+ARG VCHORD
+ARG PGVECTOR
 
-RUN echo ${PG_VERSION}
-COPY ./build/postgresql-${PG_VERSION}-vchord_${SEMVER}-1_${TARGETARCH}.deb /tmp/vchord.deb
-RUN apt-get install -y /tmp/vchord.deb && rm -f /tmp/vchord.deb
+RUN apt-get update && \
+	apt-get install -y --no-install-recommends wget ca-certificates && \
+	wget https://github.com/tensorchord/VectorChord/releases/download/${VCHORD}/postgresql-${PG_MAJOR}-vchord_${VCHORD}-1_$(dpkg --print-architecture).deb -P /tmp && \
+	apt-get install -y postgresql-${PG_MAJOR}-pgvector=${PGVECTOR}-* && \
+	apt-get install -y /tmp/postgresql-${PG_MAJOR}-vchord_${VCHORD}-1_$(dpkg --print-architecture).deb && \
+	apt-get remove -y wget ca-certificates && \
+	apt-get purge -y --auto-remove && \
+	rm -rf /tmp/* /var/lib/apt/lists/*
 
 CMD ["postgres", "-c" ,"shared_preload_libraries=vchord"]
