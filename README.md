@@ -38,7 +38,7 @@ VectorChord introduces remarkable enhancements over pgvecto.rs and pgvector:
 
 **⚡ Enhanced Performance**: Delivering optimized operations with up to 5x faster queries, 16x higher insert throughput, and 16x quicker[^1] index building compared to pgvector's HNSW implementation.
 
-[^1]: Based on [MyScale Benchmark](https://myscale.github.io/benchmark/#/) with 768-dimensional vectors and 95% recall. Please checkout our [blog post](https://blog.vectorchord.ai/vectorchord-store-400k-vectors-for-1-in-postgresql) for more details.
+[^1]: Based on [MyScale Benchmark](https://myscale.github.io/benchmark/) with 768-dimensional vectors and 95% recall. Please checkout our [blog post](https://blog.vectorchord.ai/vectorchord-store-400k-vectors-for-1-in-postgresql) for more details.
 
 **💰 Affordable Vector Search**: Query 100M 768-dimensional vectors using just 32GB of memory, achieving 35ms P50 latency with top10 recall@95%, helping you keep infrastructure costs down while maintaining high search quality.
 
@@ -56,7 +56,7 @@ VectorChord introduces remarkable enhancements over pgvecto.rs and pgvector:
 
 [^4]: Please check our [blog post](https://blog.vectorchord.ai/vector-search-at-10000-qps-in-postgresql-with-vectorchord)  for more details, the PostgreSQL scalability is powered by [CloudNative-PG](https://github.com/cloudnative-pg/cloudnative-pg).
 
-**🏭 Production Proven**: Deployed in mission-critical environments, VectorChord ​​reliably handles 3B+ vectors​​ in production with consistent performance. Please check out [3B vectors in PostgresQL to Protect the Earth](https://blog.vectorchord.ai/3-billion-vectors-in-postgresql-to-protect-the-earth).
+**🏭 Production Proven**: Deployed in mission-critical environments, VectorChord ​​reliably handles 3B+ vectors​​ in production with consistent performance. Please check out [3B vectors in PostgreSQL to Protect the Earth](https://blog.vectorchord.ai/3-billion-vectors-in-postgresql-to-protect-the-earth).
 
 ## Quick Start
 
@@ -67,7 +67,7 @@ docker run \
   --name vectorchord-demo \
   -e POSTGRES_PASSWORD=mysecretpassword \
   -p 5432:5432 \
-  -d ghcr.io/tensorchord/vchord-postgres:pg17-v0.4.3
+  -d ghcr.io/tensorchord/vchord-postgres:pg17-v0.5.0
 ```
 > [!NOTE]
 > In addition to the base image with the VectorChord extension, we provide an all-in-one image, `tensorchord/vchord-suite:pg17-latest`. This comprehensive image includes all official TensorChord extensions, including `VectorChord`, `VectorChord-bm25` and `pg_tokenizer.rs` . Developers should select an image tag that is compatible with their extension's version, as indicated in [the support matrix](https://github.com/tensorchord/VectorChord-images?tab=readme-ov-file#support-matrix).
@@ -109,9 +109,11 @@ For more usage, please read:
 
 - [Indexing](https://docs.vectorchord.ai/vectorchord/usage/indexing.html)
 - [Multi-Vector Retrieval](https://docs.vectorchord.ai/vectorchord/usage/indexing-with-maxsim-operators.html)
+- [Graph Index](https://docs.vectorchord.ai/vectorchord/usage/graph-index.html)
 - [Similarity Filter](https://docs.vectorchord.ai/vectorchord/usage/range-query.html)
 - [PostgreSQL Tuning](https://docs.vectorchord.ai/vectorchord/usage/performance-tuning.html)
 - [Monitoring](https://docs.vectorchord.ai/vectorchord/usage/monitoring.html)
+- [Measure Recall](https://docs.vectorchord.ai/vectorchord/usage/measure-recall.html)
 - [Prewarm](https://docs.vectorchord.ai/vectorchord/usage/prewarm.html)
 - [Prefilter](https://docs.vectorchord.ai/vectorchord/usage/prefilter.html)
 - [Prefetch](https://docs.vectorchord.ai/vectorchord/usage/prefetch.html)
