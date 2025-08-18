@@ -58,8 +58,10 @@
 typedef _Float16 f16;
 typedef float f32;
 
-__attribute__((target("arch=x86-64-v4,avx512fp16"))) float
-fp16_reduce_sum_of_xy_v4_avx512fp16(f16 *restrict a, f16 *restrict b, size_t n) {
+__attribute__((target("avx512bw,avx512cd,avx512dq,avx512vl,bmi,bmi2,lzcnt,"
+                      "movbe,popcnt,avx512fp16"))) float
+fp16_reduce_sum_of_xy_v4_avx512fp16(f16 *restrict a, f16 *restrict b,
+                                    size_t n) {
   __m512h xy = _mm512_setzero_ph();
   while (n >= 32) {
     __m512h x = _mm512_loadu_ph(a);
@@ -78,8 +80,10 @@ fp16_reduce_sum_of_xy_v4_avx512fp16(f16 *restrict a, f16 *restrict b, size_t n) 
   return _mm512_reduce_add_ph(xy);
 }
 
-__attribute__((target("arch=x86-64-v4,avx512fp16"))) float
-fp16_reduce_sum_of_d2_v4_avx512fp16(f16 *restrict a, f16 *restrict b, size_t n) {
+__attribute__((target("avx512bw,avx512cd,avx512dq,avx512vl,bmi,bmi2,lzcnt,"
+                      "movbe,popcnt,avx512fp16"))) float
+fp16_reduce_sum_of_d2_v4_avx512fp16(f16 *restrict a, f16 *restrict b,
+                                    size_t n) {
   __m512h d2 = _mm512_setzero_ph();
   while (n >= 32) {
     __m512h x = _mm512_loadu_ph(a);
