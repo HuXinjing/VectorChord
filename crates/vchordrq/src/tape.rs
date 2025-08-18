@@ -244,7 +244,9 @@ pub fn read_h1_tape<'b, R, A, T>(
                     let mut x = x.take().unwrap_or_else(&accessor);
                     x.push(tuple.elements());
                     let values = x.finish((tuple.metadata(), tuple.delta()));
-                    let prefetch: [_; 32] = fix_0(tuple.prefetch());
+                    let prefetch = tuple.prefetch();
+                    let flattened = prefetch.as_flattened();
+                    let step = prefetch.len();
                     for (j, value) in values.into_iter().enumerate() {
                         if j < tuple.len() as usize {
                             callback(
@@ -252,7 +254,7 @@ pub fn read_h1_tape<'b, R, A, T>(
                                 tuple.head()[j],
                                 tuple.norm()[j],
                                 tuple.first()[j],
-                                fix_1(prefetch[j]),
+                                &flattened[j * step..][..step],
                             );
                         }
                     }
@@ -283,10 +285,17 @@ pub fn read_frozen_tape<'b, R, A, T>(
                     let mut x = x.take().unwrap_or_else(&accessor);
                     x.push(tuple.elements());
                     let values = x.finish((tuple.metadata(), tuple.delta()));
-                    let prefetch: [_; 32] = fix_0(tuple.prefetch());
+                    let prefetch = tuple.prefetch();
+                    let flattened = prefetch.as_flattened();
+                    let step = prefetch.len();
                     for (j, value) in values.into_iter().enumerate() {
                         if let Some(payload) = tuple.payload()[j] {
-                            callback(value, tuple.head()[j], payload, fix_1(prefetch[j]));
+                            callback(
+                                value,
+                                tuple.head()[j],
+                                payload,
+                                &flattened[j * step..][..step],
+                            );
                         }
                     }
                 }
@@ -391,19 +400,5 @@ where
                 current = read.get_opaque().next;
             }
         }
-    }
-}
-
-fn fix_0<T>(x: &[[T; 32]]) -> [&[T]; 32] {
-    let step = x.len();
-    let flat = x.as_flattened();
-    std::array::from_fn(|i| &flat[i * step..][..step])
-}
-
-fn fix_1(x: &[u32]) -> &[u32] {
-    if let Some(i) = x.iter().position(|&x| x == u32::MAX) {
-        &x[..i]
-    } else {
-        x
     }
 }

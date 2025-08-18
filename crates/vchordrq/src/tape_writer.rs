@@ -97,7 +97,7 @@ where
                             chunk.each_ref().map(|x| x.code.0.factor_err),
                         ],
                         delta: chunk.each_ref().map(|x| x.delta),
-                        prefetch: fix(chunk.each_ref().map(|x| x.prefetch.as_slice())),
+                        prefetch: fix_good(chunk.each_ref().map(|x| x.prefetch.as_slice())),
                         norm: chunk.each_ref().map(|x| x.norm),
                         head: chunk.each_ref().map(|x| x.head),
                         first: chunk.each_ref().map(|x| x.extra),
@@ -138,7 +138,7 @@ where
                         any_pack(chunk.iter().map(|x| x.code.0.factor_err)),
                     ],
                     delta: any_pack(chunk.iter().map(|x| x.delta)),
-                    prefetch: fix(chunk.iter().map(|x| x.prefetch.as_slice())),
+                    prefetch: fix_bad(chunk.iter().map(|x| x.prefetch.as_slice())),
                     head: any_pack(chunk.iter().map(|x| x.head)),
                     norm: any_pack(chunk.iter().map(|x| x.norm)),
                     first: any_pack(chunk.iter().map(|x| x.extra)),
@@ -197,7 +197,7 @@ where
                             chunk.each_ref().map(|x| x.code.0.factor_err),
                         ],
                         delta: chunk.each_ref().map(|x| x.delta),
-                        prefetch: fix(chunk.each_ref().map(|x| x.prefetch.as_slice())),
+                        prefetch: fix_good(chunk.each_ref().map(|x| x.prefetch.as_slice())),
                         head: chunk.each_ref().map(|x| x.head),
                         payload: chunk.each_ref().map(|x| Some(x.extra)),
                         elements: remain,
@@ -222,15 +222,36 @@ where
     }
 }
 
-fn fix<'a>(into_iter: impl IntoIterator<Item = &'a [u32]>) -> Vec<[u32; 32]> {
-    use std::array::from_fn;
-    let mut iter = into_iter.into_iter();
-    let mut array: [_; 32] = from_fn(|_| iter.next().map(<[u32]>::to_vec).unwrap_or_default());
-    if iter.next().is_some() {
+fn fix_good<'a>(into_iter: impl IntoIterator<Item = &'a [u32]>) -> Vec<[u32; 32]> {
+    let slices = into_iter.into_iter().collect::<Vec<_>>();
+    if slices.len() != 32 {
+        panic!("too many or too few slices");
+    }
+    let min = slices.iter().map(|x| x.len()).min().unwrap_or_default();
+    let max = slices.iter().map(|x| x.len()).max().unwrap_or_default();
+    if min != max {
+        panic!("the number of pages for prefetching is not a constant");
+    }
+    let flattened = slices.into_iter().flatten().copied().collect::<Vec<_>>();
+    let (arrays, remainder) = flattened.as_chunks::<32>();
+    assert!(remainder.is_empty());
+    arrays.to_vec()
+}
+
+fn fix_bad<'a>(into_iter: impl IntoIterator<Item = &'a [u32]>) -> Vec<[u32; 32]> {
+    let mut slices = into_iter.into_iter().collect::<Vec<_>>();
+    if slices.len() > 32 {
         panic!("too many slices");
     }
-    let step = array.iter().map(Vec::len).max().unwrap_or_default();
-    array.iter_mut().for_each(|x| x.resize(step, u32::MAX));
-    let flat = array.into_iter().flatten().collect::<Vec<_>>();
-    (0..step).map(|i| from_fn(|j| flat[i * 32 + j])).collect()
+    let min = slices.iter().map(|x| x.len()).min().unwrap_or_default();
+    let max = slices.iter().map(|x| x.len()).max().unwrap_or_default();
+    if min != max {
+        panic!("the number of pages for prefetching is not a constant");
+    }
+    let temp = vec![u32::MAX; max];
+    slices.resize(32, temp.as_slice());
+    let flattened = slices.into_iter().flatten().copied().collect::<Vec<_>>();
+    let (arrays, remainder) = flattened.as_chunks::<32>();
+    assert!(remainder.is_empty());
+    arrays.to_vec()
 }
