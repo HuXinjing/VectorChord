@@ -124,4 +124,33 @@ pub const TARGET_CPUS: &[TargetCpu] = &[
         target_arch: "s390x",
         target_features: &["vector"],
     },
+    TargetCpu {
+        target_cpu: "p9",
+        target_arch: "powerpc64",
+        target_features: &[
+            "altivec",
+            "vsx",
+            "power8-altivec",
+            "power8-crypto",
+            "power8-vector",
+            "power9-altivec",
+            "power9-vector",
+        ],
+    },
+    TargetCpu {
+        target_cpu: "p8",
+        target_arch: "powerpc64",
+        target_features: &[
+            "altivec",
+            "vsx",
+            "power8-altivec",
+            "power8-crypto",
+            "power8-vector",
+        ],
+    },
+    TargetCpu {
+        target_cpu: "p7",
+        target_arch: "powerpc64",
+        target_features: &["altivec", "vsx"],
+    },
 ];

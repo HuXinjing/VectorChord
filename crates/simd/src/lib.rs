@@ -16,6 +16,9 @@
 #![cfg_attr(target_arch = "s390x", feature(stdarch_s390x_feature_detection))]
 #![cfg_attr(target_arch = "s390x", feature(s390x_target_feature))]
 #![cfg_attr(target_arch = "s390x", feature(stdarch_s390x))]
+#![cfg_attr(target_arch = "powerpc64", feature(stdarch_powerpc_feature_detection))]
+#![cfg_attr(target_arch = "powerpc64", feature(powerpc_target_feature))]
+#![cfg_attr(target_arch = "powerpc64", feature(stdarch_powerpc))]
 
 mod aligned;
 mod emulate;
@@ -73,6 +76,9 @@ mod internal {
     #[cfg(target_arch = "s390x")]
     simd_macros::define_is_cpu_detected!("s390x");
 
+    #[cfg(target_arch = "powerpc64")]
+    simd_macros::define_is_cpu_detected!("powerpc64");
+
     #[cfg(target_arch = "x86_64")]
     #[allow(unused_imports)]
     pub use is_x86_64_cpu_detected;
@@ -84,6 +90,10 @@ mod internal {
     #[cfg(target_arch = "s390x")]
     #[allow(unused_imports)]
     pub use is_s390x_cpu_detected;
+
+    #[cfg(target_arch = "powerpc64")]
+    #[allow(unused_imports)]
+    pub use is_powerpc64_cpu_detected;
 
     #[cfg(target_arch = "x86_64")]
     pub fn is_v4_detected() -> bool {
@@ -213,6 +223,32 @@ mod internal {
     pub fn is_z13_detected() -> bool {
         std::arch::is_s390x_feature_detected!("vector")
     }
+
+    #[cfg(target_arch = "powerpc64")]
+    pub fn is_p9_detected() -> bool {
+        std::arch::is_powerpc64_feature_detected!("altivec")
+            && std::arch::is_powerpc64_feature_detected!("vsx")
+            && std::arch::is_powerpc64_feature_detected!("power8-altivec")
+            && std::arch::is_powerpc64_feature_detected!("power8-crypto")
+            && std::arch::is_powerpc64_feature_detected!("power8-vector")
+            && std::arch::is_powerpc64_feature_detected!("power9-altivec")
+            && std::arch::is_powerpc64_feature_detected!("power9-vector")
+    }
+
+    #[cfg(target_arch = "powerpc64")]
+    pub fn is_p8_detected() -> bool {
+        std::arch::is_powerpc64_feature_detected!("altivec")
+            && std::arch::is_powerpc64_feature_detected!("vsx")
+            && std::arch::is_powerpc64_feature_detected!("power8-altivec")
+            && std::arch::is_powerpc64_feature_detected!("power8-crypto")
+            && std::arch::is_powerpc64_feature_detected!("power8-vector")
+    }
+
+    #[cfg(target_arch = "powerpc64")]
+    pub fn is_p7_detected() -> bool {
+        std::arch::is_powerpc64_feature_detected!("altivec")
+            && std::arch::is_powerpc64_feature_detected!("vsx")
+    }
 }
 
 pub use simd_macros::{multiversion, target_cpu};
@@ -229,6 +265,10 @@ pub use std::arch::is_aarch64_feature_detected as is_feature_detected;
 #[allow(unused_imports)]
 pub use std::arch::is_s390x_feature_detected as is_feature_detected;
 
+#[cfg(target_arch = "powerpc64")]
+#[allow(unused_imports)]
+pub use std::arch::is_powerpc64_feature_detected as is_feature_detected;
+
 #[cfg(target_arch = "x86_64")]
 #[allow(unused_imports)]
 pub use internal::is_x86_64_cpu_detected as is_cpu_detected;
@@ -240,3 +280,7 @@ pub use internal::is_aarch64_cpu_detected as is_cpu_detected;
 #[cfg(target_arch = "s390x")]
 #[allow(unused_imports)]
 pub use internal::is_s390x_cpu_detected as is_cpu_detected;
+
+#[cfg(target_arch = "powerpc64")]
+#[allow(unused_imports)]
+pub use internal::is_powerpc64_cpu_detected as is_cpu_detected;

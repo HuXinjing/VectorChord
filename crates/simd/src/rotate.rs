@@ -13,7 +13,9 @@
 // Copyright (c) 2025 TensorChord Inc.
 
 pub mod givens {
-    #[crate::multiversion("v4", "v3", "v2", "a2", "z17", "z16", "z15", "z14", "z13")]
+    #[crate::multiversion(
+        "v4", "v3", "v2", "a2", "z17", "z16", "z15", "z14", "z13", "p9", "p8", "p7"
+    )]
     pub fn givens(lhs: &mut [f32], rhs: &mut [f32]) {
         assert!(lhs.len() == rhs.len());
         let n = lhs.len();
@@ -29,7 +31,9 @@ pub fn givens(lhs: &mut [f32], rhs: &mut [f32]) {
 }
 
 pub mod flip {
-    #[crate::multiversion("v4", "v3", "v2", "a2", "z17", "z16", "z15", "z14", "z13")]
+    #[crate::multiversion(
+        "v4", "v3", "v2", "a2", "z17", "z16", "z15", "z14", "z13", "p9", "p8", "p7"
+    )]
     pub fn flip(bits: &[u64; 1024], result: &mut [f32]) {
         use std::hint::select_unpredictable;
         let result: &mut [u32] = zerocopy::transmute_mut!(result);
