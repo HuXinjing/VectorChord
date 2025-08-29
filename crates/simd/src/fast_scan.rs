@@ -514,11 +514,13 @@ mod scan {
             let n = code.len();
 
             use std::arch::powerpc64::*;
+            #[cfg(target_endian = "big")]
+            use std::intrinsics::simd::simd_bswap as vec_revb;
             use std::mem::transmute;
             use {vector_unsigned_char as u8x16, vector_unsigned_short as u16x8};
 
             let _0008_u16x8 = vec_splat_u16::<0x0008>();
-            let _00ff_u16x8 = vec_splat_u16::<{ 0x00ffu8 as i8 }>();
+            let _00ff_u16x8 = vec_splats(0x00ffu16);
             let _ff00_u16x8 = vec_splats(0xff00u16);
 
             let mut accu_0 = vec_splat_u16::<0>();
@@ -534,12 +536,26 @@ mod scan {
                 let chi = vec_srl(code, vec_splat_u8::<4>());
 
                 let lut: u8x16 = vec_xl((i as isize) * 16, lut.as_ptr().cast::<u8>());
-                let res_lo = transmute::<u8x16, u16x8>(vec_perm(lut, lut, clo));
-                accu_0 = vec_add(accu_0, res_lo);
-                accu_1 = vec_add(accu_1, vec_sr(res_lo, _0008_u16x8));
-                let res_hi = transmute::<u8x16, u16x8>(vec_perm(lut, lut, chi));
-                accu_2 = vec_add(accu_2, res_hi);
-                accu_3 = vec_add(accu_3, vec_sr(res_hi, _0008_u16x8));
+                #[cfg(target_endian = "big")]
+                {
+                    let res_lo_r = transmute::<u8x16, u16x8>(vec_perm(lut, lut, clo));
+                    let res_lo = vec_revb(res_lo_r);
+                    accu_0 = vec_add(accu_0, res_lo);
+                    accu_1 = vec_add(accu_1, vec_and(res_lo_r, _00ff_u16x8));
+                    let res_hi_r = transmute::<u8x16, u16x8>(vec_perm(lut, lut, chi));
+                    let res_hi = vec_revb(res_hi_r);
+                    accu_2 = vec_add(accu_2, res_hi);
+                    accu_3 = vec_add(accu_3, vec_and(res_hi_r, _00ff_u16x8));
+                }
+                #[cfg(target_endian = "little")]
+                {
+                    let res_lo = transmute::<u8x16, u16x8>(vec_perm(lut, lut, clo));
+                    accu_0 = vec_add(accu_0, res_lo);
+                    accu_1 = vec_add(accu_1, vec_sr(res_lo, _0008_u16x8));
+                    let res_hi = transmute::<u8x16, u16x8>(vec_perm(lut, lut, chi));
+                    accu_2 = vec_add(accu_2, res_hi);
+                    accu_3 = vec_add(accu_3, vec_sr(res_hi, _0008_u16x8));
+                }
 
                 i += 1;
             }
@@ -547,11 +563,25 @@ mod scan {
 
             let mut result = [0_u16; 32];
 
-            accu_0 = vec_sub(accu_0, vec_sl(accu_1, _0008_u16x8));
+            #[cfg(target_endian = "big")]
+            {
+                accu_0 = vec_sub(accu_0, vec_and(vec_revb(accu_1), _ff00_u16x8));
+            }
+            #[cfg(target_endian = "little")]
+            {
+                accu_0 = vec_sub(accu_0, vec_sl(accu_1, _0008_u16x8));
+            }
             vec_xst(accu_0, 0, result.as_mut_ptr().cast());
             vec_xst(accu_1, 16, result.as_mut_ptr().cast());
 
-            accu_2 = vec_sub(accu_2, vec_sl(accu_3, _0008_u16x8));
+            #[cfg(target_endian = "big")]
+            {
+                accu_2 = vec_sub(accu_2, vec_and(vec_revb(accu_3), _ff00_u16x8));
+            }
+            #[cfg(target_endian = "little")]
+            {
+                accu_2 = vec_sub(accu_2, vec_sl(accu_3, _0008_u16x8));
+            }
             vec_xst(accu_2, 32, result.as_mut_ptr().cast());
             vec_xst(accu_3, 48, result.as_mut_ptr().cast());
 

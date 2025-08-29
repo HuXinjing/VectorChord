@@ -12,8 +12,9 @@
 //
 // Copyright (c) 2025 TensorChord Inc.
 
-#![allow(unsafe_code)]
+#![allow(unsafe_code, internal_features)]
 #![cfg_attr(feature = "experimental", feature(float_algebraic, f16))]
+#![cfg_attr(feature = "experimental", feature(core_intrinsics))]
 #![cfg_attr(target_arch = "s390x", feature(stdarch_s390x_feature_detection))]
 #![cfg_attr(target_arch = "s390x", feature(s390x_target_feature))]
 #![cfg_attr(target_arch = "s390x", feature(stdarch_s390x))]
