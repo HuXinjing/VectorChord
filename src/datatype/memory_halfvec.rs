@@ -87,6 +87,10 @@ impl HalfvecOutput {
             let size = HalfvecHeader::size_of(slice.len());
 
             let ptr = pgrx::pg_sys::palloc0(size) as *mut HalfvecHeader;
+            // SET_VARSIZE_4B
+            #[cfg(target_endian = "big")]
+            (&raw mut (*ptr).varlena).write((size as u32) & 0x3FFFFFFF);
+            #[cfg(target_endian = "little")]
             (&raw mut (*ptr).varlena).write((size << 2) as u32);
             (&raw mut (*ptr).dims).write(vector.dims() as _);
             (&raw mut (*ptr).unused).write(0);
