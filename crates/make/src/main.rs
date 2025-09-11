@@ -168,7 +168,8 @@ fn build(
 ) -> Result<PathBuf, Box<dyn Error>> {
     let mut command = Command::new("cargo");
     command
-        .args(["build", "-p", "vchord", "--lib"])
+        .args(["build", "--locked"])
+        .args(["-p", "vchord", "--lib"])
         .args(["--profile", profile])
         .args(["--target", target])
         .args(["--features", pg_version])
@@ -265,7 +266,8 @@ fn generate(
     )?;
     let mut command = Command::new("cargo");
     command
-        .args(["rustc", "-p", "vchord", "--bin", "pgrx_embed_vchord"])
+        .args(["rustc", "--locked"])
+        .args(["-p", "vchord", "--bin", "pgrx_embed_vchord"])
         .args(["--profile", profile])
         .args(["--target", target])
         .args(["--features", pg_version])

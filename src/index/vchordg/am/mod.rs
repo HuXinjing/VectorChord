@@ -365,6 +365,7 @@ pub unsafe extern "C-unwind" fn amrescan(
                     (*scan).indexRelation,
                     (*scan).heapRelation,
                     (*scan).xs_snapshot,
+                    (*scan).xs_heapfetch,
                     if let Some(hack) = hack {
                         hack.as_ptr()
                     } else {

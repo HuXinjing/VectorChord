@@ -48,6 +48,7 @@ pub struct HeapFetcher {
     econtext: *mut pgrx::pg_sys::ExprContext,
     heap_relation: pgrx::pg_sys::Relation,
     snapshot: pgrx::pg_sys::Snapshot,
+    heapfetch: *mut pgrx::pg_sys::IndexFetchTableData,
     slot: *mut pgrx::pg_sys::TupleTableSlot,
     values: [Datum; 32],
     is_nulls: [bool; 32],
@@ -59,6 +60,7 @@ impl HeapFetcher {
         index_relation: pgrx::pg_sys::Relation,
         heap_relation: pgrx::pg_sys::Relation,
         snapshot: pgrx::pg_sys::Snapshot,
+        heapfetch: *mut pgrx::pg_sys::IndexFetchTableData,
         hack: *mut pgrx::pg_sys::IndexScanState,
     ) -> Self {
         unsafe {
@@ -71,6 +73,7 @@ impl HeapFetcher {
                 econtext,
                 heap_relation,
                 snapshot,
+                heapfetch,
                 slot: pgrx::pg_sys::table_slot_create(heap_relation, std::ptr::null_mut()),
                 values: [Datum::null(); 32],
                 is_nulls: [true; 32],
@@ -99,16 +102,49 @@ impl Fetcher for HeapFetcher {
             use pgrx::pg_sys::ffi::pg_guard_ffi_boundary;
             let mut ctid = key_to_ctid(key);
             let table_am = (*self.heap_relation).rd_tableam;
-            let fetch_row_version = (*table_am)
-                .tuple_fetch_row_version
+            let index_fetch_tuple = (*table_am)
+                .index_fetch_tuple
                 .expect("unsupported heap access method");
-            #[allow(ffi_unwind_calls, reason = "protected by pg_guard_ffi_boundary")]
-            if pg_guard_ffi_boundary(|| {
-                !fetch_row_version(self.heap_relation, &mut ctid, self.snapshot, self.slot)
-            }) {
-                return None;
+            let found = 'a: {
+                let mut call_again = false;
+                let mut all_dead = false;
+                #[allow(ffi_unwind_calls, reason = "protected by pg_guard_ffi_boundary")]
+                let found = pg_guard_ffi_boundary(|| {
+                    index_fetch_tuple(
+                        self.heapfetch,
+                        &mut ctid,
+                        self.snapshot,
+                        self.slot,
+                        &mut call_again,
+                        &mut all_dead,
+                    )
+                });
+                if found {
+                    break 'a true;
+                }
+                while call_again {
+                    #[allow(ffi_unwind_calls, reason = "protected by pg_guard_ffi_boundary")]
+                    let found = pg_guard_ffi_boundary(|| {
+                        index_fetch_tuple(
+                            self.heapfetch,
+                            &mut ctid,
+                            self.snapshot,
+                            self.slot,
+                            &mut call_again,
+                            &mut all_dead,
+                        )
+                    });
+                    if found {
+                        break 'a true;
+                    }
+                }
+                false
+            };
+            if found {
+                Some(HeapTuple { this: self })
+            } else {
+                None
             }
-            Some(HeapTuple { this: self })
         }
     }
 }
