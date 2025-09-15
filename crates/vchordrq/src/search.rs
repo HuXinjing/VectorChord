@@ -123,7 +123,7 @@ where
         })
     };
 
-    for i in (1..height_of_root).rev() {
+    for i in 1..height_of_root {
         state = step(state).take(probes[i as usize - 1] as _).collect();
     }
 
@@ -265,7 +265,7 @@ where
     };
 
     let mut it = None;
-    for i in (1..height_of_root).rev() {
+    for i in 1..height_of_root {
         let it = it.insert(step(state));
         state = it.take(probes[i as usize - 1] as _).collect();
     }
