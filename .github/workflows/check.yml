@@ -711,10 +711,10 @@ jobs:
       - name: Clippy & Test
         run: |
           PGRX_PG_CONFIG_PATH=pg_config \
-            cargo clippy --locked --target ${{ matrix.rust_triple }} \
+            cargo clippy --target ${{ matrix.rust_triple }} \
             --workspace --features pg${{ matrix.version }}
           PGRX_PG_CONFIG_PATH=pg_config \
-            cargo test --locked --target ${{ matrix.rust_triple }} \
+            cargo test --target ${{ matrix.rust_triple }} \
             --workspace --exclude vchord  --no-fail-fast \
             -- --no-capture
 
