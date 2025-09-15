@@ -88,7 +88,7 @@ impl Drop for Index {
 }
 
 #[pgrx::pg_extern(sql = "")]
-fn _vchordrq_sampled_vectors(indexrelid: Oid) -> SetOfIterator<'static, String> {
+fn _vchordrq_sampled_values(indexrelid: Oid) -> SetOfIterator<'static, String> {
     let pg_am = PgAm::search_amname(c"vchordrq").unwrap();
     let Some(pg_am) = pg_am.get() else {
         pgrx::error!("vchord is not installed");

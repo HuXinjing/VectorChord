@@ -142,11 +142,10 @@ IMMUTABLE STRICT PARALLEL SAFE LANGUAGE c AS 'MODULE_PATHNAME', '_vchord_vector_
 CREATE FUNCTION quantize_to_scalar8(halfvec) RETURNS scalar8
 IMMUTABLE STRICT PARALLEL SAFE LANGUAGE c AS 'MODULE_PATHNAME', '_vchord_halfvec_quantize_to_scalar8_wrapper';
 
-CREATE FUNCTION vchordrq_sampled_vectors(regclass)
-RETURNS SETOF TEXT
-STRICT LANGUAGE c AS 'MODULE_PATHNAME', '_vchordrq_sampled_vectors_wrapper';
+CREATE FUNCTION vchordrq_sampled_values(regclass) RETURNS SETOF TEXT
+STRICT LANGUAGE c AS 'MODULE_PATHNAME', '_vchordrq_sampled_values_wrapper';
 
-CREATE OR REPLACE FUNCTION vchordrq_sampled_queries(regclass)
+CREATE FUNCTION vchordrq_sampled_queries(regclass)
 RETURNS TABLE(
     schema_name NAME,
     index_name NAME,
@@ -155,8 +154,7 @@ RETURNS TABLE(
     operator NAME,
     value TEXT
 )
-LANGUAGE plpgsql
-STRICT AS $$
+STRICT LANGUAGE plpgsql AS $$
 DECLARE
     ext_schema TEXT;
     query_text TEXT;
@@ -214,7 +212,7 @@ BEGIN
             s.value
         FROM
             index_metadata im,
-            LATERAL %2$I.vchordrq_sampled_vectors(%1$s) AS s(value);
+            LATERAL %2$I.vchordrq_sampled_values(%1$s) AS s(value);
         $q$,
         $1::oid,
         ext_schema
@@ -222,25 +220,6 @@ BEGIN
     RETURN QUERY EXECUTE query_text;
 END;
 $$;
-
-CREATE VIEW vchordrq_sampled_queries AS
-SELECT
-    record.schema_name,
-    record.index_name,
-    record.table_name,
-    record.column_name,
-    record.operator,
-    record.value
-FROM
-    (
-        SELECT i.oid
-        FROM pg_catalog.pg_class AS i
-        JOIN pg_catalog.pg_index AS ix ON i.oid = ix.indexrelid
-        JOIN pg_catalog.pg_opclass AS opc ON ix.indclass[0] = opc.oid
-        JOIN pg_catalog.pg_am AS am ON opc.opcmethod = am.oid
-        WHERE am.amname = 'vchordrq'
-    ) AS index_oids
-CROSS JOIN LATERAL vchordrq_sampled_queries(index_oids.oid::regclass) AS record;
 
 CREATE FUNCTION vchordrq_amhandler(internal) RETURNS index_am_handler
 IMMUTABLE STRICT PARALLEL SAFE LANGUAGE c AS 'MODULE_PATHNAME', '_vchordrq_amhandler_wrapper';
@@ -432,3 +411,24 @@ CREATE OPERATOR CLASS halfvec_cosine_ops
     OPERATOR 1 <=> (halfvec, halfvec) FOR ORDER BY float_ops,
     OPERATOR 2 <<=>> (halfvec, sphere_halfvec) FOR SEARCH,
     FUNCTION 1 _vchordg_support_halfvec_cosine_ops();
+
+-- List of views
+
+CREATE VIEW vchordrq_sampled_queries AS
+SELECT
+    record.schema_name,
+    record.index_name,
+    record.table_name,
+    record.column_name,
+    record.operator,
+    record.value
+FROM
+    (
+        SELECT i.oid
+        FROM pg_catalog.pg_class AS i
+        JOIN pg_catalog.pg_index AS ix ON i.oid = ix.indexrelid
+        JOIN pg_catalog.pg_opclass AS opc ON ix.indclass[0] = opc.oid
+        JOIN pg_catalog.pg_am AS am ON opc.opcmethod = am.oid
+        WHERE am.amname = 'vchordrq'
+    ) AS index_oids
+CROSS JOIN LATERAL vchordrq_sampled_queries(index_oids.oid::regclass) AS record;
