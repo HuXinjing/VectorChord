@@ -16,22 +16,8 @@ use rabitq::bit::block::BlockCode;
 use rabitq::packing::{any_pack, padding_pack};
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
-use rayon::iter::{IntoParallelIterator, IntoParallelRefMutIterator, ParallelIterator};
+use rayon::iter::{IntoParallelIterator, ParallelIterator};
 use simd::Floating;
-
-pub fn preprocess<T: Send>(num_threads: usize, x: &mut [T], f: impl Fn(&mut T) + Sync) {
-    rayon::ThreadPoolBuilder::new()
-        .num_threads(num_threads)
-        .build_scoped(
-            |thread| thread.run(),
-            move |pool| {
-                pool.install(|| {
-                    x.par_iter_mut().for_each(&f);
-                });
-            },
-        )
-        .expect("failed to build thread pool")
-}
 
 pub fn k_means(
     num_threads: usize,
@@ -57,7 +43,7 @@ pub fn k_means(
                         if n >= 1024 && c >= 1024 {
                             rabitq_index(n, c, samples, centroids)
                         } else {
-                            flat_index(dims, n, c, samples, centroids)
+                            flat_index(n, c, samples, centroids)
                         }
                     };
                     let mut lloyd_k_means =
@@ -73,18 +59,6 @@ pub fn k_means(
             )
             .expect("failed to build thread pool")
     }
-}
-
-pub fn k_means_lookup(vector: &[f32], centroids: &[Vec<f32>]) -> usize {
-    assert_ne!(centroids.len(), 0);
-    let mut result = (f32::INFINITY, 0);
-    for i in 0..centroids.len() {
-        let dis = f32::reduce_sum_of_d2(vector, &centroids[i]);
-        if dis <= result.0 {
-            result = (dis, i);
-        }
-    }
-    result.1
 }
 
 fn quick_centers(
@@ -175,13 +149,7 @@ fn rabitq_index(n: usize, c: usize, samples: &[Vec<f32>], centroids: &[Vec<f32>]
         .collect::<Vec<_>>()
 }
 
-fn flat_index(
-    _dims: usize,
-    n: usize,
-    c: usize,
-    samples: &[Vec<f32>],
-    centroids: &[Vec<f32>],
-) -> Vec<usize> {
+fn flat_index(n: usize, c: usize, samples: &[Vec<f32>], centroids: &[Vec<f32>]) -> Vec<usize> {
     (0..n)
         .into_par_iter()
         .map(|i| {

@@ -12,13 +12,13 @@
 //
 // Copyright (c) 2025 TensorChord Inc.
 
-use crate::closure_lifetime_binder::id_2;
+use crate::closure_lifetime_binder::{id_0, id_1, id_2};
 use crate::linked_vec::LinkedVec;
 use crate::operator::*;
 use crate::tape::{by_directory, by_next};
 use crate::tuples::*;
 use crate::{Opaque, Page, tape, vectors};
-use algo::accessor::LAccess;
+use algo::accessor::{FunctionalAccessor, LAccess};
 use algo::prefetcher::{Prefetcher, PrefetcherHeapFamily, PrefetcherSequenceFamily};
 use algo::{BorrowedIter, Bump, PackedRefMut4, PackedRefMut8, RelationRead};
 use always_equal::AlwaysEqual;
@@ -51,6 +51,7 @@ where
     let dims = meta_tuple.dims();
     let is_residual = meta_tuple.is_residual();
     let height_of_root = meta_tuple.height_of_root();
+    let cells = meta_tuple.cells().to_vec();
     assert_eq!(dims, vector.dims(), "unmatched dimensions");
     if height_of_root as usize != 1 + probes.len() {
         panic!(
@@ -59,27 +60,26 @@ where
             probes.len()
         );
     }
+    debug_assert_eq!(cells[(height_of_root - 1) as usize], 1);
 
     type State = Vec<(Reverse<Distance>, AlwaysEqual<f32>, AlwaysEqual<u32>)>;
-    let mut state: State = if !is_residual {
-        let first = meta_tuple.first();
-        // it's safe to leave it a fake value
-        vec![(
-            Reverse(Distance::ZERO),
-            AlwaysEqual(0.0),
-            AlwaysEqual(first),
-        )]
-    } else {
+    let mut state: State = if is_residual {
         let prefetch =
             BorrowedIter::from_slice(meta_tuple.centroid_prefetch(), |x| bump.alloc_slice(x));
         let head = meta_tuple.centroid_head();
-        let norm = meta_tuple.centroid_norm();
-        let first = meta_tuple.first();
         let distance = vectors::read_for_h1_tuple::<R, O, _>(
             prefetch.map(|id| index.read(id)),
             head,
             LAccess::new(O::Vector::unpack(vector), O::DistanceAccessor::default()),
         );
+        let norm = meta_tuple.centroid_norm();
+        let first = meta_tuple.first();
+        vec![(Reverse(distance), AlwaysEqual(norm), AlwaysEqual(first))]
+    } else {
+        // fast path
+        let distance = Distance::ZERO;
+        let norm = meta_tuple.centroid_norm();
+        let first = meta_tuple.first();
         vec![(Reverse(distance), AlwaysEqual(norm), AlwaysEqual(first))]
     };
 
@@ -124,7 +124,27 @@ where
     };
 
     for i in 1..height_of_root {
-        state = step(state).take(probes[i as usize - 1] as _).collect();
+        let partial_scan = probes[i as usize - 1] < cells[(height_of_root - 1 - i) as usize];
+        if partial_scan || is_residual {
+            state = step(state).take(probes[i as usize - 1] as _).collect();
+        } else {
+            // fast path
+            let mut results = LinkedVec::new();
+            for (Reverse(_), AlwaysEqual(_), AlwaysEqual(first)) in state {
+                tape::read_h1_tape::<R, _, _>(
+                    by_next(index, first),
+                    || FunctionalAccessor::new((), id_0(|_, _| ()), id_1(|_, _| [(); _])),
+                    |(), _, norm, first, _| {
+                        results.push((
+                            Reverse(Distance::ZERO),
+                            AlwaysEqual(norm),
+                            AlwaysEqual(first),
+                        ));
+                    },
+                );
+            }
+            state = results.into_vec();
+        }
     }
 
     let mut results = LinkedVec::<(_, AlwaysEqual<_>)>::new();
@@ -192,6 +212,7 @@ where
     let dims = meta_tuple.dims();
     let is_residual = meta_tuple.is_residual();
     let height_of_root = meta_tuple.height_of_root();
+    let cells = meta_tuple.cells().to_vec();
     assert_eq!(dims, vector.dims(), "unmatched dimensions");
     if height_of_root as usize != 1 + probes.len() {
         panic!(
@@ -200,27 +221,26 @@ where
             probes.len()
         );
     }
+    debug_assert_eq!(cells[(height_of_root - 1) as usize], 1);
 
     type State = Vec<(Reverse<Distance>, AlwaysEqual<f32>, AlwaysEqual<u32>)>;
-    let mut state: State = if !is_residual {
-        let first = meta_tuple.first();
-        // it's safe to leave it a fake value
-        vec![(
-            Reverse(Distance::ZERO),
-            AlwaysEqual(0.0),
-            AlwaysEqual(first),
-        )]
-    } else {
+    let mut state: State = if is_residual {
         let prefetch =
             BorrowedIter::from_slice(meta_tuple.centroid_prefetch(), |x| bump.alloc_slice(x));
         let head = meta_tuple.centroid_head();
-        let norm = meta_tuple.centroid_norm();
-        let first = meta_tuple.first();
         let distance = vectors::read_for_h1_tuple::<R, O, _>(
             prefetch.map(|id| index.read(id)),
             head,
             LAccess::new(O::Vector::unpack(vector), O::DistanceAccessor::default()),
         );
+        let norm = meta_tuple.centroid_norm();
+        let first = meta_tuple.first();
+        vec![(Reverse(distance), AlwaysEqual(norm), AlwaysEqual(first))]
+    } else {
+        // fast path
+        let distance = Distance::ZERO;
+        let norm = meta_tuple.centroid_norm();
+        let first = meta_tuple.first();
         vec![(Reverse(distance), AlwaysEqual(norm), AlwaysEqual(first))]
     };
 
@@ -266,8 +286,29 @@ where
 
     let mut it = None;
     for i in 1..height_of_root {
-        let it = it.insert(step(state));
-        state = it.take(probes[i as usize - 1] as _).collect();
+        let partial_scan = probes[i as usize - 1] < cells[(height_of_root - 1 - i) as usize];
+        let needs_sort = i + 1 == height_of_root && threshold != 0;
+        if partial_scan || is_residual || needs_sort {
+            let it = it.insert(step(state));
+            state = it.take(probes[i as usize - 1] as _).collect();
+        } else {
+            // fast path
+            let mut results = LinkedVec::new();
+            for (Reverse(_), AlwaysEqual(_), AlwaysEqual(first)) in state {
+                tape::read_h1_tape::<R, _, _>(
+                    by_next(index, first),
+                    || FunctionalAccessor::new((), id_0(|_, _| ()), id_1(|_, _| [(); _])),
+                    |(), _, norm, first, _| {
+                        results.push((
+                            Reverse(Distance::ZERO),
+                            AlwaysEqual(norm),
+                            AlwaysEqual(first),
+                        ));
+                    },
+                );
+            }
+            state = results.into_vec();
+        }
     }
 
     let mut results = LinkedVec::<(_, AlwaysEqual<_>)>::new();

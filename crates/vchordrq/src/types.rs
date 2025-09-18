@@ -79,7 +79,7 @@ impl VectorKind {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Validate)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Validate)]
 #[serde(deny_unknown_fields)]
 #[validate(schema(function = "Self::validate_self"))]
 pub struct VectorOptions {

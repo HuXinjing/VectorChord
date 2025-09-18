@@ -18,6 +18,17 @@ use vchordrq::types::VchordrqIndexOptions;
 
 #[derive(Debug, Clone, Serialize, Deserialize, Validate)]
 #[serde(deny_unknown_fields)]
+pub struct VchordrqDefaultBuildOptions {}
+
+#[allow(clippy::derivable_impls)]
+impl Default for VchordrqDefaultBuildOptions {
+    fn default() -> Self {
+        Self {}
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Validate)]
+#[serde(deny_unknown_fields)]
 pub struct VchordrqInternalBuildOptions {
     #[serde(default = "VchordrqInternalBuildOptions::default_lists")]
     #[validate(length(min = 0, max = 8), custom(function = VchordrqInternalBuildOptions::validate_lists))]
@@ -84,13 +95,14 @@ pub struct VchordrqExternalBuildOptions {
 #[serde(deny_unknown_fields)]
 #[serde(rename_all = "snake_case")]
 pub enum VchordrqBuildSourceOptions {
+    Default(VchordrqDefaultBuildOptions),
     Internal(VchordrqInternalBuildOptions),
     External(VchordrqExternalBuildOptions),
 }
 
 impl Default for VchordrqBuildSourceOptions {
     fn default() -> Self {
-        Self::Internal(Default::default())
+        Self::Default(Default::default())
     }
 }
 
@@ -98,6 +110,7 @@ impl Validate for VchordrqBuildSourceOptions {
     fn validate(&self) -> Result<(), ValidationErrors> {
         use VchordrqBuildSourceOptions::*;
         match self {
+            Default(default_build) => default_build.validate(),
             Internal(internal_build) => internal_build.validate(),
             External(external_build) => external_build.validate(),
         }

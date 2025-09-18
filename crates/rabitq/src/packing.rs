@@ -101,14 +101,15 @@ pub fn any_pack<T: Default>(mut x: impl Iterator<Item = T>) -> [T; 32] {
     std::array::from_fn(|_| x.next()).map(|x| x.unwrap_or_default())
 }
 
-pub fn pack_to_u4(signs: &[bool]) -> Vec<u8> {
-    fn f(x: [bool; 4]) -> u8 {
-        x[0] as u8 | (x[1] as u8) << 1 | (x[2] as u8) << 2 | (x[3] as u8) << 3
-    }
-    let mut result = Vec::with_capacity(signs.len().div_ceil(4));
-    for i in 0..signs.len().div_ceil(4) {
-        let x = std::array::from_fn(|j| signs.get(i * 4 + j).copied().unwrap_or_default());
-        result.push(f(x));
-    }
-    result
+pub fn pack_to_u4(input: &[bool]) -> Vec<u8> {
+    let f = |t: &[bool; 4]| t[0] as u8 | (t[1] as u8) << 1 | (t[2] as u8) << 2 | (t[3] as u8) << 3;
+    let (arrays, remainder) = input.as_chunks::<4>();
+    let mut buffer = [false; 4];
+    let tailing = if !remainder.is_empty() {
+        buffer[..remainder.len()].copy_from_slice(remainder);
+        Some(&buffer)
+    } else {
+        None
+    };
+    arrays.iter().chain(tailing).map(f).collect()
 }

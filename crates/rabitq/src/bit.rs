@@ -73,15 +73,9 @@ pub fn code(vector: &[f32]) -> Code {
         CodeMetadata {
             dis_u_2: sum_of_x_2,
             factor_cnt: {
-                let cnt_pos = vector
-                    .iter()
-                    .map(|x| x.is_sign_positive() as i32)
-                    .sum::<i32>();
-                let cnt_neg = vector
-                    .iter()
-                    .map(|x| x.is_sign_negative() as i32)
-                    .sum::<i32>();
-                (cnt_pos - cnt_neg) as f32
+                let cnt_pos = vector.iter().filter(|x| x.is_sign_positive()).count();
+                let cnt_neg = vector.iter().filter(|x| x.is_sign_negative()).count();
+                cnt_pos as f32 - cnt_neg as f32
             },
             factor_ip: sum_of_x_2 / sum_of_abs_x,
             factor_err: {

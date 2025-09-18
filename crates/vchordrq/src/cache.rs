@@ -39,7 +39,7 @@ where
         for first in state {
             tape::read_h1_tape::<R, _, _>(
                 by_next(index, first).inspect(|guard| trace.push(guard.id())),
-                || FunctionalAccessor::new((), id_0(|_, _| ()), id_1(|_, _| [(); 32])),
+                || FunctionalAccessor::new((), id_0(|_, _| ()), id_1(|_, _| [(); _])),
                 |(), _, _, first, _| {
                     results.push(first);
                 },

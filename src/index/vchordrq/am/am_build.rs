@@ -34,11 +34,12 @@ use vector::vect::VectOwned;
 #[repr(u16)]
 pub enum BuildPhaseCode {
     Initializing = 0,
-    InternalBuild = 1,
-    ExternalBuild = 2,
-    Build = 3,
-    Inserting = 4,
-    Compacting = 5,
+    DefaultBuild = 1,
+    InternalBuild = 2,
+    ExternalBuild = 3,
+    Build = 4,
+    Inserting = 5,
+    Compacting = 6,
 }
 
 pub struct BuildPhase(BuildPhaseCode, u16);
@@ -47,6 +48,7 @@ impl BuildPhase {
     pub const fn new(code: BuildPhaseCode, k: u16) -> Option<Self> {
         match (code, k) {
             (BuildPhaseCode::Initializing, 0) => Some(BuildPhase(code, k)),
+            (BuildPhaseCode::DefaultBuild, 0) => Some(BuildPhase(code, k)),
             (BuildPhaseCode::InternalBuild, 0..102) => Some(BuildPhase(code, k)),
             (BuildPhaseCode::ExternalBuild, 0) => Some(BuildPhase(code, k)),
             (BuildPhaseCode::Build, 0) => Some(BuildPhase(code, k)),
@@ -59,6 +61,10 @@ impl BuildPhase {
         match self {
             BuildPhase(BuildPhaseCode::Initializing, k) => {
                 static RAW: [&CStr; 1] = [c"initializing"];
+                RAW[k as usize]
+            }
+            BuildPhase(BuildPhaseCode::DefaultBuild, k) => {
+                static RAW: [&CStr; 1] = [c"initializing index, by default build"];
                 RAW[k as usize]
             }
             BuildPhase(BuildPhaseCode::InternalBuild, k) => {
@@ -122,6 +128,7 @@ impl BuildPhase {
     }
     pub const fn from_value(value: u32) -> Option<Self> {
         const INITIALIZING: u16 = BuildPhaseCode::Initializing as _;
+        const DEFAULT_BUILD: u16 = BuildPhaseCode::DefaultBuild as _;
         const INTERNAL_BUILD: u16 = BuildPhaseCode::InternalBuild as _;
         const EXTERNAL_BUILD: u16 = BuildPhaseCode::ExternalBuild as _;
         const BUILD: u16 = BuildPhaseCode::Build as _;
@@ -130,6 +137,7 @@ impl BuildPhase {
         let k = value as u16;
         match (value >> 16) as u16 {
             INITIALIZING => Self::new(BuildPhaseCode::Initializing, k),
+            DEFAULT_BUILD => Self::new(BuildPhaseCode::DefaultBuild, k),
             INTERNAL_BUILD => Self::new(BuildPhaseCode::InternalBuild, k),
             EXTERNAL_BUILD => Self::new(BuildPhaseCode::ExternalBuild, k),
             BUILD => Self::new(BuildPhaseCode::Build, k),
@@ -276,12 +284,11 @@ pub unsafe extern "C-unwind" fn ambuild(
         scan: std::ptr::null_mut(),
     };
     let mut reporter = PostgresReporter {};
-    let structures = match vchordrq_options.build.source.clone() {
-        VchordrqBuildSourceOptions::External(external_build) => {
-            reporter.phase(BuildPhase::from_code(BuildPhaseCode::ExternalBuild));
-            let reltuples = unsafe { (*(*index_relation).rd_rel).reltuples };
-            reporter.tuples_total(reltuples as u64);
-            make_external_build(vector_options.clone(), opfamily, external_build.clone())
+    reporter.tuples_total(unsafe { (*(*index_relation).rd_rel).reltuples as u64 });
+    let mut structures = match vchordrq_options.build.source.clone() {
+        VchordrqBuildSourceOptions::Default(default_build) => {
+            reporter.phase(BuildPhase::from_code(BuildPhaseCode::DefaultBuild));
+            make_default_build(vector_options, default_build)
         }
         VchordrqBuildSourceOptions::Internal(internal_build) => {
             reporter.phase(BuildPhase::from_code(BuildPhaseCode::InternalBuild));
@@ -321,18 +328,22 @@ pub unsafe extern "C-unwind" fn ambuild(
                 samples
             };
             reporter.tuples_total(tuples_total);
-            make_internal_build(
-                vector_options.clone(),
-                internal_build.clone(),
-                samples,
-                &mut reporter,
-            )
+            make_internal_build(vector_options, internal_build, samples, &mut reporter)
+        }
+        VchordrqBuildSourceOptions::External(external_build) => {
+            reporter.phase(BuildPhase::from_code(BuildPhaseCode::ExternalBuild));
+            make_external_build(vector_options, opfamily, external_build)
         }
     };
+    for structure in structures.iter_mut() {
+        for centroid in structure.centroids.iter_mut() {
+            *centroid = rabitq::rotate::rotate(centroid);
+        }
+    }
     reporter.phase(BuildPhase::from_code(BuildPhaseCode::Build));
     crate::index::vchordrq::algo::build(vector_options, vchordrq_options.index, &index, structures);
     reporter.phase(BuildPhase::from_code(BuildPhaseCode::Inserting));
-    let cache = if vchordrq_options.build.pin {
+    let cached = if vchordrq_options.build.pin {
         let mut trace = vchordrq::cache(&index);
         trace.sort();
         trace.dedup();
@@ -349,15 +360,17 @@ pub unsafe extern "C-unwind" fn ambuild(
         }
     } else {
         vchordrq_cached::VchordrqCached::_0 {}
-    };
+    }
+    .serialize();
     if let Some(leader) = unsafe {
         VchordrqLeader::enter(
             heap_relation,
             index_relation,
             (*index_info).ii_Concurrent,
-            cache,
+            &cached,
         )
     } {
+        drop(cached);
         unsafe {
             parallel_build(
                 index_relation,
@@ -389,18 +402,18 @@ pub unsafe extern "C-unwind" fn ambuild(
             pgrx::pg_sys::ConditionVariableCancelSleep();
         }
     } else {
-        let mut indtuples = 0;
-        reporter.tuples_done(indtuples);
-        heap.traverse(true, |(ctid, store)| {
-            for (vector, extra) in store {
-                let key = ctid_to_key(ctid);
-                let payload = kv_to_pointer((key, extra));
-                crate::index::vchordrq::algo::insert(opfamily, &index, payload, vector, true);
-            }
-            indtuples += 1;
-            reporter.tuples_done(indtuples);
-        });
-        reporter.tuples_total(indtuples);
+        unsafe {
+            let indtuples = sequential_build(
+                index_relation,
+                heap_relation,
+                index_info,
+                &cached,
+                |indtuples| {
+                    reporter.tuples_done(indtuples);
+                },
+            );
+            reporter.tuples_total(indtuples);
+        }
     }
     let check = || {
         pgrx::check_for_interrupts!();
@@ -581,12 +594,8 @@ impl VchordrqLeader {
         heap_relation: pgrx::pg_sys::Relation,
         index_relation: pgrx::pg_sys::Relation,
         isconcurrent: bool,
-        cache: vchordrq_cached::VchordrqCached,
+        vchordrq_cached: &[u8],
     ) -> Option<Self> {
-        let _cache = cache.serialize();
-        drop(cache);
-        let cache = _cache;
-
         unsafe fn compute_parallel_workers(
             heap_relation: pgrx::pg_sys::Relation,
             index_relation: pgrx::pg_sys::Relation,
@@ -648,7 +657,7 @@ impl VchordrqLeader {
             estimate_keys(&mut (*pcxt).estimator, 1);
             estimate_chunk(&mut (*pcxt).estimator, est_tablescandesc);
             estimate_keys(&mut (*pcxt).estimator, 1);
-            estimate_chunk(&mut (*pcxt).estimator, 8 + cache.len());
+            estimate_chunk(&mut (*pcxt).estimator, 8 + vchordrq_cached.len());
             estimate_keys(&mut (*pcxt).estimator, 1);
         }
 
@@ -690,9 +699,10 @@ impl VchordrqLeader {
         };
 
         let vchordrqcached = unsafe {
-            let x = pgrx::pg_sys::shm_toc_allocate((*pcxt).toc, 8 + cache.len()).cast::<u8>();
-            (x as *mut u64).write_unaligned(cache.len() as _);
-            std::ptr::copy(cache.as_ptr(), x.add(8), cache.len());
+            let x =
+                pgrx::pg_sys::shm_toc_allocate((*pcxt).toc, 8 + vchordrq_cached.len()).cast::<u8>();
+            (x as *mut u64).write_unaligned(vchordrq_cached.len() as _);
+            std::ptr::copy(vchordrq_cached.as_ptr(), x.add(8), vchordrq_cached.len());
             x
         };
 
@@ -882,6 +892,58 @@ unsafe fn parallel_build(
     }
 }
 
+unsafe fn sequential_build(
+    index_relation: pgrx::pg_sys::Relation,
+    heap_relation: pgrx::pg_sys::Relation,
+    index_info: *mut pgrx::pg_sys::IndexInfo,
+    vchordrqcached: &[u8],
+    mut callback: impl FnMut(u64),
+) -> u64 {
+    use vchordrq_cached::VchordrqCachedReader;
+    let cached = VchordrqCachedReader::deserialize_ref(vchordrqcached);
+    let index = unsafe { PostgresRelation::new(index_relation) };
+
+    let opfamily = unsafe { opfamily(index_relation) };
+    let heap = Heap {
+        heap_relation,
+        index_relation,
+        index_info,
+        opfamily,
+        scan: std::ptr::null_mut(),
+    };
+
+    let mut indtuples = 0;
+    match cached {
+        VchordrqCachedReader::_0(_) => {
+            heap.traverse(true, |(ctid, store)| {
+                for (vector, extra) in store {
+                    let key = ctid_to_key(ctid);
+                    let payload = kv_to_pointer((key, extra));
+                    crate::index::vchordrq::algo::insert(opfamily, &index, payload, vector, true);
+                }
+                indtuples += 1;
+                callback(indtuples);
+            });
+        }
+        VchordrqCachedReader::_1(cached) => {
+            let index = CachingRelation {
+                cache: cached,
+                relation: index,
+            };
+            heap.traverse(true, |(ctid, store)| {
+                for (vector, extra) in store {
+                    let key = ctid_to_key(ctid);
+                    let payload = kv_to_pointer((key, extra));
+                    crate::index::vchordrq::algo::insert(opfamily, &index, payload, vector, true);
+                }
+                indtuples += 1;
+                callback(indtuples);
+            });
+        }
+    }
+    indtuples
+}
+
 #[pgrx::pg_guard]
 pub unsafe extern "C-unwind" fn ambuildempty(_index_relation: pgrx::pg_sys::Relation) {
     pgrx::error!("Unlogged indexes are not supported.");
@@ -945,16 +1007,23 @@ unsafe fn options(
     (vector, rabitq)
 }
 
+fn make_default_build(
+    vector_options: VectorOptions,
+    _default_build: VchordrqDefaultBuildOptions,
+) -> Vec<Structure<Vec<f32>>> {
+    vec![Structure::<Vec<f32>> {
+        centroids: vec![vec![0.0f32; vector_options.dims as usize]],
+        children: vec![vec![]],
+    }]
+}
+
 fn make_internal_build(
     vector_options: VectorOptions,
     internal_build: VchordrqInternalBuildOptions,
-    mut samples: Vec<Vec<f32>>,
+    samples: Vec<Vec<f32>>,
     reporter: &mut PostgresReporter,
 ) -> Vec<Structure<Vec<f32>>> {
     use std::iter::once;
-    k_means::preprocess(internal_build.build_threads as _, &mut samples, |sample| {
-        *sample = rabitq::rotate::rotate(sample)
-    });
     let mut result = Vec::<Structure<Vec<f32>>>::new();
     for w in internal_build.lists.iter().rev().copied().chain(once(1)) {
         let input = if let Some(structure) = result.last() {
@@ -1014,7 +1083,18 @@ fn make_internal_build(
         if let Some(structure) = result.last() {
             let mut children = vec![Vec::new(); centroids.len()];
             for i in 0..structure.len() as u32 {
-                let target = k_means::k_means_lookup(&structure.centroids[i as usize], &centroids);
+                pub fn k_means_lookup(vector: &[f32], centroids: &[Vec<f32>]) -> usize {
+                    assert_ne!(centroids.len(), 0);
+                    let mut result = (f32::INFINITY, 0);
+                    for i in 0..centroids.len() {
+                        let dis = f32::reduce_sum_of_d2(vector, &centroids[i]);
+                        if dis <= result.0 {
+                            result = (dis, i);
+                        }
+                    }
+                    result.1
+                }
+                let target = k_means_lookup(&structure.centroids[i as usize], &centroids);
                 children[target].push(i);
             }
             let (centroids, children) = std::iter::zip(centroids, children)
@@ -1078,7 +1158,7 @@ fn make_external_build(
             if vector_options.dims != vector.as_borrowed().dims() {
                 pgrx::error!("external build: incorrect dimension, id = {id}");
             }
-            vectors.insert(id, rabitq::rotate::rotate(vector.as_borrowed().slice()));
+            vectors.insert(id, vector.as_borrowed().slice().to_vec());
         }
     });
     if parents.len() >= 2 && parents.values().all(|x| x.is_none()) {

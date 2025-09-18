@@ -64,7 +64,7 @@ where
         for first in state {
             tape::read_h1_tape::<R, _, _>(
                 by_next(index, first).inspect(|_| counter += 1),
-                || FunctionalAccessor::new((), id_0(|_, _| ()), id_1(|_, _| [(); 32])),
+                || FunctionalAccessor::new((), id_0(|_, _| ()), id_1(|_, _| [(); _])),
                 |(), head, _, first, prefetch| {
                     vectors::read_for_h1_tuple::<R, O, _>(
                         prefetch.iter().map(|&id| index.read(id)),
@@ -97,7 +97,7 @@ where
                     tape::read_directory_tape::<R>(by_next(index, jump_tuple.directory_first()));
                 tape::read_frozen_tape::<R, _, _>(
                     by_directory(&mut prefetch_h0_tuples, directory).inspect(|_| counter += 1),
-                    || FunctionalAccessor::new((), id_0(|_, _| ()), id_1(|_, _| [(); 32])),
+                    || FunctionalAccessor::new((), id_0(|_, _| ()), id_1(|_, _| [(); _])),
                     id_2(|_, _, _, _| {
                         results.push(());
                     }),
@@ -105,7 +105,7 @@ where
             } else {
                 tape::read_frozen_tape::<R, _, _>(
                     by_next(index, jump_tuple.frozen_first()).inspect(|_| counter += 1),
-                    || FunctionalAccessor::new((), id_0(|_, _| ()), id_1(|_, _| [(); 32])),
+                    || FunctionalAccessor::new((), id_0(|_, _| ()), id_1(|_, _| [(); _])),
                     id_2(|_, _, _, _| {
                         results.push(());
                     }),

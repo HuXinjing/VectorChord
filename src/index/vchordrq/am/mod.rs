@@ -228,7 +228,7 @@ pub unsafe extern "C-unwind" fn amcostestimate(
                 let denumerator = r.clone();
                 let scale = r.skip(1).chain(std::iter::once(tuples));
                 for (scale, (numerator, denumerator)) in scale.zip(numerator.zip(denumerator)) {
-                    count += (scale as f64) * ((numerator as f64) / (denumerator as f64));
+                    count += (scale as f64) * 1.0f64.min((numerator as f64) / (denumerator as f64));
                 }
                 count
             };

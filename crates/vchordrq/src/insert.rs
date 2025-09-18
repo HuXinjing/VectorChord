@@ -77,25 +77,23 @@ pub fn insert<'b, R: RelationRead + RelationWrite, O: Operator>(
     let epsilon = 1.9;
 
     type State = (Reverse<Distance>, AlwaysEqual<f32>, AlwaysEqual<u32>);
-    let mut state: State = if !is_residual {
-        let first = meta_tuple.first();
-        // it's safe to leave it a fake value
-        (
-            Reverse(Distance::ZERO),
-            AlwaysEqual(0.0),
-            AlwaysEqual(first),
-        )
-    } else {
+    let mut state: State = if is_residual {
         let prefetch =
             BorrowedIter::from_slice(meta_tuple.centroid_prefetch(), |x| bump.alloc_slice(x));
         let head = meta_tuple.centroid_head();
-        let norm = meta_tuple.centroid_norm();
-        let first = meta_tuple.first();
         let distance = vectors::read_for_h1_tuple::<R, O, _>(
             prefetch.map(|id| index.read(id)),
             head,
             LAccess::new(O::Vector::unpack(vector), O::DistanceAccessor::default()),
         );
+        let norm = meta_tuple.centroid_norm();
+        let first = meta_tuple.first();
+        (Reverse(distance), AlwaysEqual(norm), AlwaysEqual(first))
+    } else {
+        // fast path
+        let distance = Distance::ZERO;
+        let norm = meta_tuple.centroid_norm();
+        let first = meta_tuple.first();
         (Reverse(distance), AlwaysEqual(norm), AlwaysEqual(first))
     };
 
