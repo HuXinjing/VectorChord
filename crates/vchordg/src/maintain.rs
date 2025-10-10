@@ -17,8 +17,8 @@ use crate::operator::{CloneAccessor, Operator};
 use crate::tuples::{MetaTuple, VectorTuple, VertexTuple, WithReader};
 use crate::types::DistanceKind;
 use crate::vectors::{by_read, copy_all, copy_nothing, copy_outs, update};
-use algo::{Page, PageGuard, RelationRead, RelationWrite};
 use always_equal::AlwaysEqual;
+use index::relation::{Page, PageGuard, RelationRead, RelationWrite};
 use std::cmp::Reverse;
 use vector::VectorOwned;
 

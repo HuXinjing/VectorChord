@@ -42,7 +42,7 @@ where
 #[inline(always)]
 pub fn id_3<F, T, A: ?Sized, B: ?Sized>(f: F) -> F
 where
-    T: algo::RelationWrite,
+    T: index::relation::RelationWrite,
     F: for<'a> Fn(&'a T, A, B) -> T::WriteGuard<'a>,
 {
     f
@@ -51,8 +51,8 @@ where
 #[inline(always)]
 pub fn id_4<'b, F, P, A, B, R: ?Sized>(f: F) -> F
 where
-    P: algo::prefetcher::Prefetcher<'b>,
-    <P as IntoIterator>::Item: algo::Fetch<'b>,
+    P: index::prefetcher::Prefetcher<'b>,
+    <P as IntoIterator>::Item: index::fetch::Fetch<'b>,
     F: FnMut(A, P::Guards, B) -> R,
 {
     f

@@ -13,7 +13,7 @@
 // Copyright (c) 2025 TensorChord Inc.
 
 use crate::tuples::{MetaTuple, WithReader};
-use algo::{Page, RelationRead};
+use index::relation::{Page, RelationRead};
 
 pub struct Cost {
     pub dims: u32,

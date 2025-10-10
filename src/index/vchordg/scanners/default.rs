@@ -15,18 +15,19 @@
 use crate::index::fetcher::{Fetcher, pointer_to_kv};
 use crate::index::opclass::Sphere;
 use crate::index::scanners::{Io, SearchBuilder};
-use crate::index::vchordg::algo::*;
+use crate::index::vchordg::dispatch::*;
 use crate::index::vchordg::opclass::Opfamily;
 use crate::index::vchordg::scanners::SearchOptions;
 use crate::recorder::{Recorder, halfvec_out, vector_out};
-use algo::accessor::{Dot, L2S};
-use algo::*;
 use distance::Distance;
+use index::accessor::{Dot, L2S};
+use index::bump::Bump;
+use index::relation::{Hints, Page, RelationPrefetch, RelationRead, RelationReadStream};
 use simd::f16;
 use std::num::NonZero;
 use vchordg::operator::{self};
+use vchordg::search;
 use vchordg::types::{DistanceKind, OwnedVector, VectorKind};
-use vchordg::*;
 use vector::VectorOwned;
 use vector::vect::{VectBorrowed, VectOwned};
 
@@ -107,17 +108,19 @@ impl SearchBuilder for DefaultBuilder {
         let Some(vector) = vector else {
             return Box::new(std::iter::empty()) as Box<dyn Iterator<Item = (f32, [u16; 3], bool)>>;
         };
+        let vertex_hints = Hints::default().full(true);
+        let vector_hints = Hints::default().full(true);
         let make_vertex_plain_prefetcher = MakePlainPrefetcher { index };
         let make_vertex_simple_prefetcher = MakeSimplePrefetcher { index };
         let make_vertex_stream_prefetcher = MakeStreamPrefetcher {
             index,
-            hints: Hints::default().full(true),
+            hints: vertex_hints,
         };
         let make_vector_plain_prefetcher = MakePlainPrefetcher { index };
         let make_vector_simple_prefetcher = MakeSimplePrefetcher { index };
         let make_vector_stream_prefetcher = MakeStreamPrefetcher {
             index,
-            hints: Hints::default().full(true),
+            hints: vector_hints,
         };
         let iter: Box<dyn Iterator<Item = (Distance, NonZero<u64>)>> =
             match (opfamily.vector_kind(), opfamily.distance_kind()) {

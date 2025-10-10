@@ -12,8 +12,9 @@
 //
 // Copyright (c) 2025 TensorChord Inc.
 
-use algo::prefetcher::{Prefetcher, PrefetcherSequenceFamily};
-use algo::{Fetch, RelationRead};
+use index::fetch::Fetch;
+use index::prefetcher::{Prefetcher, PrefetcherSequenceFamily};
+use index::relation::RelationRead;
 use std::collections::{BinaryHeap, VecDeque};
 use std::marker::PhantomData;
 

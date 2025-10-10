@@ -12,7 +12,7 @@
 //
 // Copyright (c) 2025 TensorChord Inc.
 
-use algo::Sequence;
+use index::prefetcher::Sequence;
 
 pub struct Filter<S, P> {
     sequence: S,

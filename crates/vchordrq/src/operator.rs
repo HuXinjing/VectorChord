@@ -12,8 +12,8 @@
 //
 // Copyright (c) 2025 TensorChord Inc.
 
-use algo::accessor::{Accessor1, Accessor2, DistanceAccessor, Dot, L2S, RAccess};
 use distance::Distance;
+use index::accessor::{Accessor1, Accessor2, DistanceAccessor, Dot, L2S, RAccess};
 use rabitq::bit::CodeMetadata;
 use rabitq::bit::binary::BinaryLut;
 use rabitq::bit::block::{BlockLut, STEP};

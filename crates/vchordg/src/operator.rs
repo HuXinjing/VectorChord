@@ -13,8 +13,8 @@
 // Copyright (c) 2025 TensorChord Inc.
 
 use crate::types::DistanceKind;
-use algo::accessor::{Accessor1, Accessor2, DistanceAccessor, Dot, L2S};
 use distance::Distance;
+use index::accessor::{Accessor1, Accessor2, DistanceAccessor, Dot, L2S};
 use rabitq::bits::Bits;
 use simd::{Floating, f16};
 use std::fmt::Debug;

@@ -37,7 +37,7 @@ fn _vchordg_prewarm(indexrelid: Oid) -> String {
     let relation = Index::open(indexrelid, pgrx::pg_sys::AccessShareLock as _);
     let opfamily = unsafe { crate::index::vchordg::opclass::opfamily(relation.raw()) };
     let index = unsafe { PostgresRelation::new(relation.raw()) };
-    crate::index::vchordg::algo::prewarm(opfamily, &index)
+    crate::index::vchordg::dispatch::prewarm(opfamily, &index)
 }
 
 #[pgrx::pg_extern(sql = "")]
@@ -59,7 +59,7 @@ fn _vchordrq_prewarm(indexrelid: Oid, height: i32) -> String {
     let relation = Index::open(indexrelid, pgrx::pg_sys::AccessShareLock as _);
     let opfamily = unsafe { crate::index::vchordrq::opclass::opfamily(relation.raw()) };
     let index = unsafe { PostgresRelation::new(relation.raw()) };
-    crate::index::vchordrq::algo::prewarm(opfamily, &index, height)
+    crate::index::vchordrq::dispatch::prewarm(opfamily, &index, height)
 }
 
 struct Index {

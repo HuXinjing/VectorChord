@@ -12,15 +12,94 @@
 //
 // Copyright (c) 2025 TensorChord Inc.
 
-use crate::{
-    Fetch, Hints, ReadStream, RelationPrefetch, RelationRead, RelationReadStream,
-    RelationReadTypes, Sequence,
+use crate::fetch::Fetch;
+use crate::relation::{
+    Hints, ReadStream, RelationPrefetch, RelationRead, RelationReadStream, RelationReadTypes,
 };
-use std::collections::{VecDeque, vec_deque};
-use std::iter::Chain;
+use dary_heap::DaryHeap;
+use std::collections::{BinaryHeap, VecDeque};
 
 pub const WINDOW_SIZE: usize = 32;
 const _: () = assert!(WINDOW_SIZE > 0);
+
+pub trait Sequence {
+    type Item;
+    type Inner: Iterator<Item = Self::Item>;
+    #[must_use]
+    fn next(&mut self) -> Option<Self::Item>;
+    #[must_use]
+    fn peek(&mut self) -> Option<&Self::Item>;
+    #[must_use]
+    fn into_inner(self) -> Self::Inner;
+}
+
+impl<T: Ord> Sequence for BinaryHeap<T> {
+    type Item = T;
+    type Inner = std::vec::IntoIter<T>;
+    #[inline]
+    fn next(&mut self) -> Option<T> {
+        self.pop()
+    }
+    #[inline]
+    fn peek(&mut self) -> Option<&T> {
+        (self as &Self).peek()
+    }
+    #[inline]
+    fn into_inner(self) -> Self::Inner {
+        self.into_vec().into_iter()
+    }
+}
+
+impl<const N: usize, T: Ord> Sequence for DaryHeap<T, N> {
+    type Item = T;
+    type Inner = std::vec::IntoIter<T>;
+    #[inline]
+    fn next(&mut self) -> Option<T> {
+        self.pop()
+    }
+    #[inline]
+    fn peek(&mut self) -> Option<&T> {
+        (self as &Self).peek()
+    }
+    #[inline]
+    fn into_inner(self) -> Self::Inner {
+        self.into_vec().into_iter()
+    }
+}
+
+impl<I: Iterator> Sequence for std::iter::Peekable<I> {
+    type Item = I::Item;
+    type Inner = std::iter::Peekable<I>;
+    #[inline]
+    fn next(&mut self) -> Option<I::Item> {
+        Iterator::next(self)
+    }
+    #[inline]
+    fn peek(&mut self) -> Option<&I::Item> {
+        self.peek()
+    }
+    #[inline]
+    fn into_inner(self) -> Self::Inner {
+        self
+    }
+}
+
+impl<T> Sequence for VecDeque<T> {
+    type Item = T;
+    type Inner = std::collections::vec_deque::IntoIter<T>;
+    #[inline]
+    fn next(&mut self) -> Option<T> {
+        self.pop_front()
+    }
+    #[inline]
+    fn peek(&mut self) -> Option<&T> {
+        self.front()
+    }
+    #[inline]
+    fn into_inner(self) -> Self::Inner {
+        self.into_iter()
+    }
+}
 
 pub trait Prefetcher<'b>: IntoIterator
 where
@@ -154,7 +233,7 @@ impl<'b, R, S: Sequence> SimplePrefetcher<'b, R, S> {
 impl<'b, R, S: Sequence> IntoIterator for SimplePrefetcher<'b, R, S> {
     type Item = S::Item;
 
-    type IntoIter = Chain<vec_deque::IntoIter<S::Item>, S::Inner>;
+    type IntoIter = std::iter::Chain<std::collections::vec_deque::IntoIter<S::Item>, S::Inner>;
 
     #[inline]
     fn into_iter(self) -> Self::IntoIter {

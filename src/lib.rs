@@ -13,8 +13,7 @@
 // Copyright (c) 2025 TensorChord Inc.
 
 #![allow(unsafe_code)]
-#![allow(unused_crate_dependencies)]
-#![warn(ffi_unwind_calls)]
+#![deny(ffi_unwind_calls)]
 
 mod datatype;
 mod index;

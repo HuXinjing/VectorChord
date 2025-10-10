@@ -16,20 +16,20 @@ use crate::datatype::typmod::Typmod;
 use crate::index::fetcher::*;
 use crate::index::storage::{PostgresPage, PostgresRelation};
 use crate::index::vchordrq::am::Reloption;
+use crate::index::vchordrq::build::{Normalize, Normalized};
 use crate::index::vchordrq::opclass::{Opfamily, opfamily};
 use crate::index::vchordrq::types::*;
-use algo::{
+use index::relation::{
     Page, PageGuard, Relation, RelationRead, RelationReadTypes, RelationWrite, RelationWriteTypes,
 };
 use pgrx::pg_sys::{Datum, ItemPointerData};
 use rand::Rng;
-use simd::{Floating, f16};
+use simd::Floating;
 use std::ffi::CStr;
 use std::num::NonZero;
 use std::ops::Deref;
 use vchordrq::Chooser;
 use vchordrq::types::*;
-use vector::VectorOwned;
 use vector::vect::VectOwned;
 
 #[derive(Debug, Clone, Copy)]
@@ -309,8 +309,8 @@ pub unsafe extern "C-unwind" fn ambuild(
                 heap.traverse(false, |(_, store)| {
                     for (vector, _) in store {
                         let x = match vector {
-                            OwnedVector::Vecf32(x) => VectOwned::build_to_vecf32(x.as_borrowed()),
-                            OwnedVector::Vecf16(x) => VectOwned::build_to_vecf32(x.as_borrowed()),
+                            OwnedVector::Vecf32(x) => VectOwned::normalize(x),
+                            OwnedVector::Vecf16(x) => VectOwned::normalize(x),
                         };
                         assert_eq!(
                             vector_options.dims,
@@ -343,7 +343,12 @@ pub unsafe extern "C-unwind" fn ambuild(
         }
     }
     reporter.phase(BuildPhase::from_code(BuildPhaseCode::Build));
-    crate::index::vchordrq::algo::build(vector_options, vchordrq_options.index, &index, structures);
+    crate::index::vchordrq::dispatch::build(
+        vector_options,
+        vchordrq_options.index,
+        &index,
+        structures,
+    );
     reporter.phase(BuildPhase::from_code(BuildPhaseCode::Inserting));
     let cached = if vchordrq_options.build.pin >= 0 {
         let mut trace = vchordrq::cache(&index, vchordrq_options.build.pin);
@@ -421,7 +426,7 @@ pub unsafe extern "C-unwind" fn ambuild(
         pgrx::check_for_interrupts!();
     };
     reporter.phase(BuildPhase::from_code(BuildPhaseCode::Compacting));
-    crate::index::vchordrq::algo::maintain(opfamily, &index, check);
+    crate::index::vchordrq::dispatch::maintain(opfamily, &index, check);
     unsafe { pgrx::pgbox::PgBox::<pgrx::pg_sys::IndexBuildResult>::alloc0().into_pg() }
 }
 
@@ -446,7 +451,7 @@ mod vchordrq_cached {
     pub type Tag = u64;
 
     use crate::index::storage::PostgresPage;
-    use algo::tuples::RefChecker;
+    use index::tuples::RefChecker;
     use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
     #[repr(C, align(8))]
@@ -869,7 +874,7 @@ unsafe fn parallel_build(
                     let payload = kv_to_pointer((key, extra));
                     let mut chooser = IdChooser(wid);
                     let bump = bumpalo::Bump::new();
-                    crate::index::vchordrq::algo::insert(
+                    crate::index::vchordrq::dispatch::insert(
                         opfamily,
                         &index,
                         payload,
@@ -903,7 +908,7 @@ unsafe fn parallel_build(
                     let payload = kv_to_pointer((key, extra));
                     let mut chooser = IdChooser(wid);
                     let bump = bumpalo::Bump::new();
-                    crate::index::vchordrq::algo::insert(
+                    crate::index::vchordrq::dispatch::insert(
                         opfamily,
                         &index,
                         payload,
@@ -973,7 +978,7 @@ unsafe fn sequential_build(
                     let payload = kv_to_pointer((key, extra));
                     let mut chooser = ChooseZero;
                     let bump = bumpalo::Bump::new();
-                    crate::index::vchordrq::algo::insert(
+                    crate::index::vchordrq::dispatch::insert(
                         opfamily,
                         &index,
                         payload,
@@ -999,7 +1004,7 @@ unsafe fn sequential_build(
                     let payload = kv_to_pointer((key, extra));
                     let mut chooser = ChooseZero;
                     let bump = bumpalo::Bump::new();
-                    crate::index::vchordrq::algo::insert(
+                    crate::index::vchordrq::dispatch::insert(
                         opfamily,
                         &index,
                         payload,
@@ -1084,8 +1089,8 @@ unsafe fn options(
 fn make_default_build(
     vector_options: VectorOptions,
     _default_build: VchordrqDefaultBuildOptions,
-) -> Vec<Structure<Vec<f32>>> {
-    vec![Structure::<Vec<f32>> {
+) -> Vec<Structure<Normalized>> {
+    vec![Structure::<Normalized> {
         centroids: vec![vec![0.0f32; vector_options.dims as usize]],
         children: vec![vec![]],
     }]
@@ -1094,11 +1099,11 @@ fn make_default_build(
 fn make_internal_build(
     vector_options: VectorOptions,
     internal_build: VchordrqInternalBuildOptions,
-    samples: Vec<Vec<f32>>,
+    samples: Vec<Normalized>,
     reporter: &mut PostgresReporter,
-) -> Vec<Structure<Vec<f32>>> {
+) -> Vec<Structure<Normalized>> {
     use std::iter::once;
-    let mut result = Vec::<Structure<Vec<f32>>>::new();
+    let mut result = Vec::<Structure<Normalized>>::new();
     for w in internal_build.lists.iter().rev().copied().chain(once(1)) {
         let input = if let Some(structure) = result.last() {
             &structure.centroids
@@ -1157,7 +1162,7 @@ fn make_internal_build(
         if let Some(structure) = result.last() {
             let mut children = vec![Vec::new(); centroids.len()];
             for i in 0..structure.len() as u32 {
-                pub fn k_means_lookup(vector: &[f32], centroids: &[Vec<f32>]) -> usize {
+                pub fn k_means_lookup(vector: &[f32], centroids: &[Normalized]) -> usize {
                     assert_ne!(centroids.len(), 0);
                     let mut result = (f32::INFINITY, 0);
                     for i in 0..centroids.len() {
@@ -1194,7 +1199,7 @@ fn make_external_build(
     vector_options: VectorOptions,
     _opfamily: Opfamily,
     external_build: VchordrqExternalBuildOptions,
-) -> Vec<Structure<Vec<f32>>> {
+) -> Vec<Structure<Normalized>> {
     use std::collections::BTreeMap;
     let VchordrqExternalBuildOptions { table } = external_build;
     let mut parents = BTreeMap::new();
@@ -1330,9 +1335,9 @@ fn make_external_build(
     fn extract(
         height: u32,
         labels: &BTreeMap<i32, (u32, u32)>,
-        vectors: &BTreeMap<i32, Vec<f32>>,
+        vectors: &BTreeMap<i32, Normalized>,
         children: &BTreeMap<i32, Vec<i32>>,
-    ) -> (Vec<Vec<f32>>, Vec<Vec<u32>>) {
+    ) -> (Vec<Normalized>, Vec<Vec<u32>>) {
         labels
             .iter()
             .filter(|(_, (h, _))| *h == height)
@@ -1353,32 +1358,6 @@ fn make_external_build(
         });
     }
     result
-}
-
-pub trait InternalBuild: VectorOwned {
-    fn build_to_vecf32(vector: Self::Borrowed<'_>) -> Vec<f32>;
-
-    fn build_from_vecf32(x: &[f32]) -> Self;
-}
-
-impl InternalBuild for VectOwned<f32> {
-    fn build_to_vecf32(vector: Self::Borrowed<'_>) -> Vec<f32> {
-        vector.slice().to_vec()
-    }
-
-    fn build_from_vecf32(x: &[f32]) -> Self {
-        Self::new(x.to_vec())
-    }
-}
-
-impl InternalBuild for VectOwned<f16> {
-    fn build_to_vecf32(vector: Self::Borrowed<'_>) -> Vec<f32> {
-        f16::vector_to_f32(vector.slice())
-    }
-
-    fn build_from_vecf32(x: &[f32]) -> Self {
-        Self::new(f16::vector_from_f32(x))
-    }
 }
 
 struct CachingRelation<'a, R> {

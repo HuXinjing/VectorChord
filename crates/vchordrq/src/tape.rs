@@ -13,10 +13,10 @@
 // Copyright (c) 2025 TensorChord Inc.
 
 use crate::tuples::*;
-use crate::{Opaque, Page, PageGuard, freepages};
-use algo::accessor::Accessor1;
-use algo::prefetcher::{Prefetcher, PrefetcherSequenceFamily};
-use algo::{RelationRead, RelationWrite};
+use crate::{Opaque, freepages};
+use index::accessor::Accessor1;
+use index::prefetcher::{Prefetcher, PrefetcherSequenceFamily};
+use index::relation::{Page, PageGuard, RelationRead, RelationWrite};
 use std::marker::PhantomData;
 use std::num::NonZero;
 

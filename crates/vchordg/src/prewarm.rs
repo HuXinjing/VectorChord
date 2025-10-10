@@ -14,7 +14,7 @@
 
 use crate::Opaque;
 use crate::operator::Operator;
-use algo::{Page, RelationRead};
+use index::relation::{Page, RelationRead};
 
 pub fn prewarm<R: RelationRead, O: Operator>(index: &R) -> String
 where

@@ -14,14 +14,13 @@
 
 use crate::closure_lifetime_binder::{id_0, id_1, id_2, id_3};
 use crate::operator::{Operator, Vector};
-use crate::tape::{self, TapeWriter, by_directory, by_next};
 use crate::tape_writer::{DirectoryTapeWriter, FrozenTapeWriter};
 use crate::tuples::*;
-use crate::{Branch, Opaque, Page, freepages};
-use algo::accessor::FunctionalAccessor;
-use algo::prefetcher::PrefetcherSequenceFamily;
-use algo::{
-    PageGuard, Relation, RelationRead, RelationReadTypes, RelationWrite, RelationWriteTypes,
+use crate::{Branch, Opaque, freepages, tape};
+use index::accessor::FunctionalAccessor;
+use index::prefetcher::PrefetcherSequenceFamily;
+use index::relation::{
+    Page, PageGuard, Relation, RelationRead, RelationReadTypes, RelationWrite, RelationWriteTypes,
 };
 use rabitq::packing::unpack;
 use std::cell::RefCell;
@@ -56,7 +55,7 @@ where
         let mut results = Vec::new();
         for first in state {
             tape::read_h1_tape::<R, _, _>(
-                by_next(index, first).inspect(|_| check()),
+                tape::by_next(index, first).inspect(|_| check()),
                 || FunctionalAccessor::new((), id_0(|_, _| ()), id_1(|_, _| [(); _])),
                 |(), _, _, first, _| results.push(first),
             );
@@ -129,12 +128,12 @@ where
             tuples += 1;
         });
         let directory = tape::read_directory_tape::<R>(
-            by_next(index, *jump_tuple.directory_first())
+            tape::by_next(index, *jump_tuple.directory_first())
                 .inspect(|_| check())
                 .inspect(|guard| trace_directory.push(guard.id())),
         );
         tape::read_frozen_tape::<R, _, _>(
-            by_directory(&mut prefetch_h0_tuples, directory)
+            tape::by_directory(&mut prefetch_h0_tuples, directory)
                 .inspect(|_| check())
                 .inspect(|guard| trace_forzen.push(guard.id())),
             || {
@@ -167,7 +166,7 @@ where
             &mut callback,
         );
         tape::read_appendable_tape::<R, _>(
-            by_next(index, *jump_tuple.appendable_first())
+            tape::by_next(index, *jump_tuple.appendable_first())
                 .inspect(|_| check())
                 .inspect(|guard| trace_appendable.push(guard.id())),
             |metadata, elements, delta| {
@@ -194,7 +193,7 @@ where
 
         let (frozen_tape, branches) = tape.into_inner();
 
-        let mut appendable_tape = TapeWriter::create(&hooked_index, false);
+        let mut appendable_tape = tape::TapeWriter::create(&hooked_index, false);
 
         for branch in branches {
             appendable_tape.push(AppendableTuple {
@@ -214,7 +213,7 @@ where
 
         let frozen_first = { frozen_tape }.first();
 
-        let directory = by_next(index, frozen_first)
+        let directory = tape::by_next(index, frozen_first)
             .inspect(|_| check())
             .map(|guard| guard.id())
             .collect::<Vec<_>>();

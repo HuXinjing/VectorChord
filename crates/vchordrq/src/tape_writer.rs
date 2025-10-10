@@ -15,7 +15,7 @@
 use crate::tape::TapeWriter;
 use crate::tuples::*;
 use crate::{Branch, Opaque};
-use algo::{Page, RelationWrite};
+use index::relation::{Page, RelationWrite};
 use rabitq::packing::{any_pack, padding_pack};
 use std::num::NonZero;
 

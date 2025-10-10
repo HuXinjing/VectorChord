@@ -13,11 +13,10 @@
 // Copyright (c) 2025 TensorChord Inc.
 
 use crate::closure_lifetime_binder::{id_0, id_1};
-use crate::tape::by_next;
 use crate::tuples::{MetaTuple, WithReader};
-use crate::{Opaque, Page, PageGuard, tape};
-use algo::RelationRead;
-use algo::accessor::FunctionalAccessor;
+use crate::{Opaque, tape};
+use index::accessor::FunctionalAccessor;
+use index::relation::{Page, PageGuard, RelationRead};
 
 pub fn cache<R: RelationRead>(index: &R, level: i32) -> Vec<u32>
 where
@@ -46,7 +45,7 @@ where
             let mut results = Vec::new();
             for first in state {
                 tape::read_h1_tape::<R, _, _>(
-                    by_next(index, first).inspect(|guard| trace.push(guard.id())),
+                    tape::by_next(index, first).inspect(|guard| trace.push(guard.id())),
                     || FunctionalAccessor::new((), id_0(|_, _| ()), id_1(|_, _| [(); _])),
                     |(), _, _, first, _| {
                         results.push(first);
@@ -69,7 +68,7 @@ where
 
     if level >= 2 {
         // centroid tuples
-        for guard in by_next(index, centroids_first) {
+        for guard in tape::by_next(index, centroids_first) {
             trace.push(guard.id());
         }
     }

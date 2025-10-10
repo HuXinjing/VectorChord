@@ -199,7 +199,7 @@ pub unsafe extern "C-unwind" fn ambuild(
     }
     let index = unsafe { PostgresRelation::new(index_relation) };
     let mut reporter = PostgresReporter {};
-    crate::index::vchordg::algo::build(vector_options, vchordg_options.index, &index);
+    crate::index::vchordg::dispatch::build(vector_options, vchordg_options.index, &index);
     reporter.phase(BuildPhase::from_code(BuildPhaseCode::Inserting));
     let cached = vchordg_cached::VchordgCached::_0 {}.serialize();
     if let Some(leader) = unsafe {
@@ -547,7 +547,7 @@ unsafe fn parallel_build(
                 for (vector, extra) in store {
                     let key = ctid_to_key(ctid);
                     let payload = kv_to_pointer((key, extra));
-                    crate::index::vchordg::algo::insert(opfamily, &index, payload, vector);
+                    crate::index::vchordg::dispatch::insert(opfamily, &index, payload, vector);
                 }
                 unsafe {
                     let indtuples;
@@ -597,7 +597,7 @@ unsafe fn sequential_build(
                 for (vector, extra) in store {
                     let key = ctid_to_key(ctid);
                     let payload = kv_to_pointer((key, extra));
-                    crate::index::vchordg::algo::insert(opfamily, &index, payload, vector);
+                    crate::index::vchordg::dispatch::insert(opfamily, &index, payload, vector);
                 }
                 indtuples += 1;
                 callback(indtuples);
@@ -673,7 +673,7 @@ unsafe fn options(
 mod vchordg_cached {
     pub type Tag = u64;
 
-    use algo::tuples::RefChecker;
+    use index::tuples::RefChecker;
     use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
     #[repr(C, align(8))]

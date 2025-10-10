@@ -14,7 +14,8 @@
 
 use crate::index::fetcher::Fetcher;
 use crate::recorder::Recorder;
-use algo::{Bump, Page, RelationPrefetch, RelationRead, RelationReadStream};
+use index::bump::Bump;
+use index::relation::{Page, RelationPrefetch, RelationRead, RelationReadStream};
 use pgrx::pg_sys::Datum;
 
 #[derive(Debug, Clone, Copy)]

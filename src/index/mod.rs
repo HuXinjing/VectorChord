@@ -12,15 +12,15 @@
 //
 // Copyright (c) 2025 TensorChord Inc.
 
-pub mod fetcher;
-pub mod functions;
-pub mod gucs;
-pub mod hook;
-pub mod opclass;
-pub mod scanners;
-pub mod storage;
-pub mod vchordg;
-pub mod vchordrq;
+mod fetcher;
+mod functions;
+mod gucs;
+mod hook;
+mod opclass;
+mod scanners;
+mod storage;
+mod vchordg;
+mod vchordrq;
 
 pub fn init() {
     gucs::init();

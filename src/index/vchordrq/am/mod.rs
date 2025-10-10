@@ -12,7 +12,7 @@
 //
 // Copyright (c) 2025 TensorChord Inc.
 
-pub mod am_build;
+mod am_build;
 
 use crate::index::fetcher::*;
 use crate::index::gucs;
@@ -320,7 +320,7 @@ unsafe fn aminsertinner(
             let payload = kv_to_pointer((key, extra));
             let mut chooser = RngChooser(rand::rng());
             let bump = bumpalo::Bump::new();
-            crate::index::vchordrq::algo::insert(
+            crate::index::vchordrq::dispatch::insert(
                 opfamily,
                 &index,
                 payload,
@@ -372,7 +372,7 @@ pub unsafe extern "C-unwind" fn ambulkdelete(
             pg_guard_ffi_boundary(|| callback(&mut ctid, callback_state))
         }
     };
-    crate::index::vchordrq::algo::bulkdelete(opfamily, &index, check, callback);
+    crate::index::vchordrq::dispatch::bulkdelete(opfamily, &index, check, callback);
     stats
 }
 
@@ -401,7 +401,7 @@ pub unsafe extern "C-unwind" fn amvacuumcleanup(
         #[cfg(feature = "pg18")]
         pgrx::pg_sys::vacuum_delay_point(false);
     };
-    crate::index::vchordrq::algo::maintain(opfamily, &index, check);
+    crate::index::vchordrq::dispatch::maintain(opfamily, &index, check);
     stats
 }
 

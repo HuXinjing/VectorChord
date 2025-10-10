@@ -15,12 +15,14 @@
 use crate::closure_lifetime_binder::id_4;
 use crate::operator::*;
 use crate::tuples::{MetaTuple, WithReader};
-use crate::{Page, vectors};
-use algo::accessor::{Accessor2, LTryAccess};
-use algo::prefetcher::Prefetcher;
-use algo::{PackedRefMut, RelationRead, RerankMethod};
+use crate::{RerankMethod, vectors};
 use always_equal::AlwaysEqual;
 use distance::Distance;
+use index::accessor::{Accessor2, LTryAccess};
+use index::fetch::BorrowedIter;
+use index::packed::PackedRefMut;
+use index::prefetcher::Prefetcher;
+use index::relation::{Page, RelationRead};
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
 use std::marker::PhantomData;
@@ -52,7 +54,7 @@ impl<'b, T, F, P, W> Iterator for Reranker<T, F, P, W>
 where
     F: FnMut(NonZero<u64>, P::Guards, u16) -> Option<Distance>,
     P: Prefetcher<'b, Item = ((Reverse<Distance>, AlwaysEqual<T>), AlwaysEqual<W>)>,
-    W: 'b + PackedRefMut<T = (NonZero<u64>, u16, algo::BorrowedIter<'b>)>,
+    W: 'b + PackedRefMut<T = (NonZero<u64>, u16, BorrowedIter<'b>)>,
 {
     type Item = (Distance, NonZero<u64>);
 
@@ -82,7 +84,7 @@ pub fn rerank_index<
     O: Operator,
     T,
     P: Prefetcher<'b, Item = ((Reverse<Distance>, AlwaysEqual<T>), AlwaysEqual<W>)>,
-    W: 'b + PackedRefMut<T = (NonZero<u64>, u16, algo::BorrowedIter<'b>)>,
+    W: 'b + PackedRefMut<T = (NonZero<u64>, u16, BorrowedIter<'b>)>,
 >(
     vector: O::Vector,
     prefetcher: P,
@@ -110,7 +112,7 @@ pub fn rerank_heap<
     O: Operator,
     T,
     P: Prefetcher<'b, Item = ((Reverse<Distance>, AlwaysEqual<T>), AlwaysEqual<W>)>,
-    W: 'b + PackedRefMut<T = (NonZero<u64>, u16, algo::BorrowedIter<'b>)>,
+    W: 'b + PackedRefMut<T = (NonZero<u64>, u16, BorrowedIter<'b>)>,
 >(
     vector: O::Vector,
     prefetcher: P,

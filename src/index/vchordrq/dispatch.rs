@@ -12,24 +12,28 @@
 //
 // Copyright (c) 2025 TensorChord Inc.
 
-use crate::index::vchordrq::am::am_build::InternalBuild;
+use crate::index::vchordrq::build::{Normalize, Normalized};
 use crate::index::vchordrq::opclass::Opfamily;
-use algo::accessor::{Dot, L2S};
-use algo::prefetcher::*;
-use algo::*;
+use index::accessor::{Dot, L2S};
+use index::bump::Bump;
+use index::fetch::Fetch;
+use index::prefetcher::*;
+use index::relation::{
+    Hints, Page, RelationPrefetch, RelationRead, RelationReadStream, RelationWrite,
+};
 use simd::f16;
 use std::collections::BinaryHeap;
 use std::num::NonZero;
 use vchordrq::operator::Op;
 use vchordrq::types::*;
-use vchordrq::{Chooser, FastHeap, Opaque};
+use vchordrq::{Chooser, FastHeap};
 use vector::VectorOwned;
 use vector::vect::{VectBorrowed, VectOwned};
 
 pub fn prewarm<R>(opfamily: Opfamily, index: &R, height: i32) -> String
 where
     R: RelationRead,
-    R::Page: Page<Opaque = Opaque>,
+    R::Page: Page<Opaque = vchordrq::Opaque>,
 {
     let make_h0_plain_prefetcher = MakeH0PlainPrefetcher { index };
     match (opfamily.vector_kind(), opfamily.distance_kind()) {
@@ -55,7 +59,7 @@ pub fn bulkdelete<R>(
     callback: impl Fn(NonZero<u64>) -> bool,
 ) where
     R: RelationRead + RelationWrite,
-    R::Page: Page<Opaque = Opaque>,
+    R::Page: Page<Opaque = vchordrq::Opaque>,
 {
     match (opfamily.vector_kind(), opfamily.distance_kind()) {
         (VectorKind::Vecf32, DistanceKind::L2S) => {
@@ -80,7 +84,7 @@ pub fn bulkdelete<R>(
 pub fn maintain<R>(opfamily: Opfamily, index: &R, check: impl Fn())
 where
     R: RelationRead + RelationWrite,
-    R::Page: Page<Opaque = Opaque>,
+    R::Page: Page<Opaque = vchordrq::Opaque>,
 {
     let make_h0_plain_prefetcher = MakeH0PlainPrefetcher { index };
     let maintain = match (opfamily.vector_kind(), opfamily.distance_kind()) {
@@ -115,35 +119,35 @@ pub fn build<R>(
     vector_options: VectorOptions,
     vchordrq_options: VchordrqIndexOptions,
     index: &R,
-    structures: Vec<Structure<Vec<f32>>>,
+    structures: Vec<Structure<Normalized>>,
 ) where
     R: RelationRead + RelationWrite,
-    R::Page: Page<Opaque = Opaque>,
+    R::Page: Page<Opaque = vchordrq::Opaque>,
 {
     match (vector_options.v, vector_options.d) {
         (VectorKind::Vecf32, DistanceKind::L2S) => vchordrq::build::<_, Op<VectOwned<f32>, L2S>>(
             vector_options,
             vchordrq_options,
             index,
-            map_structures(structures, |x| InternalBuild::build_from_vecf32(&x)),
+            map_structures(structures, Normalize::denormalize),
         ),
         (VectorKind::Vecf32, DistanceKind::Dot) => vchordrq::build::<_, Op<VectOwned<f32>, Dot>>(
             vector_options,
             vchordrq_options,
             index,
-            map_structures(structures, |x| InternalBuild::build_from_vecf32(&x)),
+            map_structures(structures, Normalize::denormalize),
         ),
         (VectorKind::Vecf16, DistanceKind::L2S) => vchordrq::build::<_, Op<VectOwned<f16>, L2S>>(
             vector_options,
             vchordrq_options,
             index,
-            map_structures(structures, |x| InternalBuild::build_from_vecf32(&x)),
+            map_structures(structures, Normalize::denormalize),
         ),
         (VectorKind::Vecf16, DistanceKind::Dot) => vchordrq::build::<_, Op<VectOwned<f16>, Dot>>(
             vector_options,
             vchordrq_options,
             index,
-            map_structures(structures, |x| InternalBuild::build_from_vecf32(&x)),
+            map_structures(structures, Normalize::denormalize),
         ),
     }
 }
@@ -159,7 +163,7 @@ pub fn insert<R>(
     bump: &impl Bump,
 ) where
     R: RelationRead + RelationWrite,
-    R::Page: Page<Opaque = Opaque>,
+    R::Page: Page<Opaque = vchordrq::Opaque>,
 {
     let make_h1_plain_prefetcher = MakeH1PlainPrefetcherForInsertion { index };
     match (vector, opfamily.distance_kind()) {
@@ -412,7 +416,7 @@ impl<'b, R> Clone for MakeH0StreamPrefetcher<'b, R> {
     fn clone(&self) -> Self {
         Self {
             index: self.index,
-            hints: self.hints.clone(),
+            hints: self.hints,
         }
     }
 }
@@ -429,7 +433,7 @@ impl<'b, R: RelationRead + RelationReadStream> PrefetcherSequenceFamily<'b, R>
     where
         S::Item: Fetch<'b>,
     {
-        StreamPrefetcher::new(self.index, seq, self.hints.clone())
+        StreamPrefetcher::new(self.index, seq, self.hints)
     }
 
     fn is_not_plain(&self) -> bool {

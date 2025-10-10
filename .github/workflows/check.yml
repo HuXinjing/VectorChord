@@ -214,7 +214,7 @@ jobs:
           sudo -iu postgres psql -c 'ALTER SYSTEM SET shared_preload_libraries = "vchord"'
           sudo systemctl stop postgresql
 
-          curl -fsSL https://github.com/risinglightdb/sqllogictest-rs/releases/download/v0.26.4/sqllogictest-bin-v0.26.4-$(uname -m)-unknown-linux-musl.tar.gz | tar -xOzf - ./sqllogictest | install -m 755 /dev/stdin /usr/local/bin/sqllogictest
+          curl -fsSL https://github.com/risinglightdb/sqllogictest-rs/releases/download/v0.28.4/sqllogictest-bin-v0.28.4-$(uname -m)-unknown-linux-musl.tar.gz | tar -xOzf - ./sqllogictest | install -m 755 /dev/stdin /usr/local/bin/sqllogictest
 
       - name: Set up Sccache
         uses: mozilla-actions/sccache-action@v0.0.9
@@ -297,7 +297,7 @@ jobs:
           make -C ~/pgvector-install/pgvector-0.8.1 PG_CONFIG=$(brew --prefix postgresql@${{ matrix.version }})/bin/pg_config
           sudo make -C ~/pgvector-install/pgvector-0.8.1 PG_CONFIG=$(brew --prefix postgresql@${{ matrix.version }})/bin/pg_config install
 
-          curl -fsSL https://github.com/risinglightdb/sqllogictest-rs/releases/download/v0.26.4/sqllogictest-bin-v0.26.4-${{ matrix.arch }}-apple-darwin.tar.gz | tar -xOzf - ./sqllogictest | tee /usr/local/bin/sqllogictest > /dev/null && chmod 755 /usr/local/bin/sqllogictest
+          curl -fsSL https://github.com/risinglightdb/sqllogictest-rs/releases/download/v0.28.4/sqllogictest-bin-v0.28.4-${{ matrix.arch }}-apple-darwin.tar.gz | tar -xOzf - ./sqllogictest | tee /usr/local/bin/sqllogictest > /dev/null && chmod 755 /usr/local/bin/sqllogictest
 
       - name: Set up Sccache
         uses: mozilla-actions/sccache-action@v0.0.9
@@ -404,7 +404,7 @@ jobs:
           nmake /F Makefile.win PGROOT="D:\postgresql-install\pgsql" install
           Pop-Location
 
-          Invoke-WebRequest -Uri https://github.com/risinglightdb/sqllogictest-rs/releases/download/v0.26.4/sqllogictest-bin-v0.26.4-${{ matrix.arch }}-pc-windows-msvc.zip -OutFile "$env:TEMP\sqllogictest-install.zip"
+          Invoke-WebRequest -Uri https://github.com/risinglightdb/sqllogictest-rs/releases/download/v0.28.4/sqllogictest-bin-v0.28.4-${{ matrix.arch }}-pc-windows-msvc.zip -OutFile "$env:TEMP\sqllogictest-install.zip"
           Expand-Archive -Path "$env:TEMP\sqllogictest-install.zip" -DestinationPath "D:\sqllogictest-install" -Force
           Add-Content -Path $env:GITHUB_PATH -Value "D:\sqllogictest-install"
 
@@ -503,7 +503,7 @@ jobs:
           make -C ~/pgvector-install/pgvector-0.8.1 PG_CONFIG=/usr/libexec/postgresql${{ matrix.version }}/pg_config
           make -C ~/pgvector-install/pgvector-0.8.1 PG_CONFIG=/usr/libexec/postgresql${{ matrix.version }}/pg_config install
 
-          curl -fsSL https://github.com/risinglightdb/sqllogictest-rs/releases/download/v0.26.4/sqllogictest-bin-v0.26.4-$(uname -m)-unknown-linux-musl.tar.gz | tar -xOzf - ./sqllogictest | install -m 755 /dev/stdin /usr/local/bin/sqllogictest
+          curl -fsSL https://github.com/risinglightdb/sqllogictest-rs/releases/download/v0.28.4/sqllogictest-bin-v0.28.4-$(uname -m)-unknown-linux-musl.tar.gz | tar -xOzf - ./sqllogictest | install -m 755 /dev/stdin /usr/local/bin/sqllogictest
 
       - name: Set up Sccache
         uses: mozilla-actions/sccache-action@v0.0.9
@@ -686,7 +686,7 @@ jobs:
           make -C ~/pgvector-install/pgvector-0.8.1 with_llvm=no CC=clang CFLAGS="-fuse-ld=lld --target=${{ matrix.clang_triple }} --sysroot=/sysroot" OPTFLAGS=""
           sudo make -C ~/pgvector-install/pgvector-0.8.1 with_llvm=no CC=clang CFLAGS="-fuse-ld=lld --target=${{ matrix.clang_triple }} --sysroot=/sysroot" OPTFLAGS="" install
 
-          curl -fsSL https://github.com/risinglightdb/sqllogictest-rs/releases/download/v0.26.4/sqllogictest-bin-v0.26.4-$(uname -m)-unknown-linux-musl.tar.gz | tar -xOzf - ./sqllogictest | install -m 755 /dev/stdin /usr/local/bin/sqllogictest
+          curl -fsSL https://github.com/risinglightdb/sqllogictest-rs/releases/download/v0.28.4/sqllogictest-bin-v0.28.4-$(uname -m)-unknown-linux-musl.tar.gz | tar -xOzf - ./sqllogictest | install -m 755 /dev/stdin /usr/local/bin/sqllogictest
 
       - name: Set up Sccache
         uses: mozilla-actions/sccache-action@v0.0.9

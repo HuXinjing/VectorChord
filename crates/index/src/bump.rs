@@ -12,8 +12,21 @@
 //
 // Copyright (c) 2025 TensorChord Inc.
 
-pub mod am;
-pub mod dispatch;
-pub mod opclass;
-mod scanners;
-pub mod types;
+pub trait Bump: 'static {
+    #[allow(clippy::mut_from_ref)]
+    fn alloc<T: Copy>(&self, value: T) -> &mut T;
+    #[allow(clippy::mut_from_ref)]
+    fn alloc_slice<T: Copy>(&self, slice: &[T]) -> &mut [T];
+}
+
+impl Bump for bumpalo::Bump {
+    #[inline]
+    fn alloc<T: Copy>(&self, value: T) -> &mut T {
+        self.alloc(value)
+    }
+
+    #[inline]
+    fn alloc_slice<T: Copy>(&self, slice: &[T]) -> &mut [T] {
+        self.alloc_slice_copy(slice)
+    }
+}

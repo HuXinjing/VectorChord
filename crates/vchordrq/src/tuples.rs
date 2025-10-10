@@ -13,7 +13,7 @@
 // Copyright (c) 2025 TensorChord Inc.
 
 use crate::operator::Vector;
-use algo::tuples::{Bool, MutChecker, Padding, RefChecker};
+use index::tuples::{Bool, MutChecker, Padding, RefChecker};
 use std::num::NonZero;
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 

@@ -81,17 +81,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             build.opt_level(3);
             build.compile("simd_cshim");
         }
-        _ => {
-            /*
-            let messages = [
-                "This platform has poor SIMD implementation.",
-                "Please submit a feature request on https://github.com/tensorchord/VectorChord/issues.",
-            ];
-            for message in messages {
-                println!("cargo::warning={message}");
-            }
-            */
-        }
+        _ => {}
     }
     Ok(())
 }

@@ -13,12 +13,14 @@
 // Copyright (c) 2025 TensorChord Inc.
 
 use crate::index::vchordg::opclass::Opfamily;
-use algo::accessor::{Dot, L2S};
-use algo::prefetcher::*;
-use algo::*;
+use index::accessor::{Dot, L2S};
+use index::fetch::Fetch;
+use index::prefetcher::*;
+use index::relation::{
+    Hints, Page, RelationPrefetch, RelationRead, RelationReadStream, RelationWrite,
+};
 use simd::f16;
 use std::num::NonZero;
-use vchordg::Opaque;
 use vchordg::operator::Op;
 use vchordg::types::*;
 use vector::VectorOwned;
@@ -27,7 +29,7 @@ use vector::vect::{VectBorrowed, VectOwned};
 pub fn prewarm<R>(opfamily: Opfamily, index: &R) -> String
 where
     R: RelationRead,
-    R::Page: Page<Opaque = Opaque>,
+    R::Page: Page<Opaque = vchordg::Opaque>,
 {
     match (opfamily.vector_kind(), opfamily.distance_kind()) {
         (VectorKind::Vecf32, DistanceKind::L2S) => {
@@ -52,7 +54,7 @@ pub fn bulkdelete<R>(
     callback: impl Fn(NonZero<u64>) -> bool,
 ) where
     R: RelationRead + RelationWrite,
-    R::Page: Page<Opaque = Opaque>,
+    R::Page: Page<Opaque = vchordg::Opaque>,
 {
     match (opfamily.vector_kind(), opfamily.distance_kind()) {
         (VectorKind::Vecf32, DistanceKind::L2S) => {
@@ -73,7 +75,7 @@ pub fn bulkdelete<R>(
 pub fn maintain<R>(opfamily: Opfamily, index: &R, check: impl Fn())
 where
     R: RelationRead + RelationWrite,
-    R::Page: Page<Opaque = Opaque>,
+    R::Page: Page<Opaque = vchordg::Opaque>,
 {
     match (opfamily.vector_kind(), opfamily.distance_kind()) {
         (VectorKind::Vecf32, DistanceKind::L2S) => {
@@ -94,7 +96,7 @@ where
 pub fn build<R>(vector_options: VectorOptions, vchordg_options: VchordgIndexOptions, index: &R)
 where
     R: RelationRead + RelationWrite,
-    R::Page: Page<Opaque = Opaque>,
+    R::Page: Page<Opaque = vchordg::Opaque>,
 {
     match (vector_options.v, vector_options.d) {
         (VectorKind::Vecf32, DistanceKind::L2S) => {
@@ -115,7 +117,7 @@ where
 pub fn insert<R>(opfamily: Opfamily, index: &R, payload: NonZero<u64>, vector: OwnedVector)
 where
     R: RelationRead + RelationWrite + RelationReadStream,
-    R::Page: Page<Opaque = Opaque>,
+    R::Page: Page<Opaque = vchordg::Opaque>,
 {
     let bump = bumpalo::Bump::new();
     let make_vertex_plain_prefetcher = MakePlainPrefetcher { index };
@@ -266,7 +268,7 @@ impl<'b, R> Clone for MakeStreamPrefetcher<'b, R> {
     fn clone(&self) -> Self {
         Self {
             index: self.index,
-            hints: self.hints.clone(),
+            hints: self.hints,
         }
     }
 }
@@ -283,7 +285,7 @@ impl<'b, R: RelationRead + RelationReadStream> PrefetcherSequenceFamily<'b, R>
     where
         S::Item: Fetch<'b>,
     {
-        StreamPrefetcher::new(self.index, seq, self.hints.clone())
+        StreamPrefetcher::new(self.index, seq, self.hints)
     }
 
     fn is_not_plain(&self) -> bool {

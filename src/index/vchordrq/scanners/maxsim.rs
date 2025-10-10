@@ -14,23 +14,25 @@
 
 use crate::index::fetcher::*;
 use crate::index::scanners::{Io, SearchBuilder};
-use crate::index::vchordrq::algo::*;
+use crate::index::vchordrq::dispatch::*;
 use crate::index::vchordrq::filter::filter;
 use crate::index::vchordrq::opclass::Opfamily;
 use crate::index::vchordrq::scanners::SearchOptions;
 use crate::recorder::Recorder;
-use algo::accessor::Dot;
-use algo::prefetcher::*;
-use algo::*;
 use always_equal::AlwaysEqual;
 use dary_heap::QuaternaryHeap as Heap;
 use distance::Distance;
+use index::accessor::Dot;
+use index::bump::Bump;
+use index::packed::PackedRefMut8;
+use index::prefetcher::*;
+use index::relation::{Hints, Page, RelationPrefetch, RelationRead, RelationReadStream};
 use simd::f16;
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
 use std::num::NonZero;
 use vchordrq::types::{DistanceKind, OwnedVector, VectorKind};
-use vchordrq::*;
+use vchordrq::{RerankMethod, how, maxsim_search, rerank_index};
 use vector::VectorOwned;
 use vector::vect::VectOwned;
 
@@ -101,12 +103,14 @@ impl SearchBuilder for MaxsimBuilder {
             pgrx::error!("maxsim search with rerank_in_table is not supported");
         }
         assert!(matches!(opfamily.distance_kind(), DistanceKind::Dot));
+        let search_hints = Hints::default().full(true);
+        let rerank_hints = Hints::default().full(false);
         let make_h1_plain_prefetcher = MakeH1PlainPrefetcher { index };
         let make_h0_plain_prefetcher = MakeH0PlainPrefetcher { index };
         let make_h0_simple_prefetcher = MakeH0SimplePrefetcher { index };
         let make_h0_stream_prefetcher = MakeH0StreamPrefetcher {
             index,
-            hints: Hints::default().full(true),
+            hints: search_hints,
         };
         let n = vectors.len();
         let accu_map = |(Reverse(distance), AlwaysEqual(payload))| (distance, payload);
@@ -117,7 +121,7 @@ impl SearchBuilder for MaxsimBuilder {
             )| (rough, payload);
         let iter: Box<dyn Iterator<Item = _>> = match opfamily.vector_kind() {
             VectorKind::Vecf32 => {
-                type Op = operator::Op<VectOwned<f32>, Dot>;
+                type Op = vchordrq::operator::Op<VectOwned<f32>, Dot>;
                 let unprojected = vectors
                     .into_iter()
                     .map(|vector| {
@@ -225,7 +229,7 @@ impl SearchBuilder for MaxsimBuilder {
                             }
                             (Io::Stream, false) => {
                                 let prefetcher =
-                                    StreamPrefetcher::new(index, sequence, Hints::default());
+                                    StreamPrefetcher::new(index, sequence, rerank_hints);
                                 let mut reranker =
                                     rerank_index::<Op, _, _, _>(unprojected[i].clone(), prefetcher);
                                 accu_set.extend(reranker.by_ref().take(maxsim_refine as _));
@@ -244,7 +248,7 @@ impl SearchBuilder for MaxsimBuilder {
                                     });
                                 let sequence = filter(sequence, predicate);
                                 let prefetcher =
-                                    StreamPrefetcher::new(index, sequence, Hints::default());
+                                    StreamPrefetcher::new(index, sequence, rerank_hints);
                                 let mut reranker =
                                     rerank_index::<Op, _, _, _>(unprojected[i].clone(), prefetcher);
                                 accu_set.extend(reranker.by_ref().take(maxsim_refine as _));
@@ -261,7 +265,7 @@ impl SearchBuilder for MaxsimBuilder {
                 }))
             }
             VectorKind::Vecf16 => {
-                type Op = operator::Op<VectOwned<f16>, Dot>;
+                type Op = vchordrq::operator::Op<VectOwned<f16>, Dot>;
                 let unprojected = vectors
                     .into_iter()
                     .map(|vector| {
@@ -369,7 +373,7 @@ impl SearchBuilder for MaxsimBuilder {
                             }
                             (Io::Stream, false) => {
                                 let prefetcher =
-                                    StreamPrefetcher::new(index, sequence, Hints::default());
+                                    StreamPrefetcher::new(index, sequence, rerank_hints);
                                 let mut reranker =
                                     rerank_index::<Op, _, _, _>(unprojected[i].clone(), prefetcher);
                                 accu_set.extend(reranker.by_ref().take(maxsim_refine as _));
@@ -388,7 +392,7 @@ impl SearchBuilder for MaxsimBuilder {
                                     });
                                 let sequence = filter(sequence, predicate);
                                 let prefetcher =
-                                    StreamPrefetcher::new(index, sequence, Hints::default());
+                                    StreamPrefetcher::new(index, sequence, rerank_hints);
                                 let mut reranker =
                                     rerank_index::<Op, _, _, _>(unprojected[i].clone(), prefetcher);
                                 accu_set.extend(reranker.by_ref().take(maxsim_refine as _));

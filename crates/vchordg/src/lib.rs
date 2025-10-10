@@ -45,11 +45,11 @@ pub struct Opaque {
 }
 
 #[allow(unsafe_code)]
-unsafe impl algo::Opaque for Opaque {}
+unsafe impl index::relation::Opaque for Opaque {}
 
 pub type Id = (u32, u16);
 
-impl algo::Fetch1 for tuples::Pointer {
+impl index::fetch::Fetch1 for tuples::Pointer {
     fn fetch_1(&self) -> u32 {
         self.into_inner().0
     }

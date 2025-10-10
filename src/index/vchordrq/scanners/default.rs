@@ -15,21 +15,22 @@
 use crate::index::fetcher::*;
 use crate::index::opclass::Sphere;
 use crate::index::scanners::{Io, SearchBuilder};
-use crate::index::vchordrq::algo::*;
+use crate::index::vchordrq::dispatch::*;
 use crate::index::vchordrq::filter::filter;
 use crate::index::vchordrq::opclass::Opfamily;
 use crate::index::vchordrq::scanners::SearchOptions;
 use crate::recorder::{Recorder, halfvec_out, vector_out};
-use algo::accessor::{Dot, L2S};
-use algo::prefetcher::*;
-use algo::*;
 use always_equal::AlwaysEqual;
 use dary_heap::QuaternaryHeap as Heap;
+use index::accessor::{Dot, L2S};
+use index::bump::Bump;
+use index::packed::PackedRefMut4;
+use index::prefetcher::*;
+use index::relation::{Hints, Page, RelationPrefetch, RelationRead, RelationReadStream};
 use simd::f16;
 use std::num::NonZero;
-use vchordrq::operator::{self};
 use vchordrq::types::{DistanceKind, OwnedVector, VectorKind};
-use vchordrq::*;
+use vchordrq::{RerankMethod, default_search, how, rerank_heap, rerank_index};
 use vector::VectorOwned;
 use vector::vect::VectOwned;
 
@@ -110,18 +111,20 @@ impl SearchBuilder for DefaultBuilder {
         let Some(vector) = vector else {
             return Box::new(std::iter::empty()) as Box<dyn Iterator<Item = (f32, [u16; 3], bool)>>;
         };
+        let search_hints = Hints::default().full(true);
+        let rerank_hints = Hints::default().full(false);
         let make_h1_plain_prefetcher = MakeH1PlainPrefetcher { index };
         let make_h0_plain_prefetcher = MakeH0PlainPrefetcher { index };
         let make_h0_simple_prefetcher = MakeH0SimplePrefetcher { index };
         let make_h0_stream_prefetcher = MakeH0StreamPrefetcher {
             index,
-            hints: Hints::default().full(true),
+            hints: search_hints,
         };
         let f = move |(distance, payload)| (opfamily.output(distance), payload);
         let iter: Box<dyn Iterator<Item = (f32, NonZero<u64>)>> =
             match (opfamily.vector_kind(), opfamily.distance_kind()) {
                 (VectorKind::Vecf32, DistanceKind::L2S) => {
-                    type Op = operator::Op<VectOwned<f32>, L2S>;
+                    type Op = vchordrq::operator::Op<VectOwned<f32>, L2S>;
                     let unprojected = if let OwnedVector::Vecf32(vector) = vector.clone() {
                         vector
                     } else {
@@ -195,8 +198,7 @@ impl SearchBuilder for DefaultBuilder {
                             Box::new(rerank_index::<Op, _, _, _>(unprojected, prefetcher).map(f))
                         }
                         (RerankMethod::Index, Io::Stream, false) => {
-                            let prefetcher =
-                                StreamPrefetcher::new(index, sequence, Hints::default());
+                            let prefetcher = StreamPrefetcher::new(index, sequence, rerank_hints);
                             Box::new(rerank_index::<Op, _, _, _>(unprojected, prefetcher).map(f))
                         }
                         (RerankMethod::Index, Io::Stream, true) => {
@@ -209,8 +211,7 @@ impl SearchBuilder for DefaultBuilder {
                                     tuple.filter()
                                 });
                             let sequence = filter(sequence, predicate);
-                            let prefetcher =
-                                StreamPrefetcher::new(index, sequence, Hints::default());
+                            let prefetcher = StreamPrefetcher::new(index, sequence, rerank_hints);
                             Box::new(rerank_index::<Op, _, _, _>(unprojected, prefetcher).map(f))
                         }
                         (RerankMethod::Heap, _, false) => {
@@ -261,7 +262,7 @@ impl SearchBuilder for DefaultBuilder {
                     }
                 }
                 (VectorKind::Vecf32, DistanceKind::Dot) => {
-                    type Op = operator::Op<VectOwned<f32>, Dot>;
+                    type Op = vchordrq::operator::Op<VectOwned<f32>, Dot>;
                     let unprojected = if let OwnedVector::Vecf32(vector) = vector.clone() {
                         vector
                     } else {
@@ -335,8 +336,7 @@ impl SearchBuilder for DefaultBuilder {
                             Box::new(rerank_index::<Op, _, _, _>(unprojected, prefetcher).map(f))
                         }
                         (RerankMethod::Index, Io::Stream, false) => {
-                            let prefetcher =
-                                StreamPrefetcher::new(index, sequence, Hints::default());
+                            let prefetcher = StreamPrefetcher::new(index, sequence, rerank_hints);
                             Box::new(rerank_index::<Op, _, _, _>(unprojected, prefetcher).map(f))
                         }
                         (RerankMethod::Index, Io::Stream, true) => {
@@ -349,8 +349,7 @@ impl SearchBuilder for DefaultBuilder {
                                     tuple.filter()
                                 });
                             let sequence = filter(sequence, predicate);
-                            let prefetcher =
-                                StreamPrefetcher::new(index, sequence, Hints::default());
+                            let prefetcher = StreamPrefetcher::new(index, sequence, rerank_hints);
                             Box::new(rerank_index::<Op, _, _, _>(unprojected, prefetcher).map(f))
                         }
                         (RerankMethod::Heap, _, false) => {
@@ -401,7 +400,7 @@ impl SearchBuilder for DefaultBuilder {
                     }
                 }
                 (VectorKind::Vecf16, DistanceKind::L2S) => {
-                    type Op = operator::Op<VectOwned<f16>, L2S>;
+                    type Op = vchordrq::operator::Op<VectOwned<f16>, L2S>;
                     let unprojected = if let OwnedVector::Vecf16(vector) = vector.clone() {
                         vector
                     } else {
@@ -475,8 +474,7 @@ impl SearchBuilder for DefaultBuilder {
                             Box::new(rerank_index::<Op, _, _, _>(unprojected, prefetcher).map(f))
                         }
                         (RerankMethod::Index, Io::Stream, false) => {
-                            let prefetcher =
-                                StreamPrefetcher::new(index, sequence, Hints::default());
+                            let prefetcher = StreamPrefetcher::new(index, sequence, rerank_hints);
                             Box::new(rerank_index::<Op, _, _, _>(unprojected, prefetcher).map(f))
                         }
                         (RerankMethod::Index, Io::Stream, true) => {
@@ -489,8 +487,7 @@ impl SearchBuilder for DefaultBuilder {
                                     tuple.filter()
                                 });
                             let sequence = filter(sequence, predicate);
-                            let prefetcher =
-                                StreamPrefetcher::new(index, sequence, Hints::default());
+                            let prefetcher = StreamPrefetcher::new(index, sequence, rerank_hints);
                             Box::new(rerank_index::<Op, _, _, _>(unprojected, prefetcher).map(f))
                         }
                         (RerankMethod::Heap, _, false) => {
@@ -541,7 +538,7 @@ impl SearchBuilder for DefaultBuilder {
                     }
                 }
                 (VectorKind::Vecf16, DistanceKind::Dot) => {
-                    type Op = operator::Op<VectOwned<f16>, Dot>;
+                    type Op = vchordrq::operator::Op<VectOwned<f16>, Dot>;
                     let unprojected = if let OwnedVector::Vecf16(vector) = vector.clone() {
                         vector
                     } else {
@@ -615,8 +612,7 @@ impl SearchBuilder for DefaultBuilder {
                             Box::new(rerank_index::<Op, _, _, _>(unprojected, prefetcher).map(f))
                         }
                         (RerankMethod::Index, Io::Stream, false) => {
-                            let prefetcher =
-                                StreamPrefetcher::new(index, sequence, Hints::default());
+                            let prefetcher = StreamPrefetcher::new(index, sequence, rerank_hints);
                             Box::new(rerank_index::<Op, _, _, _>(unprojected, prefetcher).map(f))
                         }
                         (RerankMethod::Index, Io::Stream, true) => {
@@ -629,8 +625,7 @@ impl SearchBuilder for DefaultBuilder {
                                     tuple.filter()
                                 });
                             let sequence = filter(sequence, predicate);
-                            let prefetcher =
-                                StreamPrefetcher::new(index, sequence, Hints::default());
+                            let prefetcher = StreamPrefetcher::new(index, sequence, rerank_hints);
                             Box::new(rerank_index::<Op, _, _, _>(unprojected, prefetcher).map(f))
                         }
                         (RerankMethod::Heap, _, false) => {

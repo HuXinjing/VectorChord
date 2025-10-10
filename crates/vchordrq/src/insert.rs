@@ -14,15 +14,15 @@
 
 use crate::linked_vec::LinkedVec;
 use crate::operator::*;
-use crate::tape::by_next;
 use crate::tuples::*;
-use crate::vectors::{self};
-use crate::{Chooser, Opaque, Page, centroids, tape};
-use algo::accessor::{FunctionalAccessor, LAccess};
-use algo::prefetcher::{Prefetcher, PrefetcherHeapFamily};
-use algo::{BorrowedIter, Bump, RelationRead, RelationWrite};
+use crate::{Chooser, Opaque, centroids, tape, vectors};
 use always_equal::AlwaysEqual;
 use distance::Distance;
+use index::accessor::{FunctionalAccessor, LAccess};
+use index::bump::Bump;
+use index::fetch::BorrowedIter;
+use index::prefetcher::{Prefetcher, PrefetcherHeapFamily};
+use index::relation::{Page, RelationRead, RelationWrite};
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
 use std::num::NonZero;
@@ -112,7 +112,7 @@ pub fn insert<'b, R: RelationRead + RelationWrite, O: Operator>(
         {
             let (Reverse(dis_f), AlwaysEqual(norm), AlwaysEqual(first)) = state;
             tape::read_h1_tape::<R, _, _>(
-                by_next(index, first),
+                tape::by_next(index, first),
                 || O::block_access(&lut.0, is_residual, dis_f.to_f32(), norm),
                 |(rough, err), head, norm, first, prefetch| {
                     let lowerbound = Distance::from_f32(rough - err * epsilon);

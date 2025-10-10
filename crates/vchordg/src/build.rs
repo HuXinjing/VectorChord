@@ -16,7 +16,7 @@ use crate::Opaque;
 use crate::operator::Operator;
 use crate::tuples::{MetaTuple, OptionPointer, Tuple};
 use crate::types::{VchordgIndexOptions, VectorOptions};
-use algo::{Page, PageGuard, RelationWrite};
+use index::relation::{Page, PageGuard, RelationWrite};
 
 pub fn build<R: RelationWrite, O: Operator>(
     vector_options: VectorOptions,

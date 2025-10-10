@@ -14,9 +14,9 @@
 
 use crate::operator::*;
 use crate::tuples::*;
-use crate::{Opaque, Page, PageGuard, tape};
-use algo::accessor::TryAccessor1;
-use algo::{RelationRead, RelationWrite};
+use crate::{Opaque, tape};
+use index::accessor::TryAccessor1;
+use index::relation::{Page, PageGuard, RelationRead, RelationWrite};
 use std::num::NonZero;
 use vector::VectorOwned;
 

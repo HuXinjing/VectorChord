@@ -34,7 +34,6 @@ mod vectors;
 pub mod operator;
 pub mod types;
 
-use algo::{Page, PageGuard};
 pub use build::build;
 pub use bulkdelete::{bulkdelete, bulkdelete_vectors};
 pub use cache::cache;
@@ -45,8 +44,8 @@ pub use maintain::maintain;
 pub use prewarm::prewarm;
 pub use rerank::{how, rerank_heap, rerank_index};
 pub use search::{default_search, maxsim_search};
-use std::num::NonZero;
 
+use std::num::NonZero;
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
 #[repr(C, align(8))]
@@ -57,7 +56,7 @@ pub struct Opaque {
 }
 
 #[allow(unsafe_code)]
-unsafe impl algo::Opaque for Opaque {}
+unsafe impl index::relation::Opaque for Opaque {}
 
 pub(crate) struct Branch<T> {
     pub code: rabitq::bit::Code,
@@ -70,4 +69,10 @@ pub(crate) struct Branch<T> {
 
 pub trait Chooser {
     fn choose(&mut self, n: NonZero<usize>) -> usize;
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum RerankMethod {
+    Index,
+    Heap,
 }

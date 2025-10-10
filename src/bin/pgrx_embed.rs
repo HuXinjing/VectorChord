@@ -13,7 +13,6 @@
 // Copyright (c) 2025 TensorChord Inc.
 
 #![allow(unsafe_code)]
-#![allow(unused_crate_dependencies)]
 
 ::pgrx::pgrx_embed!();
 

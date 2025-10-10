@@ -12,9 +12,9 @@
 //
 // Copyright (c) 2025 TensorChord Inc.
 
+use crate::Opaque;
 use crate::tuples::*;
-use crate::{Opaque, Page};
-use algo::RelationWrite;
+use index::relation::{Page, RelationWrite};
 
 pub fn alloc<R: RelationWrite>(index: &R, freepages_first: u32) -> Option<R::WriteGuard<'_>>
 where

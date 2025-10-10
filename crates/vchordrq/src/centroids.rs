@@ -12,11 +12,10 @@
 //
 // Copyright (c) 2025 TensorChord Inc.
 
-use crate::Page;
 use crate::operator::*;
 use crate::tuples::*;
-use algo::RelationRead;
-use algo::accessor::Accessor1;
+use index::accessor::Accessor1;
+use index::relation::{Page, RelationRead};
 
 pub fn read<
     'a,

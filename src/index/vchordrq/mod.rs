@@ -12,9 +12,10 @@
 //
 // Copyright (c) 2025 TensorChord Inc.
 
-pub mod algo;
 pub mod am;
-pub mod filter;
+mod build;
+pub mod dispatch;
+mod filter;
 pub mod opclass;
-pub mod scanners;
+mod scanners;
 pub mod types;

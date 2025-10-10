@@ -21,7 +21,10 @@
 #![cfg_attr(target_arch = "powerpc64", feature(stdarch_powerpc_feature_detection))]
 #![cfg_attr(target_arch = "powerpc64", feature(powerpc_target_feature))]
 #![cfg_attr(target_arch = "powerpc64", feature(stdarch_powerpc))]
-#![cfg_attr(target_arch = "powerpc64", feature(core_intrinsics))]
+#![cfg_attr(
+    all(target_arch = "powerpc64", target_endian = "big"),
+    feature(core_intrinsics)
+)]
 #![cfg_attr(target_arch = "riscv64", feature(stdarch_riscv_feature_detection))]
 #![cfg_attr(target_arch = "riscv64", feature(riscv_target_feature))]
 

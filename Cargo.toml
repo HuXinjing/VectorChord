@@ -22,9 +22,9 @@ pg17 = ["pgrx/pg17", "pgrx-catalog/pg17"]
 pg18 = ["pgrx/pg18", "pgrx-catalog/pg18"]
 
 [dependencies]
-algo = { path = "./crates/algo" }
 always_equal = { path = "./crates/always_equal" }
 distance = { path = "./crates/distance" }
+index = { path = "./crates/index" }
 k_means = { path = "./crates/k_means" }
 rabitq = { path = "./crates/rabitq" }
 simd = { path = "./crates/simd" }
@@ -42,7 +42,7 @@ rand.workspace = true
 rusqlite = { version = "0.37.0", features = ["bundled"] }
 seq-macro.workspace = true
 serde.workspace = true
-toml = "0.9.7"
+toml = "0.9.8"
 validator.workspace = true
 zerocopy.workspace = true
 
@@ -72,7 +72,6 @@ validator = { version = "0.20.0", features = ["derive"] }
 zerocopy = { version = "0.8.27", features = ["derive"] }
 
 [workspace.lints]
-rust.unknown_lints = "allow"
 # complexity
 clippy.identity_op = "allow"
 clippy.int_plus_one = "allow"
@@ -87,7 +86,6 @@ clippy.needless_range_loop = "allow"
 rust.unsafe_code = "deny"
 rust.unsafe_op_in_unsafe_fn = "deny"
 # unused
-rust.unused_crate_dependencies = "allow"
 rust.unused_extern_crates = "warn"
 rust.unused_import_braces = "warn"
 rust.unused_lifetimes = "warn"

@@ -18,7 +18,7 @@ use crate::tape_writer::{DirectoryTapeWriter, H1TapeWriter};
 use crate::tuples::*;
 use crate::types::*;
 use crate::{Branch, Opaque};
-use algo::{Page, RelationWrite};
+use index::relation::{Page, RelationWrite};
 use vector::{VectorBorrowed, VectorOwned};
 
 pub fn build<R: RelationWrite, O: Operator>(

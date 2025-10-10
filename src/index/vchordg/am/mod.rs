@@ -12,7 +12,7 @@
 //
 // Copyright (c) 2025 TensorChord Inc.
 
-pub mod am_build;
+mod am_build;
 
 use crate::index::fetcher::*;
 use crate::index::gucs;
@@ -229,7 +229,7 @@ unsafe fn aminsertinner(
         for (vector, extra) in store {
             let key = ctid_to_key(ctid);
             let payload = kv_to_pointer((key, extra));
-            crate::index::vchordg::algo::insert(opfamily, &index, payload, vector);
+            crate::index::vchordg::dispatch::insert(opfamily, &index, payload, vector);
         }
     }
     false
@@ -272,7 +272,7 @@ pub unsafe extern "C-unwind" fn ambulkdelete(
             pg_guard_ffi_boundary(|| callback(&mut ctid, callback_state))
         }
     };
-    crate::index::vchordg::algo::bulkdelete(opfamily, &index, check, callback);
+    crate::index::vchordg::dispatch::bulkdelete(opfamily, &index, check, callback);
     stats
 }
 
@@ -301,7 +301,7 @@ pub unsafe extern "C-unwind" fn amvacuumcleanup(
         #[cfg(feature = "pg18")]
         pgrx::pg_sys::vacuum_delay_point(false);
     };
-    crate::index::vchordg::algo::maintain(opfamily, &index, check);
+    crate::index::vchordg::dispatch::maintain(opfamily, &index, check);
     stats
 }
 

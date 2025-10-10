@@ -15,7 +15,7 @@
 use crate::Opaque;
 use crate::operator::Operator;
 use crate::tuples::{MetaTuple, VertexTuple, WithReader, WithWriter};
-use algo::{Page, RelationRead, RelationWrite};
+use index::relation::{Page, RelationRead, RelationWrite};
 use std::num::NonZero;
 
 pub fn bulkdelete<R: RelationRead + RelationWrite, O: Operator>(
