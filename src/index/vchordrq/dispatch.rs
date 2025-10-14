@@ -26,7 +26,7 @@ use std::collections::BinaryHeap;
 use std::num::NonZero;
 use vchordrq::operator::Op;
 use vchordrq::types::*;
-use vchordrq::{Chooser, FastHeap};
+use vchordrq::{FastHeap, InsertChooser, MaintainChooser};
 use vector::VectorOwned;
 use vector::vect::{VectBorrowed, VectOwned};
 
@@ -81,24 +81,48 @@ pub fn bulkdelete<R>(
     }
 }
 
-pub fn maintain<R>(opfamily: Opfamily, index: &R, check: impl Fn())
-where
+pub fn maintain<R>(
+    opfamily: Opfamily,
+    index: &R,
+    chooser: &mut impl MaintainChooser,
+    check: impl Fn(),
+) where
     R: RelationRead + RelationWrite,
     R::Page: Page<Opaque = vchordrq::Opaque>,
 {
     let make_h0_plain_prefetcher = MakeH0PlainPrefetcher { index };
     let maintain = match (opfamily.vector_kind(), opfamily.distance_kind()) {
         (VectorKind::Vecf32, DistanceKind::L2S) => {
-            vchordrq::maintain::<_, Op<VectOwned<f32>, L2S>>(index, make_h0_plain_prefetcher, check)
+            vchordrq::maintain::<_, Op<VectOwned<f32>, L2S>>(
+                index,
+                make_h0_plain_prefetcher,
+                chooser,
+                check,
+            )
         }
         (VectorKind::Vecf32, DistanceKind::Dot) => {
-            vchordrq::maintain::<_, Op<VectOwned<f32>, Dot>>(index, make_h0_plain_prefetcher, check)
+            vchordrq::maintain::<_, Op<VectOwned<f32>, Dot>>(
+                index,
+                make_h0_plain_prefetcher,
+                chooser,
+                check,
+            )
         }
         (VectorKind::Vecf16, DistanceKind::L2S) => {
-            vchordrq::maintain::<_, Op<VectOwned<f16>, L2S>>(index, make_h0_plain_prefetcher, check)
+            vchordrq::maintain::<_, Op<VectOwned<f16>, L2S>>(
+                index,
+                make_h0_plain_prefetcher,
+                chooser,
+                check,
+            )
         }
         (VectorKind::Vecf16, DistanceKind::Dot) => {
-            vchordrq::maintain::<_, Op<VectOwned<f16>, Dot>>(index, make_h0_plain_prefetcher, check)
+            vchordrq::maintain::<_, Op<VectOwned<f16>, Dot>>(
+                index,
+                make_h0_plain_prefetcher,
+                chooser,
+                check,
+            )
         }
     };
     pgrx::info!(
@@ -159,7 +183,7 @@ pub fn insert<R>(
     vector: OwnedVector,
     skip_freespaces: bool,
     skip_search: bool,
-    chooser: &mut impl Chooser,
+    chooser: &mut impl InsertChooser,
     bump: &impl Bump,
 ) where
     R: RelationRead + RelationWrite,

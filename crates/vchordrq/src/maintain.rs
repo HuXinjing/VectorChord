@@ -25,6 +25,10 @@ use index::relation::{
 use rabitq::packing::unpack;
 use std::cell::RefCell;
 
+pub trait MaintainChooser {
+    fn choose(&mut self, i: usize) -> bool;
+}
+
 pub struct Maintain {
     pub number_of_formerly_allocated_pages: usize,
     pub number_of_freshly_allocated_pages: usize,
@@ -34,6 +38,7 @@ pub struct Maintain {
 pub fn maintain<'b, R: RelationRead + RelationWrite, O: Operator>(
     index: &'b R,
     mut prefetch_h0_tuples: impl PrefetcherSequenceFamily<'b, R>,
+    chooser: &mut impl MaintainChooser,
     check: impl Fn(),
 ) -> Maintain
 where
@@ -79,7 +84,11 @@ where
         number_of_freshly_allocated_pages: 0,
     });
 
-    for first in state {
+    for (idx, first) in state.into_iter().enumerate() {
+        if !chooser.choose(idx) {
+            continue;
+        }
+
         let mut jump_guard = index.write(first, false);
         let jump_bytes = jump_guard.get_mut(1).expect("data corruption");
         let mut jump_tuple = JumpTuple::deserialize_mut(jump_bytes);

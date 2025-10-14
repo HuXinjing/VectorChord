@@ -209,8 +209,16 @@ jobs:
           echo "local all all trust" | sudo tee /etc/postgresql/${{ matrix.version }}/main/pg_hba.conf
           echo "host all all 127.0.0.1/32 trust" | sudo tee -a /etc/postgresql/${{ matrix.version }}/main/pg_hba.conf
           echo "host all all ::1/128 trust" | sudo tee -a /etc/postgresql/${{ matrix.version }}/main/pg_hba.conf
+          sudo mkdir -p /etc/systemd/system/postgresql@.service.d/
+          echo "[Service]" | sudo tee /etc/systemd/system/postgresql@.service.d/limit.conf
+          echo "LimitNOFILE=infinity" | sudo tee -a /etc/systemd/system/postgresql@.service.d/limit.conf
+          echo "LimitMEMLOCK=infinity" | sudo tee -a /etc/systemd/system/postgresql@.service.d/limit.conf
           sudo -iu postgres createuser -s -r $USER
           sudo -iu postgres createdb -O $USER $USER
+          if [ "${{ matrix.version }}" -ge "18" ]; then
+            sudo -iu postgres psql -c 'ALTER SYSTEM SET io_method = io_uring'
+          fi
+          sudo -iu postgres psql -c 'ALTER SYSTEM SET max_worker_processes = 1024'
           sudo -iu postgres psql -c 'ALTER SYSTEM SET shared_preload_libraries = "vchord"'
           sudo systemctl stop postgresql
 
@@ -252,6 +260,11 @@ jobs:
             sqllogictest --db $USER --user $USER './tests/vchordrq/pg17/*.slt' --label pg${{ matrix.version }}
           fi
 
+      - name: Logging
+        if: always()
+        run: |
+          cat /var/log/postgresql/postgresql-${{ matrix.version }}-main.log
+
   psql_macos:
     if: |
       (github.event_name == 'push' && contains(github.event.head_commit.message, 'job: +psql_macos')) ||
@@ -287,6 +300,7 @@ jobs:
           for i in {1..60}; do [ -S /tmp/.s.PGSQL.5432 ] && echo "PostgreSQL ready" && break || sleep 1; done
           [ -S /tmp/.s.PGSQL.5432 ] || echo "PostgreSQL socket not found after 60 seconds"
           $(brew --prefix postgresql@${{ matrix.version }})/bin/createdb -O $USER $USER
+          $(brew --prefix postgresql@${{ matrix.version }})/bin/psql -c 'ALTER SYSTEM SET max_worker_processes = 1024'
           $(brew --prefix postgresql@${{ matrix.version }})/bin/psql -c 'ALTER SYSTEM SET shared_preload_libraries = "vchord"'
           brew services stop postgresql@${{ matrix.version }}
           echo PGRX_PG_CONFIG_PATH=$(brew --prefix postgresql@${{ matrix.version }})/bin/pg_config >> $GITHUB_ENV
@@ -337,6 +351,11 @@ jobs:
           if [ "${{ matrix.version }}" -ge "17" ]; then
             sqllogictest --db $USER --user $USER './tests/vchordrq/pg17/*.slt' --label pg${{ matrix.version }}
           fi
+
+      - name: Logging
+        if: always()
+        run: |
+          cat $(brew --prefix)/var/log/postgresql@${{ matrix.version }}.log
 
   psql_windows:
     if: |
@@ -391,9 +410,10 @@ jobs:
           Add-Content -Path $env:GITHUB_ENV -Value "PGRX_PG_CONFIG_PATH=D:\postgresql-install\pgsql\bin\pg_config.exe"
           Add-Content -Path $env:GITHUB_ENV -Value "PG_CONFIG=D:\postgresql-install\pgsql\bin\pg_config.exe"
           D:\postgresql-install\pgsql\bin\initdb.exe -D D:\postgresql-install\pgsql\data -U postgres
-          D:\postgresql-install\pgsql\bin\pg_ctl.exe start -D D:\postgresql-install\pgsql\data
+          D:\postgresql-install\pgsql\bin\pg_ctl.exe start -D D:\postgresql-install\pgsql\data -l D:\postgresql-install\postgresql.log
           D:\postgresql-install\pgsql\bin\createuser.exe -U postgres -s -r $env:USERNAME
           D:\postgresql-install\pgsql\bin\createdb.exe -O $env:USERNAME $env:USERNAME
+          D:\postgresql-install\pgsql\bin\psql.exe -c 'ALTER SYSTEM SET max_worker_processes = 1024'
           D:\postgresql-install\pgsql\bin\psql.exe -c 'ALTER SYSTEM SET shared_preload_libraries = "vchord"'
           D:\postgresql-install\pgsql\bin\pg_ctl.exe stop -D D:\postgresql-install\pgsql\data
 
@@ -435,7 +455,7 @@ jobs:
         run: |
           'PGBIN','PGDATA','PGROOT', 'PGUSER', 'PGPASSWORD' | ForEach-Object { Remove-Item "env:$_" }
 
-          D:\postgresql-install\pgsql\bin\pg_ctl.exe start -D D:\postgresql-install\pgsql\data
+          D:\postgresql-install\pgsql\bin\pg_ctl.exe start -D D:\postgresql-install\pgsql\data -l D:\postgresql-install\postgresql.log
           D:\postgresql-install\pgsql\bin\psql.exe -c 'CREATE EXTENSION IF NOT EXISTS vchord CASCADE;'
 
       - name: Sqllogictest
@@ -446,6 +466,11 @@ jobs:
           if ( "${{ matrix.version }}" -ge "17" ) {
             sqllogictest --db $env:USERNAME --user $env:USERNAME './tests/vchordrq/pg17/*.slt' --label pg${{ matrix.version }}
           }
+
+      - name: Logging
+        if: always()
+        run: |
+          Get-Content -Path 'D:\postgresql-install\postgresql.log'
 
   psql_alpine:
     if: |
@@ -488,13 +513,20 @@ jobs:
           echo PGRX_PG_CONFIG_PATH=/usr/libexec/postgresql${{ matrix.version }}/pg_config >> $GITHUB_ENV
           echo PG_CONFIG=/usr/libexec/postgresql${{ matrix.version }}/pg_config >> $GITHUB_ENV
 
+          sudo touch /var/log/postgresql.log
+          sudo chmod 644 /var/log/postgresql.log
+          sudo chown postgres /var/log/postgresql.log
           install --verbose --directory --owner postgres --group postgres --mode 1777 /var/lib/postgresql
           install --verbose --directory --owner postgres --group postgres --mode 1777 /var/lib/postgresql/data
           install --verbose --directory --owner postgres --group postgres --mode 3777 /run/postgresql
           sudo -iu postgres initdb -D /var/lib/postgresql/data
-          sudo -iu postgres pg_ctl start -D /var/lib/postgresql/data
+          sudo -iu postgres pg_ctl start -D /var/lib/postgresql/data -l /var/log/postgresql.log
           sudo -iu postgres createuser -s -r $USER
           sudo -iu postgres createdb -O $USER $USER
+          if [ "${{ matrix.version }}" -ge "18" ]; then
+            sudo -iu postgres psql -d $USER -c 'ALTER SYSTEM SET io_method = io_uring'
+          fi
+          sudo -iu postgres psql -d $USER -c 'ALTER SYSTEM SET max_worker_processes = 1024'
           sudo -iu postgres psql -d $USER -c 'ALTER SYSTEM SET shared_preload_libraries = "vchord"'
           sudo -iu postgres pg_ctl stop -D /var/lib/postgresql/data
 
@@ -541,7 +573,7 @@ jobs:
 
       - name: Service
         run: |
-          sudo -iu postgres pg_ctl start -D /var/lib/postgresql/data
+          sudo -iu postgres pg_ctl start -D /var/lib/postgresql/data -l /var/log/postgresql.log
           psql -d $USER -U $USER -c 'CREATE EXTENSION IF NOT EXISTS vchord CASCADE;'
 
       - name: Sqllogictest
@@ -552,6 +584,11 @@ jobs:
           if [ "${{ matrix.version }}" -ge "17" ]; then
             sqllogictest --db $USER --user $USER './tests/vchordrq/pg17/*.slt' --label pg${{ matrix.version }}
           fi
+
+      - name: Logging
+        if: always()
+        run: |
+          cat /var/log/postgresql.log
 
   check_debian:
     if: |
@@ -678,6 +715,15 @@ jobs:
           sudo chroot /sysroot pg_ctlcluster ${{ matrix.version }} main start
           sudo chroot /sysroot sudo -iu postgres createuser -s -r $USER
           sudo chroot /sysroot sudo -iu postgres createdb -O $USER $USER
+          sudo mkdir -p /sysroot/etc/systemd/system/postgresql@.service.d/
+          echo "[Service]" | sudo tee /sysroot/etc/systemd/system/postgresql@.service.d/limit.conf
+          echo "LimitNOFILE=infinity" | sudo tee -a /sysroot/etc/systemd/system/postgresql@.service.d/limit.conf
+          echo "LimitMEMLOCK=infinity" | sudo tee -a /sysroot/etc/systemd/system/postgresql@.service.d/limit.conf
+          if [ "${{ matrix.version }}" -ge "18" ]; then
+            # io_uring is not supported on qemu-user
+            sudo chroot /sysroot sudo -iu postgres psql -d $USER -c 'ALTER SYSTEM SET io_method = worker'
+          fi
+          sudo chroot /sysroot sudo -iu postgres psql -d $USER -c 'ALTER SYSTEM SET max_worker_processes = 1024'
           sudo chroot /sysroot sudo -iu postgres psql -d $USER -c 'ALTER SYSTEM SET shared_preload_libraries = "vchord"'
           sudo chroot /sysroot pg_ctlcluster ${{ matrix.version }} main stop
 
@@ -761,3 +807,8 @@ jobs:
           if [ "${{ matrix.version }}" -ge "17" ]; then
             sqllogictest --db $USER --user $USER './tests/vchordrq/pg17/*.slt' --label pg${{ matrix.version }}
           fi
+
+      - name: Logging
+        if: always()
+        run: |
+          cat /sysroot/var/log/postgresql/postgresql-${{ matrix.version }}-main.log

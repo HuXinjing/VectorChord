@@ -39,13 +39,12 @@ pub use bulkdelete::{bulkdelete, bulkdelete_vectors};
 pub use cache::cache;
 pub use cost::cost;
 pub use fast_heap::FastHeap;
-pub use insert::{insert, insert_vector};
-pub use maintain::maintain;
+pub use insert::{InsertChooser, insert, insert_vector};
+pub use maintain::{MaintainChooser, maintain};
 pub use prewarm::prewarm;
 pub use rerank::{how, rerank_heap, rerank_index};
 pub use search::{default_search, maxsim_search};
 
-use std::num::NonZero;
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
 #[repr(C, align(8))]
@@ -65,10 +64,6 @@ pub(crate) struct Branch<T> {
     pub head: u16,
     pub norm: f32,
     pub extra: T,
-}
-
-pub trait Chooser {
-    fn choose(&mut self, n: NonZero<usize>) -> usize;
 }
 
 #[derive(Debug, Clone, Copy)]

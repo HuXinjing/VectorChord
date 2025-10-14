@@ -29,7 +29,39 @@ SELECT val0 FROM t WHERE val0 <<->> sphere('[0, 0, 0]'::vector, 1) ORDER BY val0
 
 # 1 vector key + 0 order_by key + original style
 
-skipif pg18
+onlyif pg13
+query I
+EXPLAIN (COSTS FALSE, TIMING FALSE) 
+SELECT val0 FROM t WHERE val0 <-> '[0, 0, 0]' < 1;
+----
+ Seq Scan on t
+   Filter: ((val0 <-> '[0,0,0]'::vector) < '1'::double precision)
+
+onlyif pg14
+query I
+EXPLAIN (COSTS FALSE, TIMING FALSE) 
+SELECT val0 FROM t WHERE val0 <-> '[0, 0, 0]' < 1;
+----
+ Seq Scan on t
+   Filter: ((val0 <-> '[0,0,0]'::vector) < '1'::double precision)
+
+onlyif pg15
+query I
+EXPLAIN (COSTS FALSE, TIMING FALSE) 
+SELECT val0 FROM t WHERE val0 <-> '[0, 0, 0]' < 1;
+----
+ Seq Scan on t
+   Filter: ((val0 <-> '[0,0,0]'::vector) < '1'::double precision)
+
+onlyif pg16
+query I
+EXPLAIN (COSTS FALSE, TIMING FALSE) 
+SELECT val0 FROM t WHERE val0 <-> '[0, 0, 0]' < 1;
+----
+ Seq Scan on t
+   Filter: ((val0 <-> '[0,0,0]'::vector) < '1'::double precision)
+
+onlyif pg17
 query I
 EXPLAIN (COSTS FALSE, TIMING FALSE) 
 SELECT val0 FROM t WHERE val0 <-> '[0, 0, 0]' < 1;
@@ -147,7 +179,31 @@ ORDER BY val0 <-> '[0, 0, 0]';
 
 # 0 vector key + 0 order_by key(variable)
 
-skipif pg18
+onlyif pg13
+query I
+EXPLAIN (COSTS FALSE, TIMING FALSE) SELECT val0 FROM t;
+----
+ Seq Scan on t
+
+onlyif pg14
+query I
+EXPLAIN (COSTS FALSE, TIMING FALSE) SELECT val0 FROM t;
+----
+ Seq Scan on t
+
+onlyif pg15
+query I
+EXPLAIN (COSTS FALSE, TIMING FALSE) SELECT val0 FROM t;
+----
+ Seq Scan on t
+
+onlyif pg16
+query I
+EXPLAIN (COSTS FALSE, TIMING FALSE) SELECT val0 FROM t;
+----
+ Seq Scan on t
+
+onlyif pg17
 query I
 EXPLAIN (COSTS FALSE, TIMING FALSE) SELECT val0 FROM t;
 ----

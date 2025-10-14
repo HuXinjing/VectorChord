@@ -123,6 +123,9 @@ const AM_HANDLER: pgrx::pg_sys::IndexAmRoutine = const {
     am_routine.amgettuple = Some(amgettuple);
     am_routine.amendscan = Some(amendscan);
 
+    am_routine.amparallelvacuumoptions = pgrx::pg_sys::VACUUM_OPTION_PARALLEL_BULKDEL as u8
+        | pgrx::pg_sys::VACUUM_OPTION_PARALLEL_CLEANUP as u8;
+
     am_routine
 };
 

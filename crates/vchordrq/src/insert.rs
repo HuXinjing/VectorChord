@@ -15,7 +15,7 @@
 use crate::linked_vec::LinkedVec;
 use crate::operator::*;
 use crate::tuples::*;
-use crate::{Chooser, Opaque, centroids, tape, vectors};
+use crate::{Opaque, centroids, tape, vectors};
 use always_equal::AlwaysEqual;
 use distance::Distance;
 use index::accessor::{FunctionalAccessor, LAccess};
@@ -28,13 +28,17 @@ use std::collections::BinaryHeap;
 use std::num::NonZero;
 use vector::{VectorBorrowed, VectorOwned};
 
+pub trait InsertChooser {
+    fn choose(&mut self, n: NonZero<usize>) -> usize;
+}
+
 type Extra1<'b> = &'b mut (u32, f32, u16, BorrowedIter<'b>);
 
 pub fn insert_vector<R: RelationRead + RelationWrite, O: Operator>(
     index: &R,
     payload: NonZero<u64>,
     vector: <O::Vector as VectorOwned>::Borrowed<'_>,
-    chooser: &mut impl Chooser,
+    chooser: &mut impl InsertChooser,
     skip_search: bool,
 ) -> (Vec<u32>, u16)
 where

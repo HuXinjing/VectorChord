@@ -13,6 +13,7 @@
 // Copyright (c) 2025 TensorChord Inc.
 
 mod am_build;
+mod am_vacuumcleanup;
 
 use crate::index::fetcher::*;
 use crate::index::gucs;
@@ -30,7 +31,7 @@ use std::num::NonZero;
 use std::ops::DerefMut;
 use std::ptr::NonNull;
 use std::sync::OnceLock;
-use vchordrq::Chooser;
+use vchordrq::InsertChooser;
 
 #[repr(C)]
 struct Reloption {
@@ -118,12 +119,15 @@ const AM_HANDLER: pgrx::pg_sys::IndexAmRoutine = const {
     am_routine.ambuildempty = Some(am_build::ambuildempty);
     am_routine.aminsert = Some(aminsert);
     am_routine.ambulkdelete = Some(ambulkdelete);
-    am_routine.amvacuumcleanup = Some(amvacuumcleanup);
+    am_routine.amvacuumcleanup = Some(am_vacuumcleanup::amvacuumcleanup);
 
     am_routine.ambeginscan = Some(ambeginscan);
     am_routine.amrescan = Some(amrescan);
     am_routine.amgettuple = Some(amgettuple);
     am_routine.amendscan = Some(amendscan);
+
+    am_routine.amparallelvacuumoptions = pgrx::pg_sys::VACUUM_OPTION_PARALLEL_BULKDEL as u8
+        | pgrx::pg_sys::VACUUM_OPTION_PARALLEL_CLEANUP as u8;
 
     am_routine
 };
@@ -304,7 +308,7 @@ unsafe fn aminsertinner(
     ctid: pgrx::pg_sys::ItemPointer,
 ) -> bool {
     struct RngChooser<T>(T);
-    impl<T: RngCore> Chooser for RngChooser<T> {
+    impl<T: RngCore> InsertChooser for RngChooser<T> {
         fn choose(&mut self, n: NonZero<usize>) -> usize {
             rand::Rng::random_range(&mut self.0, 0..n.get())
         }
@@ -373,35 +377,6 @@ pub unsafe extern "C-unwind" fn ambulkdelete(
         }
     };
     crate::index::vchordrq::dispatch::bulkdelete(opfamily, &index, check, callback);
-    stats
-}
-
-#[pgrx::pg_guard]
-pub unsafe extern "C-unwind" fn amvacuumcleanup(
-    info: *mut pgrx::pg_sys::IndexVacuumInfo,
-    stats: *mut pgrx::pg_sys::IndexBulkDeleteResult,
-) -> *mut pgrx::pg_sys::IndexBulkDeleteResult {
-    let mut stats = stats;
-    if stats.is_null() {
-        stats = unsafe {
-            pgrx::pg_sys::palloc0(size_of::<pgrx::pg_sys::IndexBulkDeleteResult>()).cast()
-        };
-    }
-    let opfamily = unsafe { opfamily((*info).index) };
-    let index = unsafe { PostgresRelation::new((*info).index) };
-    let check = || unsafe {
-        #[cfg(any(
-            feature = "pg13",
-            feature = "pg14",
-            feature = "pg15",
-            feature = "pg16",
-            feature = "pg17"
-        ))]
-        pgrx::pg_sys::vacuum_delay_point();
-        #[cfg(feature = "pg18")]
-        pgrx::pg_sys::vacuum_delay_point(false);
-    };
-    crate::index::vchordrq::dispatch::maintain(opfamily, &index, check);
     stats
 }
 

@@ -19,6 +19,7 @@ use crate::index::vchordg::opclass::{Opfamily, opfamily};
 use crate::index::vchordg::types::VchordgIndexingOptions;
 use pgrx::pg_sys::{Datum, ItemPointerData};
 use std::ffi::CStr;
+use std::marker::PhantomData;
 use vchordg::types::*;
 
 #[derive(Debug, Clone, Copy)]
@@ -148,10 +149,12 @@ impl Heap {
 }
 
 #[derive(Debug, Clone)]
-struct PostgresReporter {}
+struct PostgresReporter {
+    _phantom: PhantomData<*mut ()>,
+}
 
 impl PostgresReporter {
-    fn phase(&mut self, phase: BuildPhase) {
+    fn phase(&self, phase: BuildPhase) {
         unsafe {
             pgrx::pg_sys::pgstat_progress_update_param(
                 pgrx::pg_sys::PROGRESS_CREATEIDX_SUBPHASE as _,
@@ -159,7 +162,7 @@ impl PostgresReporter {
             );
         }
     }
-    fn tuples_total(&mut self, tuples_total: u64) {
+    fn tuples_total(&self, tuples_total: u64) {
         unsafe {
             pgrx::pg_sys::pgstat_progress_update_param(
                 pgrx::pg_sys::PROGRESS_CREATEIDX_TUPLES_TOTAL as _,
@@ -167,7 +170,7 @@ impl PostgresReporter {
             );
         }
     }
-    fn tuples_done(&mut self, tuples_done: u64) {
+    fn tuples_done(&self, tuples_done: u64) {
         unsafe {
             pgrx::pg_sys::pgstat_progress_update_param(
                 pgrx::pg_sys::PROGRESS_CREATEIDX_TUPLES_DONE as _,
@@ -198,12 +201,15 @@ pub unsafe extern "C-unwind" fn ambuild(
         pgrx::warning!("warning while validating options: {errors}");
     }
     let index = unsafe { PostgresRelation::new(index_relation) };
-    let mut reporter = PostgresReporter {};
+    let reporter = PostgresReporter {
+        _phantom: PhantomData,
+    };
     crate::index::vchordg::dispatch::build(vector_options, vchordg_options.index, &index);
     reporter.phase(BuildPhase::from_code(BuildPhaseCode::Inserting));
     let cached = vchordg_cached::VchordgCached::_0 {}.serialize();
     if let Some(leader) = unsafe {
         VchordgLeader::enter(
+            c"vchordg_parallel_build_main",
             heap_relation,
             index_relation,
             (*index_info).ii_Concurrent,
@@ -292,6 +298,7 @@ struct VchordgLeader {
 
 impl VchordgLeader {
     pub unsafe fn enter(
+        main: &'static CStr,
         heap_relation: pgrx::pg_sys::Relation,
         index_relation: pgrx::pg_sys::Relation,
         isconcurrent: bool,
@@ -332,11 +339,7 @@ impl VchordgLeader {
             pgrx::pg_sys::EnterParallelMode();
         }
         let pcxt = unsafe {
-            pgrx::pg_sys::CreateParallelContext(
-                c"vchord".as_ptr(),
-                c"vchordg_parallel_build_main".as_ptr(),
-                request,
-            )
+            pgrx::pg_sys::CreateParallelContext(c"vchord".as_ptr(), main.as_ptr(), request)
         };
 
         let snapshot = if isconcurrent {
