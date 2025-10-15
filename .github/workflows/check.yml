@@ -185,10 +185,6 @@ jobs:
       - name: Set up Environment
         run: |
           rustup update
-          if [ "${{ matrix.version }}" = "13" ]; then
-            rustup default beta
-            rustup component add clippy rustfmt
-          fi
 
           sudo apt-get remove -y '^postgres.*' '^libpq.*'
           sudo apt-get purge -y '^postgres.*' '^libpq.*'
@@ -812,3 +808,160 @@ jobs:
         if: always()
         run: |
           cat /sysroot/var/log/postgresql/postgresql-${{ matrix.version }}-main.log
+
+  check_arch:
+    if: |
+      (github.event_name == 'push' && contains(github.event.head_commit.message, 'job: +check_arch')) ||
+      (github.event_name == 'pull_request' && contains(github.event.pull_request.body, 'job: +check_arch')) ||
+      github.event_name == 'workflow_dispatch'
+
+    strategy:
+      matrix:
+        version: ["17"]
+
+    runs-on: "ubuntu-24.04"
+
+    container:
+      image: archlinux/archlinux:base-devel
+      volumes:
+        - /etc/passwd:/etc/passwd:rw,rshared
+        - /etc/group:/etc/group:rw,rshared
+        - /etc/shadow:/etc/shadow:rw,rshared
+        - /etc/gshadow:/etc/gshadow:rw,rshared
+        - /etc/sudoers.d/runner:/etc/sudoers.d/runner:rw,rshared
+      options: --user 1001 --privileged
+
+    env:
+      SCCACHE_GHA_ENABLED: "true"
+      RUSTUP_AUTO_INSTALL: "0"
+      RUSTC_WRAPPER: "sccache"
+      RUSTFLAGS: "-Dwarnings"
+      CARGO_TERM_COLOR: "always"
+      RUST_BACKTRACE: "1"
+      USER: "runner"
+
+    steps:
+      - name: Set up Environment
+        run: |
+          sudo sed -i 's/^DownloadUser = alpm$/DownloadUser = runner/' /etc/pacman.conf
+          sudo pacman -Syu git github-cli nodejs --ignore systemd,systemd-libs,systemd-sysvcompat --noconfirm
+
+          # fix home directory
+          sudo mkdir -p /var/lib/postgresql
+          sudo chmod 700 /var/lib/postgresql
+          sudo chown postgres:postgres /var/lib/postgresql
+
+          sudo pacman -S python clang valgrind --noconfirm
+          curl https://sh.rustup.rs -sSf | sh -s -- -y --default-toolchain beta
+
+          curl -fsSL https://github.com/risinglightdb/sqllogictest-rs/releases/download/v0.28.4/sqllogictest-bin-v0.28.4-$(uname -m)-unknown-linux-musl.tar.gz | tar -xOzf - ./sqllogictest | sudo install -m 755 /dev/stdin /usr/local/bin/sqllogictest
+
+      - name: Set up Sccache
+        uses: mozilla-actions/sccache-action@v0.0.9
+
+      - name: Install PostgreSQL
+        run: |
+          mkdir ~/postgresql-install
+          curl -fsSL https://ftp.postgresql.org/pub/source/v17.6/postgresql-17.6.tar.bz2 | tar -xj -C ~/postgresql-install
+          pushd ~/postgresql-install/postgresql-17.6
+          ./configure \
+              --prefix=/usr \
+              --sysconfdir=/etc \
+              --mandir=/usr/share/man \
+              --datadir=/usr/share/postgresql \
+              --disable-rpath \
+              --enable-nls \
+              --with-gssapi \
+              --with-icu \
+              --with-ldap \
+              --with-lz4 \
+              --with-openssl \
+              --with-python \
+              --with-readline \
+              --with-system-tzdata=/usr/share/zoneinfo \
+              --with-uuid=e2fs \
+              --with-zstd \
+              --enable-debug \
+              --enable-cassert \
+              CC='sccache clang' \
+              CFLAGS='-O0 -g -fno-omit-frame-pointer -mno-omit-leaf-frame-pointer -fasynchronous-unwind-tables' \
+              CPPFLAGS='-DUSE_ASSERT_CHECKING=1 -DRANDOMIZE_ALLOCATED_MEMORY=1 -DUSE_VALGRIND=1'
+          make all -j$(nproc)
+          sudo make install
+          popd
+
+          sudo touch /usr/bin/postmaster
+          echo '#!/usr/bin/sh' | sudo tee -a /usr/bin/postmaster
+          echo 'export DEBUGINFOD_URLS=https://debuginfod.archlinux.org' | sudo tee -a /usr/bin/postmaster
+          echo 'exec \' | sudo tee -a /usr/bin/postmaster
+          echo '  valgrind \' | sudo tee -a /usr/bin/postmaster
+          echo '  --leak-check=no \' | sudo tee -a /usr/bin/postmaster
+          echo '  --gen-suppressions=all \' | sudo tee -a /usr/bin/postmaster
+          echo '  --time-stamp=yes \' | sudo tee -a /usr/bin/postmaster
+          echo '  --error-markers=VALGRINDERROR-BEGIN,VALGRINDERROR-END \' | sudo tee -a /usr/bin/postmaster
+          echo '  --trace-children=yes \' | sudo tee -a /usr/bin/postmaster
+          echo '  /usr/bin/postgres "$@"' | sudo tee -a /usr/bin/postmaster
+          sudo chmod 755 /usr/bin/postmaster
+
+          sudo mkdir -p /var/lib/postgres
+          sudo chmod 700 /var/lib/postgres
+          sudo chown postgres:postgres /var/lib/postgres
+          sudo touch /var/log/postgresql.log
+          sudo chmod 700 /var/log/postgresql.log
+          sudo chown postgres:postgres /var/log/postgresql.log
+
+          sudo -iu postgres initdb -D /var/lib/postgres/data
+
+          sudo -iu postgres pg_ctl start -D /var/lib/postgres/data -l /var/log/postgresql.log -p /usr/bin/postmaster
+          sudo -iu postgres createuser -s -r $USER
+          sudo -iu postgres createdb -O $USER $USER
+          if [ "${{ matrix.version }}" -ge "18" ]; then
+            sudo -iu postgres psql -c 'ALTER SYSTEM SET io_method = io_uring'
+          fi
+          sudo -iu postgres psql -c 'ALTER SYSTEM SET max_worker_processes = 1024'
+          sudo -iu postgres psql -c 'ALTER SYSTEM SET shared_preload_libraries = "vchord"'
+          sudo -iu postgres pg_ctl stop -D /var/lib/postgres/data
+
+      - name: Install pgvector
+        run: |
+          mkdir ~/pgvector-install
+          curl -fsSL https://github.com/pgvector/pgvector/archive/refs/tags/v0.8.1.tar.gz | tar -xz -C ~/pgvector-install
+          pushd ~/pgvector-install/pgvector-0.8.1
+          make -j$(nproc)
+          sudo make install
+          popd
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Clippy
+        run: |
+          . "$HOME/.cargo/env"
+          PGRX_PG_CONFIG_PATH=pg_config \
+            cargo clippy --locked --target x86_64-unknown-linux-gnu \
+            --workspace --features pg${{ matrix.version }}
+
+      - name: Install
+        run: |
+          . "$HOME/.cargo/env"
+          make PROFILE=dev build
+          sudo make install
+
+      - name: Service
+        run: |
+          sudo -iu postgres pg_ctl start -D /var/lib/postgres/data -l /var/log/postgresql.log -p /usr/bin/postmaster
+          psql -c 'CREATE EXTENSION IF NOT EXISTS vchord CASCADE;'
+
+      - name: Sqllogictest
+        run: |
+          sqllogictest --db $USER --user $USER './tests/general/*.slt' --label pg${{ matrix.version }}
+          sqllogictest --db $USER --user $USER './tests/vchordg/*.slt' --label pg${{ matrix.version }}
+          sqllogictest --db $USER --user $USER './tests/vchordrq/*.slt' --label pg${{ matrix.version }}
+          if [ "${{ matrix.version }}" -ge "17" ]; then
+            sqllogictest --db $USER --user $USER './tests/vchordrq/pg17/*.slt' --label pg${{ matrix.version }}
+          fi
+
+      - name: Logging
+        if: always()
+        run: |
+          sudo cat /var/log/postgresql.log
