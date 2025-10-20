@@ -1,0 +1,14 @@
+[package]
+name = "feistel"
+version.workspace = true
+edition.workspace = true
+publish = false
+
+[dependencies]
+
+[dev-dependencies]
+rand.workspace = true
+wyhash.workspace = true
+
+[lints]
+workspace = true

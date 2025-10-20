@@ -18,17 +18,20 @@ use std::num::NonZero;
 use std::ops::DerefMut;
 use std::ptr::NonNull;
 
-pub trait Fetcher {
-    type Tuple<'a>: Tuple
-    where
-        Self: 'a;
-
-    fn fetch(&mut self, key: [u16; 3]) -> Option<Self::Tuple<'_>>;
+pub trait FilterableTuple: Tuple {
+    fn filter(&mut self) -> bool;
 }
 
 pub trait Tuple {
     fn build(&mut self) -> (&[Datum; 32], &[bool; 32]);
-    fn filter(&mut self) -> bool;
+}
+
+pub trait Fetcher {
+    type Tuple<'a>: FilterableTuple
+    where
+        Self: 'a;
+
+    fn fetch(&mut self, key: [u16; 3]) -> Option<Self::Tuple<'_>>;
 }
 
 impl<T: Fetcher, F: FnOnce() -> T> Fetcher for LazyCell<T, F> {
@@ -102,6 +105,9 @@ impl Fetcher for HeapFetcher {
             use pgrx::pg_sys::ffi::pg_guard_ffi_boundary;
             let mut ctid = key_to_ctid(key);
             let table_am = (*self.heap_relation).rd_tableam;
+            if table_am.is_null() {
+                panic!("unknown heap access method");
+            }
             let index_fetch_tuple = (*table_am)
                 .index_fetch_tuple
                 .expect("unsupported heap access method");
@@ -169,7 +175,9 @@ impl Tuple for HeapTuple<'_> {
             (&this.values, &this.is_nulls)
         }
     }
+}
 
+impl FilterableTuple for HeapTuple<'_> {
     #[allow(clippy::collapsible_if)]
     fn filter(&mut self) -> bool {
         unsafe {

@@ -24,6 +24,7 @@ pg18 = ["pgrx/pg18", "pgrx-catalog/pg18"]
 [dependencies]
 always_equal = { path = "./crates/always_equal" }
 distance = { path = "./crates/distance" }
+feistel = { path = "./crates/feistel" }
 index = { path = "./crates/index" }
 k_means = { path = "./crates/k_means" }
 rabitq = { path = "./crates/rabitq" }
@@ -44,6 +45,7 @@ seq-macro.workspace = true
 serde.workspace = true
 toml = "0.9.8"
 validator.workspace = true
+wyhash.workspace = true
 zerocopy.workspace = true
 
 [target.'cfg(all(any(target_arch = "x86_64", target_arch = "aarch64"), any(target_os = "linux", target_os = "macos")))'.dependencies]
@@ -69,6 +71,7 @@ rand_chacha = "0.9.0"
 seq-macro = "0.3.6"
 serde = { version = "1.0", features = ["derive"] }
 validator = { version = "0.20.0", features = ["derive"] }
+wyhash = "0.6.0"
 zerocopy = { version = "0.8.27", features = ["derive"] }
 
 [workspace.lints]

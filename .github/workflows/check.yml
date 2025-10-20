@@ -11,6 +11,11 @@ concurrency:
 
 jobs:
   style:
+    if: |
+      (github.event_name == 'push' && !contains(github.event.head_commit.message, 'job: -style')) ||
+      (github.event_name == 'pull_request' && !contains(github.event.pull_request.body, 'job: -style')) ||
+      github.event_name == 'workflow_dispatch'
+
     runs-on: "ubuntu-24.04"
 
     steps:
@@ -100,6 +105,11 @@ jobs:
           ! grep -P '\t' -r ./sql
 
   lint:
+    if: |
+      (github.event_name == 'push' && !contains(github.event.head_commit.message, 'job: -lint')) ||
+      (github.event_name == 'pull_request' && !contains(github.event.pull_request.body, 'job: -lint')) ||
+      github.event_name == 'workflow_dispatch'
+
     strategy:
       matrix:
         arch: ["x86_64", "aarch64"]
@@ -817,7 +827,7 @@ jobs:
 
     strategy:
       matrix:
-        version: ["17"]
+        version: ["17", "18"]
 
     runs-on: "ubuntu-24.04"
 
@@ -851,7 +861,7 @@ jobs:
           sudo chmod 700 /var/lib/postgresql
           sudo chown postgres:postgres /var/lib/postgresql
 
-          sudo pacman -S python clang valgrind --noconfirm
+          sudo pacman -S python clang valgrind liburing numactl --noconfirm
           curl https://sh.rustup.rs -sSf | sh -s -- -y --default-toolchain beta
 
           curl -fsSL https://github.com/risinglightdb/sqllogictest-rs/releases/download/v0.28.4/sqllogictest-bin-v0.28.4-$(uname -m)-unknown-linux-musl.tar.gz | tar -xOzf - ./sqllogictest | sudo install -m 755 /dev/stdin /usr/local/bin/sqllogictest
@@ -861,9 +871,16 @@ jobs:
 
       - name: Install PostgreSQL
         run: |
+          if [ "${{ matrix.version }}" = "17" ]; then
+            VER=17.6
+          fi
+          if [ "${{ matrix.version }}" = "18" ]; then
+            VER=18.0
+          fi
+
           mkdir ~/postgresql-install
-          curl -fsSL https://ftp.postgresql.org/pub/source/v17.6/postgresql-17.6.tar.bz2 | tar -xj -C ~/postgresql-install
-          pushd ~/postgresql-install/postgresql-17.6
+          curl -fsSL https://ftp.postgresql.org/pub/source/v$VER/postgresql-$VER.tar.bz2 | tar -xj -C ~/postgresql-install
+          pushd ~/postgresql-install/postgresql-$VER
           ./configure \
               --prefix=/usr \
               --sysconfdir=/etc \
@@ -881,6 +898,9 @@ jobs:
               --with-system-tzdata=/usr/share/zoneinfo \
               --with-uuid=e2fs \
               --with-zstd \
+              ${{ matrix.version >= 18 && '--with-libcurl'  || '' }} \
+              ${{ matrix.version >= 18 && '--with-libnuma'  || '' }} \
+              ${{ matrix.version >= 18 && '--with-liburing' || '' }} \
               --enable-debug \
               --enable-cassert \
               CC='sccache clang' \

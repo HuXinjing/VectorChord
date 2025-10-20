@@ -17,8 +17,10 @@ mod functions;
 mod gucs;
 mod hook;
 mod opclass;
+mod sample;
 mod scanners;
 mod storage;
+mod traverse;
 mod vchordg;
 mod vchordrq;
 

@@ -14,7 +14,9 @@
 
 use crate::datatype::typmod::Typmod;
 use crate::index::fetcher::*;
+use crate::index::sample::{HeapSampler, Sample, Sampler, Tuple};
 use crate::index::storage::{PostgresPage, PostgresRelation};
+use crate::index::traverse::{HeapTraverser, Traverser};
 use crate::index::vchordrq::am::Reloption;
 use crate::index::vchordrq::build::{Normalize, Normalized};
 use crate::index::vchordrq::opclass::{Opfamily, opfamily};
@@ -22,8 +24,6 @@ use crate::index::vchordrq::types::*;
 use index::relation::{
     Page, PageGuard, Relation, RelationRead, RelationReadTypes, RelationWrite, RelationWriteTypes,
 };
-use pgrx::pg_sys::{Datum, ItemPointerData};
-use rand::Rng;
 use simd::Floating;
 use std::ffi::CStr;
 use std::marker::PhantomData;
@@ -168,72 +168,6 @@ pub extern "C-unwind" fn ambuildphasename(x: i64) -> *mut core::ffi::c_char {
 }
 
 #[derive(Debug, Clone)]
-struct Heap {
-    heap_relation: pgrx::pg_sys::Relation,
-    index_relation: pgrx::pg_sys::Relation,
-    index_info: *mut pgrx::pg_sys::IndexInfo,
-    opfamily: Opfamily,
-    scan: *mut pgrx::pg_sys::TableScanDescData,
-}
-
-impl Heap {
-    fn traverse<F: FnMut((ItemPointerData, Vec<(OwnedVector, u16)>))>(
-        &self,
-        progress: bool,
-        callback: F,
-    ) {
-        use pgrx::pg_sys::ffi::pg_guard_ffi_boundary;
-        pub struct State<'a, F> {
-            pub this: &'a Heap,
-            pub callback: F,
-        }
-        #[pgrx::pg_guard]
-        unsafe extern "C-unwind" fn call<F>(
-            _index_relation: pgrx::pg_sys::Relation,
-            ctid: pgrx::pg_sys::ItemPointer,
-            values: *mut Datum,
-            is_null: *mut bool,
-            _tuple_is_alive: bool,
-            state: *mut core::ffi::c_void,
-        ) where
-            F: FnMut((ItemPointerData, Vec<(OwnedVector, u16)>)),
-        {
-            let state = unsafe { &mut *state.cast::<State<F>>() };
-            let opfamily = state.this.opfamily;
-            let datum = unsafe { (!is_null.add(0).read()).then_some(values.add(0).read()) };
-            let ctid = unsafe { ctid.read() };
-            if let Some(store) = unsafe { datum.and_then(|x| opfamily.store(x)) } {
-                (state.callback)((ctid, store));
-            }
-        }
-        let table_am = unsafe { &*(*self.heap_relation).rd_tableam };
-        let mut state = State {
-            this: self,
-            callback,
-        };
-        let index_build_range_scan = table_am.index_build_range_scan.expect("bad table");
-        unsafe {
-            #[allow(ffi_unwind_calls, reason = "protected by pg_guard_ffi_boundary")]
-            pg_guard_ffi_boundary(|| {
-                index_build_range_scan(
-                    self.heap_relation,
-                    self.index_relation,
-                    self.index_info,
-                    true,
-                    false,
-                    progress,
-                    0,
-                    pgrx::pg_sys::InvalidBlockNumber,
-                    Some(call::<F>),
-                    (&mut state) as *mut State<F> as *mut _,
-                    self.scan,
-                )
-            });
-        }
-    }
-}
-
-#[derive(Debug, Clone)]
 struct PostgresReporter {
     _phantom: PhantomData<*mut ()>,
 }
@@ -280,14 +214,6 @@ pub unsafe extern "C-unwind" fn ambuild(
         pgrx::error!("error while validating options: {}", errors);
     }
     let opfamily = unsafe { opfamily(index_relation) };
-    let index = unsafe { PostgresRelation::new(index_relation) };
-    let heap = Heap {
-        heap_relation,
-        index_relation,
-        index_info,
-        opfamily,
-        scan: std::ptr::null_mut(),
-    };
     let reporter = PostgresReporter {
         _phantom: PhantomData,
     };
@@ -299,9 +225,14 @@ pub unsafe extern "C-unwind" fn ambuild(
         }
         VchordrqBuildSourceOptions::Internal(internal_build) => {
             reporter.phase(BuildPhase::from_code(BuildPhaseCode::InternalBuild));
-            let mut tuples_total = 0_u64;
+            let snapshot = if unsafe { (*index_info).ii_Concurrent } {
+                unsafe { pgrx::pg_sys::RegisterSnapshot(pgrx::pg_sys::GetTransactionSnapshot()) }
+            } else {
+                &raw mut pgrx::pg_sys::SnapshotAnyData
+            };
+            let sampler = unsafe { HeapSampler::new(index_relation, heap_relation, snapshot) };
+            let mut sample = sampler.sample();
             let samples = 'a: {
-                let mut rand = rand::rng();
                 let Some(max_number_of_samples) = internal_build
                     .lists
                     .last()
@@ -310,31 +241,43 @@ pub unsafe extern "C-unwind" fn ambuild(
                     break 'a Vec::new();
                 };
                 let mut samples = Vec::new();
-                let mut number_of_samples = 0_u32;
-                heap.traverse(false, |(_, store)| {
-                    for (vector, _) in store {
-                        let x = match vector {
-                            OwnedVector::Vecf32(x) => VectOwned::normalize(x),
-                            OwnedVector::Vecf16(x) => VectOwned::normalize(x),
-                        };
-                        assert_eq!(
-                            vector_options.dims,
-                            x.len() as u32,
-                            "invalid vector dimensions"
-                        );
-                        if number_of_samples < max_number_of_samples {
-                            samples.push(x);
-                            number_of_samples += 1;
+                while samples.len() < max_number_of_samples as usize {
+                    if let Some(mut tuple) = sample.next() {
+                        let (values, is_nulls) = tuple.build();
+                        let datum = (!is_nulls[0]).then_some(values[0]);
+                        if let Some(datum) = datum {
+                            let vectors = unsafe { opfamily.store(datum) };
+                            if let Some(vectors) = vectors {
+                                for (vector, _) in vectors {
+                                    let x = match vector {
+                                        OwnedVector::Vecf32(x) => VectOwned::normalize(x),
+                                        OwnedVector::Vecf16(x) => VectOwned::normalize(x),
+                                    };
+                                    assert_eq!(
+                                        vector_options.dims,
+                                        x.len() as u32,
+                                        "invalid vector dimensions"
+                                    );
+                                    samples.push(x);
+                                }
+                            } else {
+                                continue;
+                            }
                         } else {
-                            let index = rand.random_range(0..max_number_of_samples) as usize;
-                            samples[index] = x;
+                            continue;
                         }
+                    } else {
+                        break;
                     }
-                    tuples_total += 1;
-                });
+                }
+                samples.truncate(max_number_of_samples as usize);
                 samples
             };
-            reporter.tuples_total(tuples_total);
+            if is_mvcc_snapshot(snapshot) {
+                unsafe {
+                    pgrx::pg_sys::UnregisterSnapshot(snapshot);
+                }
+            }
             make_internal_build(vector_options, internal_build, samples, &reporter)
         }
         VchordrqBuildSourceOptions::External(external_build) => {
@@ -348,6 +291,7 @@ pub unsafe extern "C-unwind" fn ambuild(
         }
     }
     reporter.phase(BuildPhase::from_code(BuildPhaseCode::Build));
+    let index = unsafe { PostgresRelation::new(index_relation) };
     crate::index::vchordrq::dispatch::build(
         vector_options,
         vchordrq_options.index,
@@ -1037,13 +981,7 @@ unsafe fn parallel_build(
 
     let scan = unsafe { pgrx::pg_sys::table_beginscan_parallel(heap_relation, tablescandesc) };
     let opfamily = unsafe { opfamily(index_relation) };
-    let heap = Heap {
-        heap_relation,
-        index_relation,
-        index_info,
-        opfamily,
-        scan,
-    };
+    let traverser = unsafe { HeapTraverser::new(heap_relation, index_relation, index_info, scan) };
 
     struct IdChooser(u32);
     impl InsertChooser for IdChooser {
@@ -1070,7 +1008,13 @@ unsafe fn parallel_build(
 
     match cached {
         VchordrqCachedReader::_0(_) => {
-            heap.traverse(true, |(ctid, store)| {
+            traverser.traverse(true, |tuple: &mut dyn crate::index::traverse::Tuple| {
+                let ctid = tuple.id();
+                let (values, is_nulls) = tuple.build();
+                let value = unsafe { (!is_nulls.add(0).read()).then_some(values.add(0).read()) };
+                let store = value
+                    .and_then(|x| unsafe { opfamily.store(x) })
+                    .unwrap_or_default();
                 for (vector, extra) in store {
                     let key = ctid_to_key(ctid);
                     let payload = kv_to_pointer((key, extra));
@@ -1104,7 +1048,13 @@ unsafe fn parallel_build(
                 cache: cached,
                 relation: index.clone(),
             };
-            heap.traverse(true, |(ctid, store)| {
+            traverser.traverse(true, |tuple: &mut dyn crate::index::traverse::Tuple| {
+                let ctid = tuple.id();
+                let (values, is_nulls) = tuple.build();
+                let value = unsafe { (!is_nulls.add(0).read()).then_some(values.add(0).read()) };
+                let store = value
+                    .and_then(|x| unsafe { opfamily.store(x) })
+                    .unwrap_or_default();
                 for (vector, extra) in store {
                     let key = ctid_to_key(ctid);
                     let payload = kv_to_pointer((key, extra));
@@ -1163,12 +1113,13 @@ unsafe fn sequential_build(
     let index = unsafe { PostgresRelation::new(index_relation) };
 
     let opfamily = unsafe { opfamily(index_relation) };
-    let heap = Heap {
-        heap_relation,
-        index_relation,
-        index_info,
-        opfamily,
-        scan: std::ptr::null_mut(),
+    let traverser = unsafe {
+        HeapTraverser::new(
+            heap_relation,
+            index_relation,
+            index_info,
+            std::ptr::null_mut(),
+        )
     };
 
     struct ChooseZero;
@@ -1194,7 +1145,13 @@ unsafe fn sequential_build(
     let mut indtuples = 0;
     match cached {
         VchordrqCachedReader::_0(_) => {
-            heap.traverse(true, |(ctid, store)| {
+            traverser.traverse(true, |tuple: &mut dyn crate::index::traverse::Tuple| {
+                let ctid = tuple.id();
+                let (values, is_nulls) = tuple.build();
+                let value = unsafe { (!is_nulls.add(0).read()).then_some(values.add(0).read()) };
+                let store = value
+                    .and_then(|x| unsafe { opfamily.store(x) })
+                    .unwrap_or_default();
                 for (vector, extra) in store {
                     let key = ctid_to_key(ctid);
                     let payload = kv_to_pointer((key, extra));
@@ -1220,7 +1177,13 @@ unsafe fn sequential_build(
                 cache: cached,
                 relation: index.clone(),
             };
-            heap.traverse(true, |(ctid, store)| {
+            traverser.traverse(true, |tuple: &mut dyn crate::index::traverse::Tuple| {
+                let ctid = tuple.id();
+                let (values, is_nulls) = tuple.build();
+                let value = unsafe { (!is_nulls.add(0).read()).then_some(values.add(0).read()) };
+                let store = value
+                    .and_then(|x| unsafe { opfamily.store(x) })
+                    .unwrap_or_default();
                 for (vector, extra) in store {
                     let key = ctid_to_key(ctid);
                     let payload = kv_to_pointer((key, extra));
