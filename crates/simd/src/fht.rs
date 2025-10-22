@@ -156,7 +156,7 @@ mod tests {
         const EPSILON: f32 = 1e-6;
         let mut rng = rand::rng();
         let mut n = 1_usize;
-        while n <= 65536 {
+        while n <= if cfg!(not(miri)) { 65536 } else { 4096 } {
             let x = (0..n)
                 .map(|_| rng.random_range(-1.0_f32..=1.0_f32))
                 .collect::<Vec<_>>();

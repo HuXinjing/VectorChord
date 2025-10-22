@@ -83,7 +83,7 @@ fn is_a_permutation() {
         let buffer = [round.to_le_bytes(), x.to_le_bytes(), key_0, key_1];
         wyhash::wyhash(buffer.as_flattened(), 0) as u32
     };
-    for width in (0..20).step_by(2) {
+    for width in (0..if cfg!(not(miri)) { 20 } else { 10 }).step_by(2) {
         let mut y = Vec::new();
         for x in 0..1 << width {
             y.push(feistel::<u32>(width, x, 8, secret));
@@ -100,7 +100,7 @@ fn is_a_permutation() {
 
 #[test]
 fn sample() {
-    let n = 6370_u32;
+    let n = if cfg!(not(miri)) { 6370_u32 } else { 637_u32 };
     let width = (n.ilog2() + 1).next_multiple_of(2);
     let key_0 = rand::Rng::random(&mut rand::rng());
     let key_1 = rand::Rng::random(&mut rand::rng());

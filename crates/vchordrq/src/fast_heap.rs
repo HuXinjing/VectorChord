@@ -92,10 +92,8 @@ impl<T: Ord> Sequence for FastHeap<T> {
 
 #[test]
 fn test_fast_heap() {
-    for _ in 0..1000 {
-        let sequence = (0..10000)
-            .map(|_| rand::random::<i32>())
-            .collect::<Vec<_>>();
+    for _ in 0..if cfg!(not(miri)) { 1000 } else { 1 } {
+        let sequence = (0..1000).map(|_| rand::random::<i32>()).collect::<Vec<_>>();
         let answer = {
             let mut x = sequence.clone();
             x.sort_by_key(|x| std::cmp::Reverse(*x));

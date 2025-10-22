@@ -40,7 +40,7 @@ jobs:
         uses: astral-sh/ruff-action@v1
 
       - name: Rustfmt
-        run: cargo fmt --check -- --config-path /dev/null --config imports_granularity=Module
+        run: cargo fmt --check
 
       - name: Deny
         run: cargo deny check
@@ -104,6 +104,35 @@ jobs:
         run: |
           ! grep -P '\t' -r ./sql
 
+  miri:
+    if: |
+      (github.event_name == 'push' && contains(github.event.head_commit.message, 'job: +miri')) ||
+      (github.event_name == 'pull_request' && contains(github.event.pull_request.body, 'job: +miri')) ||
+      github.event_name == 'workflow_dispatch'
+
+    runs-on: "ubuntu-24.04"
+
+    env:
+      RUSTUP_AUTO_INSTALL: "0"
+      CARGO_TERM_COLOR: "always"
+      RUST_BACKTRACE: "1"
+
+    steps:
+      - name: Set up Environment
+        run: |
+          rustup default nightly
+          rustup component add miri
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Cargo Test (Miri)
+        run: |
+          RUSTFLAGS="-Ctarget-cpu=sapphirerapids" MIRIFLAGS="-Zmiri-strict-provenance" \
+            cargo miri test --locked --target x86_64-unknown-linux-gnu \
+            --workspace --exclude vchord --no-fail-fast \
+            -- --no-capture
+
   lint:
     if: |
       (github.event_name == 'push' && !contains(github.event.head_commit.message, 'job: -lint')) ||
@@ -146,13 +175,13 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Clippy
-        run: cargo clippy --locked --workspace --exclude vchord
-
       - name: Cargo Test
-        run: cargo test --locked --workspace --exclude vchord --exclude simd --no-fail-fast
+        run: |
+          cargo test --locked \
+            --workspace --exclude vchord --no-fail-fast \
+            -- --no-capture
 
-      - name: Cargo Test (simd)
+      - name: Cargo Test (QEMU)
         run: |
           if [ "$(uname -m)" == "x86_64" ]; then
             cargo \
@@ -170,6 +199,9 @@ jobs:
               --config 'target.'\''cfg(all())'\''.runner = ["qemu-aarch64-static", "-cpu", "max,sve-default-vector-length=64"]' \
               test --locked -p simd -- --no-capture
           fi
+
+      - name: Clippy
+        run: cargo clippy --locked --workspace --exclude vchord
 
   psql:
     if: |
@@ -502,7 +534,6 @@ jobs:
       # RUSTFLAGS: "-Dwarnings"
       CARGO_TERM_COLOR: "always"
       RUST_BACKTRACE: "1"
-      USER: "root"
 
     steps:
       - name: Set up Environment
@@ -511,10 +542,13 @@ jobs:
           apk add nodejs --update-cache
           mkdir /opt/bin
           ln -s /usr/bin/node /opt/bin/node
+          export USER=root
+          echo USER=$USER >> $GITHUB_ENV
 
           apk add --no-cache sudo curl make zip clang18-dev postgresql${{ matrix.version }} postgresql${{ matrix.version }}-dev
 
-          curl https://sh.rustup.rs -sSf | sh -s -- -y --default-toolchain 1.89-beta
+          curl https://sh.rustup.rs -sSf | sh -s -- -y --default-toolchain beta
+          echo RUSTC_BOOTSTRAP=1 >> $GITHUB_ENV
 
           echo PGRX_PG_CONFIG_PATH=/usr/libexec/postgresql${{ matrix.version }}/pg_config >> $GITHUB_ENV
           echo PG_CONFIG=/usr/libexec/postgresql${{ matrix.version }}/pg_config >> $GITHUB_ENV
@@ -552,11 +586,12 @@ jobs:
       - name: Patch
         run: |
           mkdir ./.cargo && touch ./.cargo/config.toml
-          echo "unstable.host-config = true" >> ./.cargo/config.toml
-          echo "unstable.target-applies-to-host = true" >> ./.cargo/config.toml
-          echo "host.rustflags = [\"-Dwarnings\", \"-Ctarget-feature=-crt-static\"]" >> ./.cargo/config.toml
-          echo "build.rustflags = [\"-Dwarnings\", \"-Ctarget-feature=-crt-static\"]" >> ./.cargo/config.toml
-          echo RUSTC_BOOTSTRAP=1 >> $GITHUB_ENV
+          cat << EOF > ./.cargo/config.toml
+          unstable.host-config = true
+          unstable.target-applies-to-host = true
+          host.rustflags = ["-Dwarnings", "-Ctarget-feature=-crt-static"]
+          build.rustflags = ["-Dwarnings", "-Ctarget-feature=-crt-static"]
+          EOF
 
       - name: Clippy
         run: |
@@ -672,6 +707,10 @@ jobs:
     steps:
       - name: Set up Environment
         run: |
+          rustup default beta
+          rustup component add rustfmt clippy
+          echo RUSTC_BOOTSTRAP=1 >> $GITHUB_ENV
+
           sudo apt-get update
           sudo apt-get install -y qemu-user-static clang lld
           sudo systemctl enable --now systemd-binfmt
@@ -748,15 +787,8 @@ jobs:
 
       - name: Patch
         run: |
-          cat << EOF > rust-toolchain.toml
-          [toolchain]
-          channel = "nightly-2025-08-29"
-          components = ["rustfmt", "clippy"]
-          targets = ["${{ matrix.rust_triple }}"]
-          profile = "minimal"
-          EOF
-          mkdir -p .cargo
-          cat << EOF > .cargo/config.toml
+          mkdir ./.cargo && touch ./.cargo/config.toml
+          cat << EOF > ./.cargo/config.toml
           [target.${{ matrix.rust_triple }}]
           runner = ["qemu-${{ matrix.platform }}-static"]
           linker = "clang"
@@ -771,17 +803,18 @@ jobs:
           CFLAGS_${{ matrix.rust_triple }} = "--target=${{ matrix.clang_triple }} --sysroot=/sysroot"
           BINDGEN_EXTRA_CLANG_ARGS_${{ matrix.rust_triple }} = "--sysroot=/sysroot"
           EOF
-          rustup toolchain install
 
-      - name: Clippy & Test
+      - name: Cargo Test
+        run: |
+          cargo test --locked --target ${{ matrix.rust_triple }} \
+            --workspace --exclude vchord --no-fail-fast \
+            -- --no-capture
+
+      - name: Clippy
         run: |
           PGRX_PG_CONFIG_PATH=pg_config \
-            cargo clippy --target ${{ matrix.rust_triple }} \
+            cargo clippy --locked --target ${{ matrix.rust_triple }} \
             --workspace --features pg${{ matrix.version }}
-          PGRX_PG_CONFIG_PATH=pg_config \
-            cargo test --target ${{ matrix.rust_triple }} \
-            --workspace --exclude vchord  --no-fail-fast \
-            -- --no-capture
 
       - name: Install
         run: |
@@ -848,13 +881,14 @@ jobs:
       RUSTFLAGS: "-Dwarnings"
       CARGO_TERM_COLOR: "always"
       RUST_BACKTRACE: "1"
-      USER: "runner"
 
     steps:
       - name: Set up Environment
         run: |
           sudo sed -i 's/^DownloadUser = alpm$/DownloadUser = runner/' /etc/pacman.conf
           sudo pacman -Syu git github-cli nodejs --ignore systemd,systemd-libs,systemd-sysvcompat --noconfirm
+          export USER=runner
+          echo USER=$USER >> $GITHUB_ENV
 
           # fix home directory
           sudo mkdir -p /var/lib/postgresql
@@ -862,7 +896,9 @@ jobs:
           sudo chown postgres:postgres /var/lib/postgresql
 
           sudo pacman -S python clang valgrind liburing numactl --noconfirm
+
           curl https://sh.rustup.rs -sSf | sh -s -- -y --default-toolchain beta
+          echo RUSTC_BOOTSTRAP=1 >> $GITHUB_ENV
 
           curl -fsSL https://github.com/risinglightdb/sqllogictest-rs/releases/download/v0.28.4/sqllogictest-bin-v0.28.4-$(uname -m)-unknown-linux-musl.tar.gz | tar -xOzf - ./sqllogictest | sudo install -m 755 /dev/stdin /usr/local/bin/sqllogictest
 
@@ -953,6 +989,13 @@ jobs:
 
       - name: Checkout
         uses: actions/checkout@v4
+
+      - name: Cargo Test
+        run: |
+          . "$HOME/.cargo/env"
+          cargo test --locked --target x86_64-unknown-linux-gnu \
+            --workspace --exclude vchord --no-fail-fast \
+            -- --no-capture
 
       - name: Clippy
         run: |

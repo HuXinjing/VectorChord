@@ -701,7 +701,7 @@ mod reduce_sum_of_x_as_u32 {
         sum
     }
 
-    #[cfg(all(target_arch = "aarch64", test))]
+    #[cfg(all(target_arch = "aarch64", test, not(miri)))]
     #[test]
     fn reduce_sum_of_x_as_u32_a2_test() {
         use rand::Rng;
