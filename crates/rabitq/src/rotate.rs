@@ -52,44 +52,100 @@ fn kacs_walk(result: &mut [f32]) {
 }
 
 pub fn rotate(vector: &[f32]) -> Vec<f32> {
+    let mut vector = vector.to_vec();
+    rotate_inplace(&mut vector);
+    vector
+}
+
+pub fn rotate_inplace(result: &mut [f32]) {
     use simd::Floating;
     use std::ops::Bound::{Excluded, Included, Unbounded};
 
-    let mut result = vector.to_vec();
-    let n = vector.len();
+    let n = result.len();
     let base = n.ilog2();
     let scale = 1.0 / ((1_usize << base) as f32).sqrt();
 
     let l = (Unbounded, Excluded(1_usize << base));
     let r = (Included(n - (1_usize << base)), Unbounded);
 
-    simd::rotate::flip(&BITS_0, &mut result);
+    simd::rotate::flip(&BITS_0, result);
     simd::fht::fht(&mut result[l]);
     f32::vector_mul_scalar_inplace(&mut result[l], scale);
     if n != (1_usize << base) {
-        kacs_walk(&mut result);
+        kacs_walk(result);
     }
 
-    simd::rotate::flip(&BITS_1, &mut result);
+    simd::rotate::flip(&BITS_1, result);
     simd::fht::fht(&mut result[r]);
     f32::vector_mul_scalar_inplace(&mut result[r], scale);
     if n != (1_usize << base) {
-        kacs_walk(&mut result);
+        kacs_walk(result);
     }
 
-    simd::rotate::flip(&BITS_2, &mut result);
+    simd::rotate::flip(&BITS_2, result);
     simd::fht::fht(&mut result[l]);
     f32::vector_mul_scalar_inplace(&mut result[l], scale);
     if n != (1_usize << base) {
-        kacs_walk(&mut result);
+        kacs_walk(result);
     }
 
-    simd::rotate::flip(&BITS_3, &mut result);
+    simd::rotate::flip(&BITS_3, result);
     simd::fht::fht(&mut result[r]);
     f32::vector_mul_scalar_inplace(&mut result[r], scale);
     if n != (1_usize << base) {
-        kacs_walk(&mut result);
+        kacs_walk(result);
     }
+}
 
-    result
+pub fn rotate_reversed_inplace(result: &mut [f32]) {
+    use simd::Floating;
+    use std::ops::Bound::{Excluded, Included, Unbounded};
+
+    let n = result.len();
+    let base = n.ilog2();
+    let scale = 1.0 / ((1_usize << base) as f32).sqrt();
+
+    let l = (Unbounded, Excluded(1_usize << base));
+    let r = (Included(n - (1_usize << base)), Unbounded);
+
+    if n != (1_usize << base) {
+        kacs_walk(result);
+    }
+    f32::vector_mul_scalar_inplace(&mut result[r], scale);
+    simd::fht::fht(&mut result[r]);
+    simd::rotate::flip(&BITS_3, result);
+
+    if n != (1_usize << base) {
+        kacs_walk(result);
+    }
+    f32::vector_mul_scalar_inplace(&mut result[l], scale);
+    simd::fht::fht(&mut result[l]);
+    simd::rotate::flip(&BITS_2, result);
+
+    if n != (1_usize << base) {
+        kacs_walk(result);
+    }
+    f32::vector_mul_scalar_inplace(&mut result[r], scale);
+    simd::fht::fht(&mut result[r]);
+    simd::rotate::flip(&BITS_1, result);
+
+    if n != (1_usize << base) {
+        kacs_walk(result);
+    }
+    f32::vector_mul_scalar_inplace(&mut result[l], scale);
+    simd::fht::fht(&mut result[l]);
+    simd::rotate::flip(&BITS_0, result);
+}
+
+#[test]
+fn reverse() {
+    let mut x = vec![2.0, 3.0, 4.0];
+    rotate_inplace(&mut x);
+    assert!((x[0] - 3.981917).abs() < 1e-6);
+    assert!((x[1] - 1.8043789).abs() < 1e-6);
+    assert!((x[2] - 3.1446066).abs() < 1e-6);
+    rotate_reversed_inplace(&mut x);
+    assert!((x[0] - 2.0).abs() < 1e-6);
+    assert!((x[1] - 3.0).abs() < 1e-6);
+    assert!((x[2] - 4.0).abs() < 1e-6);
 }

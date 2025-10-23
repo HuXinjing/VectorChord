@@ -40,7 +40,7 @@ jobs:
         uses: astral-sh/ruff-action@v1
 
       - name: Rustfmt
-        run: cargo fmt --check
+        run: cargo fmt --check -- --config-path /dev/null --config imports_granularity=Module
 
       - name: Deny
         run: cargo deny check

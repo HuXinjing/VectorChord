@@ -16,7 +16,7 @@ use binary::BinaryLut;
 use block::BlockLut;
 use simd::Floating;
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Default)]
 pub struct CodeMetadata {
     pub dis_u_2: f32,
     pub factor_cnt: f32,
@@ -64,6 +64,35 @@ impl CodeMetadata {
 }
 
 pub type Code = (CodeMetadata, Vec<bool>);
+
+pub fn code_metadata(vector: &[f32]) -> CodeMetadata {
+    let n = vector.len();
+    let sum_of_abs_x = f32::reduce_sum_of_abs_x(vector);
+    let sum_of_x_2 = f32::reduce_sum_of_x2(vector);
+    CodeMetadata {
+        dis_u_2: sum_of_x_2,
+        factor_cnt: {
+            let cnt_pos = vector.iter().filter(|x| x.is_sign_positive()).count();
+            let cnt_neg = vector.iter().filter(|x| x.is_sign_negative()).count();
+            cnt_pos as f32 - cnt_neg as f32
+        },
+        factor_ip: sum_of_x_2 / sum_of_abs_x,
+        factor_err: {
+            let dis_u = sum_of_x_2.sqrt();
+            let x_0 = sum_of_abs_x / dis_u / (n as f32).sqrt();
+            dis_u * (1.0 / (x_0 * x_0) - 1.0).sqrt() / (n as f32 - 1.0).sqrt()
+        },
+    }
+}
+
+pub fn code_elements(vector: &[f32]) -> Vec<bool> {
+    let n = vector.len();
+    let mut signs = Vec::new();
+    for i in 0..n {
+        signs.push(vector[i].is_sign_positive());
+    }
+    signs
+}
 
 pub fn code(vector: &[f32]) -> Code {
     let n = vector.len();
@@ -319,6 +348,17 @@ pub mod block {
             },
             cqvector.as_chunks::<16>().0.to_vec(),
         )
+    }
+
+    #[inline(always)]
+    pub fn accumulate(t: &[[u8; 16]], s: &[[u8; 16]]) -> [u32; 32] {
+        use std::iter::zip;
+        let mut sum = [0_u32; 32];
+        for (t, s) in zip(t.chunks(STEP), s.chunks(STEP)) {
+            let delta = simd::fast_scan::scan(t, s);
+            simd::fast_scan::accu(&mut sum, &delta);
+        }
+        sum
     }
 
     #[inline(always)]

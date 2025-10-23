@@ -24,6 +24,7 @@ use crate::index::vchordrq::types::*;
 use index::relation::{
     Page, PageGuard, Relation, RelationRead, RelationReadTypes, RelationWrite, RelationWriteTypes,
 };
+use k_means::square::Square;
 use simd::Floating;
 use std::ffi::CStr;
 use std::marker::PhantomData;
@@ -233,14 +234,14 @@ pub unsafe extern "C-unwind" fn ambuild(
             let sampler = unsafe { HeapSampler::new(index_relation, heap_relation, snapshot) };
             let mut sample = sampler.sample();
             let samples = 'a: {
+                let mut samples = Square::new(vector_options.dims as _);
                 let Some(max_number_of_samples) = internal_build
                     .lists
                     .last()
                     .map(|x| x.saturating_mul(internal_build.sampling_factor))
                 else {
-                    break 'a Vec::new();
+                    break 'a samples;
                 };
-                let mut samples = Vec::new();
                 while samples.len() < max_number_of_samples as usize {
                     if let Some(mut tuple) = sample.next() {
                         let (values, is_nulls) = tuple.build();
@@ -258,7 +259,7 @@ pub unsafe extern "C-unwind" fn ambuild(
                                         x.len() as u32,
                                         "invalid vector dimensions"
                                     );
-                                    samples.push(x);
+                                    samples.push_slice(x.as_slice());
                                 }
                             } else {
                                 continue;
@@ -1290,16 +1291,23 @@ fn make_default_build(
 fn make_internal_build(
     vector_options: VectorOptions,
     internal_build: VchordrqInternalBuildOptions,
-    samples: Vec<Normalized>,
+    samples: Square,
     reporter: &PostgresReporter,
 ) -> Vec<Structure<Normalized>> {
     use std::iter::once;
     let mut result = Vec::<Structure<Normalized>>::new();
+    let mut samples = Some(samples);
     for w in internal_build.lists.iter().rev().copied().chain(once(1)) {
         let input = if let Some(structure) = result.last() {
-            &structure.centroids
+            let mut input = Square::new(vector_options.dims as _);
+            for slice in structure.centroids.iter() {
+                input.push_slice(slice);
+            }
+            input
+        } else if let Some(samples) = samples.take() {
+            samples
         } else {
-            &samples
+            unreachable!()
         };
         let num_threads = internal_build.build_threads as _;
         let num_points = input.len();
@@ -1318,28 +1326,30 @@ fn make_internal_build(
                 "clustering: starting, using {num_threads} threads, clustering {num_points} vectors of {num_dims} dimension into {num_lists} clusters, in {num_iterations} iterations"
             );
         }
-        let centroids = k_means::k_means(
-            num_threads,
-            |i| {
-                pgrx::check_for_interrupts!();
-                if result.is_empty() {
-                    let percentage =
-                        ((i as f64 / num_iterations as f64) * 100.0).clamp(0.0, 100.0) as u16;
-                    let default = BuildPhase::from_code(BuildPhaseCode::InternalBuild);
-                    let phase = BuildPhase::new(BuildPhaseCode::InternalBuild, 1 + percentage)
-                        .unwrap_or(default);
-                    reporter.phase(phase);
-                }
-                if num_lists > 1 {
-                    pgrx::info!("clustering: iteration {}", i + 1);
-                }
-            },
-            num_lists,
-            num_dims,
-            input,
-            internal_build.spherical_centroids,
-            num_iterations,
-        );
+        let mut f = k_means::k_means(num_dims, input, num_lists, num_threads, [7; 32]);
+        if internal_build.spherical_centroids {
+            f.sphericalize();
+        }
+        for i in 0..num_iterations {
+            pgrx::check_for_interrupts!();
+            if result.is_empty() {
+                let percentage =
+                    ((i as f64 / num_iterations as f64) * 100.0).clamp(0.0, 100.0) as u16;
+                let default = BuildPhase::from_code(BuildPhaseCode::InternalBuild);
+                let phase = BuildPhase::new(BuildPhaseCode::InternalBuild, 1 + percentage)
+                    .unwrap_or(default);
+                reporter.phase(phase);
+            }
+            if num_lists > 1 {
+                pgrx::info!("clustering: iteration {}", i + 1);
+            }
+            f.assign();
+            f.update();
+            if internal_build.spherical_centroids {
+                f.sphericalize();
+            }
+        }
+        let centroids = f.finish();
         if result.is_empty() {
             let percentage = 100;
             let default = BuildPhase::from_code(BuildPhaseCode::InternalBuild);
@@ -1353,7 +1363,7 @@ fn make_internal_build(
         if let Some(structure) = result.last() {
             let mut children = vec![Vec::new(); centroids.len()];
             for i in 0..structure.len() as u32 {
-                pub fn k_means_lookup(vector: &[f32], centroids: &[Normalized]) -> usize {
+                pub fn k_means_lookup(vector: &[f32], centroids: &Square) -> usize {
                     assert_ne!(centroids.len(), 0);
                     let mut result = (f32::INFINITY, 0);
                     for i in 0..centroids.len() {
@@ -1367,8 +1377,9 @@ fn make_internal_build(
                 let target = k_means_lookup(&structure.centroids[i as usize], &centroids);
                 children[target].push(i);
             }
-            let (centroids, children) = std::iter::zip(centroids, children)
-                .filter(|(_, x)| !x.is_empty())
+            let (centroids, children) = std::iter::zip(&centroids, children)
+                .filter(|(_, children)| !children.is_empty())
+                .map(|(centroids, children)| (centroids.to_vec(), children))
                 .unzip::<_, _, Vec<_>, Vec<_>>();
             result.push(Structure {
                 centroids,
@@ -1377,7 +1388,7 @@ fn make_internal_build(
         } else {
             let children = vec![Vec::new(); centroids.len()];
             result.push(Structure {
-                centroids,
+                centroids: centroids.into_iter().map(|x| x.to_vec()).collect(),
                 children,
             });
         }
