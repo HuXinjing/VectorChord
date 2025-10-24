@@ -30,11 +30,12 @@ struct Cli {
 #[derive(Subcommand)]
 enum Commands {
     Build(BuildArgs),
+    Clippy(ClippyArgs),
 }
 
 #[derive(Args)]
 struct BuildArgs {
-    #[arg(short, long)]
+    #[arg(short, long, default_value = "./build")]
     output: String,
     #[arg(long, default_value = target_triple::TARGET, env = "TARGET")]
     target: String,
@@ -42,6 +43,14 @@ struct BuildArgs {
     profile: String,
     #[arg(long, env = "RUNNER")]
     runner: Option<String>,
+}
+
+#[derive(Args)]
+struct ClippyArgs {
+    #[arg(long, default_value = target_triple::TARGET, env = "TARGET")]
+    target: String,
+    #[arg(long, default_value = "release", env = "PROFILE")]
+    profile: String,
 }
 
 struct TargetSpecificInformation {
@@ -272,7 +281,7 @@ fn generate(
         .args(["--target", target])
         .args(["--features", pg_version])
         .env("PGRX_PG_CONFIG_PATH", pg_config.as_ref())
-        .args(["--", "--cfg", "pgrx_embed"])
+        .args(["--", "-C", "lto=off", "--cfg", "pgrx_embed"])
         .env("PGRX_EMBED", &pgrx_embed)
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit());
@@ -340,12 +349,32 @@ fn install_by_writing(
     Ok(())
 }
 
+fn clippy(
+    pg_config: impl AsRef<Path>,
+    pg_version: &str,
+    profile: &str,
+    target: &str,
+) -> Result<(), Box<dyn Error>> {
+    let mut command = Command::new("cargo");
+    command
+        .args(["clippy"])
+        .args(["--workspace"])
+        .args(["--profile", profile])
+        .args(["--target", target])
+        .args(["--features", pg_version])
+        .env("PGRX_PG_CONFIG_PATH", pg_config.as_ref())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit());
+    eprintln!("Running {command:?}");
+    let command_status = command.spawn()?.wait()?;
+    if !command_status.success() {
+        return Err(format!("Cargo clippy failed: {command_status}").into());
+    }
+    Ok(())
+}
+
 fn main() -> Result<(), Box<dyn Error>> {
     let cli = Cli::parse();
-    if !std::fs::exists("./vchord.control")? {
-        return Err("The script must be run from the VectorChord source directory.".into());
-    }
-    let vchord_version = control_file("./vchord.control")?["default_version"].clone();
     match cli.command {
         Commands::Build(BuildArgs {
             output,
@@ -353,6 +382,10 @@ fn main() -> Result<(), Box<dyn Error>> {
             profile,
             runner,
         }) => {
+            if !std::fs::exists("./vchord.control")? {
+                return Err("The script must be run from the VectorChord source directory.".into());
+            }
+            let vchord_version = control_file("./vchord.control")?["default_version"].clone();
             let runner = runner.and_then(|runner| shlex::split(&runner));
             let path = if let Some(value) = var_os("PGRX_PG_CONFIG_PATH") {
                 PathBuf::from(value)
@@ -427,6 +460,32 @@ fn main() -> Result<(), Box<dyn Error>> {
                     false,
                 )?;
             }
+        }
+        Commands::Clippy(ClippyArgs { target, profile }) => {
+            if !std::fs::exists("./vchord.control")? {
+                return Err("The script must be run from the VectorChord source directory.".into());
+            }
+            let path = if let Some(value) = var_os("PGRX_PG_CONFIG_PATH") {
+                PathBuf::from(value)
+            } else {
+                return Err("Environment variable `PGRX_PG_CONFIG_PATH` is not set.".into());
+            };
+            let pg_config = pg_config(&path)?;
+            let pg_version = {
+                let version = pg_config["VERSION"].clone();
+                if let Some(prefix_stripped) = version.strip_prefix("PostgreSQL ") {
+                    if let Some((stripped, _)) =
+                        prefix_stripped.split_once(|c: char| !c.is_ascii_digit())
+                    {
+                        format!("pg{stripped}",)
+                    } else {
+                        format!("pg{prefix_stripped}",)
+                    }
+                } else {
+                    return Err("PostgreSQL version is invalid.".into());
+                }
+            };
+            clippy(&path, &pg_version, &profile, &target)?;
         }
     }
     Ok(())

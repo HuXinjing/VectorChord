@@ -341,15 +341,15 @@ impl<O: Opaque> RelationWrite for PostgresRelation<O> {
     ) -> PostgresBufferWriteGuard<O> {
         unsafe {
             use pgrx::pg_sys::{
-                BUFFER_LOCK_EXCLUSIVE, GENERIC_XLOG_FULL_IMAGE, GenericXLogRegisterBuffer,
-                GenericXLogStart, LockBuffer,
+                GENERIC_XLOG_FULL_IMAGE, GenericXLogRegisterBuffer, GenericXLogStart,
             };
             let buf;
             #[cfg(any(feature = "pg13", feature = "pg14", feature = "pg15"))]
             {
                 use pgrx::pg_sys::{
-                    ExclusiveLock, ForkNumber, LockRelationForExtension, ReadBufferExtended,
-                    ReadBufferMode, UnlockRelationForExtension,
+                    BUFFER_LOCK_EXCLUSIVE, ExclusiveLock, ForkNumber, LockBuffer,
+                    LockRelationForExtension, ReadBufferExtended, ReadBufferMode,
+                    UnlockRelationForExtension,
                 };
                 LockRelationForExtension(self.raw, ExclusiveLock as _);
                 buf = ReadBufferExtended(
@@ -360,18 +360,25 @@ impl<O: Opaque> RelationWrite for PostgresRelation<O> {
                     std::ptr::null_mut(),
                 );
                 UnlockRelationForExtension(self.raw, ExclusiveLock as _);
+                LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE as _);
             }
             #[cfg(any(feature = "pg16", feature = "pg17", feature = "pg18"))]
             {
-                use pgrx::pg_sys::{BufferManagerRelation, ExtendBufferedRel, ForkNumber};
+                use pgrx::pg_sys::{
+                    BufferManagerRelation, ExtendBufferedFlags, ExtendBufferedRel, ForkNumber,
+                };
                 let bmr = BufferManagerRelation {
                     rel: self.raw,
                     smgr: std::ptr::null_mut(),
                     relpersistence: 0,
                 };
-                buf = ExtendBufferedRel(bmr, ForkNumber::MAIN_FORKNUM, std::ptr::null_mut(), 0);
+                buf = ExtendBufferedRel(
+                    bmr,
+                    ForkNumber::MAIN_FORKNUM,
+                    std::ptr::null_mut(),
+                    ExtendBufferedFlags::EB_LOCK_FIRST as _,
+                );
             }
-            LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE as _);
             let state = GenericXLogStart(self.raw);
             let mut page = NonNull::new(
                 GenericXLogRegisterBuffer(state, buf, GENERIC_XLOG_FULL_IMAGE as _)

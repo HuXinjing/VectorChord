@@ -52,49 +52,55 @@ jobs:
     steps:
       - name: Set up Environment
         run: |
-          rustup update
-
           sudo apt-get update
 
-          sudo apt-get remove -y '^postgres.*' '^libpq.*'
-          sudo apt-get purge -y '^postgres.*' '^libpq.*'
+      - name: Install Rust
+        run: rustup update
 
+      - name: Install Clang
+        run: |
           curl --proto '=https' --tlsv1.2 -sSf https://apt.llvm.org/llvm.sh | sudo bash -s -- 18
           sudo update-alternatives --install /usr/bin/clang clang $(which clang-18) 255
 
-          sudo apt-get install -y postgresql-common
+      - name: Install PostgreSQL
+        run: |
+          sudo apt-get remove -y '^postgres.*' '^libpq.*'
+          sudo apt-get purge -y '^postgres.*' '^libpq.*'
+
+          sudo apt-get install -y --no-install-recommends postgresql-common
           sudo /usr/share/postgresql-common/pgdg/apt.postgresql.org.sh -y
-          sudo apt-get install -y postgresql-server-dev-${{ matrix.version }}
-          echo PGRX_PG_CONFIG_PATH=pg_config >> $GITHUB_ENV
-          echo PG_CONFIG=pg_config >> $GITHUB_ENV
+          sudo apt-get install -y --no-install-recommends postgresql-server-dev-${{ matrix.version }}
 
-          sudo apt-get install -y postgresql-${{ matrix.version }} postgresql-${{ matrix.version }}-pgvector
-
-          mkdir -p ~/.pgrx
-          touch ~/.pgrx/config.toml
+          pg_config
 
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Check
-        env:
-          SEMVER: ${{ needs.semver.outputs.SEMVER }}
-        run: |
-          grep -q "default_version = '${SEMVER}'" vchord.control || exit 1
-
       - name: Build
+        run: |
+          grep -q "default_version = '${{ needs.semver.outputs.SEMVER }}'" vchord.control || exit 1
+          make build
+
+      - name: Package (binary package)
         env:
+          GH_TOKEN: ${{ github.token }}
           SEMVER: ${{ needs.semver.outputs.SEMVER }}
           VERSION: ${{ matrix.version }}
-          ARCH: ${{ matrix.arch }}
-          PLATFORM: ${{ matrix.arch == 'x86_64' && 'amd64' || 'arm64' }}
         run: |
-          make PG_CONFIG=$PG_CONFIG build
+          ARCH=$(uname -m)
+          (cd ./build && zip -r ~/postgresql-${VERSION}-vchord_${SEMVER}_${ARCH}-linux-gnu.zip .)
+          gh release upload --clobber $SEMVER ~/postgresql-${VERSION}-vchord_${SEMVER}_${ARCH}-linux-gnu.zip
 
-          (cd ./build/raw && zip -r ../postgresql-${VERSION}-vchord_${SEMVER}_${ARCH}-linux-gnu.zip .)
-
-          make DESTDIR="./build/deb" install
-          mkdir -p ./build/deb/DEBIAN
+      - name: Package (debian package)
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SEMVER: ${{ needs.semver.outputs.SEMVER }}
+          VERSION: ${{ matrix.version }}
+        run: |
+          make DESTDIR="~/debian" install
+          ARCH=$(uname -m)
+          PLATFORM=$(dpkg --print-architecture)
+          mkdir -p ~/debian/DEBIAN
           echo "Package: postgresql-${VERSION}-vchord
           Version: ${SEMVER}-1
           Depends: postgresql-${VERSION}, libgcc-s1, libc6 (>= 2.35)
@@ -105,20 +111,10 @@ jobs:
           Description: Vector database plugin for Postgres, written in Rust, specifically designed for LLM
           Homepage: https://vectorchord.ai/
           License: AGPL-3.0-only or Elastic-2.0" \
-          > ./build/deb/DEBIAN/control
-          (cd ./build/deb && find usr -type f -print0 | xargs -0 md5sum) > ./build/deb/DEBIAN/md5sums
-          dpkg-deb --root-owner-group -Zxz --build ./build/deb/ ./build/postgresql-${VERSION}-vchord_${SEMVER}-1_${PLATFORM}.deb
-
-      - name: Upload Artifacts
-        env:
-          GH_TOKEN: ${{ github.token }}
-          SEMVER: ${{ needs.semver.outputs.SEMVER }}
-          VERSION: ${{ matrix.version }}
-          ARCH: ${{ matrix.arch }}
-          PLATFORM: ${{ matrix.arch == 'x86_64' && 'amd64' || 'arm64' }}
-        run: |
-          gh release upload --clobber $SEMVER ./build/postgresql-${VERSION}-vchord_${SEMVER}-1_${PLATFORM}.deb
-          gh release upload --clobber $SEMVER ./build/postgresql-${VERSION}-vchord_${SEMVER}_${ARCH}-linux-gnu.zip
+          > ~/debian/DEBIAN/control
+          (cd ~/debian && find usr -type f -print0 | xargs -0 md5sum) > ~/debian/DEBIAN/md5sums
+          dpkg-deb --root-owner-group -Zxz --build ~/debian ~/postgresql-${VERSION}-vchord_${SEMVER}-1_${PLATFORM}.deb
+          gh release upload --clobber $SEMVER ~/postgresql-${VERSION}-vchord_${SEMVER}-1_${PLATFORM}.deb
 
   pgxn:
     runs-on: "ubuntu-latest"

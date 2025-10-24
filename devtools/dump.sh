@@ -1,15 +1,15 @@
 #!/usr/bin/env bash
 set -e
 
-mkdir -p $(dirname "$0")/../target/tools
+mkdir -p $(dirname "$0")/../target/devtools
 
 if [ $# -eq 0 ] ; then
     echo "Usage: $0 INITIAL_VERSION VERSIONS.."
     echo "Dump the extension members. Install INITIAL_VERSION first and upgrade to every version in VERSIONS."
     echo "The extension members are installed in database \"vchord\", so use \"createdb vchord\" to setup."
     echo "Examples:"
-    echo "  ./tools/dump.sh 0.1.11 0.2.0 > ./dump_upgrade.sql"
-    echo "  ./tools/dump.sh 0.2.0 > ./dump_install.sql"
+    echo "  ./devtools/dump.sh 0.1.11 0.2.0 > ./dump_upgrade.sql"
+    echo "  ./devtools/dump.sh 0.2.0 > ./dump_install.sql"
     echo "  diff ./dump_upgrade.sql ./dump_install.sql"
     exit 0
 fi
@@ -26,7 +26,7 @@ for arg in "$@"; do
     f+=("$x")
 done
 
-so=$(realpath $(dirname "$0")/../target/tools/vchord.so)
+so=$(realpath $(dirname "$0")/../target/devtools/vchord.so)
 $(dirname "$0")/dump-codegen.sh | gcc -I $(pg_config --includedir-server) -fPIC -shared -o $so -x c -
 
 sql=$(mktemp)
