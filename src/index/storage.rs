@@ -12,6 +12,8 @@
 //
 // Copyright (c) 2025 TensorChord Inc.
 
+pub mod buffered;
+
 use index::fetch::Fetch;
 use index::relation::{
     Hints, Opaque, Page, PageGuard, ReadStream, Relation, RelationPrefetch, RelationRead,
@@ -283,11 +285,12 @@ impl<O: Opaque> RelationRead for PostgresRelation<O> {
         assert!(id != u32::MAX, "no such page");
         unsafe {
             use pgrx::pg_sys::{
-                BUFFER_LOCK_SHARE, BufferGetPage, LockBuffer, ReadBufferExtended, ReadBufferMode,
+                BUFFER_LOCK_SHARE, BufferGetPage, ForkNumber, LockBuffer, ReadBufferExtended,
+                ReadBufferMode,
             };
             let buf = ReadBufferExtended(
                 self.raw,
-                0,
+                ForkNumber::MAIN_FORKNUM,
                 id,
                 ReadBufferMode::RBM_NORMAL,
                 std::ptr::null_mut(),
