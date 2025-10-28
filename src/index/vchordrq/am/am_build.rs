@@ -233,54 +233,14 @@ pub unsafe extern "C-unwind" fn ambuild(
                 &raw mut pgrx::pg_sys::SnapshotAnyData
             };
             let sampler = unsafe { HeapSampler::new(index_relation, heap_relation, snapshot) };
-            let mut sample = sampler.sample();
-            let samples = 'a: {
-                let mut samples = Square::new(vector_options.dims as _);
-                let Some(max_number_of_samples) = internal_build
-                    .lists
-                    .last()
-                    .map(|x| x.saturating_mul(internal_build.sampling_factor))
-                else {
-                    break 'a samples;
-                };
-                while samples.len() < max_number_of_samples as usize {
-                    if let Some(mut tuple) = sample.next() {
-                        let (values, is_nulls) = tuple.build();
-                        let datum = (!is_nulls[0]).then_some(values[0]);
-                        if let Some(datum) = datum {
-                            let vectors = unsafe { opfamily.store(datum) };
-                            if let Some(vectors) = vectors {
-                                for (vector, _) in vectors {
-                                    let x = match vector {
-                                        OwnedVector::Vecf32(x) => VectOwned::normalize(x),
-                                        OwnedVector::Vecf16(x) => VectOwned::normalize(x),
-                                    };
-                                    assert_eq!(
-                                        vector_options.dims,
-                                        x.len() as u32,
-                                        "invalid vector dimensions"
-                                    );
-                                    samples.push_slice(x.as_slice());
-                                }
-                            } else {
-                                continue;
-                            }
-                        } else {
-                            continue;
-                        }
-                    } else {
-                        break;
-                    }
-                }
-                samples.truncate(max_number_of_samples as usize);
-                samples
-            };
+            let result =
+                make_internal_build(vector_options, opfamily, internal_build, sampler, &reporter);
             if is_mvcc_snapshot(snapshot) {
                 unsafe {
                     pgrx::pg_sys::UnregisterSnapshot(snapshot);
                 }
             }
-            make_internal_build(vector_options, internal_build, samples, &reporter)
+            result
         }
         VchordrqBuildSourceOptions::External(external_build) => {
             reporter.phase(BuildPhase::from_code(BuildPhaseCode::ExternalBuild));
@@ -1307,16 +1267,71 @@ fn make_default_build(
 
 fn make_internal_build(
     vector_options: VectorOptions,
+    opfamily: Opfamily,
     internal_build: VchordrqInternalBuildOptions,
-    samples: Square,
+    sampler: impl Sampler,
     reporter: &PostgresReporter,
 ) -> Vec<Structure<Normalized>> {
+    use humansize::{BINARY, format_size};
     use std::iter::once;
+    {
+        let d = vector_options.dims as u64;
+        let c = internal_build.lists.last().copied().unwrap_or_default() as u64;
+        let f = internal_build.sampling_factor as u64;
+        let t = internal_build.build_threads as u64;
+        let estimated_memory_usage = 4 * c * d * (1 + f + t);
+        pgrx::info!(
+            "clustering: estimated memory usage is {}",
+            format_size(
+                estimated_memory_usage,
+                BINARY.decimal_places(2).decimal_zeroes(2)
+            )
+        );
+    }
+    let mut sample = sampler.sample();
+    let samples = 'a: {
+        let max_number_of_samples = internal_build
+            .lists
+            .last()
+            .map(|x| x.saturating_mul(internal_build.sampling_factor))
+            .unwrap_or_default();
+        let mut samples =
+            Square::with_capacity(vector_options.dims as _, max_number_of_samples as _);
+        if samples.len() >= max_number_of_samples as usize {
+            break 'a samples;
+        }
+        while let Some(mut tuple) = sample.next() {
+            let (values, is_nulls) = tuple.build();
+            let datum = (!is_nulls[0]).then_some(values[0]);
+            if let Some(datum) = datum {
+                let vectors = unsafe { opfamily.store(datum) };
+                if let Some(vectors) = vectors {
+                    for (vector, _) in vectors {
+                        let x = match vector {
+                            OwnedVector::Vecf32(x) => VectOwned::normalize(x),
+                            OwnedVector::Vecf16(x) => VectOwned::normalize(x),
+                        };
+                        assert_eq!(
+                            vector_options.dims,
+                            x.len() as u32,
+                            "invalid vector dimensions"
+                        );
+                        samples.push_slice(x.as_slice());
+                        if samples.len() >= max_number_of_samples as usize {
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        samples
+    };
     let mut result = Vec::<Structure<Normalized>>::new();
     let mut samples = Some(samples);
     for w in internal_build.lists.iter().rev().copied().chain(once(1)) {
         let input = if let Some(structure) = result.last() {
-            let mut input = Square::new(vector_options.dims as _);
+            let mut input =
+                Square::with_capacity(vector_options.dims as _, structure.centroids.len());
             for slice in structure.centroids.iter() {
                 input.push_slice(slice);
             }

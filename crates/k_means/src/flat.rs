@@ -125,7 +125,7 @@ pub fn new(
         .expect("failed to build thread pool");
     let mut rng = StdRng::from_seed(seed);
 
-    let mut centroids = Square::new(d);
+    let mut centroids = Square::with_capacity(d, c);
 
     for index in rand::seq::index::sample(&mut rng, samples.len(), c.min(samples.len())) {
         centroids.push_slice(&samples[index]);

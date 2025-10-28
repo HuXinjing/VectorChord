@@ -164,7 +164,7 @@ pub fn new(
         });
     });
 
-    let mut centroids = Square::new(d);
+    let mut centroids = Square::with_capacity(d, c);
 
     for index in rand::seq::index::sample(&mut rng, samples.len(), c.min(samples.len())) {
         centroids.push_slice(&samples[index]);

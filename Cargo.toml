@@ -37,6 +37,7 @@ vector = { path = "./crates/vector" }
 arrayvec = "0.7.6"
 bumpalo.workspace = true
 dary_heap.workspace = true
+humansize = "2.1.3"
 paste.workspace = true
 pgrx = { version = "=0.16.1", default-features = false, features = ["cshim"] }
 pgrx-catalog = "0.3.1"

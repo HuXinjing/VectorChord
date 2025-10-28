@@ -28,6 +28,12 @@ impl Square {
     pub fn is_empty(&self) -> bool {
         self.p.is_empty()
     }
+    pub fn with_capacity(d: usize, p: usize) -> Self {
+        Self {
+            d,
+            p: Vec::with_capacity(usize::saturating_mul(d, p)),
+        }
+    }
     pub fn new(d: usize) -> Self {
         Self { d, p: Vec::new() }
     }
