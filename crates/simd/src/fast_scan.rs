@@ -505,89 +505,154 @@ mod scan {
         }
     }
 
+    /// The instructions required for byte order swapping differ across CPUs, so
+    /// different instructions needs to be generated for different CPUs for the
+    /// same code.
     #[cfg(target_arch = "powerpc64")]
-    #[crate::target_cpu(enable = "p7")]
-    fn scan_p7(code: &[[u8; 16]], lut: &[[u8; 16]]) -> [u16; 32] {
-        unsafe {
-            // bounds checking is not enforced by compiler, so check it manually
-            assert_eq!(code.len(), lut.len());
-            let n = code.len();
+    macro_rules! scan_powerpc64 {
+        ($name:ident, $cpu:literal) => {
+            #[crate::target_cpu(enable = $cpu)]
+            fn $name(code: &[[u8; 16]], lut: &[[u8; 16]]) -> [u16; 32] {
+                unsafe {
+                    // bounds checking is not enforced by compiler, so check it manually
+                    assert_eq!(code.len(), lut.len());
+                    let n = code.len();
 
-            use std::arch::powerpc64::*;
-            #[cfg(target_endian = "big")]
-            use std::intrinsics::simd::simd_bswap as vec_revb;
-            use std::mem::transmute;
-            use {vector_unsigned_char as u8x16, vector_unsigned_short as u16x8};
+                    use std::arch::powerpc64::*;
+                    use std::mem::transmute;
+                    use {vector_unsigned_char as u8x16, vector_unsigned_short as u16x8};
 
-            let _0008_u16x8 = vec_splat_u16::<0x0008>();
-            let _00ff_u16x8 = vec_splats(0x00ffu16);
-            let _ff00_u16x8 = vec_splats(0xff00u16);
+                    #[cfg(target_endian = "big")]
+                    let revb = transmute::<[u8; 16], u8x16>([
+                        1, 0, 3, 2, 5, 4, 7, 6, 9, 8, 11, 10, 13, 12, 15, 14,
+                    ]);
 
-            let mut accu_0 = vec_splat_u16::<0>();
-            let mut accu_1 = vec_splat_u16::<0>();
-            let mut accu_2 = vec_splat_u16::<0>();
-            let mut accu_3 = vec_splat_u16::<0>();
+                    let _0008_u16x8 = vec_splat_u16::<0x0008>();
+                    let _00ff_u16x8 = vec_splats(0x00ffu16);
+                    let _ff00_u16x8 = vec_splats(0xff00u16);
 
-            let mut i = 0_usize;
-            while i < n {
-                let code: u8x16 = vec_xl((i as isize) * 16, code.as_ptr().cast::<u8>());
+                    let mut accu_0 = vec_splat_u16::<0>();
+                    let mut accu_1 = vec_splat_u16::<0>();
+                    let mut accu_2 = vec_splat_u16::<0>();
+                    let mut accu_3 = vec_splat_u16::<0>();
 
-                let clo = vec_and(code, vec_splat_u8::<0xf>());
-                let chi = vec_srl(code, vec_splat_u8::<4>());
+                    let mut i = 0_usize;
+                    while i < n {
+                        let code: u8x16 = vec_xl((i as isize) * 16, code.as_ptr().cast::<u8>());
 
-                let lut: u8x16 = vec_xl((i as isize) * 16, lut.as_ptr().cast::<u8>());
-                #[cfg(target_endian = "big")]
-                {
-                    let res_lo_r = transmute::<u8x16, u16x8>(vec_perm(lut, lut, clo));
-                    let res_lo = vec_revb(res_lo_r);
-                    accu_0 = vec_add(accu_0, res_lo);
-                    accu_1 = vec_add(accu_1, vec_and(res_lo_r, _00ff_u16x8));
-                    let res_hi_r = transmute::<u8x16, u16x8>(vec_perm(lut, lut, chi));
-                    let res_hi = vec_revb(res_hi_r);
-                    accu_2 = vec_add(accu_2, res_hi);
-                    accu_3 = vec_add(accu_3, vec_and(res_hi_r, _00ff_u16x8));
+                        let clo = vec_and(code, vec_splat_u8::<0xf>());
+                        let chi = vec_srl(code, vec_splat_u8::<4>());
+
+                        let lut: u8x16 = vec_xl((i as isize) * 16, lut.as_ptr().cast::<u8>());
+                        #[cfg(target_endian = "big")]
+                        {
+                            let res_lo_r = transmute::<u8x16, u16x8>(vec_perm(lut, lut, clo));
+                            let res_lo = vec_perm(res_lo_r, res_lo_r, revb);
+                            accu_0 = vec_add(accu_0, res_lo);
+                            accu_1 = vec_add(accu_1, vec_and(res_lo_r, _00ff_u16x8));
+                            let res_hi_r = transmute::<u8x16, u16x8>(vec_perm(lut, lut, chi));
+                            let res_hi = vec_perm(res_hi_r, res_hi_r, revb);
+                            accu_2 = vec_add(accu_2, res_hi);
+                            accu_3 = vec_add(accu_3, vec_and(res_hi_r, _00ff_u16x8));
+                        }
+                        #[cfg(target_endian = "little")]
+                        {
+                            let res_lo = transmute::<u8x16, u16x8>(vec_perm(lut, lut, clo));
+                            accu_0 = vec_add(accu_0, res_lo);
+                            accu_1 = vec_add(accu_1, vec_sr(res_lo, _0008_u16x8));
+                            let res_hi = transmute::<u8x16, u16x8>(vec_perm(lut, lut, chi));
+                            accu_2 = vec_add(accu_2, res_hi);
+                            accu_3 = vec_add(accu_3, vec_sr(res_hi, _0008_u16x8));
+                        }
+
+                        i += 1;
+                    }
+                    debug_assert_eq!(i, n);
+
+                    let mut result = [0_u16; 32];
+
+                    #[cfg(target_endian = "big")]
+                    {
+                        accu_0 =
+                            vec_sub(accu_0, vec_and(vec_perm(accu_1, accu_1, revb), _ff00_u16x8));
+                    }
+                    #[cfg(target_endian = "little")]
+                    {
+                        accu_0 = vec_sub(accu_0, vec_sl(accu_1, _0008_u16x8));
+                    }
+                    vec_xst(accu_0, 0, result.as_mut_ptr().cast());
+                    vec_xst(accu_1, 16, result.as_mut_ptr().cast());
+
+                    #[cfg(target_endian = "big")]
+                    {
+                        accu_2 =
+                            vec_sub(accu_2, vec_and(vec_perm(accu_3, accu_3, revb), _ff00_u16x8));
+                    }
+                    #[cfg(target_endian = "little")]
+                    {
+                        accu_2 = vec_sub(accu_2, vec_sl(accu_3, _0008_u16x8));
+                    }
+                    vec_xst(accu_2, 32, result.as_mut_ptr().cast());
+                    vec_xst(accu_3, 48, result.as_mut_ptr().cast());
+
+                    result
                 }
-                #[cfg(target_endian = "little")]
-                {
-                    let res_lo = transmute::<u8x16, u16x8>(vec_perm(lut, lut, clo));
-                    accu_0 = vec_add(accu_0, res_lo);
-                    accu_1 = vec_add(accu_1, vec_sr(res_lo, _0008_u16x8));
-                    let res_hi = transmute::<u8x16, u16x8>(vec_perm(lut, lut, chi));
-                    accu_2 = vec_add(accu_2, res_hi);
-                    accu_3 = vec_add(accu_3, vec_sr(res_hi, _0008_u16x8));
+            }
+        };
+    }
+
+    #[cfg(target_arch = "powerpc64")]
+    scan_powerpc64!(scan_p9, "p9");
+
+    #[cfg(all(target_arch = "powerpc64", test, not(miri)))]
+    #[test]
+    fn scan_p9_test() {
+        if !crate::is_cpu_detected!("p9") {
+            println!("test {} ... skipped (p9)", module_path!());
+            return;
+        }
+        for _ in 0..if cfg!(not(miri)) { 256 } else { 1 } {
+            for n in 90..110 {
+                let code = (0..n)
+                    .map(|_| std::array::from_fn(|_| rand::random()))
+                    .collect::<Vec<[u8; 16]>>();
+                let lut = (0..n)
+                    .map(|_| std::array::from_fn(|_| rand::random()))
+                    .collect::<Vec<[u8; 16]>>();
+                unsafe {
+                    assert_eq!(scan_p9(&code, &lut), fallback(&code, &lut));
                 }
-
-                i += 1;
             }
-            debug_assert_eq!(i, n);
-
-            let mut result = [0_u16; 32];
-
-            #[cfg(target_endian = "big")]
-            {
-                accu_0 = vec_sub(accu_0, vec_and(vec_revb(accu_1), _ff00_u16x8));
-            }
-            #[cfg(target_endian = "little")]
-            {
-                accu_0 = vec_sub(accu_0, vec_sl(accu_1, _0008_u16x8));
-            }
-            vec_xst(accu_0, 0, result.as_mut_ptr().cast());
-            vec_xst(accu_1, 16, result.as_mut_ptr().cast());
-
-            #[cfg(target_endian = "big")]
-            {
-                accu_2 = vec_sub(accu_2, vec_and(vec_revb(accu_3), _ff00_u16x8));
-            }
-            #[cfg(target_endian = "little")]
-            {
-                accu_2 = vec_sub(accu_2, vec_sl(accu_3, _0008_u16x8));
-            }
-            vec_xst(accu_2, 32, result.as_mut_ptr().cast());
-            vec_xst(accu_3, 48, result.as_mut_ptr().cast());
-
-            result
         }
     }
+
+    #[cfg(target_arch = "powerpc64")]
+    scan_powerpc64!(scan_p8, "p8");
+
+    #[cfg(all(target_arch = "powerpc64", test, not(miri)))]
+    #[test]
+    fn scan_p8_test() {
+        if !crate::is_cpu_detected!("p8") {
+            println!("test {} ... skipped (p8)", module_path!());
+            return;
+        }
+        for _ in 0..if cfg!(not(miri)) { 256 } else { 1 } {
+            for n in 90..110 {
+                let code = (0..n)
+                    .map(|_| std::array::from_fn(|_| rand::random()))
+                    .collect::<Vec<[u8; 16]>>();
+                let lut = (0..n)
+                    .map(|_| std::array::from_fn(|_| rand::random()))
+                    .collect::<Vec<[u8; 16]>>();
+                unsafe {
+                    assert_eq!(scan_p8(&code, &lut), fallback(&code, &lut));
+                }
+            }
+        }
+    }
+
+    #[cfg(target_arch = "powerpc64")]
+    scan_powerpc64!(scan_p7, "p7");
 
     #[cfg(all(target_arch = "powerpc64", test, not(miri)))]
     #[test]
@@ -611,7 +676,7 @@ mod scan {
         }
     }
 
-    #[crate::multiversion(@"v4", @"v3", @"v2", @"a2", @"z13", @"p7")]
+    #[crate::multiversion(@"v4", @"v3", @"v2", @"a2", @"z13", @"p9", @"p8", @"p7")]
     pub fn scan(code: &[[u8; 16]], lut: &[[u8; 16]]) -> [u16; 32] {
         assert_eq!(code.len(), lut.len());
         let n = code.len();

@@ -174,14 +174,7 @@ mod reduce_sum_of_x {
         let n = this.len();
         let mut x = 0.0f32;
         for i in 0..n {
-            #[cfg(not(all(feature = "experimental_math", feature = "experimental_f16")))]
-            {
-                x += this[i]._to_f32();
-            }
-            #[cfg(all(feature = "experimental_math", feature = "experimental_f16"))]
-            {
-                x = x.algebraic_add(this[i]._to_f32());
-            }
+            x += this[i]._to_f32();
         }
         x
     }
@@ -199,14 +192,7 @@ mod reduce_sum_of_abs_x {
         let n = this.len();
         let mut x = 0.0f32;
         for i in 0..n {
-            #[cfg(not(all(feature = "experimental_math", feature = "experimental_f16")))]
-            {
-                x += this[i]._to_f32().abs();
-            }
-            #[cfg(all(feature = "experimental_math", feature = "experimental_f16"))]
-            {
-                x = x.algebraic_add(this[i]._to_f32().abs());
-            }
+            x += this[i]._to_f32().abs();
         }
         x
     }
@@ -224,14 +210,7 @@ mod reduce_sum_of_x2 {
         let n = this.len();
         let mut x2 = 0.0f32;
         for i in 0..n {
-            #[cfg(not(all(feature = "experimental_math", feature = "experimental_f16")))]
-            {
-                x2 += this[i]._to_f32() * this[i]._to_f32();
-            }
-            #[cfg(all(feature = "experimental_math", feature = "experimental_f16"))]
-            {
-                x2 = x2.algebraic_add(this[i]._to_f32().algebraic_mul(this[i]._to_f32()));
-            }
+            x2 += this[i]._to_f32() * this[i]._to_f32();
         }
         x2
     }
@@ -526,14 +505,7 @@ mod reduce_sum_of_xy {
         let n = lhs.len();
         let mut xy = 0.0f32;
         for i in 0..n {
-            #[cfg(not(all(feature = "experimental_math", feature = "experimental_f16")))]
-            {
-                xy += lhs[i]._to_f32() * rhs[i]._to_f32();
-            }
-            #[cfg(all(feature = "experimental_math", feature = "experimental_f16"))]
-            {
-                xy = xy.algebraic_add(lhs[i]._to_f32().algebraic_mul(rhs[i]._to_f32()));
-            }
+            xy += lhs[i]._to_f32() * rhs[i]._to_f32();
         }
         xy
     }
@@ -816,16 +788,8 @@ mod reduce_sum_of_d2 {
         let n = lhs.len();
         let mut d2 = 0.0_f32;
         for i in 0..n {
-            #[cfg(not(all(feature = "experimental_math", feature = "experimental_f16")))]
-            {
-                let d = lhs[i]._to_f32() - rhs[i]._to_f32();
-                d2 += d * d;
-            }
-            #[cfg(all(feature = "experimental_math", feature = "experimental_f16"))]
-            {
-                let d = lhs[i]._to_f32().algebraic_sub(rhs[i]._to_f32());
-                d2 = d2.algebraic_add(d.algebraic_mul(d));
-            }
+            let d = lhs[i]._to_f32() - rhs[i]._to_f32();
+            d2 += d * d;
         }
         d2
     }

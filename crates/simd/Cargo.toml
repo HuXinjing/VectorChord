@@ -6,8 +6,7 @@ publish = false
 
 [features]
 init = []
-experimental_f16 = ["zerocopy/float-nightly"]
-experimental_math = []
+nightly_f16 = ["zerocopy/float-nightly"]
 
 [dependencies]
 simd_macros = { path = "../simd_macros" }
@@ -20,7 +19,7 @@ zerocopy.workspace = true
 rand.workspace = true
 
 [build-dependencies]
-cc = "1.2.41"
+cc = "1.2.43"
 which = "8.0.0"
 
 [lints]

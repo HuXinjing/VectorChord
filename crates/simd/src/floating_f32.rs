@@ -418,14 +418,7 @@ mod reduce_sum_of_x {
         let n = this.len();
         let mut sum = 0.0f32;
         for i in 0..n {
-            #[cfg(not(feature = "experimental_math"))]
-            {
-                sum += this[i];
-            }
-            #[cfg(feature = "experimental_math")]
-            {
-                sum = sum.algebraic_add(this[i]);
-            }
+            sum += this[i];
         }
         sum
     }
@@ -700,14 +693,7 @@ mod reduce_sum_of_abs_x {
         let n = this.len();
         let mut sum = 0.0f32;
         for i in 0..n {
-            #[cfg(not(feature = "experimental_math"))]
-            {
-                sum += this[i].abs();
-            }
-            #[cfg(feature = "experimental_math")]
-            {
-                sum = sum.algebraic_add(this[i].abs());
-            }
+            sum += this[i].abs();
         }
         sum
     }
@@ -972,14 +958,7 @@ mod reduce_sum_of_x2 {
         let n = this.len();
         let mut x2 = 0.0f32;
         for i in 0..n {
-            #[cfg(not(feature = "experimental_math"))]
-            {
-                x2 += this[i] * this[i];
-            }
-            #[cfg(feature = "experimental_math")]
-            {
-                x2 = x2.algebraic_add(this[i].algebraic_mul(this[i]));
-            }
+            x2 += this[i] * this[i];
         }
         x2
     }
@@ -1568,14 +1547,7 @@ mod reduce_sum_of_xy {
         let n = lhs.len();
         let mut xy = 0.0f32;
         for i in 0..n {
-            #[cfg(not(feature = "experimental_math"))]
-            {
-                xy += lhs[i] * rhs[i];
-            }
-            #[cfg(feature = "experimental_math")]
-            {
-                xy = xy.algebraic_add(lhs[i].algebraic_mul(rhs[i]));
-            }
+            xy += lhs[i] * rhs[i];
         }
         xy
     }
@@ -1900,16 +1872,8 @@ mod reduce_sum_of_d2 {
         let n = lhs.len();
         let mut d2 = 0.0f32;
         for i in 0..n {
-            #[cfg(not(feature = "experimental_math"))]
-            {
-                let d = lhs[i] - rhs[i];
-                d2 += d * d;
-            }
-            #[cfg(feature = "experimental_math")]
-            {
-                let d = lhs[i].algebraic_sub(rhs[i]);
-                d2 = d2.algebraic_add(d.algebraic_mul(d));
-            }
+            let d = lhs[i] - rhs[i];
+            d2 += d * d;
         }
         d2
     }

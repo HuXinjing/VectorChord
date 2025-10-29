@@ -12,19 +12,14 @@
 //
 // Copyright (c) 2025 TensorChord Inc.
 
-#![allow(unsafe_code, internal_features)]
-#![cfg_attr(feature = "experimental_f16", feature(f16))]
-#![cfg_attr(feature = "experimental_math", feature(float_algebraic))]
+#![allow(unsafe_code)]
+#![cfg_attr(feature = "nightly_f16", feature(f16))]
 #![cfg_attr(target_arch = "s390x", feature(stdarch_s390x_feature_detection))]
 #![cfg_attr(target_arch = "s390x", feature(s390x_target_feature))]
 #![cfg_attr(target_arch = "s390x", feature(stdarch_s390x))]
 #![cfg_attr(target_arch = "powerpc64", feature(stdarch_powerpc_feature_detection))]
 #![cfg_attr(target_arch = "powerpc64", feature(powerpc_target_feature))]
 #![cfg_attr(target_arch = "powerpc64", feature(stdarch_powerpc))]
-#![cfg_attr(
-    all(target_arch = "powerpc64", target_endian = "big"),
-    feature(core_intrinsics)
-)]
 #![cfg_attr(target_arch = "riscv64", feature(stdarch_riscv_feature_detection))]
 #![cfg_attr(target_arch = "riscv64", feature(riscv_target_feature))]
 
@@ -40,10 +35,10 @@ pub mod quantize;
 pub mod rotate;
 pub mod u8;
 
-#[cfg(not(feature = "experimental_f16"))]
+#[cfg(not(feature = "nightly_f16"))]
 pub use half::f16;
 
-#[cfg(feature = "experimental_f16")]
+#[cfg(feature = "nightly_f16")]
 pub use f16;
 
 pub trait F16: Sized {
@@ -54,7 +49,7 @@ pub trait F16: Sized {
     fn _to_f32(self) -> f32;
 }
 
-#[cfg(not(feature = "experimental_f16"))]
+#[cfg(not(feature = "nightly_f16"))]
 impl F16 for f16 {
     const _ZERO: Self = f16::ZERO;
 
@@ -67,7 +62,7 @@ impl F16 for f16 {
     }
 }
 
-#[cfg(feature = "experimental_f16")]
+#[cfg(feature = "nightly_f16")]
 impl F16 for f16 {
     const _ZERO: Self = 0.0;
 
