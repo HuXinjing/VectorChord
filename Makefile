@@ -1,4 +1,4 @@
-PG_CONFIG ?= pg_config
+export PG_CONFIG ?= pg_config
 PKGLIBDIR := $(shell $(PG_CONFIG) --pkglibdir)
 SHAREDIR := $(shell $(PG_CONFIG) --sharedir)
 CP_R ?= cp -r
@@ -9,10 +9,10 @@ MKDIR_P ?= mkdir -p
 all: build
 
 build:
-	PGRX_PG_CONFIG_PATH="$(PG_CONFIG)" cargo run -p xtask -- build
+	cargo run -p xtask -- build
 
 clippy:
-	PGRX_PG_CONFIG_PATH="$(PG_CONFIG)" cargo run -p xtask -- clippy
+	cargo run -p xtask -- clippy
 
 install:
 	$(MKDIR_P) $(DESTDIR)$(PKGLIBDIR) && \

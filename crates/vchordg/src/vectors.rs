@@ -68,7 +68,7 @@ pub fn read<
     accessor: A,
     copy: impl FnOnce(&[OptionNeighbour]) -> Output,
 ) -> Result<(A::Output, Output, Option<NonZero<u64>>, Wrapping<u32>), ()> {
-    let m = strict_sub(iterator.len(), 1);
+    let m = iterator.len().strict_sub(1);
     let mut result = accessor;
     for index in 0..m {
         let (vector_guard, i) = iterator.next().expect("internal: bad size");
@@ -167,13 +167,4 @@ pub fn update<R: RelationWrite, O: Operator>(
         *hole = fill;
     }
     Ok(true)
-}
-
-// Emulate unstable library feature `strict_overflow_ops`.
-// See https://github.com/rust-lang/rust/issues/118260.
-
-#[inline]
-const fn strict_sub(lhs: usize, rhs: usize) -> usize {
-    let (a, b) = lhs.overflowing_sub(rhs);
-    if b { panic!() } else { a }
 }

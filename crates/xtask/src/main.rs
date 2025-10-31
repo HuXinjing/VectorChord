@@ -14,6 +14,7 @@
 
 use clap::{Args, Parser, Subcommand};
 use object::{Object, ObjectSymbol};
+use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
 use std::env::var_os;
 use std::error::Error;
@@ -53,7 +54,7 @@ struct ClippyArgs {
     profile: String,
 }
 
-struct TargetSpecificInformation {
+struct RustcCfg {
     is_macos: bool,
     is_windows: bool,
     is_emscripten: bool,
@@ -61,7 +62,7 @@ struct TargetSpecificInformation {
     is_powerpc64: bool,
 }
 
-impl TargetSpecificInformation {
+impl RustcCfg {
     fn dll_prefix(&self) -> Result<&'static str, Box<dyn Error>> {
         if self.is_macos {
             Ok("lib")
@@ -116,11 +117,20 @@ impl TargetSpecificInformation {
     }
 }
 
+#[derive(Deserialize)]
+struct CargoMetadata {
+    target_directory: String,
+}
+
 fn pg_config(pg_config: impl AsRef<Path>) -> Result<HashMap<String, String>, Box<dyn Error>> {
     let mut command = Command::new(pg_config.as_ref());
     command.stderr(Stdio::inherit());
     eprintln!("Running {command:?}");
     let command_output = command.output()?;
+    let command_status = command_output.status;
+    if !command_status.success() {
+        return Err(format!("PostgreSQL failed: {command_status}").into());
+    }
     let contents = String::from_utf8(command_output.stdout)?;
     let mut result = HashMap::new();
     for line in contents.lines() {
@@ -146,7 +156,7 @@ fn control_file(path: impl AsRef<Path>) -> Result<HashMap<String, String>, Box<d
     Ok(result)
 }
 
-fn target_specific_information(target: &str) -> Result<TargetSpecificInformation, Box<dyn Error>> {
+fn rustc_cfg(target: &str) -> Result<RustcCfg, Box<dyn Error>> {
     let mut command = Command::new("rustc");
     command
         .args(["--print", "cfg"])
@@ -154,12 +164,16 @@ fn target_specific_information(target: &str) -> Result<TargetSpecificInformation
         .stderr(Stdio::inherit());
     eprintln!("Running {command:?}");
     let command_output = command.output()?;
+    let command_status = command_output.status;
+    if !command_status.success() {
+        return Err(format!("Rust failed: {command_status}").into());
+    }
     let contents = String::from_utf8(command_output.stdout)?;
     let mut cfgs = HashSet::new();
     for line in contents.lines() {
         cfgs.insert(line.to_string());
     }
-    Ok(TargetSpecificInformation {
+    Ok(RustcCfg {
         is_macos: cfgs.contains("target_os=\"macos\""),
         is_unix: cfgs.contains("target_family=\"unix\""),
         is_emscripten: cfgs.contains("target_os=\"emscripten\""),
@@ -168,10 +182,27 @@ fn target_specific_information(target: &str) -> Result<TargetSpecificInformation
     })
 }
 
+fn cargo_metadata() -> Result<CargoMetadata, Box<dyn Error>> {
+    let mut command = Command::new("cargo");
+    command
+        .args(["metadata", "--format-version", "1"])
+        .stderr(Stdio::inherit());
+    eprintln!("Running {command:?}");
+    let command_output = command.output()?;
+    let command_status = command_output.status;
+    if !command_status.success() {
+        return Err(format!("Cargo failed: {command_status}").into());
+    }
+    let contents = String::from_utf8(command_output.stdout)?;
+    let cargo_metadata: CargoMetadata = serde_json::from_str(&contents)?;
+    Ok(cargo_metadata)
+}
+
 fn build(
     pg_config: impl AsRef<Path>,
     pg_version: &str,
-    tsi: &TargetSpecificInformation,
+    rustc_cfg: &RustcCfg,
+    cargo_metadata: &CargoMetadata,
     profile: &str,
     target: &str,
 ) -> Result<PathBuf, Box<dyn Error>> {
@@ -188,29 +219,30 @@ fn build(
     eprintln!("Running {command:?}");
     let command_status = command.spawn()?.wait()?;
     if !command_status.success() {
-        return Err(format!("Cargo build failed: {command_status}").into());
+        return Err(format!("Cargo failed: {command_status}").into());
     }
-    let mut result = PathBuf::from("./target");
+    let mut result = PathBuf::from(&cargo_metadata.target_directory);
     result.push(target);
     result.push(match profile {
         "dev" | "test" => "debug",
         "release" | "bench" => "release",
         profile => profile,
     });
-    result.push(format!("{}vchord{}", tsi.dll_prefix()?, tsi.dll_suffix()?));
+    result.push(format!(
+        "{}vchord{}",
+        rustc_cfg.dll_prefix()?,
+        rustc_cfg.dll_suffix()?
+    ));
     Ok(result)
 }
 
-fn parse(
-    tsi: &TargetSpecificInformation,
-    obj: impl AsRef<Path>,
-) -> Result<Vec<String>, Box<dyn Error>> {
+fn parse(rustc_cfg: &RustcCfg, obj: impl AsRef<Path>) -> Result<Vec<String>, Box<dyn Error>> {
     let obj = obj.as_ref();
     eprintln!("Reading {obj:?}");
     let contents = std::fs::read(obj)?;
     let object = object::File::parse(contents.as_slice())?;
     let exports;
-    if tsi.is_macos {
+    if rustc_cfg.is_macos {
         exports = object
             .exports()?
             .into_iter()
@@ -219,7 +251,7 @@ fn parse(
             .filter(|x| x.starts_with("__pgrx_internals"))
             .map(str::to_string)
             .collect();
-    } else if tsi.is_emscripten {
+    } else if rustc_cfg.is_emscripten {
         exports = object
             .symbols()
             .flat_map(|x| x.name().ok())
@@ -242,13 +274,14 @@ fn generate(
     runner: &Option<Vec<String>>,
     pg_config: impl AsRef<Path>,
     pg_version: &str,
-    tsi: &TargetSpecificInformation,
+    rustc_cfg: &RustcCfg,
+    cargo_metadata: &CargoMetadata,
     profile: &str,
     target: &str,
     exports: Vec<String>,
     postmaster: impl AsRef<Path>,
 ) -> Result<String, Box<dyn Error>> {
-    let imports = if tsi.is_powerpc64 {
+    let imports = if rustc_cfg.is_powerpc64 {
         let postmaster = postmaster.as_ref();
         eprintln!("Reading {postmaster:?}");
         let contents = std::fs::read(postmaster)?;
@@ -288,16 +321,16 @@ fn generate(
     eprintln!("Running {command:?}");
     let command_status = command.spawn()?.wait()?;
     if !command_status.success() {
-        return Err(format!("Cargo build failed: {command_status}").into());
+        return Err(format!("Cargo failed: {command_status}").into());
     }
-    let mut result = PathBuf::from("./target");
+    let mut result = PathBuf::from(&cargo_metadata.target_directory);
     result.push(target);
     result.push(match profile {
         "dev" | "test" => "debug",
         "release" | "bench" => "release",
         profile => profile,
     });
-    result.push(format!("pgrx_embed_vchord{}", tsi.exe_suffix()?));
+    result.push(format!("pgrx_embed_vchord{}", rustc_cfg.exe_suffix()?));
     let mut command;
     if let Some(runner) = runner {
         command = Command::new(&runner[0]);
@@ -311,6 +344,10 @@ fn generate(
     command.stderr(Stdio::inherit());
     eprintln!("Running {command:?}");
     let command_output = command.output()?;
+    let command_status = command_output.status;
+    if !command_status.success() {
+        return Err(format!("Cargo failed: {command_status}").into());
+    }
     let command_stdout = String::from_utf8(command_output.stdout)?.replace("\t", "    ");
     Ok(command_stdout)
 }
@@ -368,12 +405,16 @@ fn clippy(
     eprintln!("Running {command:?}");
     let command_status = command.spawn()?.wait()?;
     if !command_status.success() {
-        return Err(format!("Cargo clippy failed: {command_status}").into());
+        return Err(format!("Cargo failed: {command_status}").into());
     }
     Ok(())
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
+    #[allow(unsafe_code)]
+    unsafe {
+        std::env::remove_var("PGRX_PG_CONFIG_PATH");
+    }
     let cli = Cli::parse();
     match cli.command {
         Commands::Build(BuildArgs {
@@ -387,10 +428,10 @@ fn main() -> Result<(), Box<dyn Error>> {
             }
             let vchord_version = control_file("./vchord.control")?["default_version"].clone();
             let runner = runner.and_then(|runner| shlex::split(&runner));
-            let path = if let Some(value) = var_os("PGRX_PG_CONFIG_PATH") {
+            let path = if let Some(value) = var_os("PG_CONFIG") {
                 PathBuf::from(value)
             } else {
-                return Err("Environment variable `PGRX_PG_CONFIG_PATH` is not set.".into());
+                return Err("Environment variable `PG_CONFIG` is not set.".into());
             };
             let pg_config = pg_config(&path)?;
             let pg_version = {
@@ -408,8 +449,16 @@ fn main() -> Result<(), Box<dyn Error>> {
                 }
             };
             let postmaster = format!("{}/postgres", pg_config["BINDIR"]);
-            let tsi = target_specific_information(&target)?;
-            let obj = build(&path, &pg_version, &tsi, &profile, &target)?;
+            let rustc_cfg = rustc_cfg(&target)?;
+            let cargo_metadata = cargo_metadata()?;
+            let obj = build(
+                &path,
+                &pg_version,
+                &rustc_cfg,
+                &cargo_metadata,
+                &profile,
+                &target,
+            )?;
             let pkglibdir = format!("{output}/pkglibdir");
             let sharedir = format!("{output}/sharedir");
             let sharedir_extension = format!("{sharedir}/extension");
@@ -422,7 +471,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             std::fs::create_dir_all(&sharedir_extension)?;
             install_by_copying(
                 &obj,
-                format!("{pkglibdir}/vchord{}", tsi.ext_suffix(&pg_version)?),
+                format!("{pkglibdir}/vchord{}", rustc_cfg.ext_suffix(&pg_version)?),
                 true,
             )?;
             install_by_copying(
@@ -444,13 +493,14 @@ fn main() -> Result<(), Box<dyn Error>> {
                     false,
                 )?;
             } else {
-                let exports = parse(&tsi, obj)?;
+                let exports = parse(&rustc_cfg, obj)?;
                 install_by_writing(
                     generate(
                         &runner,
                         &path,
                         &pg_version,
-                        &tsi,
+                        &rustc_cfg,
+                        &cargo_metadata,
                         &profile,
                         &target,
                         exports,
@@ -465,10 +515,10 @@ fn main() -> Result<(), Box<dyn Error>> {
             if !std::fs::exists("./vchord.control")? {
                 return Err("The script must be run from the VectorChord source directory.".into());
             }
-            let path = if let Some(value) = var_os("PGRX_PG_CONFIG_PATH") {
+            let path = if let Some(value) = var_os("PG_CONFIG") {
                 PathBuf::from(value)
             } else {
-                return Err("Environment variable `PGRX_PG_CONFIG_PATH` is not set.".into());
+                return Err("Environment variable `PG_CONFIG` is not set.".into());
             };
             let pg_config = pg_config(&path)?;
             let pg_version = {
