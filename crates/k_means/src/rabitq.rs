@@ -20,12 +20,12 @@ use rayon::prelude::*;
 use simd::Floating;
 
 struct RaBitQ<'a> {
-    this: This,
+    this: This<'a>,
     samples: SquareMut<'a>,
 }
 
-impl<'a> KMeans for RaBitQ<'a> {
-    fn this(&mut self) -> &mut This {
+impl<'a> KMeans<'a> for RaBitQ<'a> {
+    fn this(&mut self) -> &mut This<'a> {
         &mut self.this
     }
 
@@ -160,16 +160,12 @@ impl<'a> KMeans for RaBitQ<'a> {
 }
 
 pub fn new<'a>(
+    pool: &'a rayon::ThreadPool,
     d: usize,
     mut samples: SquareMut<'a>,
     c: usize,
-    num_threads: usize,
     seed: [u8; 32],
-) -> Box<dyn KMeans + 'a> {
-    let pool = rayon::ThreadPoolBuilder::new()
-        .num_threads(num_threads)
-        .build()
-        .expect("failed to build thread pool");
+) -> Box<dyn KMeans<'a> + 'a> {
     let mut rng = StdRng::from_seed(seed);
 
     pool.install(|| {

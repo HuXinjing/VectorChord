@@ -22,14 +22,14 @@ use rayon::iter::{IndexedParallelIterator, IntoParallelRefMutIterator, ParallelI
 use std::collections::BinaryHeap;
 
 struct Hierarchical<'a> {
-    this: This,
+    this: This<'a>,
     top_centroids: Square,
     partition_start: Vec<usize>,
-    bottom_k_means: Vec<Box<dyn KMeans + 'a>>,
+    bottom_k_means: Vec<Box<dyn KMeans<'a> + 'a>>,
 }
 
-impl<'a> KMeans for Hierarchical<'a> {
-    fn this(&mut self) -> &mut This {
+impl<'a> KMeans<'a> for Hierarchical<'a> {
+    fn this(&mut self) -> &mut This<'a> {
         &mut self.this
     }
 
@@ -84,17 +84,13 @@ const LOCAL_SAMPLE_FACTOR: usize = 256;
 const LOCAL_NUM_ITERATIONS: usize = 10;
 
 pub fn new<'a>(
+    pool: &'a rayon::ThreadPool,
     d: usize,
     mut samples: SquareMut<'a>,
     c: usize,
-    num_threads: usize,
     seed: [u8; 32],
     is_spherical: bool,
-) -> Box<dyn KMeans + 'a> {
-    let pool = rayon::ThreadPoolBuilder::new()
-        .num_threads(num_threads)
-        .build()
-        .expect("failed to build thread pool");
+) -> Box<dyn KMeans<'a> + 'a> {
     let centroids = Square::new(d);
     let targets = vec![0; samples.len()];
     let samples_len = samples.len();
@@ -108,13 +104,7 @@ pub fn new<'a>(
     {
         top_samples.push_slice(&samples[index]);
     }
-    let mut f = crate::k_means(
-        d,
-        top_samples.as_mut_view(),
-        top_list as usize,
-        num_threads,
-        seed,
-    );
+    let mut f = crate::k_means(pool, d, top_samples.as_mut_view(), top_list as usize, seed);
     if is_spherical {
         f.sphericalize();
     }
@@ -159,7 +149,7 @@ pub fn new<'a>(
     for (sub_samples, nlist) in all_sub_samples.into_iter().zip(alloc_lists) {
         partition_start.push(offset);
         offset += nlist as usize;
-        let f = crate::k_means(d, sub_samples, nlist as usize, num_threads, seed);
+        let f = crate::k_means(pool, d, sub_samples, nlist as usize, seed);
         bottom_k_means.push(f);
     }
     Box::new(Hierarchical {

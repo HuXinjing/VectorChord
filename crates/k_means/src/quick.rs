@@ -17,12 +17,12 @@ use crate::{KMeans, This};
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 
-struct Quick {
-    this: This,
+struct Quick<'a> {
+    this: This<'a>,
 }
 
-impl KMeans for Quick {
-    fn this(&mut self) -> &mut This {
+impl<'a> KMeans<'a> for Quick<'a> {
+    fn this(&mut self) -> &mut This<'a> {
         &mut self.this
     }
 
@@ -43,16 +43,12 @@ impl KMeans for Quick {
 }
 
 pub fn new<'a>(
+    pool: &'a rayon::ThreadPool,
     d: usize,
     samples: SquareMut<'a>,
     c: usize,
-    num_threads: usize,
     seed: [u8; 32],
-) -> Box<dyn KMeans + 'a> {
-    let pool = rayon::ThreadPoolBuilder::new()
-        .num_threads(num_threads)
-        .build()
-        .expect("failed to build thread pool");
+) -> Box<dyn KMeans<'a> + 'a> {
     let mut rng = StdRng::from_seed(seed);
 
     let mut centroids = Square::with_capacity(d, c);

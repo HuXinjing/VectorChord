@@ -21,8 +21,8 @@ pub mod square;
 use crate::square::{Square, SquareMut};
 use rand::rngs::StdRng;
 
-pub struct This {
-    pool: rayon::ThreadPool,
+pub struct This<'a> {
+    pool: &'a rayon::ThreadPool,
     rng: StdRng,
     d: usize,
     c: usize,
@@ -30,8 +30,8 @@ pub struct This {
     targets: Vec<usize>,
 }
 
-pub trait KMeans {
-    fn this(&mut self) -> &mut This;
+pub trait KMeans<'a> {
+    fn this(&mut self) -> &mut This<'a>;
     fn assign(&mut self);
     fn update(&mut self);
     fn sphericalize(&mut self) {
@@ -50,31 +50,31 @@ pub trait KMeans {
 }
 
 pub fn k_means<'a>(
+    pool: &'a rayon::ThreadPool,
     d: usize,
     samples: SquareMut<'a>,
     c: usize,
-    num_threads: usize,
     seed: [u8; 32],
-) -> Box<dyn KMeans + 'a> {
-    assert!(d > 0 && c > 0 && num_threads > 0);
+) -> Box<dyn KMeans<'a> + 'a> {
+    assert!(d > 0 && c > 0);
     let n = samples.len();
     if n <= c {
-        quick::new(d, samples, c, num_threads, seed)
+        quick::new(pool, d, samples, c, seed)
     } else if n <= c * 2 {
-        flat::new(d, samples, c, num_threads, seed)
+        flat::new(pool, d, samples, c, seed)
     } else {
-        rabitq::new(d, samples, c, num_threads, seed)
+        rabitq::new(pool, d, samples, c, seed)
     }
 }
 
 pub fn hierarchical_k_means<'a>(
+    pool: &'a rayon::ThreadPool,
     d: usize,
     samples: SquareMut<'a>,
     c: usize,
-    num_threads: usize,
     seed: [u8; 32],
     is_spherical: bool,
-) -> Box<dyn KMeans + 'a> {
-    assert!(d > 0 && c > 0 && num_threads > 0);
-    hierarchical::new(d, samples, c, num_threads, seed, is_spherical)
+) -> Box<dyn KMeans<'a> + 'a> {
+    assert!(d > 0 && c > 0);
+    hierarchical::new(pool, d, samples, c, seed, is_spherical)
 }

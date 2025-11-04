@@ -1342,6 +1342,11 @@ fn make_internal_build(
         }
         samples
     };
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(internal_build.build_threads as usize)
+        .build()
+        .expect("failed to build thread pool");
+    pgrx::info!("clustering: using {} threads", pool.current_num_threads());
     let mut result = Vec::<Structure<Normalized>>::new();
     let mut samples = Some(samples);
     for w in internal_build.lists.iter().rev().copied().chain(once(1)) {
@@ -1357,7 +1362,6 @@ fn make_internal_build(
         } else {
             unreachable!()
         };
-        let num_threads = internal_build.build_threads as _;
         let num_points = input.len();
         let num_dims = input.d();
         let num_lists = w as usize;
@@ -1371,7 +1375,7 @@ fn make_internal_build(
         }
         if num_lists > 1 {
             pgrx::info!(
-                "clustering: starting, using {num_threads} threads, clustering {num_points} vectors of {num_dims} dimension into {num_lists} clusters, in {num_iterations} iterations"
+                "clustering: starting, clustering {num_points} vectors of {num_dims} dimension into {num_lists} clusters, in {num_iterations} iterations"
             );
         }
         let mut f = {
@@ -1380,15 +1384,15 @@ fn make_internal_build(
                 && let KMeansAlgorithm::Hierarchical {} = internal_build.kmeans_algorithm
             {
                 k_means::hierarchical_k_means(
+                    &pool,
                     num_dims,
                     view,
                     num_lists,
-                    num_threads,
                     [7; 32],
                     internal_build.spherical_centroids,
                 )
             } else {
-                k_means::k_means(num_dims, view, num_lists, num_threads, [7; 32])
+                k_means::k_means(&pool, num_dims, view, num_lists, [7; 32])
             }
         };
         if internal_build.spherical_centroids {

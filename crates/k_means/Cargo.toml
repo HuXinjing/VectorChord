@@ -11,7 +11,7 @@ always_equal = { path = "../always_equal" }
 distance = { path = "../distance" }
 
 rand.workspace = true
-rayon = "1.11.0"
+rayon.workspace = true
 
 [lints]
 workspace = true

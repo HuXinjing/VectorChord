@@ -1636,6 +1636,7 @@ dependencies = [
  "pgrx-catalog",
  "rabitq",
  "rand",
+ "rayon",
  "rusqlite",
  "seq-macro",
  "serde",

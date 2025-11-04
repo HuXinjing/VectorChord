@@ -20,12 +20,12 @@ use rayon::prelude::*;
 use simd::Floating;
 
 struct Flat<'a> {
-    this: This,
+    this: This<'a>,
     samples: SquareMut<'a>,
 }
 
-impl<'a> KMeans for Flat<'a> {
-    fn this(&mut self) -> &mut This {
+impl<'a> KMeans<'a> for Flat<'a> {
+    fn this(&mut self) -> &mut This<'a> {
         &mut self.this
     }
     fn assign(&mut self) {
@@ -113,16 +113,12 @@ impl<'a> KMeans for Flat<'a> {
 }
 
 pub fn new<'a>(
+    pool: &'a rayon::ThreadPool,
     d: usize,
     samples: SquareMut<'a>,
     c: usize,
-    num_threads: usize,
     seed: [u8; 32],
-) -> Box<dyn KMeans + 'a> {
-    let pool = rayon::ThreadPoolBuilder::new()
-        .num_threads(num_threads)
-        .build()
-        .expect("failed to build thread pool");
+) -> Box<dyn KMeans<'a> + 'a> {
     let mut rng = StdRng::from_seed(seed);
 
     let mut centroids = Square::with_capacity(d, c);
