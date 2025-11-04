@@ -577,6 +577,7 @@ impl<'a, V: Vector> Clone for VectorTupleReader1<'a, V> {
 }
 
 impl<'a, V: Vector> VectorTupleReader1<'a, V> {
+    #[allow(dead_code)]
     pub fn payload(self) -> Option<NonZero<u64>> {
         self.header.payload
     }

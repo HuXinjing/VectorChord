@@ -85,6 +85,7 @@ clippy.nonminimal_bool = "allow"
 clippy.too_many_arguments = "allow"
 clippy.type_complexity = "allow"
 # style
+clippy.collapsible_if = "allow"
 clippy.just_underscores_and_digits = "allow"
 clippy.needless_range_loop = "allow"
 # unsafe

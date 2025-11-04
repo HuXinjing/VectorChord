@@ -14,7 +14,7 @@
 
 use crate::Opaque;
 use crate::operator::{CloneAccessor, Operator};
-use crate::tuples::{MetaTuple, VectorTuple, VertexTuple, WithReader};
+use crate::tuples::{MetaTuple, VertexTuple, WithReader};
 use crate::types::DistanceKind;
 use crate::vectors::{by_read, copy_all, copy_nothing, copy_outs, update};
 use always_equal::AlwaysEqual;
@@ -152,44 +152,36 @@ where
         while current != u32::MAX {
             check();
             let mut vertex_guard = index.write(current, true);
+            let mut reachable_set = Vec::<(u32, u16)>::new();
             for i in 1..=vertex_guard.len() {
                 if let Some(bytes) = vertex_guard.get(i) {
                     let tuple = VertexTuple::deserialize_ref(bytes);
                     let p = tuple.payload();
                     if p.is_none() && (current, i) != s {
                         vertex_guard.free(i);
+                    } else {
+                        let iter = tuple.pointers().iter().map(|pointer| pointer.into_inner());
+                        reachable_set.extend(iter);
                     }
-                };
+                }
             }
-            current = vertex_guard.get_opaque().next;
+            reachable_set.sort_unstable();
             {
-                let mut current = { vertex_guard }.get_opaque().link;
+                let mut current = vertex_guard.get_opaque().link;
                 while current != u32::MAX {
                     check();
                     let mut vector_guard = index.write(current, false);
                     for i in 1..=vector_guard.len() {
-                        if let Some(bytes) = vector_guard.get(i) {
-                            use crate::tuples::VectorTupleReader;
-                            let tuple = VectorTuple::<O::Vector>::deserialize_ref(bytes);
-                            match tuple {
-                                VectorTupleReader::_0(tuple) => {
-                                    let p = tuple.payload();
-                                    if p.is_none() && (current, i) != s {
-                                        vector_guard.free(i);
-                                    }
-                                }
-                                VectorTupleReader::_1(tuple) => {
-                                    let p = tuple.payload();
-                                    if p.is_none() && (current, i) != s {
-                                        vector_guard.free(i);
-                                    }
-                                }
+                        if vector_guard.get(i).is_some() {
+                            if reachable_set.binary_search(&(current, i)).is_err() {
+                                vector_guard.free(i);
                             }
-                        };
+                        }
                     }
                     current = vector_guard.get_opaque().next;
                 }
             }
+            current = vertex_guard.get_opaque().next;
         }
     }
 }

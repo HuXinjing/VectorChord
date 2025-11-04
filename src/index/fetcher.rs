@@ -178,7 +178,6 @@ impl Tuple for HeapTuple<'_> {
 }
 
 impl FilterableTuple for HeapTuple<'_> {
-    #[allow(clippy::collapsible_if)]
     fn filter(&mut self) -> bool {
         unsafe {
             use pgrx::pg_sys::ffi::pg_guard_ffi_boundary;

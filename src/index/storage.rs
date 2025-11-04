@@ -79,7 +79,7 @@ impl<O: Opaque> Page for PostgresPage<O> {
         assert!(self.header.pd_upper as usize <= size_of::<Self>());
         let lower = self.header.pd_lower as usize;
         let upper = self.header.pd_upper as usize;
-        assert!(lower <= upper);
+        assert!(offset_of!(PageHeaderData, pd_linp) <= lower && lower <= upper);
         ((lower - offset_of!(PageHeaderData, pd_linp)) / size_of::<ItemIdData>()) as u16
     }
     fn get(&self, i: u16) -> Option<&[u8]> {
@@ -89,6 +89,7 @@ impl<O: Opaque> Page for PostgresPage<O> {
         }
         assert!(self.header.pd_lower as usize <= size_of::<Self>());
         let lower = self.header.pd_lower as usize;
+        assert!(offset_of!(PageHeaderData, pd_linp) <= lower);
         let n = ((lower - offset_of!(PageHeaderData, pd_linp)) / size_of::<ItemIdData>()) as u16;
         if i > n {
             return None;
@@ -119,6 +120,7 @@ impl<O: Opaque> Page for PostgresPage<O> {
         }
         assert!(self.header.pd_lower as usize <= size_of::<Self>());
         let lower = self.header.pd_lower as usize;
+        assert!(offset_of!(PageHeaderData, pd_linp) <= lower);
         let n = ((lower - offset_of!(PageHeaderData, pd_linp)) / size_of::<ItemIdData>()) as u16;
         if i > n {
             return None;
