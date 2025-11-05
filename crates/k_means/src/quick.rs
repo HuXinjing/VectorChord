@@ -12,33 +12,28 @@
 //
 // Copyright (c) 2025 TensorChord Inc.
 
+use crate::KMeans;
+use crate::index::flat_index as prefect_index;
 use crate::square::{Square, SquareMut};
-use crate::{KMeans, This};
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
+use rayon::iter::{IntoParallelIterator, ParallelIterator};
 
-struct Quick<'a> {
-    this: This<'a>,
+struct Quick {
+    centroids: Square,
 }
 
-impl<'a> KMeans<'a> for Quick<'a> {
-    fn this(&mut self) -> &mut This<'a> {
-        &mut self.this
+impl KMeans for Quick {
+    fn prefect_index(&self) -> Box<dyn Fn(&[f32]) -> (f32, usize) + Sync + '_> {
+        Box::new(prefect_index(&self.centroids))
     }
 
     fn assign(&mut self) {}
 
     fn update(&mut self) {}
 
-    fn index(&mut self) -> Box<dyn Fn(&[f32]) -> u32> {
-        let this = self.this();
-        let centroids = this.centroids.clone();
-        Box::new(move |sample| crate::flat::k_means_lookup(sample, &centroids) as u32)
-    }
-
     fn finish(self: Box<Self>) -> Square {
-        let this = self.this;
-        this.centroids
+        self.centroids
     }
 }
 
@@ -48,7 +43,8 @@ pub fn new<'a>(
     samples: SquareMut<'a>,
     c: usize,
     seed: [u8; 32],
-) -> Box<dyn KMeans<'a> + 'a> {
+    is_spherical: bool,
+) -> Box<dyn KMeans + 'a> {
     let mut rng = StdRng::from_seed(seed);
 
     let mut centroids = Square::with_capacity(d, c);
@@ -65,16 +61,15 @@ pub fn new<'a>(
         centroids.push_iter((0..d).map(|_| rng.random_range(-1.0f32..1.0f32)));
     }
 
-    let targets = vec![0; samples.len()];
+    pool.install(|| {
+        if is_spherical {
+            use simd::Floating;
+            (&mut centroids).into_par_iter().for_each(|centroid| {
+                let l = f32::reduce_sum_of_x2(centroid).sqrt();
+                f32::vector_mul_scalar_inplace(centroid, 1.0 / l);
+            });
+        }
+    });
 
-    Box::new(Quick {
-        this: This {
-            pool,
-            rng,
-            d,
-            c,
-            centroids,
-            targets,
-        },
-    })
+    Box::new(Quick { centroids })
 }

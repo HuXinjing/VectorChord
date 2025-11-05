@@ -23,65 +23,91 @@ use std::collections::BinaryHeap;
 
 struct Hierarchical<'a> {
     this: This<'a>,
-    top_centroids: Square,
-    partition_start: Vec<usize>,
-    bottom_k_means: Vec<Box<dyn KMeans<'a> + 'a>>,
+    partitions: Vec<Box<dyn KMeans + 'a>>,
+    coarse_centroids: Square,
+    offsets: Vec<usize>,
 }
 
-impl<'a> KMeans<'a> for Hierarchical<'a> {
-    fn this(&mut self) -> &mut This<'a> {
-        &mut self.this
+impl<'a> KMeans for Hierarchical<'a> {
+    fn prefect_index(&self) -> Box<dyn Fn(&[f32]) -> (f32, usize) + Sync + '_> {
+        Box::new(prefect_index(&self.partitions, &self.offsets))
+    }
+
+    fn index(&self) -> Box<dyn Fn(&[f32]) -> (f32, usize) + Sync + '_> {
+        Box::new(index(
+            &self.partitions,
+            &self.coarse_centroids,
+            &self.offsets,
+        ))
     }
 
     fn assign(&mut self) {
-        for k_means in &mut self.bottom_k_means {
-            k_means.assign();
+        for partial in self.partitions.iter_mut() {
+            partial.assign();
         }
     }
 
     fn update(&mut self) {
-        for k_means in &mut self.bottom_k_means {
-            k_means.update();
+        for partial in self.partitions.iter_mut() {
+            partial.update();
         }
-    }
-
-    fn sphericalize(&mut self) {
-        for k_means in &mut self.bottom_k_means {
-            k_means.sphericalize();
-        }
-    }
-
-    fn index(&mut self) -> Box<dyn Fn(&[f32]) -> u32 + '_> {
-        let top_centroids = self.top_centroids.clone();
-        let top = move |sample: &[f32]| crate::flat::k_means_lookup(sample, &top_centroids) as u32;
-        let bottom_centroids: Vec<_> = self
-            .bottom_k_means
-            .iter_mut()
-            .map(|k_means| k_means.index())
-            .collect();
-        let partition_start = self.partition_start.clone();
-        let index = move |sample: &[f32]| {
-            let top_id = top(sample) as usize;
-            let bottom_id = bottom_centroids[top_id](sample) as usize;
-            (partition_start[top_id] + bottom_id) as u32
-        };
-        Box::new(index)
     }
 
     fn finish(self: Box<Self>) -> Square {
-        let mut ret = Square::new(self.this.d);
-        for k_means in self.bottom_k_means {
-            let centroids = k_means.finish();
-            for centroid in centroids.into_iter() {
-                ret.push_slice(centroid);
+        let mut centroids = Square::new(self.this.d);
+        for k_means in self.partitions {
+            let partial_centroids = k_means.finish();
+            for centroid in partial_centroids.into_iter() {
+                centroids.push_slice(centroid);
             }
         }
-        ret
+        centroids
     }
 }
 
-const LOCAL_SAMPLE_FACTOR: usize = 256;
-const LOCAL_NUM_ITERATIONS: usize = 10;
+fn prefect_index(
+    partitions: &[Box<dyn KMeans + '_>],
+    offsets: &[usize],
+) -> impl Fn(&[f32]) -> (f32, usize) + Sync {
+    let indexes = partitions
+        .iter()
+        .map(|p| p.prefect_index())
+        .collect::<Vec<_>>();
+    move |sample| {
+        let mut result = (f32::INFINITY, 0);
+        for (id, index) in indexes.iter().enumerate() {
+            let partial_result = index(sample);
+            if partial_result.0 <= result.0 {
+                result = (partial_result.0, offsets[id] + partial_result.1);
+            }
+        }
+        result
+    }
+}
+
+fn index(
+    partitions: &[Box<dyn KMeans + '_>],
+    coarse_centroids: &Square,
+    offsets: &[usize],
+) -> impl Fn(&[f32]) -> (f32, usize) + Sync {
+    let indexes = partitions.iter().map(|p| p.index()).collect::<Vec<_>>();
+    move |sample| {
+        use simd::Floating;
+        let mut result = (f32::INFINITY, 0);
+        for i in 0..coarse_centroids.len() {
+            let dis = f32::reduce_sum_of_d2(sample, &coarse_centroids[i]);
+            if dis <= result.0 {
+                result = (dis, i);
+            }
+        }
+        let id = result.1;
+        let result = indexes[id](sample);
+        (result.0, offsets[id] + result.1)
+    }
+}
+
+const COARSE_SAMPLING_FACTOR: usize = 256;
+const COARSE_ITERATIONS: usize = 10;
 
 pub fn new<'a>(
     pool: &'a rayon::ThreadPool,
@@ -90,116 +116,111 @@ pub fn new<'a>(
     c: usize,
     seed: [u8; 32],
     is_spherical: bool,
-) -> Box<dyn KMeans<'a> + 'a> {
-    let centroids = Square::new(d);
-    let targets = vec![0; samples.len()];
-    let samples_len = samples.len();
-    let top_list =
-        ((c as f64).sqrt().floor() as u32).clamp(1, (samples_len as f64).sqrt().floor() as u32);
-    let top_samples_len = LOCAL_SAMPLE_FACTOR * (top_list as usize);
-    let mut top_samples = Square::new(d);
+) -> Box<dyn KMeans + 'a> {
     let mut rng = StdRng::from_seed(seed);
-    for index in
-        rand::seq::index::sample(&mut rng, samples.len(), top_samples_len.min(samples.len()))
-    {
-        top_samples.push_slice(&samples[index]);
-    }
-    let mut f = crate::k_means(pool, d, top_samples.as_mut_view(), top_list as usize, seed);
-    if is_spherical {
-        f.sphericalize();
-    }
-    for _ in 0..LOCAL_NUM_ITERATIONS {
-        f.assign();
-        f.update();
-        if is_spherical {
-            f.sphericalize();
-        }
-    }
-    let top_centroids = f.finish();
-    let mut final_assign = vec![0; samples.len()];
-    pool.install(|| {
-        final_assign
-            .par_iter_mut()
-            .zip(samples.par_iter_mut())
-            .for_each(|(target, sample)| {
-                *target = crate::flat::k_means_lookup(sample, &top_centroids);
-            });
-    });
-    let alloc = final_assign.into_iter().enumerate().fold(
-        vec![vec![]; top_centroids.len()],
-        |mut acc, (i, target)| {
-            acc[target].push(i);
-            acc
-        },
-    );
-    let alloc_size = alloc.iter().map(|x| x.len() as u32).collect::<Vec<_>>();
-    let keep_indices: Vec<usize> = alloc_size
-        .iter()
-        .enumerate()
-        .filter_map(|(i, size)| if *size > 0 { Some(i) } else { None })
-        .collect();
-    let alloc: Vec<_> = keep_indices.iter().map(|&i| alloc[i].clone()).collect();
-    let alloc_size: Vec<_> = keep_indices.iter().map(|&i| alloc_size[i]).collect();
-    let alloc_lists = successive_quotients_allocate(c, alloc_size);
 
-    let mut bottom_k_means = vec![];
-    let mut partition_start = vec![];
+    let mut coarse_samples = {
+        let mut coarse_samples = Square::new(d);
+        let s = c.isqrt().saturating_mul(COARSE_SAMPLING_FACTOR);
+        for index in rand::seq::index::sample(&mut rng, samples.len(), s.min(samples.len())) {
+            coarse_samples.push_slice(&samples[index]);
+        }
+        coarse_samples
+    };
+    let coarse_k_means = {
+        let mut coarse_k_means = crate::lloyd_k_means(
+            pool,
+            d,
+            coarse_samples.as_mut_view(),
+            c.isqrt(),
+            seed,
+            is_spherical,
+        );
+        for _ in 0..COARSE_ITERATIONS {
+            coarse_k_means.assign();
+            coarse_k_means.update();
+        }
+        coarse_k_means
+    };
+    let coarse_assign = {
+        let coarse_index = coarse_k_means.prefect_index();
+        let mut coarse_assign = vec![0; samples.len()];
+        pool.install(|| {
+            coarse_assign
+                .par_iter_mut()
+                .zip(samples.par_iter_mut())
+                .for_each(|(target, sample)| {
+                    *target = coarse_index(sample).1;
+                });
+        });
+        coarse_assign
+    };
+    let coarse_centroids = coarse_k_means.finish();
+
+    let (weight, groups) = {
+        let mut weight = vec![0_usize; coarse_centroids.len()];
+        let mut groups = vec![vec![]; coarse_centroids.len()];
+        for (i, &target) in coarse_assign.iter().enumerate() {
+            weight[target] += 1;
+            groups[target].push(i);
+        }
+        (weight, groups)
+    };
+    let seats = modified_webster_method(c, &weight);
+
+    let mut partitions = vec![];
+    let mut offsets = vec![];
     let mut offset = 0;
-    let all_sub_samples = partition_mut(samples, &alloc);
-    for (sub_samples, nlist) in all_sub_samples.into_iter().zip(alloc_lists) {
-        partition_start.push(offset);
-        offset += nlist as usize;
-        let f = crate::k_means(pool, d, sub_samples, nlist as usize, seed);
-        bottom_k_means.push(f);
+    for (samples, c) in std::iter::zip(partition(samples, &groups), seats) {
+        partitions.push(crate::lloyd_k_means(
+            pool,
+            d,
+            samples,
+            c,
+            seed,
+            is_spherical,
+        ));
+        offsets.push(offset);
+        offset += c;
     }
+
     Box::new(Hierarchical {
         this: This {
             pool,
             d,
             c,
-            centroids,
-            targets,
             rng,
+            is_spherical,
         },
-        top_centroids,
-        partition_start,
-        bottom_k_means,
+        coarse_centroids,
+        partitions,
+        offsets,
     })
 }
 
-/// Allocate clusters to different parts according to the given proportions
-///
-/// See: https://en.wikipedia.org/wiki/Sainte-Lagu%C3%AB_method
-fn successive_quotients_allocate(all_clusters: usize, proportion: Vec<u32>) -> Vec<u32> {
-    let mut alloc_lists = vec![1u32; proportion.len()];
-    let mut diff = all_clusters as i32 - proportion.len() as i32;
-    assert!(diff >= 0);
-    let mut priorities: BinaryHeap<(AlwaysEqual<usize>, Distance)> = proportion
-        .iter()
-        .enumerate()
-        .map(|(i, x)| {
-            (
-                AlwaysEqual(i),
-                Distance::from_f32(*x as f32 / (alloc_lists[i] as f32 + 0.5)),
-            )
-        })
-        .collect();
-    while diff > 0 {
-        let index = priorities.pop().unwrap().0.0;
-        alloc_lists[index] += 1;
-        priorities.push((
-            AlwaysEqual(index),
-            Distance::from_f32(proportion[index] as f32 / (alloc_lists[index] as f32 + 0.5)),
-        ));
-        diff -= 1;
+// https://en.wikipedia.org/wiki/Sainte-Lagu%C3%AB_method
+fn modified_webster_method(n: usize, weight: &[usize]) -> Vec<usize> {
+    assert!(n >= weight.len());
+    let mut seats = vec![0_usize; weight.len()];
+    let mut quotients = Vec::new();
+    for index in 0..weight.len() {
+        seats[index] += 1;
+        let quotient = weight[index] as f64 / (seats[index] as f64 + 0.5);
+        quotients.push((Distance::from_f32(quotient as _), AlwaysEqual(index)));
     }
-    alloc_lists
+    let mut quotients = BinaryHeap::<_>::from(quotients);
+    for _ in weight.len()..n {
+        let Some((_, AlwaysEqual(index))) = quotients.pop() else {
+            break;
+        };
+        seats[index] += 1;
+        let quotient = weight[index] as f64 / (seats[index] as f64 + 0.5);
+        quotients.push((Distance::from_f32(quotient as _), AlwaysEqual(index)));
+    }
+    seats
 }
 
-pub fn partition_mut<'a>(
-    mut a: SquareMut<'a>,
-    groups: &[impl AsRef<[usize]>],
-) -> Vec<SquareMut<'a>> {
+fn partition<'a>(mut a: SquareMut<'a>, groups: &[impl AsRef<[usize]>]) -> Vec<SquareMut<'a>> {
     let n = a.len();
     let permutation = groups
         .iter()
@@ -233,20 +254,18 @@ pub fn partition_mut<'a>(
     result
 }
 
-#[cfg(test)]
-mod partition_tests {
-    use super::*;
-    use rand::prelude::*;
+#[test]
+fn test_modified_webster_method() {
+    let seats = modified_webster_method(51, &[10, 10, 10, 11, 9]);
+    assert_eq!(seats[0], 10);
+    assert_eq!(seats[1], 10);
+    assert_eq!(seats[2], 10);
+    assert_eq!(seats[3], 12);
+    assert_eq!(seats[4], 9);
+}
 
-    fn mk_square_random(d: usize, rows: usize, rng: &mut impl Rng) -> Square {
-        let mut s = Square::with_capacity(d, rows);
-        for _ in 0..rows {
-            let row: Vec<f32> = (0..d).map(|_| rng.random_range(-1000.0..1000.0)).collect();
-            s.push_slice(&row);
-        }
-        s
-    }
-
+#[test]
+fn test_partition() {
     fn gen_random_alloc(rows: usize, groups: usize, rng: &mut impl Rng) -> Vec<Vec<usize>> {
         let mut idx: Vec<usize> = (0..rows).collect();
         idx.shuffle(rng);
@@ -264,33 +283,38 @@ mod partition_tests {
         }
         alloc
     }
-    #[test]
-    fn random_partition() {
-        let mut rng = StdRng::seed_from_u64(7);
-        for trial in 0..1000 {
-            let d = rng.random_range(1..10);
-            let rows = rng.random_range(1000..2000);
-            let groups = rng.random_range(10..=rows.min(20));
-            let mut s = mk_square_random(d, rows, &mut rng);
-            let golden: Vec<Vec<f32>> = (0..s.len()).map(|i| s[i].to_vec()).collect();
-            let alloc = gen_random_alloc(rows, groups, &mut rng);
-            let views = partition_mut(s.as_mut_view(), &alloc);
-            assert_eq!(views.len(), alloc.len(), "trial {}", trial);
 
-            for (g, group) in alloc.iter().enumerate() {
-                let v = &views[g];
-                assert_eq!(v.len(), group.len(), "trial {}, group {}", trial, g);
-                assert_eq!(v.d(), d);
-                for (r, &row_idx) in group.iter().enumerate() {
-                    assert_eq!(
-                        v.row(r),
-                        &golden[row_idx][..],
-                        "trial {}, group {}, row {}",
-                        trial,
-                        g,
-                        r
-                    );
-                }
+    use rand::prelude::*;
+    let mut rng = StdRng::seed_from_u64(7);
+    for trial in 0..1000 {
+        let d = rng.random_range(1..10);
+        let rows = rng.random_range(1000..2000);
+        let groups = rng.random_range(10..=rows.min(20));
+        let mut s = {
+            let mut result = Square::with_capacity(d, rows);
+            for _ in 0..rows {
+                result.push_iter((0..d).map(|_| rng.random_range(-1000.0..1000.0)));
+            }
+            result
+        };
+        let golden: Vec<Vec<f32>> = (0..s.len()).map(|i| s[i].to_vec()).collect();
+        let alloc = gen_random_alloc(rows, groups, &mut rng);
+        let views = partition(s.as_mut_view(), &alloc);
+        assert_eq!(views.len(), alloc.len(), "trial {}", trial);
+
+        for (g, group) in alloc.iter().enumerate() {
+            let v = &views[g];
+            assert_eq!(v.len(), group.len(), "trial {}, group {}", trial, g);
+            assert_eq!(v.d(), d);
+            for (r, &row_idx) in group.iter().enumerate() {
+                assert_eq!(
+                    v.row(r),
+                    &golden[row_idx][..],
+                    "trial {}, group {}, row {}",
+                    trial,
+                    g,
+                    r
+                );
             }
         }
     }

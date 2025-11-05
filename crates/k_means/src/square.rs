@@ -127,6 +127,7 @@ pub struct SquareMut<'a> {
     d: usize,
     p: &'a mut [f32],
 }
+
 impl<'a> SquareMut<'a> {
     #[inline]
     pub fn d(&self) -> usize {
@@ -189,6 +190,16 @@ impl std::ops::Index<usize> for SquareMut<'_> {
 impl std::ops::IndexMut<usize> for SquareMut<'_> {
     fn index_mut(&mut self, index: usize) -> &mut Self::Output {
         &mut self.p[self.d * index..][..self.d]
+    }
+}
+
+impl<'a> IntoIterator for &'a mut SquareMut<'a> {
+    type Item = &'a mut [f32];
+
+    type IntoIter = std::slice::ChunksExactMut<'a, f32>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.p.chunks_exact_mut(self.d)
     }
 }
 

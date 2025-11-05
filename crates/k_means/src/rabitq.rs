@@ -12,150 +12,71 @@
 //
 // Copyright (c) 2025 TensorChord Inc.
 
+use crate::index::{flat_index as prefect_index, rabitq_index as index};
 use crate::square::{Square, SquareMut};
 use crate::{KMeans, This};
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 use rayon::prelude::*;
-use simd::Floating;
 
 struct RaBitQ<'a> {
     this: This<'a>,
     samples: SquareMut<'a>,
+    centroids: Square,
+    targets: Vec<usize>,
 }
 
-impl<'a> KMeans<'a> for RaBitQ<'a> {
-    fn this(&mut self) -> &mut This<'a> {
-        &mut self.this
+impl<'a> KMeans for RaBitQ<'a> {
+    fn prefect_index(&self) -> Box<dyn Fn(&[f32]) -> (f32, usize) + Sync + '_> {
+        let index = prefect_index(&self.centroids);
+        Box::new(move |sample| {
+            let rotated = rabitq::rotate::rotate(sample);
+            let sample = rotated.as_slice();
+            index(sample)
+        })
+    }
+
+    fn index(&self) -> Box<dyn Fn(&[f32]) -> (f32, usize) + Sync + '_> {
+        let index = index(self.this.pool, &self.centroids);
+        Box::new(move |sample| {
+            let rotated = rabitq::rotate::rotate(sample);
+            let sample = rotated.as_slice();
+            index(sample)
+        })
     }
 
     fn assign(&mut self) {
         let this = &mut self.this;
         let samples = &mut self.samples;
+        let centroids = &self.centroids;
+        let targets = &mut self.targets;
+        let index = index(this.pool, centroids);
         this.pool.install(|| {
-            use rabitq::packing::{pack_to_u4, padding_pack};
-
-            let metadata = this
-                .centroids
-                .par_iter()
-                .map(rabitq::bit::code_metadata)
-                .collect::<Vec<_>>();
-
-            let blocks = this
-                .centroids
-                .par_iter()
-                .chunks(32)
-                .map(|chunk| {
-                    let f = |x: &&_| pack_to_u4(&rabitq::bit::code_elements(x));
-                    padding_pack(chunk.iter().map(f))
-                })
-                .collect::<Vec<_>>();
-
-            this.targets
+            targets
                 .par_iter_mut()
                 .zip(samples.par_iter_mut())
                 .for_each(|(target, sample)| {
-                    let lut = rabitq::bit::block::preprocess(sample);
-                    let mut result = (f32::INFINITY, 0);
-                    let mut sum = [0u32; 32];
-                    for (j, centroid) in this.centroids.into_iter().enumerate() {
-                        if j % 32 == 0 {
-                            sum = rabitq::bit::block::accumulate(&blocks[j / 32], &lut.1);
-                        }
-                        let (rough, err) =
-                            rabitq::bit::block::half_process_l2(sum[j % 32], metadata[j], lut.0);
-                        let lowerbound = rough - err * 1.9;
-                        if lowerbound < result.0 {
-                            let dis_2 = f32::reduce_sum_of_d2(sample, centroid);
-                            if dis_2 <= result.0 {
-                                result = (dis_2, j);
-                            }
-                        }
-                    }
-                    *target = result.1;
+                    *target = index(sample).1;
                 });
         });
     }
 
     fn update(&mut self) {
-        let this = &mut self.this;
-        let samples = &mut self.samples;
-        this.pool.install(|| {
-            const DELTA: f32 = 9.7656e-4_f32;
-
-            let d = this.d;
-            let n = samples.len();
-            let c = this.c;
-
-            let list = rayon::broadcast({
-                |ctx| {
-                    let mut sum = Square::from_zeros(d, c);
-                    let mut count = vec![0.0f32; c];
-                    for i in (ctx.index()..samples.len()).step_by(ctx.num_threads()) {
-                        let target = this.targets[i];
-                        let sample = &samples[i];
-                        f32::vector_add_inplace(&mut sum[target], sample);
-                        count[target] += 1.0;
-                    }
-                    (sum, count)
-                }
-            });
-            let mut sum = Square::from_zeros(d, c);
-            let mut count = vec![0.0f32; c];
-            for (sum_1, count_1) in list {
-                for i in 0..c {
-                    f32::vector_add_inplace(&mut sum[i], &sum_1[i]);
-                    count[i] += count_1[i];
-                }
-            }
-
-            sum.par_iter_mut()
-                .enumerate()
-                .for_each(|(i, sum)| f32::vector_mul_scalar_inplace(sum, 1.0 / count[i]));
-
-            this.centroids = sum;
-
-            for i in 0..c {
-                if count[i] != 0.0f32 {
-                    continue;
-                }
-                let mut o = 0;
-                loop {
-                    let alpha = this.rng.random_range(0.0..1.0f32);
-                    let beta = (count[o] - 1.0) / (n - c) as f32;
-                    if alpha < beta {
-                        break;
-                    }
-                    o = (o + 1) % c;
-                }
-                this.centroids.copy_within(o..o + 1, i);
-                vector_mul_scalars_inplace(&mut this.centroids[i], [1.0 + DELTA, 1.0 - DELTA]);
-                vector_mul_scalars_inplace(&mut this.centroids[o], [1.0 - DELTA, 1.0 + DELTA]);
-                count[i] = count[o] / 2.0;
-                count[o] -= count[i];
-            }
-        });
+        crate::index::update(
+            &mut self.this,
+            &self.samples,
+            &self.targets,
+            &mut self.centroids,
+        );
     }
 
-    fn index(&mut self) -> Box<dyn Fn(&[f32]) -> u32> {
-        let this = self.this();
-        let mut centroids = this.centroids.clone();
-        this.pool.install(|| {
-            centroids.par_iter_mut().for_each(|centroid| {
+    fn finish(mut self: Box<Self>) -> Square {
+        self.this.pool.install(|| {
+            self.centroids.par_iter_mut().for_each(|centroid| {
                 rabitq::rotate::rotate_reversed_inplace(centroid);
             });
         });
-        Box::new(move |sample| crate::flat::k_means_lookup(sample, &centroids) as u32)
-    }
-
-    fn finish(self: Box<Self>) -> Square {
-        let mut this = self.this;
-        this.pool.install(|| {
-            this.centroids.par_iter_mut().for_each(|centroid| {
-                rabitq::rotate::rotate_reversed_inplace(centroid);
-            });
-        });
-        this.centroids
+        self.centroids
     }
 }
 
@@ -165,7 +86,8 @@ pub fn new<'a>(
     mut samples: SquareMut<'a>,
     c: usize,
     seed: [u8; 32],
-) -> Box<dyn KMeans<'a> + 'a> {
+    is_spherical: bool,
+) -> Box<dyn KMeans + 'a> {
     let mut rng = StdRng::from_seed(seed);
 
     pool.install(|| {
@@ -188,6 +110,16 @@ pub fn new<'a>(
         centroids.push_iter((0..d).map(|_| rng.random_range(-1.0f32..1.0f32)));
     }
 
+    pool.install(|| {
+        if is_spherical {
+            use simd::Floating;
+            (&mut centroids).into_par_iter().for_each(|centroid| {
+                let l = f32::reduce_sum_of_x2(centroid).sqrt();
+                f32::vector_mul_scalar_inplace(centroid, 1.0 / l);
+            });
+        }
+    });
+
     let targets = vec![0; samples.len()];
 
     Box::new(RaBitQ {
@@ -195,21 +127,11 @@ pub fn new<'a>(
             pool,
             d,
             c,
-            centroids,
-            targets,
             rng,
+            is_spherical,
         },
         samples,
+        centroids,
+        targets,
     })
-}
-
-fn vector_mul_scalars_inplace(this: &mut [f32], scalars: [f32; 2]) {
-    let n: usize = this.len();
-    for i in 0..n {
-        if i % 2 == 0 {
-            this[i] *= scalars[0];
-        } else {
-            this[i] *= scalars[1];
-        }
-    }
 }

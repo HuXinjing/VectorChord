@@ -12,10 +12,12 @@
 //
 // Copyright (c) 2025 TensorChord Inc.
 
-pub mod flat;
-pub mod hierarchical;
-pub mod quick;
-pub mod rabitq;
+mod flat;
+mod hierarchical;
+mod index;
+mod quick;
+mod rabitq;
+
 pub mod square;
 
 use crate::square::{Square, SquareMut};
@@ -26,44 +28,47 @@ pub struct This<'a> {
     rng: StdRng,
     d: usize,
     c: usize,
-    centroids: Square,
-    targets: Vec<usize>,
+    is_spherical: bool,
 }
 
-pub trait KMeans<'a> {
-    fn this(&mut self) -> &mut This<'a>;
+pub trait KMeans {
+    fn prefect_index(&self) -> Box<dyn Fn(&[f32]) -> (f32, usize) + Sync + '_>;
+    fn index(&self) -> Box<dyn Fn(&[f32]) -> (f32, usize) + Sync + '_> {
+        self.prefect_index()
+    }
     fn assign(&mut self);
     fn update(&mut self);
-    fn sphericalize(&mut self) {
-        use rayon::iter::{IntoParallelIterator, ParallelIterator};
-        use simd::Floating;
-        let this = self.this();
-        this.pool.install(|| {
-            (&mut this.centroids).into_par_iter().for_each(|centroid| {
-                let l = f32::reduce_sum_of_x2(centroid).sqrt();
-                f32::vector_mul_scalar_inplace(centroid, 1.0 / l);
-            });
-        });
-    }
-    fn index(&mut self) -> Box<dyn Fn(&[f32]) -> u32 + '_>;
     fn finish(self: Box<Self>) -> Square;
 }
 
-pub fn k_means<'a>(
+pub fn k_means_lookup(sample: &[f32], centroids: &Square) -> usize {
+    use simd::Floating;
+    let mut result = (f32::INFINITY, 0);
+    for (i, centroid) in centroids.into_iter().enumerate() {
+        let dis = f32::reduce_sum_of_d2(sample, centroid);
+        if dis <= result.0 {
+            result = (dis, i);
+        }
+    }
+    result.1
+}
+
+pub fn lloyd_k_means<'a>(
     pool: &'a rayon::ThreadPool,
     d: usize,
     samples: SquareMut<'a>,
     c: usize,
     seed: [u8; 32],
-) -> Box<dyn KMeans<'a> + 'a> {
+    is_spherical: bool,
+) -> Box<dyn KMeans + 'a> {
     assert!(d > 0 && c > 0);
     let n = samples.len();
     if n <= c {
-        quick::new(pool, d, samples, c, seed)
+        quick::new(pool, d, samples, c, seed, is_spherical)
     } else if n <= c * 2 {
-        flat::new(pool, d, samples, c, seed)
+        flat::new(pool, d, samples, c, seed, is_spherical)
     } else {
-        rabitq::new(pool, d, samples, c, seed)
+        rabitq::new(pool, d, samples, c, seed, is_spherical)
     }
 }
 
@@ -74,7 +79,7 @@ pub fn hierarchical_k_means<'a>(
     c: usize,
     seed: [u8; 32],
     is_spherical: bool,
-) -> Box<dyn KMeans<'a> + 'a> {
+) -> Box<dyn KMeans + 'a> {
     assert!(d > 0 && c > 0);
     hierarchical::new(pool, d, samples, c, seed, is_spherical)
 }

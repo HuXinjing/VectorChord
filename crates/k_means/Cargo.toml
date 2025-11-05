@@ -5,10 +5,10 @@ edition.workspace = true
 publish = false
 
 [dependencies]
-rabitq = { path = "../rabitq" }
-simd = { path = "../simd" }
 always_equal = { path = "../always_equal" }
 distance = { path = "../distance" }
+rabitq = { path = "../rabitq" }
+simd = { path = "../simd" }
 
 rand.workspace = true
 rayon.workspace = true

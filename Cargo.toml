@@ -36,6 +36,7 @@ vector = { path = "./crates/vector" }
 
 arrayvec = "0.7.6"
 bumpalo.workspace = true
+crossbeam-channel = "0.5.15"
 dary_heap.workspace = true
 humansize = "2.1.3"
 paste.workspace = true
