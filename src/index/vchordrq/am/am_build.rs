@@ -1288,12 +1288,11 @@ fn make_internal_build(
         }
     };
     {
-        let d = vector_options.dims as u64;
-        let d_ = sample_dim as u64;
+        let d = sample_dim as u64;
         let c = internal_build.lists.last().copied().unwrap_or_default() as u64;
         let f = internal_build.sampling_factor as u64;
         let t = internal_build.build_threads as u64;
-        let estimated_memory_usage = 4 * c * d_ * f + 4 * c * d * (1 + t);
+        let estimated_memory_usage = 4 * c * d * (1 + t + f);
         pgrx::info!(
             "clustering: estimated memory usage is {}",
             format_size(
@@ -1436,7 +1435,11 @@ fn make_internal_build(
                 let index = f.index();
                 let index = &index;
                 let is_spherical = internal_build.spherical_centroids;
-                let num_threads = internal_build.build_threads as usize;
+                let num_threads = {
+                    let config = internal_build.build_threads as f64;
+                    let ratio = sample_dim as f64 / vector_options.dims as f64;
+                    (config * ratio).ceil().max(1.0).min(config) as usize
+                };
                 let (tx, rx) = crossbeam_channel::bounded::<Vec<f32>>(1024);
                 let list = std::thread::scope(move |scope| {
                     assert_ne!(num_threads, 0);
