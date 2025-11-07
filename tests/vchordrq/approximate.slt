@@ -11,7 +11,7 @@ residual_quantization = true
 [build.internal]
 lists = [33]
 spherical_centroids = false
-kmeans_dimension_reduction = 2
+kmeans_dimension = 2
 kmeans_algorithm.hierarchical = {}
 $$);
 

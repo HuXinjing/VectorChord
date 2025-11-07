@@ -54,9 +54,9 @@ pub struct VchordrqInternalBuildOptions {
     pub build_threads: u16,
     #[serde(default = "VchordrqInternalBuildOptions::default_kmeans_algorithm")]
     pub kmeans_algorithm: KMeansAlgorithm,
-    #[serde(default = "VchordrqInternalBuildOptions::default_kmeans_dimension_reduction")]
+    #[serde(default = "VchordrqInternalBuildOptions::default_kmeans_dimension")]
     #[validate(range(min = 1, max = 16000))]
-    pub kmeans_dimension_reduction: Option<u32>,
+    pub kmeans_dimension: Option<u32>,
 }
 
 impl VchordrqInternalBuildOptions {
@@ -87,7 +87,7 @@ impl VchordrqInternalBuildOptions {
     fn default_kmeans_algorithm() -> KMeansAlgorithm {
         KMeansAlgorithm::Lloyd {}
     }
-    fn default_kmeans_dimension_reduction() -> Option<u32> {
+    fn default_kmeans_dimension() -> Option<u32> {
         None
     }
 }
@@ -101,7 +101,7 @@ impl Default for VchordrqInternalBuildOptions {
             kmeans_iterations: Self::default_kmeans_iterations(),
             build_threads: Self::default_build_threads(),
             kmeans_algorithm: Self::default_kmeans_algorithm(),
-            kmeans_dimension_reduction: Self::default_kmeans_dimension_reduction(),
+            kmeans_dimension: Self::default_kmeans_dimension(),
         }
     }
 }

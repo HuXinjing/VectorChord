@@ -1275,12 +1275,12 @@ fn make_internal_build(
 ) -> Vec<Structure<Normalized>> {
     use humansize::{BINARY, format_size};
     use std::iter::once;
-    let (reduction, sample_dim) = match internal_build.kmeans_dimension_reduction {
+    let (reduction, sample_dim) = match internal_build.kmeans_dimension {
         None => (None, vector_options.dims as usize),
         Some(d) if d < vector_options.dims => (Some(d as usize), d as usize),
         Some(d) => {
             pgrx::warning!(
-                "ignoring `kmeans_dimension_reduction = {}` because it is less than the vector dimension {}",
+                "ignoring `kmeans_dimension = {}` because it is less than the vector dimension {}",
                 d,
                 vector_options.dims
             );
