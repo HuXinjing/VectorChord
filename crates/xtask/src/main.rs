@@ -16,9 +16,7 @@ use clap::{Args, Parser, Subcommand};
 use object::{Object, ObjectSymbol};
 use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
-use std::env::var_os;
 use std::error::Error;
-use std::fs::read_dir;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
@@ -296,16 +294,14 @@ fn generate(
     } else {
         Vec::new()
     };
-    let pgrx_embed = std::env::temp_dir().join("VCHORD_PGRX_EMBED");
-    eprintln!("Writing {pgrx_embed:?}");
-    std::fs::write(
-        &pgrx_embed,
-        format!(
-            "crate::schema_generation!({}; {});",
-            exports.join(" "),
-            imports.join(" ")
-        ),
-    )?;
+    let mut pgrx_embed = tempfile::NamedTempFile::new()?;
+    eprintln!("Writing {:?}", pgrx_embed.path());
+    let contents = format!(
+        "crate::schema_generation!({}; {});",
+        exports.join(" "),
+        imports.join(" ")
+    );
+    std::io::Write::write_all(pgrx_embed.as_file_mut(), contents.as_bytes())?;
     let mut command = Command::new("cargo");
     command
         .args(["rustc"])
@@ -315,7 +311,7 @@ fn generate(
         .args(["--features", pg_version])
         .env("PGRX_PG_CONFIG_PATH", pg_config.as_ref())
         .args(["--", "-C", "lto=off", "--cfg", "pgrx_embed"])
-        .env("PGRX_EMBED", &pgrx_embed)
+        .env("PGRX_EMBED", pgrx_embed.path())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit());
     eprintln!("Running {command:?}");
@@ -428,7 +424,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             }
             let vchord_version = control_file("./vchord.control")?["default_version"].clone();
             let runner = runner.and_then(|runner| shlex::split(&runner));
-            let path = if let Some(value) = var_os("PG_CONFIG") {
+            let path = if let Some(value) = std::env::var_os("PG_CONFIG") {
                 PathBuf::from(value)
             } else {
                 return Err("Environment variable `PG_CONFIG` is not set.".into());
@@ -480,7 +476,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                 false,
             )?;
             if vchord_version != "0.0.0" {
-                for e in read_dir("./sql/upgrade")?.collect::<Result<Vec<_>, _>>()? {
+                for e in std::fs::read_dir("./sql/upgrade")?.collect::<Result<Vec<_>, _>>()? {
                     install_by_copying(
                         e.path(),
                         format!("{sharedir}/extension/{}", e.file_name().display()),
@@ -515,7 +511,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             if !std::fs::exists("./vchord.control")? {
                 return Err("The script must be run from the VectorChord source directory.".into());
             }
-            let path = if let Some(value) = var_os("PG_CONFIG") {
+            let path = if let Some(value) = std::env::var_os("PG_CONFIG") {
                 PathBuf::from(value)
             } else {
                 return Err("Environment variable `PG_CONFIG` is not set.".into());
