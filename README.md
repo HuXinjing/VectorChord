@@ -38,7 +38,7 @@ VectorChord introduces remarkable enhancements over pgvecto.rs and pgvector:
 
 **⚡ Enhanced Performance**: Delivering optimized operations with up to 5x faster queries, 16x higher insert throughput, and 16x quicker[^1] index building compared to pgvector's HNSW implementation.
 
-[^1]: Based on [MyScale Benchmark](https://myscale.github.io/benchmark/) with 768-dimensional vectors and 95% recall. Please checkout our [blog post](https://blog.vectorchord.ai/vectorchord-store-400k-vectors-for-1-in-postgresql) for more details.
+[^1]: Based on [MyScale Benchmark](https://myscale.github.io/benchmark/) with 768-dimensional vectors and 95% recall. Please check out our [blog post](https://blog.vectorchord.ai/vectorchord-store-400k-vectors-for-1-in-postgresql) for more details.
 
 **💰 Affordable Vector Search**: Query 100M 768-dimensional vectors using just 32GB of memory, achieving 35ms P50 latency with top10 recall@95%, helping you keep infrastructure costs down while maintaining high search quality.
 
@@ -67,7 +67,7 @@ docker run \
   --name vectorchord-demo \
   -e POSTGRES_PASSWORD=mysecretpassword \
   -p 5432:5432 \
-  -d ghcr.io/tensorchord/vchord-postgres:pg18-v0.5.3
+  -d ghcr.io/tensorchord/vchord-postgres:pg18-v1.0.0
 ```
 > [!NOTE]
 > In addition to the base image with the VectorChord extension, we provide an all-in-one image, `tensorchord/vchord-suite:pg17-latest`. This comprehensive image includes all official TensorChord extensions, including `VectorChord`, `VectorChord-bm25` and `pg_tokenizer.rs` . Developers should select an image tag that is compatible with their extension's version, as indicated in [the support matrix](https://github.com/tensorchord/VectorChord-images?tab=readme-ov-file#support-matrix).
@@ -117,7 +117,7 @@ For more usage, please read:
 - [Prewarm](https://docs.vectorchord.ai/vectorchord/usage/prewarm.html)
 - [Prefilter](https://docs.vectorchord.ai/vectorchord/usage/prefilter.html)
 - [Prefetch](https://docs.vectorchord.ai/vectorchord/usage/prefetch.html)
-- [Rerank In Table](https://docs.vectorchord.ai/vectorchord/usage/rerank-in-table.html)
+- [Rerank in Table](https://docs.vectorchord.ai/vectorchord/usage/rerank-in-table.html)
 - [External Build](https://docs.vectorchord.ai/vectorchord/usage/external-index-precomputation.html)
 
 ## License
