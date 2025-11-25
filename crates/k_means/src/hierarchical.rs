@@ -286,7 +286,7 @@ fn test_partition() {
 
     use rand::prelude::*;
     let mut rng = StdRng::seed_from_u64(7);
-    for trial in 0..1000 {
+    for trial in 0..if cfg!(not(miri)) { 1000 } else { 1 } {
         let d = rng.random_range(1..10);
         let rows = rng.random_range(1000..2000);
         let groups = rng.random_range(10..=rows.min(20));

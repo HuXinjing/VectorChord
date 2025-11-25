@@ -154,7 +154,7 @@ pub fn multiversion(
             fn cold() -> fn(#inputs) #output {
                 #cold
             }
-            #[cfg(feature = "init")]
+            #[cfg(all(feature = "init", not(miri)))]
             #[cfg(all(target_os = "linux", target_env = "gnu"))]
             {
                 #[used]
