@@ -15,6 +15,7 @@
 use serde::{Deserialize, Serialize};
 use simd::f16;
 use validator::{Validate, ValidationError};
+use vector::rabitq8::{Rabitq8Borrowed, Rabitq8Owned};
 use vector::vect::{VectBorrowed, VectOwned};
 
 #[derive(Debug, Clone, Serialize, Deserialize, Validate)]
@@ -83,12 +84,14 @@ impl Default for VchordgIndexOptions {
 pub enum OwnedVector {
     Vecf32(VectOwned<f32>),
     Vecf16(VectOwned<f16>),
+    Rabitq8(Rabitq8Owned),
 }
 
 #[derive(Debug, Clone, Copy)]
 pub enum BorrowedVector<'a> {
     Vecf32(VectBorrowed<'a, f32>),
     Vecf16(VectBorrowed<'a, f16>),
+    Rabitq8(Rabitq8Borrowed<'a>),
 }
 
 #[repr(u8)]
@@ -103,6 +106,7 @@ pub enum DistanceKind {
 pub enum VectorKind {
     Vecf32,
     Vecf16,
+    Rabitq8,
 }
 
 impl VectorKind {
@@ -110,6 +114,7 @@ impl VectorKind {
         match self {
             VectorKind::Vecf32 => size_of::<f32>() as _,
             VectorKind::Vecf16 => size_of::<f16>() as _,
+            VectorKind::Rabitq8 => size_of::<u8>() as _,
         }
     }
 }

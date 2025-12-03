@@ -16,7 +16,6 @@ use crate::{VectorBorrowed, VectorOwned};
 use distance::Distance;
 use simd::Floating;
 use std::cmp::Ordering;
-use std::ops::RangeBounds;
 
 #[derive(Debug, Clone)]
 #[repr(transparent)]
@@ -68,11 +67,6 @@ impl<S: Floating> VectorOwned for VectOwned<S> {
     #[inline(always)]
     fn as_borrowed(&self) -> VectBorrowed<'_, S> {
         VectBorrowed(self.0.as_slice())
-    }
-
-    #[inline(always)]
-    fn zero(dims: u32) -> Self {
-        Self::new(vec![S::zero(); dims as usize])
     }
 }
 
@@ -186,17 +180,6 @@ impl<S: Floating> VectorBorrowed for VectBorrowed<'_, S> {
 
     fn operator_xor(&self, _: Self) -> Self::Owned {
         unimplemented!()
-    }
-
-    #[inline(always)]
-    fn subvector(&self, bounds: impl RangeBounds<u32>) -> Option<Self::Owned> {
-        let start_bound = bounds.start_bound().map(|x| *x as usize);
-        let end_bound = bounds.end_bound().map(|x| *x as usize);
-        let slice = self.0.get((start_bound, end_bound))?;
-        if slice.is_empty() {
-            return None;
-        }
-        Self::Owned::new_checked(slice.to_vec())
     }
 }
 

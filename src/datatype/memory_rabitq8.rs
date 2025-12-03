@@ -18,35 +18,35 @@ use pgrx::pgrx_sql_entity_graph::metadata::*;
 use std::marker::PhantomData;
 use std::ptr::NonNull;
 use vector::VectorBorrowed;
-use vector::scalar8::Scalar8Borrowed;
+use vector::rabitq8::Rabitq8Borrowed;
 
 #[repr(C)]
-struct Scalar8Header {
+struct Rabitq8Header {
     varlena: u32,
     dims: u16,
     unused: u16,
     sum_of_x2: f32,
-    k: f32,
-    b: f32,
+    norm_of_lattice: f32,
     sum_of_code: f32,
+    sum_of_abs_x: f32,
     elements: [u8; 0],
 }
 
-impl Scalar8Header {
+impl Rabitq8Header {
     fn size_of(len: usize) -> usize {
         if len > 65535 {
             panic!("vector is too large");
         }
-        (size_of::<Self>() + size_of::<u8>() * len).next_multiple_of(8)
+        size_of::<Self>() + size_of::<u8>() * len
     }
-    unsafe fn as_borrowed<'a>(this: NonNull<Self>) -> Scalar8Borrowed<'a> {
+    unsafe fn as_borrowed<'a>(this: NonNull<Self>) -> Rabitq8Borrowed<'a> {
         unsafe {
             let this = this.as_ptr();
-            Scalar8Borrowed::new(
+            Rabitq8Borrowed::new(
                 (&raw const (*this).sum_of_x2).read(),
-                (&raw const (*this).k).read(),
-                (&raw const (*this).b).read(),
+                (&raw const (*this).norm_of_lattice).read(),
                 (&raw const (*this).sum_of_code).read(),
+                (&raw const (*this).sum_of_abs_x).read(),
                 std::slice::from_raw_parts(
                     (&raw const (*this).elements).cast(),
                     (&raw const (*this).dims).read() as usize,
@@ -56,10 +56,10 @@ impl Scalar8Header {
     }
 }
 
-pub struct Scalar8Input<'a>(NonNull<Scalar8Header>, PhantomData<&'a ()>, bool);
+pub struct Rabitq8Input<'a>(NonNull<Rabitq8Header>, PhantomData<&'a ()>, bool);
 
-impl Scalar8Input<'_> {
-    unsafe fn from_ptr(p: NonNull<Scalar8Header>) -> Self {
+impl Rabitq8Input<'_> {
+    unsafe fn from_ptr(p: NonNull<Rabitq8Header>) -> Self {
         let q = unsafe {
             NonNull::new(pgrx::pg_sys::pg_detoast_datum(p.as_ptr().cast()).cast()).unwrap()
         };
@@ -70,18 +70,18 @@ impl Scalar8Input<'_> {
             #[cfg(target_endian = "little")]
             let size = varlena as usize >> 2;
             let dims = q.byte_add(4).cast::<u16>().read();
-            assert_eq!(Scalar8Header::size_of(dims as _), size);
+            assert_eq!(Rabitq8Header::size_of(dims as _), size);
             let unused = q.byte_add(6).cast::<u16>().read();
             assert_eq!(unused, 0);
         }
-        Scalar8Input(q, PhantomData, p != q)
+        Rabitq8Input(q, PhantomData, p != q)
     }
-    pub fn as_borrowed(&self) -> Scalar8Borrowed<'_> {
-        unsafe { Scalar8Header::as_borrowed(self.0) }
+    pub fn as_borrowed(&self) -> Rabitq8Borrowed<'_> {
+        unsafe { Rabitq8Header::as_borrowed(self.0) }
     }
 }
 
-impl Drop for Scalar8Input<'_> {
+impl Drop for Rabitq8Input<'_> {
     fn drop(&mut self) {
         if self.2 {
             unsafe {
@@ -91,10 +91,10 @@ impl Drop for Scalar8Input<'_> {
     }
 }
 
-pub struct Scalar8Output(NonNull<Scalar8Header>);
+pub struct Rabitq8Output(NonNull<Rabitq8Header>);
 
-impl Scalar8Output {
-    unsafe fn from_ptr(p: NonNull<Scalar8Header>) -> Self {
+impl Rabitq8Output {
+    unsafe fn from_ptr(p: NonNull<Rabitq8Header>) -> Self {
         let q = unsafe {
             NonNull::new(pgrx::pg_sys::pg_detoast_datum_copy(p.as_ptr().cast()).cast()).unwrap()
         };
@@ -105,18 +105,18 @@ impl Scalar8Output {
             #[cfg(target_endian = "little")]
             let size = varlena as usize >> 2;
             let dims = q.byte_add(4).cast::<u16>().read();
-            assert_eq!(Scalar8Header::size_of(dims as _), size);
+            assert_eq!(Rabitq8Header::size_of(dims as _), size);
             let unused = q.byte_add(6).cast::<u16>().read();
             assert_eq!(unused, 0);
         }
         Self(q)
     }
-    pub fn new(vector: Scalar8Borrowed<'_>) -> Self {
+    pub fn new(vector: Rabitq8Borrowed<'_>) -> Self {
         unsafe {
             let code = vector.code();
-            let size = Scalar8Header::size_of(code.len());
+            let size = Rabitq8Header::size_of(code.len());
 
-            let ptr = pgrx::pg_sys::palloc0(size) as *mut Scalar8Header;
+            let ptr = pgrx::pg_sys::palloc0(size) as *mut Rabitq8Header;
             // SET_VARSIZE_4B
             #[cfg(target_endian = "big")]
             (&raw mut (*ptr).varlena).write((size as u32) & 0x3FFFFFFF);
@@ -125,9 +125,9 @@ impl Scalar8Output {
             (&raw mut (*ptr).dims).write(vector.dims() as _);
             (&raw mut (*ptr).unused).write(0);
             (&raw mut (*ptr).sum_of_x2).write(vector.sum_of_x2());
-            (&raw mut (*ptr).k).write(vector.k());
-            (&raw mut (*ptr).b).write(vector.b());
+            (&raw mut (*ptr).norm_of_lattice).write(vector.norm_of_lattice());
             (&raw mut (*ptr).sum_of_code).write(vector.sum_of_code());
+            (&raw mut (*ptr).sum_of_abs_x).write(vector.sum_of_abs_x());
             std::ptr::copy_nonoverlapping(
                 code.as_ptr(),
                 (&raw mut (*ptr).elements).cast(),
@@ -136,17 +136,17 @@ impl Scalar8Output {
             Self(NonNull::new(ptr).unwrap())
         }
     }
-    pub fn as_borrowed(&self) -> Scalar8Borrowed<'_> {
-        unsafe { Scalar8Header::as_borrowed(self.0) }
+    pub fn as_borrowed(&self) -> Rabitq8Borrowed<'_> {
+        unsafe { Rabitq8Header::as_borrowed(self.0) }
     }
-    fn into_raw(self) -> *mut Scalar8Header {
+    fn into_raw(self) -> *mut Rabitq8Header {
         let result = self.0.as_ptr();
         std::mem::forget(self);
         result
     }
 }
 
-impl Drop for Scalar8Output {
+impl Drop for Rabitq8Output {
     fn drop(&mut self) {
         unsafe {
             pgrx::pg_sys::pfree(self.0.as_ptr().cast());
@@ -156,7 +156,7 @@ impl Drop for Scalar8Output {
 
 // FromDatum
 
-impl FromDatum for Scalar8Input<'_> {
+impl FromDatum for Rabitq8Input<'_> {
     unsafe fn from_polymorphic_datum(datum: Datum, is_null: bool, _typoid: Oid) -> Option<Self> {
         if is_null {
             None
@@ -167,7 +167,7 @@ impl FromDatum for Scalar8Input<'_> {
     }
 }
 
-impl FromDatum for Scalar8Output {
+impl FromDatum for Rabitq8Output {
     unsafe fn from_polymorphic_datum(datum: Datum, is_null: bool, _typoid: Oid) -> Option<Self> {
         if is_null {
             None
@@ -180,7 +180,7 @@ impl FromDatum for Scalar8Output {
 
 // IntoDatum
 
-impl IntoDatum for Scalar8Output {
+impl IntoDatum for Rabitq8Output {
     fn into_datum(self) -> Option<Datum> {
         Some(Datum::from(self.into_raw()))
     }
@@ -196,8 +196,24 @@ impl IntoDatum for Scalar8Output {
 
 // UnboxDatum
 
-unsafe impl pgrx::datum::UnboxDatum for Scalar8Output {
-    type As<'src> = Scalar8Output;
+unsafe impl<'a> pgrx::datum::UnboxDatum for Rabitq8Input<'a> {
+    type As<'src>
+        = Rabitq8Input<'src>
+    where
+        'a: 'src;
+    #[inline]
+    unsafe fn unbox<'src>(datum: pgrx::datum::Datum<'src>) -> Self::As<'src>
+    where
+        Self: 'src,
+    {
+        let datum = datum.sans_lifetime();
+        let ptr = NonNull::new(datum.cast_mut_ptr()).unwrap();
+        unsafe { Self::from_ptr(ptr) }
+    }
+}
+
+unsafe impl pgrx::datum::UnboxDatum for Rabitq8Output {
+    type As<'src> = Rabitq8Output;
     #[inline]
     unsafe fn unbox<'src>(datum: pgrx::datum::Datum<'src>) -> Self::As<'src>
     where
@@ -211,27 +227,27 @@ unsafe impl pgrx::datum::UnboxDatum for Scalar8Output {
 
 // SqlTranslatable
 
-unsafe impl SqlTranslatable for Scalar8Input<'_> {
+unsafe impl SqlTranslatable for Rabitq8Input<'_> {
     fn argument_sql() -> Result<SqlMapping, ArgumentError> {
-        Ok(SqlMapping::As(String::from("scalar8")))
+        Ok(SqlMapping::As(String::from("rabitq8")))
     }
     fn return_sql() -> Result<Returns, ReturnsError> {
-        Ok(Returns::One(SqlMapping::As(String::from("scalar8"))))
+        Ok(Returns::One(SqlMapping::As(String::from("rabitq8"))))
     }
 }
 
-unsafe impl SqlTranslatable for Scalar8Output {
+unsafe impl SqlTranslatable for Rabitq8Output {
     fn argument_sql() -> Result<SqlMapping, ArgumentError> {
-        Ok(SqlMapping::As(String::from("scalar8")))
+        Ok(SqlMapping::As(String::from("rabitq8")))
     }
     fn return_sql() -> Result<Returns, ReturnsError> {
-        Ok(Returns::One(SqlMapping::As(String::from("scalar8"))))
+        Ok(Returns::One(SqlMapping::As(String::from("rabitq8"))))
     }
 }
 
 // ArgAbi
 
-unsafe impl<'fcx> pgrx::callconv::ArgAbi<'fcx> for Scalar8Input<'fcx> {
+unsafe impl<'fcx> pgrx::callconv::ArgAbi<'fcx> for Rabitq8Input<'fcx> {
     unsafe fn unbox_arg_unchecked(arg: pgrx::callconv::Arg<'_, 'fcx>) -> Self {
         let index = arg.index();
         unsafe {
@@ -243,7 +259,7 @@ unsafe impl<'fcx> pgrx::callconv::ArgAbi<'fcx> for Scalar8Input<'fcx> {
 
 // BoxRet
 
-unsafe impl pgrx::callconv::BoxRet for Scalar8Output {
+unsafe impl pgrx::callconv::BoxRet for Rabitq8Output {
     unsafe fn box_into<'fcx>(
         self,
         fcinfo: &mut pgrx::callconv::FcInfo<'fcx>,

@@ -12,13 +12,14 @@
 //
 // Copyright (c) 2025 TensorChord Inc.
 
-mod binary_scalar8;
-mod functions_scalar8;
+mod binary_rabitq8;
+mod functions_rabitq8;
 pub mod memory_halfvec;
-pub mod memory_scalar8;
+pub mod memory_rabitq8;
 pub mod memory_vector;
 mod operators_halfvec;
-mod operators_scalar8;
+mod operators_rabitq8;
 mod operators_vector;
-mod text_scalar8;
+mod text_rabitq8;
 pub mod typmod;
+mod typmod_rabitq8;

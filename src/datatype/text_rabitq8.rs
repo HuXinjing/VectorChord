@@ -12,13 +12,13 @@
 //
 // Copyright (c) 2025 TensorChord Inc.
 
-use crate::datatype::memory_scalar8::{Scalar8Input, Scalar8Output};
+use crate::datatype::memory_rabitq8::{Rabitq8Input, Rabitq8Output};
 use pgrx::pg_sys::Oid;
 use std::ffi::{CStr, CString};
-use vector::scalar8::Scalar8Borrowed;
+use vector::rabitq8::Rabitq8Borrowed;
 
 #[pgrx::pg_extern(immutable, strict, parallel_safe)]
-fn _vchord_scalar8_in(input: &CStr, oid: Oid, typmod: i32) -> Scalar8Output {
+fn _vchord_rabitq8_in(input: &CStr, oid: Oid, typmod: i32) -> Rabitq8Output {
     let _ = (oid, typmod);
     let mut input = input.to_bytes().iter();
     let mut p0 = Vec::<f32>::new();
@@ -118,26 +118,28 @@ fn _vchord_scalar8_in(input: &CStr, oid: Oid, typmod: i32) -> Scalar8Output {
         pgrx::error!("vector must have at least 1 dimension");
     }
     let sum_of_x2 = p0[0];
-    let k = p0[1];
-    let b = p0[2];
-    let sum_of_code = p0[3];
+    let norm_of_lattice = p0[1];
+    let sum_of_code = p0[2];
+    let sum_of_abs_x = p0[3];
     let code = p1;
-    if let Some(x) = Scalar8Borrowed::new_checked(sum_of_x2, k, b, sum_of_code, &code) {
-        Scalar8Output::new(x)
+    if let Some(x) =
+        Rabitq8Borrowed::new_checked(sum_of_x2, norm_of_lattice, sum_of_code, sum_of_abs_x, &code)
+    {
+        Rabitq8Output::new(x)
     } else {
         pgrx::error!("incorrect vector");
     }
 }
 
 #[pgrx::pg_extern(immutable, strict, parallel_safe)]
-fn _vchord_scalar8_out(vector: Scalar8Input<'_>) -> CString {
+fn _vchord_rabitq8_out(vector: Rabitq8Input<'_>) -> CString {
     let vector = vector.as_borrowed();
     let mut buffer = String::new();
     buffer.push('(');
     buffer.push_str(format!("{}", vector.sum_of_x2()).as_str());
-    buffer.push_str(format!(", {}", vector.k()).as_str());
-    buffer.push_str(format!(", {}", vector.b()).as_str());
+    buffer.push_str(format!(", {}", vector.norm_of_lattice()).as_str());
     buffer.push_str(format!(", {}", vector.sum_of_code()).as_str());
+    buffer.push_str(format!(", {}", vector.sum_of_abs_x()).as_str());
     buffer.push(')');
     buffer.push('[');
     if let Some(&x) = vector.code().first() {

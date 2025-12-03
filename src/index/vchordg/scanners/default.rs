@@ -18,7 +18,7 @@ use crate::index::scanners::{Io, SearchBuilder};
 use crate::index::vchordg::dispatch::*;
 use crate::index::vchordg::opclass::Opfamily;
 use crate::index::vchordg::scanners::SearchOptions;
-use crate::recorder::{Recorder, halfvec_out, vector_out};
+use crate::recorder::{Recorder, text};
 use distance::Distance;
 use index::accessor::{Dot, L2S};
 use index::bump::Bump;
@@ -29,6 +29,7 @@ use vchordg::operator::{self};
 use vchordg::search;
 use vchordg::types::{DistanceKind, OwnedVector, VectorKind};
 use vector::VectorOwned;
+use vector::rabitq8::{Rabitq8Borrowed, Rabitq8Owned};
 use vector::vect::{VectBorrowed, VectOwned};
 
 pub struct DefaultBuilder {
@@ -47,12 +48,15 @@ impl SearchBuilder for DefaultBuilder {
     fn new(opfamily: Opfamily) -> Self {
         assert!(matches!(
             opfamily,
-            Opfamily::HalfvecCosine
-                | Opfamily::HalfvecL2
-                | Opfamily::VectorCosine
+            Opfamily::VectorCosine
                 | Opfamily::VectorL2
                 | Opfamily::VectorIp
+                | Opfamily::HalfvecCosine
+                | Opfamily::HalfvecL2
                 | Opfamily::HalfvecIp
+                | Opfamily::Rabitq8Cosine
+                | Opfamily::Rabitq8L2
+                | Opfamily::Rabitq8Ip
         ));
         Self {
             opfamily,
@@ -126,6 +130,101 @@ impl SearchBuilder for DefaultBuilder {
             match (opfamily.vector_kind(), opfamily.distance_kind()) {
                 (VectorKind::Vecf32, DistanceKind::L2S) => {
                     type Op = operator::Op<VectOwned<f32>, L2S>;
+                    let unprojected = if let OwnedVector::Vecf32(vector) = vector.clone() {
+                        VectBorrowed::new(bump.alloc_slice(vector.slice()))
+                    } else {
+                        unreachable!()
+                    };
+                    let projected = {
+                        let projected = RandomProject::project(unprojected);
+                        VectBorrowed::new(bump.alloc_slice(projected.slice()))
+                    };
+                    match (options.io_search, options.io_rerank) {
+                        (Io::Plain, Io::Plain) => search::<_, Op>(
+                            index,
+                            projected,
+                            options.ef_search,
+                            options.beam_search,
+                            bump,
+                            make_vertex_plain_prefetcher,
+                            make_vector_plain_prefetcher,
+                        ),
+                        (Io::Plain, Io::Simple) => search::<_, Op>(
+                            index,
+                            projected,
+                            options.ef_search,
+                            options.beam_search,
+                            bump,
+                            make_vertex_simple_prefetcher,
+                            make_vector_plain_prefetcher,
+                        ),
+                        (Io::Plain, Io::Stream) => search::<_, Op>(
+                            index,
+                            projected,
+                            options.ef_search,
+                            options.beam_search,
+                            bump,
+                            make_vertex_stream_prefetcher,
+                            make_vector_plain_prefetcher,
+                        ),
+                        (Io::Simple, Io::Plain) => search::<_, Op>(
+                            index,
+                            projected,
+                            options.ef_search,
+                            options.beam_search,
+                            bump,
+                            make_vertex_plain_prefetcher,
+                            make_vector_simple_prefetcher,
+                        ),
+                        (Io::Simple, Io::Simple) => search::<_, Op>(
+                            index,
+                            projected,
+                            options.ef_search,
+                            options.beam_search,
+                            bump,
+                            make_vertex_simple_prefetcher,
+                            make_vector_simple_prefetcher,
+                        ),
+                        (Io::Simple, Io::Stream) => search::<_, Op>(
+                            index,
+                            projected,
+                            options.ef_search,
+                            options.beam_search,
+                            bump,
+                            make_vertex_stream_prefetcher,
+                            make_vector_simple_prefetcher,
+                        ),
+                        (Io::Stream, Io::Plain) => search::<_, Op>(
+                            index,
+                            projected,
+                            options.ef_search,
+                            options.beam_search,
+                            bump,
+                            make_vertex_plain_prefetcher,
+                            make_vector_stream_prefetcher,
+                        ),
+                        (Io::Stream, Io::Simple) => search::<_, Op>(
+                            index,
+                            projected,
+                            options.ef_search,
+                            options.beam_search,
+                            bump,
+                            make_vertex_simple_prefetcher,
+                            make_vector_stream_prefetcher,
+                        ),
+                        (Io::Stream, Io::Stream) => search::<_, Op>(
+                            index,
+                            projected,
+                            options.ef_search,
+                            options.beam_search,
+                            bump,
+                            make_vertex_stream_prefetcher,
+                            make_vector_stream_prefetcher,
+                        ),
+                    }
+                }
+                (VectorKind::Vecf32, DistanceKind::Dot) => {
+                    type Op = operator::Op<VectOwned<f32>, Dot>;
                     let unprojected = if let OwnedVector::Vecf32(vector) = vector.clone() {
                         VectBorrowed::new(bump.alloc_slice(vector.slice()))
                     } else {
@@ -314,101 +413,6 @@ impl SearchBuilder for DefaultBuilder {
                         ),
                     }
                 }
-                (VectorKind::Vecf32, DistanceKind::Dot) => {
-                    type Op = operator::Op<VectOwned<f32>, Dot>;
-                    let unprojected = if let OwnedVector::Vecf32(vector) = vector.clone() {
-                        VectBorrowed::new(bump.alloc_slice(vector.slice()))
-                    } else {
-                        unreachable!()
-                    };
-                    let projected = {
-                        let projected = RandomProject::project(unprojected);
-                        VectBorrowed::new(bump.alloc_slice(projected.slice()))
-                    };
-                    match (options.io_search, options.io_rerank) {
-                        (Io::Plain, Io::Plain) => search::<_, Op>(
-                            index,
-                            projected,
-                            options.ef_search,
-                            options.beam_search,
-                            bump,
-                            make_vertex_plain_prefetcher,
-                            make_vector_plain_prefetcher,
-                        ),
-                        (Io::Plain, Io::Simple) => search::<_, Op>(
-                            index,
-                            projected,
-                            options.ef_search,
-                            options.beam_search,
-                            bump,
-                            make_vertex_simple_prefetcher,
-                            make_vector_plain_prefetcher,
-                        ),
-                        (Io::Plain, Io::Stream) => search::<_, Op>(
-                            index,
-                            projected,
-                            options.ef_search,
-                            options.beam_search,
-                            bump,
-                            make_vertex_stream_prefetcher,
-                            make_vector_plain_prefetcher,
-                        ),
-                        (Io::Simple, Io::Plain) => search::<_, Op>(
-                            index,
-                            projected,
-                            options.ef_search,
-                            options.beam_search,
-                            bump,
-                            make_vertex_plain_prefetcher,
-                            make_vector_simple_prefetcher,
-                        ),
-                        (Io::Simple, Io::Simple) => search::<_, Op>(
-                            index,
-                            projected,
-                            options.ef_search,
-                            options.beam_search,
-                            bump,
-                            make_vertex_simple_prefetcher,
-                            make_vector_simple_prefetcher,
-                        ),
-                        (Io::Simple, Io::Stream) => search::<_, Op>(
-                            index,
-                            projected,
-                            options.ef_search,
-                            options.beam_search,
-                            bump,
-                            make_vertex_stream_prefetcher,
-                            make_vector_simple_prefetcher,
-                        ),
-                        (Io::Stream, Io::Plain) => search::<_, Op>(
-                            index,
-                            projected,
-                            options.ef_search,
-                            options.beam_search,
-                            bump,
-                            make_vertex_plain_prefetcher,
-                            make_vector_stream_prefetcher,
-                        ),
-                        (Io::Stream, Io::Simple) => search::<_, Op>(
-                            index,
-                            projected,
-                            options.ef_search,
-                            options.beam_search,
-                            bump,
-                            make_vertex_simple_prefetcher,
-                            make_vector_stream_prefetcher,
-                        ),
-                        (Io::Stream, Io::Stream) => search::<_, Op>(
-                            index,
-                            projected,
-                            options.ef_search,
-                            options.beam_search,
-                            bump,
-                            make_vertex_stream_prefetcher,
-                            make_vector_stream_prefetcher,
-                        ),
-                    }
-                }
                 (VectorKind::Vecf16, DistanceKind::Dot) => {
                     type Op = operator::Op<VectOwned<f16>, Dot>;
                     let unprojected = if let OwnedVector::Vecf16(vector) = vector.clone() {
@@ -504,6 +508,202 @@ impl SearchBuilder for DefaultBuilder {
                         ),
                     }
                 }
+                (VectorKind::Rabitq8, DistanceKind::L2S) => {
+                    type Op = operator::Op<Rabitq8Owned, L2S>;
+                    let unprojected = if let OwnedVector::Rabitq8(vector) = vector.clone() {
+                        let vector = vector.as_borrowed();
+                        Rabitq8Borrowed::new(
+                            vector.sum_of_x2(),
+                            vector.norm_of_lattice(),
+                            vector.sum_of_code(),
+                            vector.sum_of_abs_x(),
+                            bump.alloc_slice(vector.code()),
+                        )
+                    } else {
+                        unreachable!()
+                    };
+                    match (options.io_search, options.io_rerank) {
+                        (Io::Plain, Io::Plain) => search::<_, Op>(
+                            index,
+                            unprojected,
+                            options.ef_search,
+                            options.beam_search,
+                            bump,
+                            make_vertex_plain_prefetcher,
+                            make_vector_plain_prefetcher,
+                        ),
+                        (Io::Plain, Io::Simple) => search::<_, Op>(
+                            index,
+                            unprojected,
+                            options.ef_search,
+                            options.beam_search,
+                            bump,
+                            make_vertex_simple_prefetcher,
+                            make_vector_plain_prefetcher,
+                        ),
+                        (Io::Plain, Io::Stream) => search::<_, Op>(
+                            index,
+                            unprojected,
+                            options.ef_search,
+                            options.beam_search,
+                            bump,
+                            make_vertex_stream_prefetcher,
+                            make_vector_plain_prefetcher,
+                        ),
+                        (Io::Simple, Io::Plain) => search::<_, Op>(
+                            index,
+                            unprojected,
+                            options.ef_search,
+                            options.beam_search,
+                            bump,
+                            make_vertex_plain_prefetcher,
+                            make_vector_simple_prefetcher,
+                        ),
+                        (Io::Simple, Io::Simple) => search::<_, Op>(
+                            index,
+                            unprojected,
+                            options.ef_search,
+                            options.beam_search,
+                            bump,
+                            make_vertex_simple_prefetcher,
+                            make_vector_simple_prefetcher,
+                        ),
+                        (Io::Simple, Io::Stream) => search::<_, Op>(
+                            index,
+                            unprojected,
+                            options.ef_search,
+                            options.beam_search,
+                            bump,
+                            make_vertex_stream_prefetcher,
+                            make_vector_simple_prefetcher,
+                        ),
+                        (Io::Stream, Io::Plain) => search::<_, Op>(
+                            index,
+                            unprojected,
+                            options.ef_search,
+                            options.beam_search,
+                            bump,
+                            make_vertex_plain_prefetcher,
+                            make_vector_stream_prefetcher,
+                        ),
+                        (Io::Stream, Io::Simple) => search::<_, Op>(
+                            index,
+                            unprojected,
+                            options.ef_search,
+                            options.beam_search,
+                            bump,
+                            make_vertex_simple_prefetcher,
+                            make_vector_stream_prefetcher,
+                        ),
+                        (Io::Stream, Io::Stream) => search::<_, Op>(
+                            index,
+                            unprojected,
+                            options.ef_search,
+                            options.beam_search,
+                            bump,
+                            make_vertex_stream_prefetcher,
+                            make_vector_stream_prefetcher,
+                        ),
+                    }
+                }
+                (VectorKind::Rabitq8, DistanceKind::Dot) => {
+                    type Op = operator::Op<Rabitq8Owned, Dot>;
+                    let unprojected = if let OwnedVector::Rabitq8(vector) = vector.clone() {
+                        let vector = vector.as_borrowed();
+                        Rabitq8Borrowed::new(
+                            vector.sum_of_x2(),
+                            vector.norm_of_lattice(),
+                            vector.sum_of_code(),
+                            vector.sum_of_abs_x(),
+                            bump.alloc_slice(vector.code()),
+                        )
+                    } else {
+                        unreachable!()
+                    };
+                    match (options.io_search, options.io_rerank) {
+                        (Io::Plain, Io::Plain) => search::<_, Op>(
+                            index,
+                            unprojected,
+                            options.ef_search,
+                            options.beam_search,
+                            bump,
+                            make_vertex_plain_prefetcher,
+                            make_vector_plain_prefetcher,
+                        ),
+                        (Io::Plain, Io::Simple) => search::<_, Op>(
+                            index,
+                            unprojected,
+                            options.ef_search,
+                            options.beam_search,
+                            bump,
+                            make_vertex_simple_prefetcher,
+                            make_vector_plain_prefetcher,
+                        ),
+                        (Io::Plain, Io::Stream) => search::<_, Op>(
+                            index,
+                            unprojected,
+                            options.ef_search,
+                            options.beam_search,
+                            bump,
+                            make_vertex_stream_prefetcher,
+                            make_vector_plain_prefetcher,
+                        ),
+                        (Io::Simple, Io::Plain) => search::<_, Op>(
+                            index,
+                            unprojected,
+                            options.ef_search,
+                            options.beam_search,
+                            bump,
+                            make_vertex_plain_prefetcher,
+                            make_vector_simple_prefetcher,
+                        ),
+                        (Io::Simple, Io::Simple) => search::<_, Op>(
+                            index,
+                            unprojected,
+                            options.ef_search,
+                            options.beam_search,
+                            bump,
+                            make_vertex_simple_prefetcher,
+                            make_vector_simple_prefetcher,
+                        ),
+                        (Io::Simple, Io::Stream) => search::<_, Op>(
+                            index,
+                            unprojected,
+                            options.ef_search,
+                            options.beam_search,
+                            bump,
+                            make_vertex_stream_prefetcher,
+                            make_vector_simple_prefetcher,
+                        ),
+                        (Io::Stream, Io::Plain) => search::<_, Op>(
+                            index,
+                            unprojected,
+                            options.ef_search,
+                            options.beam_search,
+                            bump,
+                            make_vertex_plain_prefetcher,
+                            make_vector_stream_prefetcher,
+                        ),
+                        (Io::Stream, Io::Simple) => search::<_, Op>(
+                            index,
+                            unprojected,
+                            options.ef_search,
+                            options.beam_search,
+                            bump,
+                            make_vertex_simple_prefetcher,
+                            make_vector_stream_prefetcher,
+                        ),
+                        (Io::Stream, Io::Stream) => search::<_, Op>(
+                            index,
+                            unprojected,
+                            options.ef_search,
+                            options.beam_search,
+                            bump,
+                            make_vertex_stream_prefetcher,
+                            make_vector_stream_prefetcher,
+                        ),
+                    }
+                }
             };
         let iter = if let Some(threshold) = threshold {
             Box::new(iter.take_while(move |(distance, _)| distance.to_f32() < threshold))
@@ -518,10 +718,13 @@ impl SearchBuilder for DefaultBuilder {
         if recorder.is_enabled() {
             match &vector {
                 OwnedVector::Vecf32(v) => {
-                    recorder.send(&vector_out(v.as_borrowed()));
+                    recorder.send(&text::vector_out(v.as_borrowed()));
                 }
                 OwnedVector::Vecf16(v) => {
-                    recorder.send(&halfvec_out(v.as_borrowed()));
+                    recorder.send(&text::halfvec_out(v.as_borrowed()));
+                }
+                OwnedVector::Rabitq8(v) => {
+                    recorder.send(&text::rabitq8_out(v.as_borrowed()));
                 }
             }
         }

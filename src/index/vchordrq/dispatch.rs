@@ -28,6 +28,7 @@ use vchordrq::operator::Op;
 use vchordrq::types::*;
 use vchordrq::{FastHeap, InsertChooser, MaintainChooser};
 use vector::VectorOwned;
+use vector::rabitq8::Rabitq8Owned;
 use vector::vect::{VectBorrowed, VectOwned};
 
 pub fn prewarm<R>(opfamily: Opfamily, index: &R, height: i32) -> String
@@ -48,6 +49,12 @@ where
         }
         (VectorKind::Vecf16, DistanceKind::Dot) => {
             vchordrq::prewarm::<_, Op<VectOwned<f16>, Dot>>(index, height, make_h0_plain_prefetcher)
+        }
+        (VectorKind::Rabitq8, DistanceKind::L2S) => {
+            vchordrq::prewarm::<_, Op<Rabitq8Owned, L2S>>(index, height, make_h0_plain_prefetcher)
+        }
+        (VectorKind::Rabitq8, DistanceKind::Dot) => {
+            vchordrq::prewarm::<_, Op<Rabitq8Owned, Dot>>(index, height, make_h0_plain_prefetcher)
         }
     }
 }
@@ -77,6 +84,14 @@ pub fn bulkdelete<R>(
         (VectorKind::Vecf16, DistanceKind::Dot) => {
             vchordrq::bulkdelete::<_, Op<VectOwned<f16>, Dot>>(index, &check, &callback);
             vchordrq::bulkdelete_vectors::<_, Op<VectOwned<f16>, Dot>>(index, &check, &callback);
+        }
+        (VectorKind::Rabitq8, DistanceKind::L2S) => {
+            vchordrq::bulkdelete::<_, Op<Rabitq8Owned, L2S>>(index, &check, &callback);
+            vchordrq::bulkdelete_vectors::<_, Op<Rabitq8Owned, L2S>>(index, &check, &callback);
+        }
+        (VectorKind::Rabitq8, DistanceKind::Dot) => {
+            vchordrq::bulkdelete::<_, Op<Rabitq8Owned, Dot>>(index, &check, &callback);
+            vchordrq::bulkdelete_vectors::<_, Op<Rabitq8Owned, Dot>>(index, &check, &callback);
         }
     }
 }
@@ -124,6 +139,18 @@ pub fn maintain<R>(
                 check,
             )
         }
+        (VectorKind::Rabitq8, DistanceKind::L2S) => vchordrq::maintain::<_, Op<Rabitq8Owned, L2S>>(
+            index,
+            make_h0_plain_prefetcher,
+            chooser,
+            check,
+        ),
+        (VectorKind::Rabitq8, DistanceKind::Dot) => vchordrq::maintain::<_, Op<Rabitq8Owned, Dot>>(
+            index,
+            make_h0_plain_prefetcher,
+            chooser,
+            check,
+        ),
     };
     pgrx::info!(
         "maintain: number_of_formerly_allocated_pages = {}",
@@ -168,6 +195,18 @@ pub fn build<R>(
             map_structures(structures, Normalize::denormalize),
         ),
         (VectorKind::Vecf16, DistanceKind::Dot) => vchordrq::build::<_, Op<VectOwned<f16>, Dot>>(
+            vector_options,
+            vchordrq_options,
+            index,
+            map_structures(structures, Normalize::denormalize),
+        ),
+        (VectorKind::Rabitq8, DistanceKind::L2S) => vchordrq::build::<_, Op<Rabitq8Owned, L2S>>(
+            vector_options,
+            vchordrq_options,
+            index,
+            map_structures(structures, Normalize::denormalize),
+        ),
+        (VectorKind::Rabitq8, DistanceKind::Dot) => vchordrq::build::<_, Op<Rabitq8Owned, Dot>>(
             vector_options,
             vchordrq_options,
             index,
@@ -265,6 +304,44 @@ pub fn insert<R>(
                 index,
                 payload,
                 projected.as_borrowed(),
+                key,
+                bump,
+                make_h1_plain_prefetcher,
+                skip_freespaces,
+            )
+        }
+        (OwnedVector::Rabitq8(vector), DistanceKind::Dot) => {
+            assert!(opfamily.vector_kind() == VectorKind::Rabitq8);
+            let key = vchordrq::insert_vector::<_, Op<Rabitq8Owned, Dot>>(
+                index,
+                payload,
+                vector.as_borrowed(),
+                chooser,
+                skip_search,
+            );
+            vchordrq::insert::<_, Op<Rabitq8Owned, Dot>>(
+                index,
+                payload,
+                vector.as_borrowed(),
+                key,
+                bump,
+                make_h1_plain_prefetcher,
+                skip_freespaces,
+            )
+        }
+        (OwnedVector::Rabitq8(vector), DistanceKind::L2S) => {
+            assert!(opfamily.vector_kind() == VectorKind::Rabitq8);
+            let key = vchordrq::insert_vector::<_, Op<Rabitq8Owned, L2S>>(
+                index,
+                payload,
+                vector.as_borrowed(),
+                chooser,
+                skip_search,
+            );
+            vchordrq::insert::<_, Op<Rabitq8Owned, L2S>>(
+                index,
+                payload,
+                vector.as_borrowed(),
                 key,
                 bump,
                 make_h1_plain_prefetcher,

@@ -389,10 +389,13 @@ pub unsafe extern "C-unwind" fn amrescan(
         scanner.scanning = match opfamily {
             Opfamily::VectorL2
             | Opfamily::VectorCosine
+            | Opfamily::VectorIp
             | Opfamily::HalfvecL2
             | Opfamily::HalfvecCosine
-            | Opfamily::VectorIp
-            | Opfamily::HalfvecIp => {
+            | Opfamily::HalfvecIp
+            | Opfamily::Rabitq8L2
+            | Opfamily::Rabitq8Cosine
+            | Opfamily::Rabitq8Ip => {
                 let mut builder = DefaultBuilder::new(opfamily);
                 for i in 0..(*scan).numberOfOrderBys {
                     let data = (*scan).orderByData.add(i as usize);

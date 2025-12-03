@@ -702,6 +702,7 @@ dependencies = [
  "bumpalo",
  "dary_heap",
  "distance",
+ "rabitq",
  "simd",
  "small_iter",
  "vector",
@@ -1725,6 +1726,7 @@ name = "vector"
 version = "0.0.0"
 dependencies = [
  "distance",
+ "rabitq",
  "simd",
 ]
 

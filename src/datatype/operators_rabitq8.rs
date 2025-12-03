@@ -12,47 +12,48 @@
 //
 // Copyright (c) 2025 TensorChord Inc.
 
-use crate::datatype::memory_scalar8::{Scalar8Input, Scalar8Output};
+use crate::datatype::memory_rabitq8::{Rabitq8Input, Rabitq8Output};
+use pgrx::datum::Array;
 use std::num::NonZero;
 use vector::VectorBorrowed;
-use vector::scalar8::Scalar8Borrowed;
+use vector::rabitq8::Rabitq8Borrowed;
 
 #[pgrx::pg_extern(immutable, strict, parallel_safe)]
-fn _vchord_scalar8_operator_ip(lhs: Scalar8Input<'_>, rhs: Scalar8Input<'_>) -> f32 {
+fn _vchord_rabitq8_operator_l2(lhs: Rabitq8Input<'_>, rhs: Rabitq8Input<'_>) -> f32 {
     let lhs = lhs.as_borrowed();
     let rhs = rhs.as_borrowed();
     if lhs.dims() != rhs.dims() {
         pgrx::error!("dimension is not matched");
     }
-    Scalar8Borrowed::operator_dot(lhs, rhs).to_f32()
+    Rabitq8Borrowed::operator_l2s(lhs, rhs).to_f32().sqrt()
 }
 
 #[pgrx::pg_extern(immutable, strict, parallel_safe)]
-fn _vchord_scalar8_operator_l2(lhs: Scalar8Input<'_>, rhs: Scalar8Input<'_>) -> f32 {
+fn _vchord_rabitq8_operator_ip(lhs: Rabitq8Input<'_>, rhs: Rabitq8Input<'_>) -> f32 {
     let lhs = lhs.as_borrowed();
     let rhs = rhs.as_borrowed();
     if lhs.dims() != rhs.dims() {
         pgrx::error!("dimension is not matched");
     }
-    Scalar8Borrowed::operator_l2s(lhs, rhs).to_f32().sqrt()
+    Rabitq8Borrowed::operator_dot(lhs, rhs).to_f32()
 }
 
 #[pgrx::pg_extern(immutable, strict, parallel_safe)]
-fn _vchord_scalar8_operator_cosine(lhs: Scalar8Input<'_>, rhs: Scalar8Input<'_>) -> f32 {
+fn _vchord_rabitq8_operator_cosine(lhs: Rabitq8Input<'_>, rhs: Rabitq8Input<'_>) -> f32 {
     let lhs = lhs.as_borrowed();
     let rhs = rhs.as_borrowed();
     if lhs.dims() != rhs.dims() {
         pgrx::error!("dimension is not matched");
     }
-    Scalar8Borrowed::operator_cos(lhs, rhs).to_f32()
+    Rabitq8Borrowed::operator_cos(lhs, rhs).to_f32()
 }
 
 #[pgrx::pg_extern(immutable, strict, parallel_safe)]
-fn _vchord_scalar8_sphere_ip_in(
-    lhs: Scalar8Input<'_>,
-    rhs: pgrx::composite_type!("sphere_scalar8"),
+fn _vchord_rabitq8_sphere_l2_in(
+    lhs: Rabitq8Input<'_>,
+    rhs: pgrx::composite_type!("sphere_rabitq8"),
 ) -> bool {
-    let center: Scalar8Output = match rhs.get_by_index(NonZero::new(1).unwrap()) {
+    let center: Rabitq8Output = match rhs.get_by_index(NonZero::new(1).unwrap()) {
         Ok(Some(s)) => s,
         Ok(None) => pgrx::error!("Bad input: empty center at sphere"),
         Err(_) => unreachable!(),
@@ -67,16 +68,16 @@ fn _vchord_scalar8_sphere_ip_in(
     if lhs.dims() != center.dims() {
         pgrx::error!("dimension is not matched");
     }
-    let d = Scalar8Borrowed::operator_dot(lhs, center).to_f32();
+    let d = Rabitq8Borrowed::operator_l2s(lhs, center).to_f32().sqrt();
     d < radius
 }
 
 #[pgrx::pg_extern(immutable, strict, parallel_safe)]
-fn _vchord_scalar8_sphere_l2_in(
-    lhs: Scalar8Input<'_>,
-    rhs: pgrx::composite_type!("sphere_scalar8"),
+fn _vchord_rabitq8_sphere_ip_in(
+    lhs: Rabitq8Input<'_>,
+    rhs: pgrx::composite_type!("sphere_rabitq8"),
 ) -> bool {
-    let center: Scalar8Output = match rhs.get_by_index(NonZero::new(1).unwrap()) {
+    let center: Rabitq8Output = match rhs.get_by_index(NonZero::new(1).unwrap()) {
         Ok(Some(s)) => s,
         Ok(None) => pgrx::error!("Bad input: empty center at sphere"),
         Err(_) => unreachable!(),
@@ -91,16 +92,16 @@ fn _vchord_scalar8_sphere_l2_in(
     if lhs.dims() != center.dims() {
         pgrx::error!("dimension is not matched");
     }
-    let d = Scalar8Borrowed::operator_l2s(lhs, center).to_f32().sqrt();
+    let d = Rabitq8Borrowed::operator_dot(lhs, center).to_f32();
     d < radius
 }
 
 #[pgrx::pg_extern(immutable, strict, parallel_safe)]
-fn _vchord_scalar8_sphere_cosine_in(
-    lhs: Scalar8Input<'_>,
-    rhs: pgrx::composite_type!("sphere_scalar8"),
+fn _vchord_rabitq8_sphere_cosine_in(
+    lhs: Rabitq8Input<'_>,
+    rhs: pgrx::composite_type!("sphere_rabitq8"),
 ) -> bool {
-    let center: Scalar8Output = match rhs.get_by_index(NonZero::new(1).unwrap()) {
+    let center: Rabitq8Output = match rhs.get_by_index(NonZero::new(1).unwrap()) {
         Ok(Some(s)) => s,
         Ok(None) => pgrx::error!("Bad input: empty center at sphere"),
         Err(_) => unreachable!(),
@@ -115,6 +116,24 @@ fn _vchord_scalar8_sphere_cosine_in(
     if lhs.dims() != center.dims() {
         pgrx::error!("dimension is not matched");
     }
-    let d = Scalar8Borrowed::operator_cos(lhs, center).to_f32();
+    let d = Rabitq8Borrowed::operator_cos(lhs, center).to_f32();
     d < radius
+}
+
+#[pgrx::pg_extern(sql = "")]
+fn _vchord_rabitq8_operator_maxsim(
+    lhs: Array<'_, Rabitq8Input<'_>>,
+    rhs: Array<'_, Rabitq8Input<'_>>,
+) -> f32 {
+    let mut maxsim = 0.0f32;
+    for rhs in rhs.iter().flatten() {
+        let mut d = f32::INFINITY;
+        for lhs in lhs.iter().flatten() {
+            let lhs = lhs.as_borrowed();
+            let rhs = rhs.as_borrowed();
+            d = d.min(Rabitq8Borrowed::operator_dot(lhs, rhs).to_f32());
+        }
+        maxsim += d;
+    }
+    maxsim
 }

@@ -131,8 +131,8 @@ pub unsafe extern "C-unwind" fn ambuild(
     if vector_options.d != DistanceKind::L2S
         && (vchordg_options.index.alpha != [1.0] && vchordg_options.index.alpha != [1.0, 1.2])
     {
-        let errors = "alpha not equal to `1.0` are only applicable to l2 and cosine distance.";
-        pgrx::warning!("warning while validating options: {errors}");
+        let warnings = "alpha not equal to `1.0` are only applicable to l2 and cosine distance.";
+        pgrx::warning!("warning while validating options: {warnings}");
     }
     let index = unsafe { PostgresRelation::new(index_relation) };
     let reporter = PostgresReporter {
@@ -584,7 +584,7 @@ unsafe fn options(
         pgrx::error!("multicolumn index is not supported");
     }
     // get dims
-    let typmod = Typmod::parse_from_i32(atts[0].atttypmod).unwrap();
+    let typmod = Typmod::new(atts[0].atttypmod).unwrap();
     let dims = if let Some(dims) = typmod.dims() {
         dims.get()
     } else {

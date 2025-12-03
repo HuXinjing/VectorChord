@@ -24,6 +24,7 @@ use std::num::NonZero;
 use vchordg::operator::Op;
 use vchordg::types::*;
 use vector::VectorOwned;
+use vector::rabitq8::Rabitq8Owned;
 use vector::vect::{VectBorrowed, VectOwned};
 
 pub fn prewarm<R>(opfamily: Opfamily, index: &R) -> String
@@ -44,6 +45,12 @@ where
         (VectorKind::Vecf16, DistanceKind::Dot) => {
             vchordg::prewarm::<_, Op<VectOwned<f16>, Dot>>(index)
         }
+        (VectorKind::Rabitq8, DistanceKind::L2S) => {
+            vchordg::prewarm::<_, Op<Rabitq8Owned, L2S>>(index)
+        }
+        (VectorKind::Rabitq8, DistanceKind::Dot) => {
+            vchordg::prewarm::<_, Op<Rabitq8Owned, Dot>>(index)
+        }
     }
 }
 
@@ -60,14 +67,20 @@ pub fn bulkdelete<R>(
         (VectorKind::Vecf32, DistanceKind::L2S) => {
             vchordg::bulkdelete::<_, Op<VectOwned<f32>, L2S>>(index, &check, &callback);
         }
-        (VectorKind::Vecf16, DistanceKind::L2S) => {
-            vchordg::bulkdelete::<_, Op<VectOwned<f16>, L2S>>(index, &check, &callback);
-        }
         (VectorKind::Vecf32, DistanceKind::Dot) => {
             vchordg::bulkdelete::<_, Op<VectOwned<f32>, Dot>>(index, &check, &callback);
         }
+        (VectorKind::Vecf16, DistanceKind::L2S) => {
+            vchordg::bulkdelete::<_, Op<VectOwned<f16>, L2S>>(index, &check, &callback);
+        }
         (VectorKind::Vecf16, DistanceKind::Dot) => {
             vchordg::bulkdelete::<_, Op<VectOwned<f16>, Dot>>(index, &check, &callback);
+        }
+        (VectorKind::Rabitq8, DistanceKind::L2S) => {
+            vchordg::bulkdelete::<_, Op<Rabitq8Owned, L2S>>(index, &check, &callback);
+        }
+        (VectorKind::Rabitq8, DistanceKind::Dot) => {
+            vchordg::bulkdelete::<_, Op<Rabitq8Owned, Dot>>(index, &check, &callback);
         }
     }
 }
@@ -81,14 +94,20 @@ where
         (VectorKind::Vecf32, DistanceKind::L2S) => {
             vchordg::maintain::<_, Op<VectOwned<f32>, L2S>>(index, &check);
         }
-        (VectorKind::Vecf16, DistanceKind::L2S) => {
-            vchordg::maintain::<_, Op<VectOwned<f16>, L2S>>(index, &check);
-        }
         (VectorKind::Vecf32, DistanceKind::Dot) => {
             vchordg::maintain::<_, Op<VectOwned<f32>, Dot>>(index, &check);
         }
+        (VectorKind::Vecf16, DistanceKind::L2S) => {
+            vchordg::maintain::<_, Op<VectOwned<f16>, L2S>>(index, &check);
+        }
         (VectorKind::Vecf16, DistanceKind::Dot) => {
             vchordg::maintain::<_, Op<VectOwned<f16>, Dot>>(index, &check);
+        }
+        (VectorKind::Rabitq8, DistanceKind::L2S) => {
+            vchordg::maintain::<_, Op<Rabitq8Owned, L2S>>(index, &check);
+        }
+        (VectorKind::Rabitq8, DistanceKind::Dot) => {
+            vchordg::maintain::<_, Op<Rabitq8Owned, Dot>>(index, &check);
         }
     }
 }
@@ -102,14 +121,20 @@ where
         (VectorKind::Vecf32, DistanceKind::L2S) => {
             vchordg::build::<_, Op<VectOwned<f32>, L2S>>(vector_options, vchordg_options, index)
         }
-        (VectorKind::Vecf16, DistanceKind::L2S) => {
-            vchordg::build::<_, Op<VectOwned<f16>, L2S>>(vector_options, vchordg_options, index)
-        }
         (VectorKind::Vecf32, DistanceKind::Dot) => {
             vchordg::build::<_, Op<VectOwned<f32>, Dot>>(vector_options, vchordg_options, index)
         }
+        (VectorKind::Vecf16, DistanceKind::L2S) => {
+            vchordg::build::<_, Op<VectOwned<f16>, L2S>>(vector_options, vchordg_options, index)
+        }
         (VectorKind::Vecf16, DistanceKind::Dot) => {
             vchordg::build::<_, Op<VectOwned<f16>, Dot>>(vector_options, vchordg_options, index)
+        }
+        (VectorKind::Rabitq8, DistanceKind::L2S) => {
+            vchordg::build::<_, Op<Rabitq8Owned, L2S>>(vector_options, vchordg_options, index)
+        }
+        (VectorKind::Rabitq8, DistanceKind::Dot) => {
+            vchordg::build::<_, Op<Rabitq8Owned, Dot>>(vector_options, vchordg_options, index)
         }
     }
 }
@@ -135,10 +160,10 @@ where
                 make_vector_plain_prefetcher,
             )
         }
-        (OwnedVector::Vecf16(unprojected), DistanceKind::L2S) => {
-            assert!(opfamily.vector_kind() == VectorKind::Vecf16);
+        (OwnedVector::Vecf32(unprojected), DistanceKind::Dot) => {
+            assert!(opfamily.vector_kind() == VectorKind::Vecf32);
             let projected = RandomProject::project(unprojected.as_borrowed());
-            vchordg::insert::<_, Op<VectOwned<f16>, L2S>>(
+            vchordg::insert::<_, Op<VectOwned<f32>, Dot>>(
                 index,
                 projected.as_borrowed(),
                 payload,
@@ -147,10 +172,10 @@ where
                 make_vector_plain_prefetcher,
             )
         }
-        (OwnedVector::Vecf32(unprojected), DistanceKind::Dot) => {
-            assert!(opfamily.vector_kind() == VectorKind::Vecf32);
+        (OwnedVector::Vecf16(unprojected), DistanceKind::L2S) => {
+            assert!(opfamily.vector_kind() == VectorKind::Vecf16);
             let projected = RandomProject::project(unprojected.as_borrowed());
-            vchordg::insert::<_, Op<VectOwned<f32>, Dot>>(
+            vchordg::insert::<_, Op<VectOwned<f16>, L2S>>(
                 index,
                 projected.as_borrowed(),
                 payload,
@@ -165,6 +190,28 @@ where
             vchordg::insert::<_, Op<VectOwned<f16>, Dot>>(
                 index,
                 projected.as_borrowed(),
+                payload,
+                &bump,
+                make_vertex_plain_prefetcher,
+                make_vector_plain_prefetcher,
+            )
+        }
+        (OwnedVector::Rabitq8(unprojected), DistanceKind::L2S) => {
+            assert!(opfamily.vector_kind() == VectorKind::Rabitq8);
+            vchordg::insert::<_, Op<Rabitq8Owned, L2S>>(
+                index,
+                unprojected.as_borrowed(),
+                payload,
+                &bump,
+                make_vertex_plain_prefetcher,
+                make_vector_plain_prefetcher,
+            )
+        }
+        (OwnedVector::Rabitq8(unprojected), DistanceKind::Dot) => {
+            assert!(opfamily.vector_kind() == VectorKind::Rabitq8);
+            vchordg::insert::<_, Op<Rabitq8Owned, Dot>>(
+                index,
+                unprojected.as_borrowed(),
                 payload,
                 &bump,
                 make_vertex_plain_prefetcher,

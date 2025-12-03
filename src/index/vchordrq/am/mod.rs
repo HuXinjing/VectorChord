@@ -208,6 +208,9 @@ pub unsafe extern "C-unwind" fn amcostestimate(
                     | Opfamily::VectorCosine
                     | Opfamily::VectorIp
                     | Opfamily::VectorL2
+                    | Opfamily::Rabitq8Cosine
+                    | Opfamily::Rabitq8Ip
+                    | Opfamily::Rabitq8L2
             ) {
                 *index_startup_cost = 0.0;
                 *index_total_cost = 0.0;
@@ -470,7 +473,10 @@ pub unsafe extern "C-unwind" fn amrescan(
             | Opfamily::VectorCosine
             | Opfamily::HalfvecL2
             | Opfamily::HalfvecIp
-            | Opfamily::HalfvecCosine => {
+            | Opfamily::HalfvecCosine
+            | Opfamily::Rabitq8L2
+            | Opfamily::Rabitq8Ip
+            | Opfamily::Rabitq8Cosine => {
                 let mut builder = DefaultBuilder::new(opfamily);
                 for i in 0..(*scan).numberOfOrderBys {
                     let data = (*scan).orderByData.add(i as usize);
@@ -490,7 +496,7 @@ pub unsafe extern "C-unwind" fn amrescan(
                     builder.build(index, options, fetcher, bump, recorder)
                 }))
             }
-            Opfamily::VectorMaxsim | Opfamily::HalfvecMaxsim => {
+            Opfamily::VectorMaxsim | Opfamily::HalfvecMaxsim | Opfamily::Rabitq8Maxsim => {
                 let mut builder = MaxsimBuilder::new(opfamily);
                 for i in 0..(*scan).numberOfOrderBys {
                     let data = (*scan).orderByData.add(i as usize);

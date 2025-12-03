@@ -13,6 +13,7 @@
 // Copyright (c) 2025 TensorChord Inc.
 
 use crate::datatype::memory_halfvec::{HalfvecInput, HalfvecOutput};
+use crate::datatype::memory_rabitq8::{Rabitq8Input, Rabitq8Output};
 use crate::datatype::memory_vector::{VectorInput, VectorOutput};
 use crate::index::opclass::Sphere;
 use distance::Distance;
@@ -31,8 +32,12 @@ pub enum Opfamily {
     HalfvecL2,
     HalfvecIp,
     HalfvecCosine,
+    Rabitq8L2,
+    Rabitq8Ip,
+    Rabitq8Cosine,
     VectorMaxsim,
     HalfvecMaxsim,
+    Rabitq8Maxsim,
 }
 
 impl Opfamily {
@@ -47,6 +52,10 @@ impl Opfamily {
             (B::Vecf16(x), Self::HalfvecIp | Self::HalfvecMaxsim) => O::Vecf16(x.own()),
             (B::Vecf16(x), Self::HalfvecCosine) => O::Vecf16(x.function_normalize()),
             (B::Vecf16(_), _) => unreachable!(),
+            (B::Rabitq8(x), Self::Rabitq8L2) => O::Rabitq8(x.own()),
+            (B::Rabitq8(x), Self::Rabitq8Ip | Self::Rabitq8Maxsim) => O::Rabitq8(x.own()),
+            (B::Rabitq8(x), Self::Rabitq8Cosine) => O::Rabitq8(x.function_normalize()),
+            (B::Rabitq8(_), _) => unreachable!(),
         }
     }
     pub unsafe fn store(self, datum: Datum) -> Option<Vec<(OwnedVector, u16)>> {
@@ -61,6 +70,10 @@ impl Opfamily {
             Self::HalfvecL2 | Self::HalfvecIp | Self::HalfvecCosine => {
                 let vector = unsafe { HalfvecInput::from_datum(datum, false).unwrap() };
                 vec![(self.input(BorrowedVector::Vecf16(vector.as_borrowed())), 0)]
+            }
+            Self::Rabitq8L2 | Self::Rabitq8Ip | Self::Rabitq8Cosine => {
+                let vector = unsafe { Rabitq8Input::from_datum(datum, false).unwrap() };
+                vec![(self.input(BorrowedVector::Rabitq8(vector.as_borrowed())), 0)]
             }
             Self::VectorMaxsim => {
                 let vectors =
@@ -87,6 +100,19 @@ impl Opfamily {
                 }
                 result
             }
+            Self::Rabitq8Maxsim => {
+                let vectors = unsafe {
+                    pgrx::datum::Array::<Rabitq8Input>::from_datum(datum, false).unwrap()
+                };
+                let mut result = Vec::with_capacity(vectors.len());
+                for (i, vector) in vectors.iter_deny_null().enumerate() {
+                    result.push((
+                        self.input(BorrowedVector::Rabitq8(vector.as_borrowed())),
+                        i as u16,
+                    ));
+                }
+                result
+            }
         };
         Some(store)
     }
@@ -106,6 +132,10 @@ impl Opfamily {
                 let vector = tuple.get_by_index::<HalfvecOutput>(attno_1).unwrap()?;
                 self.input(BorrowedVector::Vecf16(vector.as_borrowed()))
             }
+            Self::Rabitq8L2 | Self::Rabitq8Ip | Self::Rabitq8Cosine | Self::Rabitq8Maxsim => {
+                let vector = tuple.get_by_index::<Rabitq8Output>(attno_1).unwrap()?;
+                self.input(BorrowedVector::Rabitq8(vector.as_borrowed()))
+            }
         };
         let radius = tuple.get_by_index::<f32>(attno_2).unwrap()?;
         Some(Sphere { center, radius })
@@ -122,6 +152,10 @@ impl Opfamily {
             Self::HalfvecL2 | Self::HalfvecIp | Self::HalfvecCosine | Self::HalfvecMaxsim => {
                 let vector = unsafe { HalfvecInput::from_datum(datum, false).unwrap() };
                 self.input(BorrowedVector::Vecf16(vector.as_borrowed()))
+            }
+            Self::Rabitq8L2 | Self::Rabitq8Ip | Self::Rabitq8Cosine | Self::Rabitq8Maxsim => {
+                let vector = unsafe { Rabitq8Input::from_datum(datum, false).unwrap() };
+                self.input(BorrowedVector::Rabitq8(vector.as_borrowed()))
             }
         };
         Some(vector)
@@ -150,27 +184,43 @@ impl Opfamily {
                 }
                 result
             }
+            Self::Rabitq8L2 | Self::Rabitq8Ip | Self::Rabitq8Cosine | Self::Rabitq8Maxsim => {
+                let vectors = unsafe {
+                    pgrx::datum::Array::<Rabitq8Input>::from_datum(datum, false).unwrap()
+                };
+                let mut result = Vec::with_capacity(vectors.len());
+                for vector in vectors.iter_deny_null() {
+                    result.push(self.input(BorrowedVector::Rabitq8(vector.as_borrowed())));
+                }
+                result
+            }
         };
         Some(vectors)
     }
     pub fn output(self, x: Distance) -> f32 {
         match self {
-            Self::VectorCosine | Self::HalfvecCosine => x.to_f32() + 1.0f32,
-            Self::VectorL2 | Self::HalfvecL2 => x.to_f32().sqrt(),
-            Self::VectorIp | Self::HalfvecIp | Self::VectorMaxsim | Self::HalfvecMaxsim => {
-                x.to_f32()
-            }
+            Self::VectorCosine | Self::HalfvecCosine | Self::Rabitq8Cosine => x.to_f32() + 1.0f32,
+            Self::VectorL2 | Self::HalfvecL2 | Self::Rabitq8L2 => x.to_f32().sqrt(),
+            Self::VectorIp
+            | Self::HalfvecIp
+            | Self::Rabitq8Ip
+            | Self::VectorMaxsim
+            | Self::HalfvecMaxsim
+            | Self::Rabitq8Maxsim => x.to_f32(),
         }
     }
     pub const fn distance_kind(self) -> DistanceKind {
         match self {
-            Self::VectorL2 | Self::HalfvecL2 => DistanceKind::L2S,
+            Self::VectorL2 | Self::HalfvecL2 | Self::Rabitq8L2 => DistanceKind::L2S,
             Self::VectorIp
             | Self::HalfvecIp
+            | Self::Rabitq8Ip
             | Self::VectorCosine
             | Self::HalfvecCosine
+            | Self::Rabitq8Cosine
             | Self::VectorMaxsim
-            | Self::HalfvecMaxsim => DistanceKind::Dot,
+            | Self::HalfvecMaxsim
+            | Self::Rabitq8Maxsim => DistanceKind::Dot,
         }
     }
     pub const fn vector_kind(self) -> VectorKind {
@@ -180,6 +230,9 @@ impl Opfamily {
             }
             Self::HalfvecL2 | Self::HalfvecIp | Self::HalfvecCosine | Self::HalfvecMaxsim => {
                 VectorKind::Vecf16
+            }
+            Self::Rabitq8L2 | Self::Rabitq8Ip | Self::Rabitq8Cosine | Self::Rabitq8Maxsim => {
+                VectorKind::Rabitq8
             }
         }
     }
@@ -226,8 +279,12 @@ pub unsafe fn opfamily(index_relation: pgrx::pg_sys::Relation) -> Opfamily {
         "vchordrq_halfvec_l2_ops" => Opfamily::HalfvecL2,
         "vchordrq_halfvec_ip_ops" => Opfamily::HalfvecIp,
         "vchordrq_halfvec_cosine_ops" => Opfamily::HalfvecCosine,
+        "vchordrq_rabitq8_l2_ops" => Opfamily::Rabitq8L2,
+        "vchordrq_rabitq8_ip_ops" => Opfamily::Rabitq8Ip,
+        "vchordrq_rabitq8_cosine_ops" => Opfamily::Rabitq8Cosine,
         "vchordrq_vector_maxsim_ops" => Opfamily::VectorMaxsim,
         "vchordrq_halfvec_maxsim_ops" => Opfamily::HalfvecMaxsim,
+        "vchordrq_rabitq8_maxsim_ops" => Opfamily::Rabitq8Maxsim,
         _ => pgrx::error!("unknown operator class"),
     };
 

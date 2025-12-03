@@ -34,6 +34,7 @@ use std::num::NonZero;
 use std::ops::Deref;
 use vchordrq::types::*;
 use vchordrq::{InsertChooser, MaintainChooser};
+use vector::rabitq8::Rabitq8Owned;
 use vector::vect::VectOwned;
 
 #[derive(Debug, Clone, Copy)]
@@ -216,6 +217,10 @@ pub unsafe extern "C-unwind" fn ambuild(
     if let Err(errors) = Validate::validate(&vchordrq_options) {
         pgrx::error!("error while validating options: {}", errors);
     }
+    if vector_options.v == VectorKind::Rabitq8 && vchordrq_options.index.residual_quantization {
+        let errors = "residual_quantization is not supported for rabitq8 type";
+        pgrx::error!("error while validating options: {errors}");
+    }
     let opfamily = unsafe { opfamily(index_relation) };
     let reporter = PostgresReporter {
         _phantom: PhantomData,
@@ -250,7 +255,7 @@ pub unsafe extern "C-unwind" fn ambuild(
     };
     for structure in structures.iter_mut() {
         for centroid in structure.centroids.iter_mut() {
-            *centroid = rabitq::rotate::rotate(centroid);
+            rabitq::rotate::rotate_inplace(centroid);
         }
     }
     reporter.phase(BuildPhase::from_code(BuildPhaseCode::Build));
@@ -1226,7 +1231,7 @@ unsafe fn options(
         pgrx::error!("multicolumn index is not supported");
     }
     // get dims
-    let typmod = Typmod::parse_from_i32(atts[0].atttypmod).unwrap();
+    let typmod = Typmod::new(atts[0].atttypmod).unwrap();
     let dims = if let Some(dims) = typmod.dims() {
         dims.get()
     } else {
@@ -1322,6 +1327,7 @@ fn make_internal_build(
                         let mut x = match vector {
                             OwnedVector::Vecf32(x) => VectOwned::normalize(x),
                             OwnedVector::Vecf16(x) => VectOwned::normalize(x),
+                            OwnedVector::Rabitq8(x) => Rabitq8Owned::normalize(x),
                         };
                         assert_eq!(
                             vector_options.dims,
@@ -1477,6 +1483,9 @@ fn make_internal_build(
                                             let x = match vector {
                                                 OwnedVector::Vecf32(x) => VectOwned::normalize(x),
                                                 OwnedVector::Vecf16(x) => VectOwned::normalize(x),
+                                                OwnedVector::Rabitq8(x) => {
+                                                    Rabitq8Owned::normalize(x)
+                                                }
                                             };
                                             assert_eq!(
                                                 vector_options.dims,

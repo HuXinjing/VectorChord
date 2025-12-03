@@ -13,6 +13,7 @@
 // Copyright (c) 2025 TensorChord Inc.
 
 use crate::datatype::memory_halfvec::{HalfvecInput, HalfvecOutput};
+use crate::datatype::memory_rabitq8::{Rabitq8Input, Rabitq8Output};
 use crate::datatype::memory_vector::{VectorInput, VectorOutput};
 use crate::index::opclass::Sphere;
 use distance::Distance;
@@ -31,6 +32,9 @@ pub enum Opfamily {
     HalfvecL2,
     HalfvecCosine,
     HalfvecIp,
+    Rabitq8L2,
+    Rabitq8Cosine,
+    Rabitq8Ip,
 }
 
 impl Opfamily {
@@ -49,6 +53,12 @@ impl Opfamily {
             (Self::HalfvecCosine, _) => unreachable!(),
             (Self::HalfvecIp, B::Vecf16(x)) => O::Vecf16(x.own()),
             (Self::HalfvecIp, _) => unreachable!(),
+            (Self::Rabitq8L2, B::Rabitq8(x)) => O::Rabitq8(x.own()),
+            (Self::Rabitq8L2, _) => unreachable!(),
+            (Self::Rabitq8Cosine, B::Rabitq8(x)) => O::Rabitq8(x.function_normalize()),
+            (Self::Rabitq8Cosine, _) => unreachable!(),
+            (Self::Rabitq8Ip, B::Rabitq8(x)) => O::Rabitq8(x.own()),
+            (Self::Rabitq8Ip, _) => unreachable!(),
         }
     }
     pub unsafe fn store(self, datum: Datum) -> Option<Vec<(OwnedVector, u16)>> {
@@ -63,6 +73,10 @@ impl Opfamily {
             Self::HalfvecL2 | Self::HalfvecCosine | Self::HalfvecIp => {
                 let vector = unsafe { HalfvecInput::from_datum(datum, false).unwrap() };
                 vec![(self.input(BorrowedVector::Vecf16(vector.as_borrowed())), 0)]
+            }
+            Self::Rabitq8L2 | Self::Rabitq8Cosine | Self::Rabitq8Ip => {
+                let vector = unsafe { Rabitq8Input::from_datum(datum, false).unwrap() };
+                vec![(self.input(BorrowedVector::Rabitq8(vector.as_borrowed())), 0)]
             }
         };
         Some(store)
@@ -83,6 +97,10 @@ impl Opfamily {
                 let vector = tuple.get_by_index::<HalfvecOutput>(attno_1).unwrap()?;
                 self.input(BorrowedVector::Vecf16(vector.as_borrowed()))
             }
+            Self::Rabitq8L2 | Self::Rabitq8Cosine | Self::Rabitq8Ip => {
+                let vector = tuple.get_by_index::<Rabitq8Output>(attno_1).unwrap()?;
+                self.input(BorrowedVector::Rabitq8(vector.as_borrowed()))
+            }
         };
         let radius = tuple.get_by_index::<f32>(attno_2).unwrap()?;
         Some(Sphere { center, radius })
@@ -100,27 +118,32 @@ impl Opfamily {
                 let vector = unsafe { HalfvecInput::from_datum(datum, false).unwrap() };
                 self.input(BorrowedVector::Vecf16(vector.as_borrowed()))
             }
+            Self::Rabitq8L2 | Self::Rabitq8Cosine | Self::Rabitq8Ip => {
+                let vector = unsafe { Rabitq8Input::from_datum(datum, false).unwrap() };
+                self.input(BorrowedVector::Rabitq8(vector.as_borrowed()))
+            }
         };
         Some(vector)
     }
     pub fn output(self, x: Distance) -> f32 {
         match self {
-            Self::VectorCosine | Self::HalfvecCosine => x.to_f32() * 0.5,
-            Self::VectorL2 | Self::HalfvecL2 => x.to_f32().sqrt(),
-            Self::VectorIp | Self::HalfvecIp => x.to_f32(),
+            Self::VectorCosine | Self::HalfvecCosine | Self::Rabitq8Cosine => x.to_f32() * 0.5,
+            Self::VectorL2 | Self::HalfvecL2 | Self::Rabitq8L2 => x.to_f32().sqrt(),
+            Self::VectorIp | Self::HalfvecIp | Self::Rabitq8Ip => x.to_f32(),
         }
     }
     pub const fn distance_kind(self) -> DistanceKind {
         match self {
-            Self::VectorL2 | Self::HalfvecL2 => DistanceKind::L2S,
-            Self::VectorCosine | Self::HalfvecCosine => DistanceKind::L2S,
-            Self::VectorIp | Self::HalfvecIp => DistanceKind::Dot,
+            Self::VectorL2 | Self::HalfvecL2 | Self::Rabitq8L2 => DistanceKind::L2S,
+            Self::VectorCosine | Self::HalfvecCosine | Self::Rabitq8Cosine => DistanceKind::L2S,
+            Self::VectorIp | Self::HalfvecIp | Self::Rabitq8Ip => DistanceKind::Dot,
         }
     }
     pub const fn vector_kind(self) -> VectorKind {
         match self {
             Self::VectorL2 | Self::VectorCosine | Self::VectorIp => VectorKind::Vecf32,
             Self::HalfvecL2 | Self::HalfvecCosine | Self::HalfvecIp => VectorKind::Vecf16,
+            Self::Rabitq8L2 | Self::Rabitq8Cosine | Self::Rabitq8Ip => VectorKind::Rabitq8,
         }
     }
 }
@@ -161,11 +184,14 @@ pub unsafe fn opfamily(index_relation: pgrx::pg_sys::Relation) -> Opfamily {
 
     let result = match result_string.as_str() {
         "vchordg_vector_l2_ops" => Opfamily::VectorL2,
+        "vchordg_vector_ip_ops" => Opfamily::VectorIp,
         "vchordg_vector_cosine_ops" => Opfamily::VectorCosine,
         "vchordg_halfvec_l2_ops" => Opfamily::HalfvecL2,
-        "vchordg_halfvec_cosine_ops" => Opfamily::HalfvecCosine,
-        "vchordg_vector_ip_ops" => Opfamily::VectorIp,
         "vchordg_halfvec_ip_ops" => Opfamily::HalfvecIp,
+        "vchordg_halfvec_cosine_ops" => Opfamily::HalfvecCosine,
+        "vchordg_rabitq8_l2_ops" => Opfamily::Rabitq8L2,
+        "vchordg_rabitq8_ip_ops" => Opfamily::Rabitq8Ip,
+        "vchordg_rabitq8_cosine_ops" => Opfamily::Rabitq8Cosine,
         _ => pgrx::error!("unknown operator class"),
     };
 

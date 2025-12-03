@@ -14,11 +14,14 @@
 
 use crate::types::DistanceKind;
 use distance::Distance;
-use index::accessor::{Accessor1, Accessor2, DistanceAccessor, Dot, L2S};
+use index::accessor::{
+    Accessor1, Accessor2, DimensionDistanceAccessor, DistanceAccessor, Dot, L2S,
+};
 use rabitq::bits::Bits;
 use simd::{Floating, f16};
 use std::fmt::Debug;
 use std::marker::PhantomData;
+use vector::rabitq8::Rabitq8Owned;
 use vector::vect::VectOwned;
 use vector::{VectorBorrowed, VectorOwned};
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
@@ -115,6 +118,72 @@ impl Vector for VectOwned<f16> {
 
     fn preprocess(vector: Self::Borrowed<'_>) -> rabitq::bits::binary::BinaryLut {
         rabitq::bits::binary::preprocess(&f16::vector_to_f32(vector.slice()))
+    }
+}
+
+impl Vector for Rabitq8Owned {
+    type Metadata = [f32; 4];
+
+    type Element = u8;
+
+    fn unpack(vector: Self::Borrowed<'_>) -> (&[Self::Element], Self::Metadata) {
+        (
+            vector.code(),
+            [
+                vector.sum_of_x2(),
+                vector.norm_of_lattice(),
+                vector.sum_of_code(),
+                vector.sum_of_abs_x(),
+            ],
+        )
+    }
+
+    fn split(
+        vector: Self::Borrowed<'_>,
+        m: usize,
+    ) -> (Vec<&[Self::Element]>, (&[Self::Element], Self::Metadata)) {
+        let metadata = [
+            vector.sum_of_x2(),
+            vector.norm_of_lattice(),
+            vector.sum_of_code(),
+            vector.sum_of_abs_x(),
+        ];
+        let slice = vector.code();
+        let tailing = (size_of::<crate::tuples::OptionNeighbour>() * m)
+            .next_multiple_of(crate::tuples::ALIGN);
+        assert!(tailing <= 8000);
+        if slice.len() <= (8000 - tailing) / size_of::<f16>() {
+            return (vec![], (slice, metadata));
+        }
+        let (l, r) = slice.split_at(slice.len() - (8000 - tailing) / size_of::<f16>());
+        (
+            l.chunks(8000 / size_of::<f16>()).collect::<Vec<_>>(),
+            (r, metadata),
+        )
+    }
+
+    fn pack(code: Vec<Self::Element>, [_0, _1, _2, _3]: Self::Metadata) -> Self {
+        Rabitq8Owned::new(_0, _1, _2, _3, code)
+    }
+
+    fn code(bits: Bits, vector: Self::Borrowed<'_>) -> rabitq::bits::Code {
+        let scale = vector.sum_of_x2().sqrt() / vector.norm_of_lattice();
+        let mut result = Vec::with_capacity(vector.dims() as _);
+        for c in vector.code().iter().copied() {
+            let base = -0.5 * ((1 << 8) - 1) as f32;
+            result.push((base + c as f32) * scale);
+        }
+        rabitq::bits::code(bits, &result)
+    }
+
+    fn preprocess(vector: Self::Borrowed<'_>) -> rabitq::bits::binary::BinaryLut {
+        let scale = vector.sum_of_x2().sqrt() / vector.norm_of_lattice();
+        let mut result = Vec::with_capacity(vector.dims() as _);
+        for c in vector.code().iter().copied() {
+            let base = -0.5 * ((1 << 8) - 1) as f32;
+            result.push((base + c as f32) * scale);
+        }
+        rabitq::bits::binary::preprocess(&result)
     }
 }
 
@@ -260,6 +329,72 @@ impl Operator for Op<VectOwned<f16>, Dot> {
     type Vector = VectOwned<f16>;
 
     type DistanceAccessor = DistanceAccessor<VectOwned<f16>, Dot>;
+
+    fn process(
+        bits: Bits,
+        n: u32,
+        code: ([f32; 3], &[u64]),
+        lut: &rabitq::bits::binary::BinaryLut,
+    ) -> Distance {
+        use rabitq::bits::CodeMetadata;
+        let value = rabitq::bits::binary::accumulate(bits, code.1, &lut.1);
+        let (distance,) = rabitq::bits::binary::half_process_dot(
+            bits,
+            n,
+            value,
+            CodeMetadata::from_array(code.0),
+            lut.0,
+        );
+        Distance::from_f32(distance)
+    }
+
+    fn distance(
+        lhs: <Self::Vector as VectorOwned>::Borrowed<'_>,
+        rhs: <Self::Vector as VectorOwned>::Borrowed<'_>,
+    ) -> Distance {
+        lhs.operator_dot(rhs)
+    }
+}
+
+impl Operator for Op<Rabitq8Owned, L2S> {
+    const DISTANCE: DistanceKind = DistanceKind::L2S;
+
+    type Vector = Rabitq8Owned;
+
+    type DistanceAccessor = DimensionDistanceAccessor<Rabitq8Owned, L2S>;
+
+    fn process(
+        bits: Bits,
+        n: u32,
+        code: ([f32; 3], &[u64]),
+        lut: &rabitq::bits::binary::BinaryLut,
+    ) -> Distance {
+        use rabitq::bits::CodeMetadata;
+        let value = rabitq::bits::binary::accumulate(bits, code.1, &lut.1);
+        let (distance,) = rabitq::bits::binary::half_process_l2(
+            bits,
+            n,
+            value,
+            CodeMetadata::from_array(code.0),
+            lut.0,
+        );
+        Distance::from_f32(distance)
+    }
+
+    fn distance(
+        lhs: <Self::Vector as VectorOwned>::Borrowed<'_>,
+        rhs: <Self::Vector as VectorOwned>::Borrowed<'_>,
+    ) -> Distance {
+        lhs.operator_l2s(rhs)
+    }
+}
+
+impl Operator for Op<Rabitq8Owned, Dot> {
+    const DISTANCE: DistanceKind = DistanceKind::Dot;
+
+    type Vector = Rabitq8Owned;
+
+    type DistanceAccessor = DimensionDistanceAccessor<Rabitq8Owned, Dot>;
 
     fn process(
         bits: Bits,

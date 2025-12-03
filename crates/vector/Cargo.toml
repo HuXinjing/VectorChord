@@ -6,6 +6,7 @@ publish = false
 
 [dependencies]
 distance = { path = "../distance" }
+rabitq = { path = "../rabitq" }
 simd = { path = "../simd" }
 
 [lints]

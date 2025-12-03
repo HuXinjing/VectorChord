@@ -14,7 +14,6 @@
 
 use crate::{VectorBorrowed, VectorOwned};
 use distance::Distance;
-use std::ops::{Bound, RangeBounds};
 
 pub const BVECTOR_WIDTH: u32 = u64::BITS;
 
@@ -69,11 +68,6 @@ impl VectorOwned for BVectOwned {
             dims: self.dims,
             data: &self.data,
         }
-    }
-
-    #[inline(always)]
-    fn zero(dims: u32) -> Self {
-        Self::new(dims, vec![0; dims.div_ceil(BVECTOR_WIDTH) as usize])
     }
 }
 
@@ -224,39 +218,6 @@ impl VectorBorrowed for BVectBorrowed<'_> {
         assert_eq!(self.dims, rhs.dims);
         let data = simd::bit::vector_xor(self.data, rhs.data);
         BVectOwned::new(self.dims, data)
-    }
-
-    #[inline(always)]
-    fn subvector(&self, bounds: impl RangeBounds<u32>) -> Option<Self::Owned> {
-        let start = match bounds.start_bound().cloned() {
-            Bound::Included(x) => x,
-            Bound::Excluded(u32::MAX) => return None,
-            Bound::Excluded(x) => x + 1,
-            Bound::Unbounded => 0,
-        };
-        let end = match bounds.end_bound().cloned() {
-            Bound::Included(u32::MAX) => return None,
-            Bound::Included(x) => x + 1,
-            Bound::Excluded(x) => x,
-            Bound::Unbounded => self.dims,
-        };
-        if start >= end || end > self.dims {
-            return None;
-        }
-        let dims = end - start;
-        let mut data = vec![0_u64; dims.div_ceil(BVECTOR_WIDTH) as _];
-        {
-            let mut i = 0;
-            let mut j = start;
-            while j < end {
-                if self.data[(j / BVECTOR_WIDTH) as usize] & (1 << (j % BVECTOR_WIDTH)) != 0 {
-                    data[(i / BVECTOR_WIDTH) as usize] |= 1 << (i % BVECTOR_WIDTH);
-                }
-                i += 1;
-                j += 1;
-            }
-        }
-        Self::Owned::new_checked(dims, data)
     }
 }
 

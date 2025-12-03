@@ -13,13 +13,16 @@
 // Copyright (c) 2025 TensorChord Inc.
 
 use distance::Distance;
-use index::accessor::{Accessor1, Accessor2, DistanceAccessor, Dot, L2S, RAccess};
+use index::accessor::{
+    Accessor1, Accessor2, DimensionDistanceAccessor, DistanceAccessor, Dot, L2S, RAccess,
+};
 use rabitq::bit::CodeMetadata;
 use rabitq::bit::binary::BinaryLut;
 use rabitq::bit::block::{BlockLut, STEP};
 use simd::{Floating, f16};
 use std::fmt::Debug;
 use std::marker::PhantomData;
+use vector::rabitq8::{Rabitq8Borrowed, Rabitq8Owned};
 use vector::vect::{VectBorrowed, VectOwned};
 use vector::{VectorBorrowed, VectorOwned};
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
@@ -206,6 +209,109 @@ impl Vector for VectOwned<f16> {
 
     fn squared_norm(vector: Self::Borrowed<'_>) -> f32 {
         f16::reduce_sum_of_x2(vector.slice())
+    }
+}
+
+impl Vector for Rabitq8Owned {
+    type Metadata = [f32; 4];
+
+    type Element = u8;
+
+    fn split(vector: Self::Borrowed<'_>) -> (Vec<&[u8]>, [f32; 4]) {
+        (
+            match vector.code().len() {
+                0 => unreachable!(),
+                1..=3840 => vec![vector.code()],
+                3841..=5120 => vec![&vector.code()[..1280], &vector.code()[1280..]],
+                5121.. => vector.code().chunks(7680).collect(),
+            },
+            [
+                vector.sum_of_x2(),
+                vector.norm_of_lattice(),
+                vector.sum_of_code(),
+                vector.sum_of_abs_x(),
+            ],
+        )
+    }
+
+    fn count(n: usize) -> usize {
+        match n {
+            0 => unreachable!(),
+            1..=3840 => 1,
+            3841..=5120 => 2,
+            5121.. => n.div_ceil(7680),
+        }
+    }
+
+    fn unpack(vector: Self::Borrowed<'_>) -> (&[Self::Element], Self::Metadata) {
+        (
+            vector.code(),
+            [
+                vector.sum_of_x2(),
+                vector.norm_of_lattice(),
+                vector.sum_of_code(),
+                vector.sum_of_abs_x(),
+            ],
+        )
+    }
+
+    fn pack(elements: Vec<Self::Element>, [_0, _1, _2, _3]: Self::Metadata) -> Self {
+        Rabitq8Owned::new(_0, _1, _2, _3, elements)
+    }
+
+    fn block_preprocess(vector: Self::Borrowed<'_>) -> BlockLut {
+        let scale = vector.sum_of_x2().sqrt() / vector.norm_of_lattice();
+        let mut result = Vec::with_capacity(vector.dims() as _);
+        for c in vector.code().iter().copied() {
+            let base = -0.5 * ((1 << 8) - 1) as f32;
+            result.push((base + c as f32) * scale);
+        }
+        rabitq::bit::block::preprocess(&result)
+    }
+
+    fn preprocess(vector: Self::Borrowed<'_>) -> (BlockLut, BinaryLut) {
+        let scale = vector.sum_of_x2().sqrt() / vector.norm_of_lattice();
+        let mut result = Vec::with_capacity(vector.dims() as _);
+        for c in vector.code().iter().copied() {
+            let base = -0.5 * ((1 << 8) - 1) as f32;
+            result.push((base + c as f32) * scale);
+        }
+        rabitq::bit::preprocess(&result)
+    }
+
+    fn code(vector: Self::Borrowed<'_>) -> rabitq::bit::Code {
+        let n = vector.dims();
+        let sum_of_abs_x = vector.sum_of_abs_x();
+        let sum_of_x_2 = vector.sum_of_x2();
+        (
+            CodeMetadata {
+                dis_u_2: sum_of_x_2,
+                factor_cnt: {
+                    let cnt_pos = vector.code().iter().filter(|&&x| x >= 128).count();
+                    let cnt_neg = vector.code().iter().filter(|&&x| x <= 127).count();
+                    cnt_pos as f32 - cnt_neg as f32
+                },
+                factor_ip: sum_of_x_2 / sum_of_abs_x,
+                factor_err: {
+                    let dis_u = sum_of_x_2.sqrt();
+                    let x_0 = sum_of_abs_x / dis_u / (n as f32).sqrt();
+                    dis_u * (1.0 / (x_0 * x_0) - 1.0).sqrt() / (n as f32 - 1.0).sqrt()
+                },
+            },
+            {
+                let vector = vector.code();
+                let n = vector.len();
+                let mut signs = Vec::new();
+                for i in 0..n {
+                    signs.push(vector[i] >= 128);
+                }
+                signs
+            },
+        )
+    }
+
+    fn squared_norm(vector: Self::Borrowed<'_>) -> f32 {
+        vector.sum_of_x2()
     }
 }
 
@@ -559,6 +665,108 @@ impl Operator for Op<VectOwned<f16>, Dot> {
             let delta = 0.0;
             (code, delta)
         }
+    }
+}
+
+impl Operator for Op<Rabitq8Owned, L2S> {
+    type Vector = Rabitq8Owned;
+
+    type DistanceAccessor = DimensionDistanceAccessor<Rabitq8Owned, L2S>;
+
+    fn block_access(
+        lut: &BlockLut,
+        is_residual: bool,
+        _dis_f: f32,
+        _norm: f32,
+    ) -> impl for<'x> Accessor1<[u8; 16], (&'x [[f32; 32]; 4], &'x [f32; 32]), Output = [(f32, f32); 32]>
+    {
+        assert!(!is_residual);
+        RAccess::new(
+            (&lut.1, ()),
+            BlockAccessor([0_u32; 32], move |value, code, _delta| {
+                rabitq::bit::block::half_process_l2(value, code, lut.0)
+            }),
+        )
+    }
+
+    fn binary_access(
+        lut: &BinaryLut,
+        is_residual: bool,
+        _dis_f: f32,
+        _norm: f32,
+    ) -> impl FnMut([f32; 4], &[u64], f32) -> (f32, f32) {
+        assert!(!is_residual);
+        move |metadata: [f32; 4], elements: &[u64], _delta: f32| {
+            let value = rabitq::bit::binary::accumulate(elements, &lut.1);
+            let code = CodeMetadata {
+                dis_u_2: metadata[0],
+                factor_cnt: metadata[1],
+                factor_ip: metadata[2],
+                factor_err: metadata[3],
+            };
+            rabitq::bit::binary::half_process_l2(value, code, lut.0)
+        }
+    }
+
+    fn build(
+        vector: Rabitq8Borrowed<'_>,
+        centroid: Option<Self::Vector>,
+    ) -> (rabitq::bit::Code, f32) {
+        if centroid.is_some() {
+            unimplemented!();
+        }
+        (Self::Vector::code(vector), 0.0)
+    }
+}
+
+impl Operator for Op<Rabitq8Owned, Dot> {
+    type Vector = Rabitq8Owned;
+
+    type DistanceAccessor = DimensionDistanceAccessor<Rabitq8Owned, Dot>;
+
+    fn block_access(
+        lut: &BlockLut,
+        is_residual: bool,
+        _dis_f: f32,
+        _norm: f32,
+    ) -> impl for<'x> Accessor1<[u8; 16], (&'x [[f32; 32]; 4], &'x [f32; 32]), Output = [(f32, f32); 32]>
+    {
+        assert!(!is_residual);
+        RAccess::new(
+            (&lut.1, ()),
+            BlockAccessor([0_u32; 32], move |value, code, _delta| {
+                rabitq::bit::block::half_process_dot(value, code, lut.0)
+            }),
+        )
+    }
+
+    fn binary_access(
+        lut: &BinaryLut,
+        is_residual: bool,
+        _dis_f: f32,
+        _norm: f32,
+    ) -> impl FnMut([f32; 4], &[u64], f32) -> (f32, f32) {
+        assert!(!is_residual);
+        move |metadata: [f32; 4], elements: &[u64], _delta: f32| {
+            let value = rabitq::bit::binary::accumulate(elements, &lut.1);
+            let code = CodeMetadata {
+                dis_u_2: metadata[0],
+                factor_cnt: metadata[1],
+                factor_ip: metadata[2],
+                factor_err: metadata[3],
+            };
+            rabitq::bit::binary::half_process_dot(value, code, lut.0)
+        }
+    }
+
+    fn build(
+        vector: Rabitq8Borrowed<'_>,
+        centroid: Option<Self::Vector>,
+    ) -> (rabitq::bit::Code, f32) {
+        if centroid.is_some() {
+            unimplemented!();
+        }
+        (Self::Vector::code(vector), 0.0)
     }
 }
 

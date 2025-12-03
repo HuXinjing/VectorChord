@@ -13,7 +13,7 @@
 // Copyright (c) 2025 TensorChord Inc.
 
 pub mod bvect;
-pub mod scalar8;
+pub mod rabitq8;
 pub mod svect;
 pub mod vect;
 
@@ -21,8 +21,6 @@ pub trait VectorOwned: Clone + 'static {
     type Borrowed<'a>: VectorBorrowed<Owned = Self>;
 
     fn as_borrowed(&self) -> Self::Borrowed<'_>;
-
-    fn zero(dims: u32) -> Self;
 }
 
 pub trait VectorBorrowed: Copy {
@@ -57,6 +55,4 @@ pub trait VectorBorrowed: Copy {
     fn operator_or(&self, rhs: Self) -> Self::Owned;
 
     fn operator_xor(&self, rhs: Self) -> Self::Owned;
-
-    fn subvector(&self, bounds: impl std::ops::RangeBounds<u32>) -> Option<Self::Owned>;
 }

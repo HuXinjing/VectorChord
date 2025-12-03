@@ -15,7 +15,6 @@
 use crate::{VectorBorrowed, VectorOwned};
 use distance::Distance;
 use simd::Floating;
-use std::ops::{Bound, RangeBounds};
 
 #[derive(Debug, Clone)]
 pub struct SVectOwned<S> {
@@ -93,11 +92,6 @@ impl<S: Floating> VectorOwned for SVectOwned<S> {
             indexes: &self.indexes,
             values: &self.values,
         }
-    }
-
-    #[inline(always)]
-    fn zero(dims: u32) -> Self {
-        Self::new(dims, vec![], vec![])
     }
 }
 
@@ -374,34 +368,6 @@ impl<S: Floating> VectorBorrowed for SVectBorrowed<'_, S> {
 
     fn operator_xor(&self, _: Self) -> Self::Owned {
         unimplemented!()
-    }
-
-    #[inline(always)]
-    fn subvector(&self, bounds: impl RangeBounds<u32>) -> Option<Self::Owned> {
-        let start = match bounds.start_bound().cloned() {
-            Bound::Included(x) => x,
-            Bound::Excluded(u32::MAX) => return None,
-            Bound::Excluded(x) => x + 1,
-            Bound::Unbounded => 0,
-        };
-        let end = match bounds.end_bound().cloned() {
-            Bound::Included(u32::MAX) => return None,
-            Bound::Included(x) => x + 1,
-            Bound::Excluded(x) => x,
-            Bound::Unbounded => self.dims,
-        };
-        if start >= end || end > self.dims {
-            return None;
-        }
-        let dims = end - start;
-        let s = self.indexes.partition_point(|&x| x < start);
-        let e = self.indexes.partition_point(|&x| x < end);
-        let indexes = self.indexes[s..e]
-            .iter()
-            .map(|x| x - start)
-            .collect::<Vec<_>>();
-        let values = self.values[s..e].to_vec();
-        Self::Owned::new_checked(dims, indexes, values)
     }
 }
 

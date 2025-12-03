@@ -12,14 +12,14 @@
 //
 // Copyright (c) 2025 TensorChord Inc.
 
-pub use text::{halfvec_out, vector_out};
 pub use types::{DefaultRecorder, Recorder};
 pub use worker::dump;
 
 mod hook;
-mod text;
 mod types;
 mod worker;
+
+pub mod text;
 
 pub fn init() {
     hook::init();

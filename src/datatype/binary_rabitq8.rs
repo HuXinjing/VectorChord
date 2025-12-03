@@ -12,21 +12,21 @@
 //
 // Copyright (c) 2025 TensorChord Inc.
 
-use crate::datatype::memory_scalar8::{Scalar8Input, Scalar8Output};
+use crate::datatype::memory_rabitq8::{Rabitq8Input, Rabitq8Output};
 use pgrx::datum::Internal;
 use pgrx::pg_sys::Oid;
 use vector::VectorBorrowed;
-use vector::scalar8::Scalar8Borrowed;
+use vector::rabitq8::Rabitq8Borrowed;
 
 #[pgrx::pg_extern(immutable, strict, parallel_safe)]
-fn _vchord_scalar8_send(vector: Scalar8Input<'_>) -> Vec<u8> {
+fn _vchord_rabitq8_send(vector: Rabitq8Input<'_>) -> Vec<u8> {
     let vector = vector.as_borrowed();
     let mut stream = Vec::<u8>::new();
     stream.extend(vector.dims().to_be_bytes());
     stream.extend(vector.sum_of_x2().to_be_bytes());
-    stream.extend(vector.k().to_be_bytes());
-    stream.extend(vector.b().to_be_bytes());
+    stream.extend(vector.norm_of_lattice().to_be_bytes());
     stream.extend(vector.sum_of_code().to_be_bytes());
+    stream.extend(vector.sum_of_abs_x().to_be_bytes());
     for &c in vector.code() {
         stream.extend(c.to_be_bytes());
     }
@@ -34,7 +34,7 @@ fn _vchord_scalar8_send(vector: Scalar8Input<'_>) -> Vec<u8> {
 }
 
 #[pgrx::pg_extern(immutable, strict, parallel_safe)]
-fn _vchord_scalar8_recv(mut internal: Internal, oid: Oid, typmod: i32) -> Scalar8Output {
+fn _vchord_rabitq8_recv(mut internal: Internal, oid: Oid, typmod: i32) -> Rabitq8Output {
     let _ = (oid, typmod);
     let buf = unsafe { internal.get_mut::<pgrx::pg_sys::StringInfoData>().unwrap() };
 
@@ -50,19 +50,19 @@ fn _vchord_scalar8_recv(mut internal: Internal, oid: Oid, typmod: i32) -> Scalar
         buf.cursor += 4;
         f32::from_be_bytes(raw)
     };
-    let k = {
-        assert!(buf.cursor < i32::MAX - 4 && buf.cursor + 4 <= buf.len);
-        let raw = unsafe { buf.data.add(buf.cursor as _).cast::<[u8; 4]>().read() };
-        buf.cursor += 4;
-        f32::from_be_bytes(raw)
-    };
-    let b = {
+    let norm_of_lattice = {
         assert!(buf.cursor < i32::MAX - 4 && buf.cursor + 4 <= buf.len);
         let raw = unsafe { buf.data.add(buf.cursor as _).cast::<[u8; 4]>().read() };
         buf.cursor += 4;
         f32::from_be_bytes(raw)
     };
     let sum_of_code = {
+        assert!(buf.cursor < i32::MAX - 4 && buf.cursor + 4 <= buf.len);
+        let raw = unsafe { buf.data.add(buf.cursor as _).cast::<[u8; 4]>().read() };
+        buf.cursor += 4;
+        f32::from_be_bytes(raw)
+    };
+    let sum_of_abs_x = {
         assert!(buf.cursor < i32::MAX - 4 && buf.cursor + 4 <= buf.len);
         let raw = unsafe { buf.data.add(buf.cursor as _).cast::<[u8; 4]>().read() };
         buf.cursor += 4;
@@ -81,8 +81,10 @@ fn _vchord_scalar8_recv(mut internal: Internal, oid: Oid, typmod: i32) -> Scalar
         result
     };
 
-    if let Some(x) = Scalar8Borrowed::new_checked(sum_of_x2, k, b, sum_of_code, &code) {
-        Scalar8Output::new(x)
+    if let Some(x) =
+        Rabitq8Borrowed::new_checked(sum_of_x2, norm_of_lattice, sum_of_code, sum_of_abs_x, &code)
+    {
+        Rabitq8Output::new(x)
     } else {
         pgrx::error!("detect data corruption");
     }

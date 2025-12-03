@@ -14,8 +14,13 @@
 
 pub use crate::extended::{Code, CodeMetadata};
 
+#[deprecated]
 pub fn code(vector: &[f32]) -> Code {
     crate::extended::code::<8>(vector)
+}
+
+pub fn ugly_code(vector: &[f32]) -> Code {
+    crate::extended::ugly_code::<8>(vector)
 }
 
 pub mod binary {
@@ -27,8 +32,14 @@ pub mod binary {
     pub type BinaryLut = (BinaryLutMetadata, Vec<u8>);
     pub type BinaryCode<'a> = ((f32, f32, f32, f32), &'a [u8]);
 
+    #[deprecated]
     pub fn preprocess(vector: &[f32]) -> BinaryLut {
         let (metadata, elements) = crate::extended::code::<BITS>(vector);
+        (metadata, elements)
+    }
+
+    pub fn ugly_preprocess(vector: &[f32]) -> BinaryLut {
+        let (metadata, elements) = crate::extended::ugly_code::<BITS>(vector);
         (metadata, elements)
     }
 
@@ -53,6 +64,16 @@ pub mod binary {
         lut: BinaryLutMetadata,
     ) -> (f32,) {
         let rough = crate::extended::half_process_l2::<8, BITS>(n, value, code, lut);
+        (rough,)
+    }
+
+    pub fn half_process_cos(
+        n: u32,
+        value: u32,
+        code: CodeMetadata,
+        lut: BinaryLutMetadata,
+    ) -> (f32,) {
+        let rough = crate::extended::half_process_cos::<8, BITS>(n, value, code, lut);
         (rough,)
     }
 }

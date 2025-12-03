@@ -40,6 +40,13 @@ pub fn code(bits: Bits, vector: &[f32]) -> Code {
     }
 }
 
+pub fn ugly_code(bits: Bits, vector: &[f32]) -> Code {
+    match bits {
+        Bits::_1 => crate::extended::ugly_code::<1>(vector),
+        Bits::_2 => crate::extended::ugly_code::<2>(vector),
+    }
+}
+
 pub fn pack_code(bits: Bits, input: &[u8]) -> Vec<u64> {
     match bits {
         Bits::_1 => crate::extended::pack_code::<1>(input)
@@ -65,6 +72,11 @@ pub mod binary {
 
     pub fn preprocess(vector: &[f32]) -> BinaryLut {
         let (metadata, elements) = crate::extended::code::<BITS>(vector);
+        (metadata, crate::extended::pack_code::<BITS>(&elements))
+    }
+
+    pub fn ugly_preprocess(vector: &[f32]) -> BinaryLut {
+        let (metadata, elements) = crate::extended::ugly_code::<BITS>(vector);
         (metadata, crate::extended::pack_code::<BITS>(&elements))
     }
 
