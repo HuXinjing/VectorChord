@@ -29,11 +29,12 @@ mod floating_f16;
 mod floating_f32;
 
 pub mod bit;
+pub mod byte;
 pub mod fast_scan;
 pub mod fht;
+pub mod halfbyte;
 pub mod quantize;
 pub mod rotate;
-pub mod u8;
 
 #[cfg(not(feature = "nightly_f16"))]
 pub use half::f16;

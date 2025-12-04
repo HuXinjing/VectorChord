@@ -176,9 +176,9 @@ pub mod binary {
     pub(crate) fn preprocess_with_distance(vector: &[f32], dis_v_2: f32) -> BinaryLut {
         let (k, b, qvector) = simd::quantize::quantize(vector, ((1 << BITS) - 1) as f32);
         let qvector_sum = if vector.len() <= (65535_usize / ((1 << BITS) - 1)) {
-            simd::u8::reduce_sum_of_x_as_u16(&qvector) as f32
+            simd::byte::reduce_sum_of_x_as_u16(&qvector) as f32
         } else {
-            simd::u8::reduce_sum_of_x_as_u32(&qvector) as f32
+            simd::byte::reduce_sum_of_x_as_u32(&qvector) as f32
         };
         (
             BinaryLutMetadata {

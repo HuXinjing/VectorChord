@@ -409,7 +409,7 @@ impl Accessor2<u8, u8, [f32; 4], [f32; 4]> for DimensionDistanceAccessor<Rabitq8
     #[inline(always)]
     fn push(&mut self, target: &[u8], input: &[u8]) {
         self.0 += target.len() as u32;
-        self.1 += simd::u8::reduce_sum_of_x_as_u32_y_as_u32(target, input);
+        self.1 += simd::byte::reduce_sum_of_x_as_u32_y_as_u32(target, input);
     }
 
     #[inline(always)]
@@ -432,7 +432,7 @@ impl Accessor2<u8, u8, [f32; 4], [f32; 4]> for DimensionDistanceAccessor<Rabitq8
     #[inline(always)]
     fn push(&mut self, target: &[u8], input: &[u8]) {
         self.0 += target.len() as u32;
-        self.1 += simd::u8::reduce_sum_of_x_as_u32_y_as_u32(target, input);
+        self.1 += simd::byte::reduce_sum_of_x_as_u32_y_as_u32(target, input);
     }
 
     #[inline(always)]

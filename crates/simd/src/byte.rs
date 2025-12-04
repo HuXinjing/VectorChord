@@ -22,8 +22,7 @@ mod reduce_sum_of_x_as_u32_y_as_u32 {
         let mut n = lhs.len();
         let mut a = lhs.as_ptr();
         let mut b = rhs.as_ptr();
-        let lo = _mm512_set1_epi16(0x00ff_u16 as i16);
-        let hi = _mm512_set1_epi16(0xff00_u16 as i16);
+        let lo = _mm512_set1_epi16(0x00ff_i16);
         let mut _0 = _mm512_setzero_si512();
         let mut _1 = _mm512_setzero_si512();
         let mut _2 = _mm512_setzero_si512();
@@ -31,38 +30,39 @@ mod reduce_sum_of_x_as_u32_y_as_u32 {
         while n >= 64 {
             let x = unsafe { _mm512_loadu_epi8(a.cast()) };
             let y = unsafe { _mm512_loadu_epi8(b.cast()) };
-            let x_l = _mm512_and_si512(x, lo);
-            let x_h = _mm512_and_si512(_mm512_srli_epi16(_mm512_and_si512(x, hi), 8), lo);
-            let y_l = _mm512_and_si512(y, lo);
-            let y_h = _mm512_and_si512(_mm512_srli_epi16(_mm512_and_si512(y, hi), 8), lo);
-            let l = _mm512_mullo_epi16(x_l, y_l);
-            let h = _mm512_mullo_epi16(x_h, y_h);
+            let x_0 = _mm512_and_si512(x, lo);
+            let x_1 = _mm512_srli_epi16(x, 8);
+            let y_0 = _mm512_and_si512(y, lo);
+            let y_1 = _mm512_srli_epi16(y, 8);
+            let z_0 = _mm512_mullo_epi16(x_0, y_0);
+            let z_1 = _mm512_mullo_epi16(x_1, y_1);
             a = unsafe { a.add(64) };
             b = unsafe { b.add(64) };
             n -= 64;
-            _0 = _mm512_add_epi32(_0, _mm512_cvtepu16_epi32(_mm512_extracti32x8_epi32(l, 0)));
-            _1 = _mm512_add_epi32(_1, _mm512_cvtepu16_epi32(_mm512_extracti32x8_epi32(l, 1)));
-            _2 = _mm512_add_epi32(_2, _mm512_cvtepu16_epi32(_mm512_extracti32x8_epi32(h, 0)));
-            _3 = _mm512_add_epi32(_3, _mm512_cvtepu16_epi32(_mm512_extracti32x8_epi32(h, 1)));
+            _0 = _mm512_add_epi32(_0, _mm512_cvtepu16_epi32(_mm512_extracti32x8_epi32(z_0, 0)));
+            _1 = _mm512_add_epi32(_1, _mm512_cvtepu16_epi32(_mm512_extracti32x8_epi32(z_0, 1)));
+            _2 = _mm512_add_epi32(_2, _mm512_cvtepu16_epi32(_mm512_extracti32x8_epi32(z_1, 0)));
+            _3 = _mm512_add_epi32(_3, _mm512_cvtepu16_epi32(_mm512_extracti32x8_epi32(z_1, 1)));
         }
         if n > 0 {
             let mask = _bzhi_u64(0xffffffffffffffff, n as u32);
             let x = unsafe { _mm512_maskz_loadu_epi8(mask, a.cast()) };
             let y = unsafe { _mm512_maskz_loadu_epi8(mask, b.cast()) };
-            let x_l = _mm512_and_si512(x, lo);
-            let x_h = _mm512_and_si512(_mm512_srli_epi16(_mm512_and_si512(x, hi), 8), lo);
-            let y_l = _mm512_and_si512(y, lo);
-            let y_h = _mm512_and_si512(_mm512_srli_epi16(_mm512_and_si512(y, hi), 8), lo);
-            let l = _mm512_mullo_epi16(x_l, y_l);
-            let h = _mm512_mullo_epi16(x_h, y_h);
-            _0 = _mm512_add_epi32(_0, _mm512_cvtepu16_epi32(_mm512_extracti32x8_epi32(l, 0)));
-            _1 = _mm512_add_epi32(_1, _mm512_cvtepu16_epi32(_mm512_extracti32x8_epi32(l, 1)));
-            _2 = _mm512_add_epi32(_2, _mm512_cvtepu16_epi32(_mm512_extracti32x8_epi32(h, 0)));
-            _3 = _mm512_add_epi32(_3, _mm512_cvtepu16_epi32(_mm512_extracti32x8_epi32(h, 1)));
+            let x_0 = _mm512_and_si512(x, lo);
+            let x_1 = _mm512_srli_epi16(x, 8);
+            let y_0 = _mm512_and_si512(y, lo);
+            let y_1 = _mm512_srli_epi16(y, 8);
+            let z_0 = _mm512_mullo_epi16(x_0, y_0);
+            let z_1 = _mm512_mullo_epi16(x_1, y_1);
+            _0 = _mm512_add_epi32(_0, _mm512_cvtepu16_epi32(_mm512_extracti32x8_epi32(z_0, 0)));
+            _1 = _mm512_add_epi32(_1, _mm512_cvtepu16_epi32(_mm512_extracti32x8_epi32(z_0, 1)));
+            _2 = _mm512_add_epi32(_2, _mm512_cvtepu16_epi32(_mm512_extracti32x8_epi32(z_1, 0)));
+            _3 = _mm512_add_epi32(_3, _mm512_cvtepu16_epi32(_mm512_extracti32x8_epi32(z_1, 1)));
         }
-        let _5 = _mm512_add_epi32(_0, _1);
-        let _6 = _mm512_add_epi32(_2, _3);
-        _mm512_reduce_add_epi32(_mm512_add_epi32(_5, _6)) as u32
+        let r_0 = _mm512_add_epi32(_0, _2);
+        let r_1 = _mm512_add_epi32(_1, _3);
+        let r_2 = _mm512_add_epi32(r_0, r_1);
+        _mm512_reduce_add_epi32(r_2) as u32
     }
 
     #[cfg(all(target_arch = "x86_64", test, not(miri)))]
@@ -101,8 +101,7 @@ mod reduce_sum_of_x_as_u32_y_as_u32 {
         let mut n = lhs.len();
         let mut a = lhs.as_ptr();
         let mut b = rhs.as_ptr();
-        let lo = _mm256_set1_epi16(0x00ff_u16 as i16);
-        let hi = _mm256_set1_epi16(0xff00_u16 as i16);
+        let lo = _mm256_set1_epi16(0x00ff_i16);
         let mut _0 = _mm256_setzero_si256();
         let mut _1 = _mm256_setzero_si256();
         let mut _2 = _mm256_setzero_si256();
@@ -110,23 +109,23 @@ mod reduce_sum_of_x_as_u32_y_as_u32 {
         while n >= 32 {
             let x = unsafe { _mm256_loadu_si256(a.cast()) };
             let y = unsafe { _mm256_loadu_si256(b.cast()) };
-            let x_l = _mm256_and_si256(x, lo);
-            let x_h = _mm256_and_si256(_mm256_srli_epi16(_mm256_and_si256(x, hi), 8), lo);
-            let y_l = _mm256_and_si256(y, lo);
-            let y_h = _mm256_and_si256(_mm256_srli_epi16(_mm256_and_si256(y, hi), 8), lo);
-            let l = _mm256_mullo_epi16(x_l, y_l);
-            let h = _mm256_mullo_epi16(x_h, y_h);
+            let x_0 = _mm256_and_si256(x, lo);
+            let x_1 = _mm256_srli_epi16(x, 8);
+            let y_0 = _mm256_and_si256(y, lo);
+            let y_1 = _mm256_srli_epi16(y, 8);
+            let z_0 = _mm256_mullo_epi16(x_0, y_0);
+            let z_1 = _mm256_mullo_epi16(x_1, y_1);
             a = unsafe { a.add(32) };
             b = unsafe { b.add(32) };
             n -= 32;
-            _0 = _mm256_add_epi32(_0, _mm256_cvtepu16_epi32(_mm256_extracti128_si256(l, 0)));
-            _1 = _mm256_add_epi32(_1, _mm256_cvtepu16_epi32(_mm256_extracti128_si256(l, 1)));
-            _2 = _mm256_add_epi32(_2, _mm256_cvtepu16_epi32(_mm256_extracti128_si256(h, 0)));
-            _3 = _mm256_add_epi32(_3, _mm256_cvtepu16_epi32(_mm256_extracti128_si256(h, 1)));
+            _0 = _mm256_add_epi32(_0, _mm256_cvtepu16_epi32(_mm256_extracti128_si256(z_0, 0)));
+            _1 = _mm256_add_epi32(_1, _mm256_cvtepu16_epi32(_mm256_extracti128_si256(z_0, 1)));
+            _2 = _mm256_add_epi32(_2, _mm256_cvtepu16_epi32(_mm256_extracti128_si256(z_1, 0)));
+            _3 = _mm256_add_epi32(_3, _mm256_cvtepu16_epi32(_mm256_extracti128_si256(z_1, 1)));
         }
         let mut sum = emulate_mm256_reduce_add_epi32(_mm256_add_epi32(
-            _mm256_add_epi32(_0, _1),
-            _mm256_add_epi32(_2, _3),
+            _mm256_add_epi32(_0, _2),
+            _mm256_add_epi32(_1, _3),
         )) as u32;
         // this hint is used to disable loop unrolling
         while std::hint::black_box(n) > 0 {
@@ -176,8 +175,7 @@ mod reduce_sum_of_x_as_u32_y_as_u32 {
         let mut n = lhs.len();
         let mut a = lhs.as_ptr();
         let mut b = rhs.as_ptr();
-        let lo = _mm_set1_epi16(0x00ff_u16 as i16);
-        let hi = _mm_set1_epi16(0xff00_u16 as i16);
+        let lo = _mm_set1_epi16(0x00ff_i16);
         let mut _0 = _mm_setzero_si128();
         let mut _1 = _mm_setzero_si128();
         let mut _2 = _mm_setzero_si128();
@@ -185,19 +183,19 @@ mod reduce_sum_of_x_as_u32_y_as_u32 {
         while n >= 16 {
             let x = unsafe { _mm_loadu_si128(a.cast()) };
             let y = unsafe { _mm_loadu_si128(b.cast()) };
-            let x_l = _mm_and_si128(x, lo);
-            let x_h = _mm_and_si128(_mm_srli_epi16(_mm_and_si128(x, hi), 8), lo);
-            let y_l = _mm_and_si128(y, lo);
-            let y_h = _mm_and_si128(_mm_srli_epi16(_mm_and_si128(y, hi), 8), lo);
-            let l = _mm_mullo_epi16(x_l, y_l);
-            let h = _mm_mullo_epi16(x_h, y_h);
+            let x_0 = _mm_and_si128(x, lo);
+            let x_1 = _mm_srli_epi16(x, 8);
+            let y_0 = _mm_and_si128(y, lo);
+            let y_1 = _mm_srli_epi16(y, 8);
+            let z_0 = _mm_mullo_epi16(x_0, y_0);
+            let z_1 = _mm_mullo_epi16(x_1, y_1);
             a = unsafe { a.add(16) };
             b = unsafe { b.add(16) };
             n -= 16;
-            _0 = _mm_add_epi32(_0, _mm_cvtepu16_epi32(l));
-            _1 = _mm_add_epi32(_1, _mm_cvtepu16_epi32(_mm_unpackhi_epi64(l, l)));
-            _2 = _mm_add_epi32(_2, _mm_cvtepu16_epi32(h));
-            _3 = _mm_add_epi32(_3, _mm_cvtepu16_epi32(_mm_unpackhi_epi64(h, h)));
+            _0 = _mm_add_epi32(_0, _mm_cvtepu16_epi32(z_0));
+            _1 = _mm_add_epi32(_1, _mm_cvtepu16_epi32(_mm_unpackhi_epi64(z_0, z_0)));
+            _2 = _mm_add_epi32(_2, _mm_cvtepu16_epi32(z_1));
+            _3 = _mm_add_epi32(_3, _mm_cvtepu16_epi32(_mm_unpackhi_epi64(z_1, z_1)));
         }
         let mut sum = emulate_mm_reduce_add_epi32(_mm_add_epi32(
             _mm_add_epi32(_0, _1),
@@ -256,23 +254,23 @@ mod reduce_sum_of_x_as_u32_y_as_u32 {
         let mut _2 = vdupq_n_u32(0);
         let mut _3 = vdupq_n_u32(0);
         while n >= 16 {
-            let x = vreinterpretq_u16_u8(unsafe { vld1q_u8(a.cast()) });
-            let y = vreinterpretq_u16_u8(unsafe { vld1q_u8(b.cast()) });
-            let x_l = vandq_u16(x, lo);
-            let x_h = vshrq_n_u16(x, 8);
-            let y_l = vandq_u16(y, lo);
-            let y_h = vshrq_n_u16(y, 8);
-            let l = vmulq_u16(x_l, y_l);
-            let h = vmulq_u16(x_h, y_h);
+            let x = unsafe { vld1q_u16(a.cast()) };
+            let y = unsafe { vld1q_u16(b.cast()) };
+            let x_0 = vandq_u16(x, lo);
+            let x_1 = vshrq_n_u16(x, 8);
+            let y_0 = vandq_u16(y, lo);
+            let y_1 = vshrq_n_u16(y, 8);
+            let z_0 = vmulq_u16(x_0, y_0);
+            let z_1 = vmulq_u16(x_1, y_1);
             a = unsafe { a.add(16) };
             b = unsafe { b.add(16) };
             n -= 16;
-            _0 = vaddq_u32(_0, vmovl_u16(vget_low_u16(l)));
-            _1 = vaddq_u32(_1, vmovl_u16(vget_high_u16(l)));
-            _2 = vaddq_u32(_2, vmovl_u16(vget_low_u16(h)));
-            _3 = vaddq_u32(_3, vmovl_u16(vget_high_u16(h)));
+            _0 = vaddq_u32(_0, vmovl_u16(vget_low_u16(z_0)));
+            _1 = vaddq_u32(_1, vmovl_u16(vget_high_u16(z_0)));
+            _2 = vaddq_u32(_2, vmovl_u16(vget_low_u16(z_1)));
+            _3 = vaddq_u32(_3, vmovl_u16(vget_high_u16(z_1)));
         }
-        let mut sum = vaddvq_u32(vaddq_u32(vaddq_u32(_0, _1), vaddq_u32(_2, _3)));
+        let mut sum = vaddvq_u32(vaddq_u32(vaddq_u32(_0, _2), vaddq_u32(_1, _3)));
         // this hint is used to disable loop unrolling
         while std::hint::black_box(n) > 0 {
             let x = unsafe { a.read() };

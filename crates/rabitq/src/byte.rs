@@ -44,7 +44,7 @@ pub mod binary {
     }
 
     pub fn accumulate(x: &[u8], y: &[u8]) -> u32 {
-        simd::u8::reduce_sum_of_x_as_u32_y_as_u32(x, y)
+        simd::byte::reduce_sum_of_x_as_u32_y_as_u32(x, y)
     }
 
     pub fn half_process_dot(
