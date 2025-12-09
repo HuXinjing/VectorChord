@@ -201,7 +201,7 @@ pub mod binary {
     }
 
     #[inline(always)]
-    pub fn half_process_l2(
+    pub fn half_process_l2s(
         sum: u32,
         CodeMetadata {
             dis_u_2,
@@ -223,7 +223,7 @@ pub mod binary {
     }
 
     #[inline(always)]
-    pub fn half_process_l2_residual(
+    pub fn half_process_l2s_residual(
         sum: u32,
         CodeMetadata {
             dis_u_2,
@@ -362,7 +362,7 @@ pub mod block {
     }
 
     #[inline(always)]
-    pub fn full_process_l2(
+    pub fn full_process_l2s(
         (dis_u_2, _, factor_ip, factor_err, t): BlockCode<'_>,
         lut: &BlockLut,
     ) -> [(f32, f32); 32] {
@@ -402,7 +402,7 @@ pub mod block {
     }
 
     #[inline(always)]
-    pub fn half_process_l2(
+    pub fn half_process_l2s(
         sum: u32,
         CodeMetadata {
             dis_u_2,
@@ -419,7 +419,7 @@ pub mod block {
     }
 
     #[inline(always)]
-    pub fn half_process_l2_residual(
+    pub fn half_process_l2s_residual(
         sum: u32,
         CodeMetadata {
             dis_u_2,

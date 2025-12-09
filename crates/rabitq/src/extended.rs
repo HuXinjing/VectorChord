@@ -153,9 +153,9 @@ pub fn ugly_code<const BITS: usize>(vector: &[f32]) -> Code {
     )
 }
 
-pub fn half_process_l2<const X: usize, const Y: usize>(
-    n: u32,
-    value: u32,
+pub fn half_process_l2s<const X: usize, const Y: usize>(
+    dim: u32,
+    sum: u32,
     lhs: CodeMetadata,
     rhs: CodeMetadata,
 ) -> f32 {
@@ -165,7 +165,7 @@ pub fn half_process_l2<const X: usize, const Y: usize>(
     let c_x = ((1 << X) - 1) as f32 * 0.5;
     let c_y = ((1 << Y) - 1) as f32 * 0.5;
 
-    let ip = value as f32 - (c_y * lhs.sum_of_code + c_x * rhs.sum_of_code) + n as f32 * c_x * c_y;
+    let ip = sum as f32 - (c_y * lhs.sum_of_code + c_x * rhs.sum_of_code) + dim as f32 * c_x * c_y;
     lhs.dis_u_2 + rhs.dis_u_2
         - 2.0
             * ip
@@ -174,8 +174,8 @@ pub fn half_process_l2<const X: usize, const Y: usize>(
 }
 
 pub fn half_process_dot<const X: usize, const Y: usize>(
-    n: u32,
-    value: u32,
+    dim: u32,
+    sum: u32,
     lhs: CodeMetadata,
     rhs: CodeMetadata,
 ) -> f32 {
@@ -185,13 +185,13 @@ pub fn half_process_dot<const X: usize, const Y: usize>(
     let c_x = ((1 << X) - 1) as f32 * 0.5;
     let c_y = ((1 << Y) - 1) as f32 * 0.5;
 
-    let ip = value as f32 - (c_y * lhs.sum_of_code + c_x * rhs.sum_of_code) + n as f32 * c_x * c_y;
+    let ip = sum as f32 - (c_y * lhs.sum_of_code + c_x * rhs.sum_of_code) + dim as f32 * c_x * c_y;
     -ip * (lhs.dis_u_2.sqrt() / lhs.norm_of_lattice) * (rhs.dis_u_2.sqrt() / rhs.norm_of_lattice)
 }
 
 pub fn half_process_cos<const X: usize, const Y: usize>(
-    n: u32,
-    value: u32,
+    dim: u32,
+    sum: u32,
     lhs: CodeMetadata,
     rhs: CodeMetadata,
 ) -> f32 {
@@ -201,7 +201,7 @@ pub fn half_process_cos<const X: usize, const Y: usize>(
     let c_x = ((1 << X) - 1) as f32 * 0.5;
     let c_y = ((1 << Y) - 1) as f32 * 0.5;
 
-    let ip = value as f32 - (c_y * lhs.sum_of_code + c_x * rhs.sum_of_code) + n as f32 * c_x * c_y;
+    let ip = sum as f32 - (c_y * lhs.sum_of_code + c_x * rhs.sum_of_code) + dim as f32 * c_x * c_y;
     -ip / lhs.norm_of_lattice / rhs.norm_of_lattice
 }
 
@@ -209,15 +209,15 @@ fn find_scale<const B: usize>(o: &[f32]) -> f32 {
     assert!((1..=8).contains(&B));
 
     let mask = (1_u32 << (B - 1)) - 1;
-    let dims = o.len();
+    let dim = o.len();
 
-    let mut code = Vec::<u8>::with_capacity(dims);
+    let mut code = Vec::<u8>::with_capacity(dim);
     let mut numerator = 0.0f64;
     let mut sqr_denominator = 0.0f64;
 
     let (mut y_m, mut x_m);
 
-    for i in 0..dims {
+    for i in 0..dim {
         code.push(0);
         let value = 0.5;
         numerator += value * o[i] as f64;
@@ -230,7 +230,7 @@ fn find_scale<const B: usize>(o: &[f32]) -> f32 {
     }
 
     let mut events = Vec::<(f64, usize)>::new();
-    for i in 0..dims {
+    for i in 0..dim {
         for c in 1..=mask {
             let x = (c as f64) / o[i] as f64;
             events.push((x, i));
@@ -254,14 +254,14 @@ fn find_scale<const B: usize>(o: &[f32]) -> f32 {
 fn ugly_find_scale<const B: usize>(o: &[f32]) -> (f32, Vec<i32>) {
     assert!((1..=8).contains(&B));
 
-    let dims = o.len();
+    let dim = o.len();
 
-    let mut code = Vec::<u8>::with_capacity(dims);
+    let mut code = Vec::<u8>::with_capacity(dim);
     let mut numerator_m = 0.0f64;
     let mut sqr_denominator_m = 0.0f64;
 
     let scale = (1 << (B - 1)) as f32 / f32::reduce_min_max_of_x(o).1;
-    for i in 0..dims {
+    for i in 0..dim {
         code.push((o[i] as f64 * scale as f64) as u8);
         let value = code[i] as f64 + 0.5;
         numerator_m += value * o[i] as f64;
@@ -269,9 +269,9 @@ fn ugly_find_scale<const B: usize>(o: &[f32]) -> (f32, Vec<i32>) {
     }
     let mut y_m = numerator_m / sqr_denominator_m.sqrt();
 
-    let mut delta = vec![0_i32; dims];
+    let mut delta = vec![0_i32; dim];
     for _ in 0..8 {
-        for i in 0..dims {
+        for i in 0..dim {
             if code[i] < (1 << (B - 1)) - 1 {
                 let numerator = numerator_m + o[i] as f64;
                 let sqr_denominator = sqr_denominator_m + 2.0 * (code[i] as f64 + 1.0);

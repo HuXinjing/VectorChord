@@ -89,28 +89,28 @@ pub mod binary {
 
     pub fn half_process_dot(
         bits: Bits,
-        n: u32,
-        value: u32,
+        dim: u32,
+        sum: u32,
         code: CodeMetadata,
         lut: BinaryLutMetadata,
     ) -> (f32,) {
         let rough = match bits {
-            Bits::_1 => crate::extended::half_process_dot::<1, BITS>(n, value, code, lut),
-            Bits::_2 => crate::extended::half_process_dot::<2, BITS>(n, value, code, lut),
+            Bits::_1 => crate::extended::half_process_dot::<1, BITS>(dim, sum, code, lut),
+            Bits::_2 => crate::extended::half_process_dot::<2, BITS>(dim, sum, code, lut),
         };
         (rough,)
     }
 
-    pub fn half_process_l2(
+    pub fn half_process_l2s(
         bits: Bits,
-        n: u32,
-        value: u32,
+        dim: u32,
+        sum: u32,
         code: CodeMetadata,
         lut: BinaryLutMetadata,
     ) -> (f32,) {
         let rough = match bits {
-            Bits::_1 => crate::extended::half_process_l2::<1, BITS>(n, value, code, lut),
-            Bits::_2 => crate::extended::half_process_l2::<2, BITS>(n, value, code, lut),
+            Bits::_1 => crate::extended::half_process_l2s::<1, BITS>(dim, sum, code, lut),
+            Bits::_2 => crate::extended::half_process_l2s::<2, BITS>(dim, sum, code, lut),
         };
         (rough,)
     }

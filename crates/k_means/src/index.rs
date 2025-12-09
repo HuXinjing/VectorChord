@@ -61,7 +61,8 @@ pub fn rabitq_index(
             if i % 32 == 0 {
                 sum = rabitq::bit::block::accumulate(&blocks[i / 32], &lut.1);
             }
-            let (rough, err) = rabitq::bit::block::half_process_l2(sum[i % 32], metadata[i], lut.0);
+            let (rough, err) =
+                rabitq::bit::block::half_process_l2s(sum[i % 32], metadata[i], lut.0);
             let lowerbound = rough - err * 1.9;
             if lowerbound < result.0 {
                 let dis = f32::reduce_sum_of_d2(sample, centroid);
