@@ -1006,9 +1006,10 @@ mod reduce_min_max_of_x {
         let mut rng = rand::rng();
         for _ in 0..if cfg!(not(miri)) { 256 } else { 1 } {
             let n = 200;
-            let x = (0..n)
+            let mut x = (0..n)
                 .map(|_| rng.random_range(-1.0..=1.0))
                 .collect::<Vec<_>>();
+            (x[0], x[1]) = (f32::NAN, -f32::NAN);
             for z in 50..200 {
                 let x = &x[..z];
                 let specialized = unsafe { reduce_min_max_of_x_v4(x) };
@@ -1060,9 +1061,10 @@ mod reduce_min_max_of_x {
         let mut rng = rand::rng();
         for _ in 0..if cfg!(not(miri)) { 256 } else { 1 } {
             let n = 200;
-            let x = (0..n)
+            let mut x = (0..n)
                 .map(|_| rng.random_range(-1.0..=1.0))
                 .collect::<Vec<_>>();
+            (x[0], x[1]) = (f32::NAN, -f32::NAN);
             for z in 50..200 {
                 let x = &x[..z];
                 let specialized = unsafe { reduce_min_max_of_x_v3(x) };
@@ -1114,65 +1116,13 @@ mod reduce_min_max_of_x {
         let mut rng = rand::rng();
         for _ in 0..if cfg!(not(miri)) { 256 } else { 1 } {
             let n = 200;
-            let x = (0..n)
+            let mut x = (0..n)
                 .map(|_| rng.random_range(-1.0..=1.0))
                 .collect::<Vec<_>>();
+            (x[0], x[1]) = (f32::NAN, -f32::NAN);
             for z in 50..200 {
                 let x = &x[..z];
                 let specialized = unsafe { reduce_min_max_of_x_v2(x) };
-                let fallback = fallback(x);
-                assert_eq!(specialized.0, fallback.0,);
-                assert_eq!(specialized.1, fallback.1,);
-            }
-        }
-    }
-
-    #[inline]
-    #[cfg(target_arch = "aarch64")]
-    #[crate::target_cpu(enable = "a2")]
-    fn reduce_min_max_of_x_a2(this: &[f32]) -> (f32, f32) {
-        use std::arch::aarch64::*;
-        let mut n = this.len();
-        let mut a = this.as_ptr();
-        let mut min = vdupq_n_f32(f32::INFINITY);
-        let mut max = vdupq_n_f32(f32::NEG_INFINITY);
-        while n >= 4 {
-            let x = unsafe { vld1q_f32(a) };
-            a = unsafe { a.add(4) };
-            n -= 4;
-            min = vminq_f32(x, min);
-            max = vmaxq_f32(x, max);
-        }
-        let mut min = vminvq_f32(min);
-        let mut max = vmaxvq_f32(max);
-        // this hint is used to disable loop unrolling
-        while std::hint::black_box(n) > 0 {
-            let x = unsafe { a.read() };
-            a = unsafe { a.add(1) };
-            n -= 1;
-            min = x.min(min);
-            max = x.max(max);
-        }
-        (min, max)
-    }
-
-    #[cfg(all(target_arch = "aarch64", test, not(miri)))]
-    #[test]
-    fn reduce_min_max_of_x_a2_test() {
-        use rand::Rng;
-        if !crate::is_cpu_detected!("a2") {
-            println!("test {} ... skipped (a2)", module_path!());
-            return;
-        }
-        let mut rng = rand::rng();
-        for _ in 0..if cfg!(not(miri)) { 256 } else { 1 } {
-            let n = 200;
-            let x = (0..n)
-                .map(|_| rng.random_range(-1.0..=1.0))
-                .collect::<Vec<_>>();
-            for z in 50..200 {
-                let x = &x[..z];
-                let specialized = unsafe { reduce_min_max_of_x_a2(x) };
                 let fallback = fallback(x);
                 assert_eq!(specialized.0, fallback.0,);
                 assert_eq!(specialized.1, fallback.1,);
@@ -1211,12 +1161,67 @@ mod reduce_min_max_of_x {
         let mut rng = rand::rng();
         for _ in 0..if cfg!(not(miri)) { 256 } else { 1 } {
             let n = 200;
-            let x = (0..n)
+            let mut x = (0..n)
                 .map(|_| rng.random_range(-1.0..=1.0))
                 .collect::<Vec<_>>();
+            (x[0], x[1]) = (f32::NAN, -f32::NAN);
             for z in 50..200 {
                 let x = &x[..z];
                 let specialized = unsafe { reduce_min_max_of_x_a3_256(x) };
+                let fallback = fallback(x);
+                assert_eq!(specialized.0, fallback.0,);
+                assert_eq!(specialized.1, fallback.1,);
+            }
+        }
+    }
+
+    #[inline]
+    #[cfg(target_arch = "aarch64")]
+    #[crate::target_cpu(enable = "a2")]
+    fn reduce_min_max_of_x_a2(this: &[f32]) -> (f32, f32) {
+        use std::arch::aarch64::*;
+        let mut n = this.len();
+        let mut a = this.as_ptr();
+        let mut min = vdupq_n_f32(f32::INFINITY);
+        let mut max = vdupq_n_f32(f32::NEG_INFINITY);
+        while n >= 4 {
+            let x = unsafe { vld1q_f32(a) };
+            a = unsafe { a.add(4) };
+            n -= 4;
+            min = vminnmq_f32(x, min);
+            max = vmaxnmq_f32(x, max);
+        }
+        let mut min = vminnmvq_f32(min);
+        let mut max = vmaxnmvq_f32(max);
+        // this hint is used to disable loop unrolling
+        while std::hint::black_box(n) > 0 {
+            let x = unsafe { a.read() };
+            a = unsafe { a.add(1) };
+            n -= 1;
+            min = x.min(min);
+            max = x.max(max);
+        }
+        (min, max)
+    }
+
+    #[cfg(all(target_arch = "aarch64", test, not(miri)))]
+    #[test]
+    fn reduce_min_max_of_x_a2_test() {
+        use rand::Rng;
+        if !crate::is_cpu_detected!("a2") {
+            println!("test {} ... skipped (a2)", module_path!());
+            return;
+        }
+        let mut rng = rand::rng();
+        for _ in 0..if cfg!(not(miri)) { 256 } else { 1 } {
+            let n = 200;
+            let mut x = (0..n)
+                .map(|_| rng.random_range(-1.0..=1.0))
+                .collect::<Vec<_>>();
+            (x[0], x[1]) = (f32::NAN, -f32::NAN);
+            for z in 50..200 {
+                let x = &x[..z];
+                let specialized = unsafe { reduce_min_max_of_x_a2(x) };
                 let fallback = fallback(x);
                 assert_eq!(specialized.0, fallback.0,);
                 assert_eq!(specialized.1, fallback.1,);

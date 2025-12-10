@@ -217,11 +217,11 @@ fp32_reduce_min_max_of_x_a3_256(float *restrict this, size_t n, float *out_min,
   for (size_t i = 0; i < n; i += svcntw()) {
     svbool_t mask = svwhilelt_b32((int64_t)i, (int64_t)n);
     svfloat32_t x = svld1_f32(mask, this + i);
-    min = svmin_f32_m(mask, min, x);
-    max = svmax_f32_m(mask, max, x);
+    min = svminnm_f32_m(mask, min, x);
+    max = svmaxnm_f32_m(mask, max, x);
   }
-  *out_min = svminv_f32(svptrue_b32(), min);
-  *out_max = svmaxv_f32(svptrue_b32(), max);
+  *out_min = svminnmv_f32(svptrue_b32(), min);
+  *out_max = svmaxnmv_f32(svptrue_b32(), max);
 }
 #endif
 
