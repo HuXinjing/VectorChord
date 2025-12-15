@@ -124,6 +124,11 @@ jobs:
           rustup default nightly
           rustup component add miri
 
+      - name: Install Clang
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://apt.llvm.org/llvm.sh | sudo bash -s -- 18
+          echo CC=clang-18 >> $GITHUB_ENV
+
       - name: Checkout
         uses: actions/checkout@v4
 
@@ -173,6 +178,11 @@ jobs:
 
       - name: Install Rust
         run: rustup update
+
+      - name: Install Clang
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://apt.llvm.org/llvm.sh | sudo bash -s -- 18
+          echo CC=clang-18 >> $GITHUB_ENV
 
       - name: Set up Sccache
         uses: mozilla-actions/sccache-action@v0.0.9
@@ -238,7 +248,7 @@ jobs:
       - name: Install Clang
         run: |
           curl --proto '=https' --tlsv1.2 -sSf https://apt.llvm.org/llvm.sh | sudo bash -s -- 18
-          sudo update-alternatives --install /usr/bin/clang clang $(which clang-18) 255
+          echo CC=clang-18 >> $GITHUB_ENV
 
       - name: Install PostgreSQL & pgvector
         run: |
