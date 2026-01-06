@@ -244,21 +244,20 @@ mod reduce_sum_of_xy {
     #[crate::target_cpu(enable = "v4")]
     #[target_feature(enable = "avx512fp16")]
     pub fn reduce_sum_of_xy_v4_avx512fp16(lhs: &[f16], rhs: &[f16]) -> f32 {
-        assert!(lhs.len() == rhs.len());
-        unsafe {
-            unsafe extern "C" {
-                unsafe fn fp16_reduce_sum_of_xy_v4_avx512fp16(
-                    a: *const (),
-                    b: *const (),
-                    n: usize,
-                ) -> f32;
-            }
-            fp16_reduce_sum_of_xy_v4_avx512fp16(lhs.as_ptr().cast(), rhs.as_ptr().cast(), lhs.len())
+        unsafe extern "C" {
+            #[link_name = "fp16_reduce_sum_of_xy_v4_avx512fp16"]
+            unsafe fn f(n: usize, a: *const f16, b: *const f16) -> f32;
         }
+        assert!(lhs.len() == rhs.len());
+        let n = lhs.len();
+        let a = lhs.as_ptr();
+        let b = rhs.as_ptr();
+        unsafe { f(n, a, b) }
     }
 
-    #[cfg(all(target_arch = "x86_64", test, not(miri)))]
+    #[cfg(all(target_arch = "x86_64", test))]
     #[test]
+    #[cfg_attr(miri, ignore)]
     fn reduce_sum_of_xy_v4_avx512fp16_test() {
         use rand::Rng;
         const EPSILON: f32 = 2.0;
@@ -293,30 +292,29 @@ mod reduce_sum_of_xy {
     #[crate::target_cpu(enable = "v4")]
     pub fn reduce_sum_of_xy_v4(lhs: &[f16], rhs: &[f16]) -> f32 {
         assert!(lhs.len() == rhs.len());
-        use std::arch::x86_64::*;
+        use core::arch::x86_64::*;
         let mut n = lhs.len();
         let mut a = lhs.as_ptr();
         let mut b = rhs.as_ptr();
-        let mut xy = _mm512_setzero_ps();
+        let mut sum = _mm512_setzero_ps();
         while n >= 16 {
             let x = unsafe { _mm512_cvtph_ps(_mm256_loadu_epi16(a.cast())) };
             let y = unsafe { _mm512_cvtph_ps(_mm256_loadu_epi16(b.cast())) };
-            a = unsafe { a.add(16) };
-            b = unsafe { b.add(16) };
-            n -= 16;
-            xy = _mm512_fmadd_ps(x, y, xy);
+            sum = _mm512_fmadd_ps(x, y, sum);
+            (n, a, b) = unsafe { (n - 16, a.add(16), b.add(16)) };
         }
         if n > 0 {
             let mask = _bzhi_u32(0xffff, n as u32) as u16;
             let x = unsafe { _mm512_cvtph_ps(_mm256_maskz_loadu_epi16(mask, a.cast())) };
             let y = unsafe { _mm512_cvtph_ps(_mm256_maskz_loadu_epi16(mask, b.cast())) };
-            xy = _mm512_fmadd_ps(x, y, xy);
+            sum = _mm512_fmadd_ps(x, y, sum);
         }
-        _mm512_reduce_add_ps(xy)
+        _mm512_reduce_add_ps(sum)
     }
 
-    #[cfg(all(target_arch = "x86_64", test, not(miri)))]
+    #[cfg(all(target_arch = "x86_64", test))]
     #[test]
+    #[cfg_attr(miri, ignore)]
     fn reduce_sum_of_xy_v4_test() {
         use rand::Rng;
         const EPSILON: f32 = 2.0;
@@ -346,36 +344,32 @@ mod reduce_sum_of_xy {
     #[cfg(target_arch = "x86_64")]
     #[crate::target_cpu(enable = "v3")]
     pub fn reduce_sum_of_xy_v3(lhs: &[f16], rhs: &[f16]) -> f32 {
-        use crate::emulate::emulate_mm256_reduce_add_ps;
+        use crate::emulate::{emulate_mm256_reduce_add_ps, partial_load};
+        use core::arch::x86_64::*;
         assert!(lhs.len() == rhs.len());
-        use std::arch::x86_64::*;
         let mut n = lhs.len();
         let mut a = lhs.as_ptr();
         let mut b = rhs.as_ptr();
-        let mut xy = _mm256_setzero_ps();
+        let mut sum = _mm256_setzero_ps();
         while n >= 8 {
             let x = unsafe { _mm256_cvtph_ps(_mm_loadu_si128(a.cast())) };
             let y = unsafe { _mm256_cvtph_ps(_mm_loadu_si128(b.cast())) };
-            a = unsafe { a.add(8) };
-            b = unsafe { b.add(8) };
-            n -= 8;
-            xy = _mm256_fmadd_ps(x, y, xy);
+            sum = _mm256_fmadd_ps(x, y, sum);
+            (n, a, b) = unsafe { (n - 8, a.add(8), b.add(8)) };
         }
-        let mut xy = emulate_mm256_reduce_add_ps(xy);
-        // this hint is used to disable loop unrolling
-        while std::hint::black_box(n) > 0 {
-            let x = unsafe { a.read()._to_f32() };
-            let y = unsafe { b.read()._to_f32() };
-            a = unsafe { a.add(1) };
-            b = unsafe { b.add(1) };
-            n -= 1;
-            xy += x * y;
+        if n > 0 {
+            let (_a, _b) = unsafe { partial_load!(8, n, a, b) };
+            (a, b) = (_a.as_ptr(), _b.as_ptr());
+            let x = unsafe { _mm256_cvtph_ps(_mm_loadu_si128(a.cast())) };
+            let y = unsafe { _mm256_cvtph_ps(_mm_loadu_si128(b.cast())) };
+            sum = _mm256_fmadd_ps(x, y, sum);
         }
-        xy
+        emulate_mm256_reduce_add_ps(sum)
     }
 
-    #[cfg(all(target_arch = "x86_64", test, not(miri)))]
+    #[cfg(all(target_arch = "x86_64", test))]
     #[test]
+    #[cfg_attr(miri, ignore)]
     fn reduce_sum_of_xy_v3_test() {
         use rand::Rng;
         const EPSILON: f32 = 2.0;
@@ -406,70 +400,23 @@ mod reduce_sum_of_xy {
     }
 
     #[inline]
-    #[cfg(target_arch = "aarch64")]
-    #[crate::target_cpu(enable = "a2")]
-    #[target_feature(enable = "fp16")]
-    pub fn reduce_sum_of_xy_a2_fp16(lhs: &[f16], rhs: &[f16]) -> f32 {
-        assert!(lhs.len() == rhs.len());
-        unsafe {
-            unsafe extern "C" {
-                unsafe fn fp16_reduce_sum_of_xy_a2_fp16(
-                    a: *const (),
-                    b: *const (),
-                    n: usize,
-                ) -> f32;
-            }
-            fp16_reduce_sum_of_xy_a2_fp16(lhs.as_ptr().cast(), rhs.as_ptr().cast(), lhs.len())
-        }
-    }
-
-    #[cfg(all(target_arch = "aarch64", test, not(miri)))]
-    #[test]
-    fn reduce_sum_of_xy_a2_fp16_test() {
-        use rand::Rng;
-        const EPSILON: f32 = 2.0;
-        if !crate::is_cpu_detected!("a2") || !crate::is_feature_detected!("fp16") {
-            println!("test {} ... skipped (a2:fp16)", module_path!());
-            return;
-        }
-        let mut rng = rand::rng();
-        for _ in 0..if cfg!(not(miri)) { 256 } else { 1 } {
-            let n = 4016;
-            let lhs = (0..n)
-                .map(|_| f16::_from_f32(rng.random_range(-1.0..=1.0)))
-                .collect::<Vec<_>>();
-            let rhs = (0..n)
-                .map(|_| f16::_from_f32(rng.random_range(-1.0..=1.0)))
-                .collect::<Vec<_>>();
-            for z in 3984..4016 {
-                let lhs = &lhs[..z];
-                let rhs = &rhs[..z];
-                let specialized = unsafe { reduce_sum_of_xy_a2_fp16(lhs, rhs) };
-                let fallback = fallback(lhs, rhs);
-                assert!(
-                    (specialized - fallback).abs() < EPSILON,
-                    "specialized = {specialized}, fallback = {fallback}."
-                );
-            }
-        }
-    }
-
-    #[inline]
     #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
     #[crate::target_cpu(enable = "a3.512")]
-    pub fn reduce_sum_of_xy_a3_512(lhs: &[f16], rhs: &[f16]) -> f32 {
-        assert!(lhs.len() == rhs.len());
-        unsafe {
-            unsafe extern "C" {
-                unsafe fn fp16_reduce_sum_of_xy_a3_512(a: *const (), b: *const (), n: usize)
-                -> f32;
-            }
-            fp16_reduce_sum_of_xy_a3_512(lhs.as_ptr().cast(), rhs.as_ptr().cast(), lhs.len())
+    fn reduce_sum_of_xy_a3_512(lhs: &[f16], rhs: &[f16]) -> f32 {
+        unsafe extern "C" {
+            #[link_name = "fp16_reduce_sum_of_xy_a3_512"]
+            unsafe fn f(n: usize, a: *const f16, b: *const f16) -> f32;
         }
+        assert!(lhs.len() == rhs.len());
+        let n = lhs.len();
+        let a = lhs.as_ptr();
+        let b = rhs.as_ptr();
+        unsafe { f(n, a, b) }
     }
 
-    #[cfg(all(target_arch = "aarch64", target_endian = "little", test, not(miri)))]
+    #[cfg(all(target_arch = "aarch64", target_endian = "little", test))]
     #[test]
+    #[cfg_attr(miri, ignore)]
     fn reduce_sum_of_xy_a3_512_test() {
         use rand::Rng;
         const EPSILON: f32 = 2.0;
@@ -499,15 +446,63 @@ mod reduce_sum_of_xy {
         }
     }
 
+    #[inline]
+    #[cfg(target_arch = "aarch64")]
+    #[crate::target_cpu(enable = "a2")]
+    #[target_feature(enable = "fp16")]
+    pub fn reduce_sum_of_xy_a2_fp16(lhs: &[f16], rhs: &[f16]) -> f32 {
+        unsafe extern "C" {
+            #[link_name = "fp16_reduce_sum_of_xy_a2_fp16"]
+            unsafe fn f(n: usize, a: *const f16, b: *const f16) -> f32;
+        }
+        assert!(lhs.len() == rhs.len());
+        let n = lhs.len();
+        let a = lhs.as_ptr();
+        let b = rhs.as_ptr();
+        unsafe { f(n, a, b) }
+    }
+
+    #[cfg(all(target_arch = "aarch64", test))]
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn reduce_sum_of_xy_a2_fp16_test() {
+        use rand::Rng;
+        const EPSILON: f32 = 2.0;
+        if !crate::is_cpu_detected!("a2") || !crate::is_feature_detected!("fp16") {
+            println!("test {} ... skipped (a2:fp16)", module_path!());
+            return;
+        }
+        let mut rng = rand::rng();
+        for _ in 0..if cfg!(not(miri)) { 256 } else { 1 } {
+            let n = 4016;
+            let lhs = (0..n)
+                .map(|_| f16::_from_f32(rng.random_range(-1.0..=1.0)))
+                .collect::<Vec<_>>();
+            let rhs = (0..n)
+                .map(|_| f16::_from_f32(rng.random_range(-1.0..=1.0)))
+                .collect::<Vec<_>>();
+            for z in 3984..4016 {
+                let lhs = &lhs[..z];
+                let rhs = &rhs[..z];
+                let specialized = unsafe { reduce_sum_of_xy_a2_fp16(lhs, rhs) };
+                let fallback = fallback(lhs, rhs);
+                assert!(
+                    (specialized - fallback).abs() < EPSILON,
+                    "specialized = {specialized}, fallback = {fallback}."
+                );
+            }
+        }
+    }
+
     #[crate::multiversion(@"v4:avx512fp16", @"v4", @"v3", #[cfg(target_endian = "little")] @"a3.512", @"a2:fp16", "z17", "z16", "z15", "z14", "z13", "p9", "p8", "p7", "r1")]
     pub fn reduce_sum_of_xy(lhs: &[f16], rhs: &[f16]) -> f32 {
         assert!(lhs.len() == rhs.len());
         let n = lhs.len();
-        let mut xy = 0.0f32;
+        let mut sum = 0.0f32;
         for i in 0..n {
-            xy += lhs[i]._to_f32() * rhs[i]._to_f32();
+            sum += lhs[i]._to_f32() * rhs[i]._to_f32();
         }
-        xy
+        sum
     }
 }
 
@@ -519,21 +514,20 @@ mod reduce_sum_of_d2 {
     #[crate::target_cpu(enable = "v4")]
     #[target_feature(enable = "avx512fp16")]
     pub fn reduce_sum_of_d2_v4_avx512fp16(lhs: &[f16], rhs: &[f16]) -> f32 {
-        assert!(lhs.len() == rhs.len());
-        unsafe {
-            unsafe extern "C" {
-                unsafe fn fp16_reduce_sum_of_d2_v4_avx512fp16(
-                    a: *const (),
-                    b: *const (),
-                    n: usize,
-                ) -> f32;
-            }
-            fp16_reduce_sum_of_d2_v4_avx512fp16(lhs.as_ptr().cast(), rhs.as_ptr().cast(), lhs.len())
+        unsafe extern "C" {
+            #[link_name = "fp16_reduce_sum_of_d2_v4_avx512fp16"]
+            unsafe fn f(n: usize, a: *const f16, b: *const f16) -> f32;
         }
+        assert!(lhs.len() == rhs.len());
+        let n = lhs.len();
+        let a = lhs.as_ptr();
+        let b = rhs.as_ptr();
+        unsafe { f(n, a, b) }
     }
 
-    #[cfg(all(target_arch = "x86_64", test, not(miri)))]
+    #[cfg(all(target_arch = "x86_64", test))]
     #[test]
+    #[cfg_attr(miri, ignore)]
     fn reduce_sum_of_d2_v4_avx512fp16_test() {
         use rand::Rng;
         const EPSILON: f32 = 6.4;
@@ -568,32 +562,31 @@ mod reduce_sum_of_d2 {
     #[crate::target_cpu(enable = "v4")]
     pub fn reduce_sum_of_d2_v4(lhs: &[f16], rhs: &[f16]) -> f32 {
         assert!(lhs.len() == rhs.len());
-        use std::arch::x86_64::*;
+        use core::arch::x86_64::*;
         let mut n = lhs.len();
         let mut a = lhs.as_ptr();
         let mut b = rhs.as_ptr();
-        let mut d2 = _mm512_setzero_ps();
+        let mut sum = _mm512_setzero_ps();
         while n >= 16 {
             let x = unsafe { _mm512_cvtph_ps(_mm256_loadu_epi16(a.cast())) };
             let y = unsafe { _mm512_cvtph_ps(_mm256_loadu_epi16(b.cast())) };
-            a = unsafe { a.add(16) };
-            b = unsafe { b.add(16) };
-            n -= 16;
             let d = _mm512_sub_ps(x, y);
-            d2 = _mm512_fmadd_ps(d, d, d2);
+            sum = _mm512_fmadd_ps(d, d, sum);
+            (n, a, b) = unsafe { (n - 16, a.add(16), b.add(16)) };
         }
         if n > 0 {
             let mask = _bzhi_u32(0xffff, n as u32) as u16;
             let x = unsafe { _mm512_cvtph_ps(_mm256_maskz_loadu_epi16(mask, a.cast())) };
             let y = unsafe { _mm512_cvtph_ps(_mm256_maskz_loadu_epi16(mask, b.cast())) };
             let d = _mm512_sub_ps(x, y);
-            d2 = _mm512_fmadd_ps(d, d, d2);
+            sum = _mm512_fmadd_ps(d, d, sum);
         }
-        _mm512_reduce_add_ps(d2)
+        _mm512_reduce_add_ps(sum)
     }
 
-    #[cfg(all(target_arch = "x86_64", test, not(miri)))]
+    #[cfg(all(target_arch = "x86_64", test))]
     #[test]
+    #[cfg_attr(miri, ignore)]
     fn reduce_sum_of_d2_v4_test() {
         use rand::Rng;
         const EPSILON: f32 = 2.0;
@@ -627,38 +620,35 @@ mod reduce_sum_of_d2 {
     #[cfg(target_arch = "x86_64")]
     #[crate::target_cpu(enable = "v3")]
     pub fn reduce_sum_of_d2_v3(lhs: &[f16], rhs: &[f16]) -> f32 {
-        use crate::emulate::emulate_mm256_reduce_add_ps;
+        use crate::emulate::{emulate_mm256_reduce_add_ps, partial_load};
         assert!(lhs.len() == rhs.len());
-        use std::arch::x86_64::*;
+        use core::arch::x86_64::*;
         let mut n = lhs.len();
         let mut a = lhs.as_ptr();
         let mut b = rhs.as_ptr();
-        let mut d2 = _mm256_setzero_ps();
+        let mut sum = _mm256_setzero_ps();
         while n >= 8 {
             let x = unsafe { _mm256_cvtph_ps(_mm_loadu_si128(a.cast())) };
             let y = unsafe { _mm256_cvtph_ps(_mm_loadu_si128(b.cast())) };
-            a = unsafe { a.add(8) };
-            b = unsafe { b.add(8) };
-            n -= 8;
             let d = _mm256_sub_ps(x, y);
-            d2 = _mm256_fmadd_ps(d, d, d2);
+            sum = _mm256_fmadd_ps(d, d, sum);
+            (n, a, b) = unsafe { (n - 8, a.add(8), b.add(8)) };
         }
-        let mut d2 = emulate_mm256_reduce_add_ps(d2);
-        // this hint is used to disable loop unrolling
-        while std::hint::black_box(n) > 0 {
-            let x = unsafe { a.read()._to_f32() };
-            let y = unsafe { b.read()._to_f32() };
-            a = unsafe { a.add(1) };
-            b = unsafe { b.add(1) };
-            n -= 1;
-            let d = x - y;
-            d2 += d * d;
+        if n > 0 {
+            let (_a, _b) = unsafe { partial_load!(8, n, a, b) };
+            (a, b) = (_a.as_ptr(), _b.as_ptr());
+
+            let x = unsafe { _mm256_cvtph_ps(_mm_loadu_si128(a.cast())) };
+            let y = unsafe { _mm256_cvtph_ps(_mm_loadu_si128(b.cast())) };
+            let d = _mm256_sub_ps(x, y);
+            sum = _mm256_fmadd_ps(d, d, sum);
         }
-        d2
+        emulate_mm256_reduce_add_ps(sum)
     }
 
-    #[cfg(all(target_arch = "x86_64", test, not(miri)))]
+    #[cfg(all(target_arch = "x86_64", test))]
     #[test]
+    #[cfg_attr(miri, ignore)]
     fn reduce_sum_of_d2_v3_test() {
         use rand::Rng;
         const EPSILON: f32 = 2.0;
@@ -689,70 +679,23 @@ mod reduce_sum_of_d2 {
     }
 
     #[inline]
-    #[cfg(target_arch = "aarch64")]
-    #[crate::target_cpu(enable = "a2")]
-    #[target_feature(enable = "fp16")]
-    pub fn reduce_sum_of_d2_a2_fp16(lhs: &[f16], rhs: &[f16]) -> f32 {
-        assert!(lhs.len() == rhs.len());
-        unsafe {
-            unsafe extern "C" {
-                unsafe fn fp16_reduce_sum_of_d2_a2_fp16(
-                    a: *const (),
-                    b: *const (),
-                    n: usize,
-                ) -> f32;
-            }
-            fp16_reduce_sum_of_d2_a2_fp16(lhs.as_ptr().cast(), rhs.as_ptr().cast(), lhs.len())
-        }
-    }
-
-    #[cfg(all(target_arch = "aarch64", test, not(miri)))]
-    #[test]
-    fn reduce_sum_of_d2_a2_fp16_test() {
-        use rand::Rng;
-        const EPSILON: f32 = 6.4;
-        if !crate::is_cpu_detected!("a2") || !crate::is_feature_detected!("fp16") {
-            println!("test {} ... skipped (a2:fp16)", module_path!());
-            return;
-        }
-        let mut rng = rand::rng();
-        for _ in 0..if cfg!(not(miri)) { 256 } else { 1 } {
-            let n = 4016;
-            let lhs = (0..n)
-                .map(|_| f16::_from_f32(rng.random_range(-1.0..=1.0)))
-                .collect::<Vec<_>>();
-            let rhs = (0..n)
-                .map(|_| f16::_from_f32(rng.random_range(-1.0..=1.0)))
-                .collect::<Vec<_>>();
-            for z in 3984..4016 {
-                let lhs = &lhs[..z];
-                let rhs = &rhs[..z];
-                let specialized = unsafe { reduce_sum_of_d2_a2_fp16(lhs, rhs) };
-                let fallback = fallback(lhs, rhs);
-                assert!(
-                    (specialized - fallback).abs() < EPSILON,
-                    "specialized = {specialized}, fallback = {fallback}."
-                );
-            }
-        }
-    }
-
-    #[inline]
     #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
     #[crate::target_cpu(enable = "a3.512")]
-    pub fn reduce_sum_of_d2_a3_512(lhs: &[f16], rhs: &[f16]) -> f32 {
-        assert!(lhs.len() == rhs.len());
-        unsafe {
-            unsafe extern "C" {
-                unsafe fn fp16_reduce_sum_of_d2_a3_512(a: *const (), b: *const (), n: usize)
-                -> f32;
-            }
-            fp16_reduce_sum_of_d2_a3_512(lhs.as_ptr().cast(), rhs.as_ptr().cast(), lhs.len())
+    fn reduce_sum_of_d2_a3_512(lhs: &[f16], rhs: &[f16]) -> f32 {
+        unsafe extern "C" {
+            #[link_name = "fp16_reduce_sum_of_d2_a3_512"]
+            unsafe fn f(n: usize, a: *const f16, b: *const f16) -> f32;
         }
+        assert!(lhs.len() == rhs.len());
+        let n = lhs.len();
+        let a = lhs.as_ptr();
+        let b = rhs.as_ptr();
+        unsafe { f(n, a, b) }
     }
 
-    #[cfg(all(target_arch = "aarch64", target_endian = "little", test, not(miri)))]
+    #[cfg(all(target_arch = "aarch64", target_endian = "little", test))]
     #[test]
+    #[cfg_attr(miri, ignore)]
     fn reduce_sum_of_d2_a3_512_test() {
         use rand::Rng;
         const EPSILON: f32 = 6.4;
@@ -782,16 +725,64 @@ mod reduce_sum_of_d2 {
         }
     }
 
+    #[inline]
+    #[cfg(target_arch = "aarch64")]
+    #[crate::target_cpu(enable = "a2")]
+    #[target_feature(enable = "fp16")]
+    pub fn reduce_sum_of_d2_a2_fp16(lhs: &[f16], rhs: &[f16]) -> f32 {
+        unsafe extern "C" {
+            #[link_name = "fp16_reduce_sum_of_d2_a2_fp16"]
+            unsafe fn f(n: usize, a: *const f16, b: *const f16) -> f32;
+        }
+        assert!(lhs.len() == rhs.len());
+        let n = lhs.len();
+        let a = lhs.as_ptr().cast();
+        let b = rhs.as_ptr().cast();
+        unsafe { f(n, a, b) }
+    }
+
+    #[cfg(all(target_arch = "aarch64", test))]
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn reduce_sum_of_d2_a2_fp16_test() {
+        use rand::Rng;
+        const EPSILON: f32 = 6.4;
+        if !crate::is_cpu_detected!("a2") || !crate::is_feature_detected!("fp16") {
+            println!("test {} ... skipped (a2:fp16)", module_path!());
+            return;
+        }
+        let mut rng = rand::rng();
+        for _ in 0..if cfg!(not(miri)) { 256 } else { 1 } {
+            let n = 4016;
+            let lhs = (0..n)
+                .map(|_| f16::_from_f32(rng.random_range(-1.0..=1.0)))
+                .collect::<Vec<_>>();
+            let rhs = (0..n)
+                .map(|_| f16::_from_f32(rng.random_range(-1.0..=1.0)))
+                .collect::<Vec<_>>();
+            for z in 3984..4016 {
+                let lhs = &lhs[..z];
+                let rhs = &rhs[..z];
+                let specialized = unsafe { reduce_sum_of_d2_a2_fp16(lhs, rhs) };
+                let fallback = fallback(lhs, rhs);
+                assert!(
+                    (specialized - fallback).abs() < EPSILON,
+                    "specialized = {specialized}, fallback = {fallback}."
+                );
+            }
+        }
+    }
+
     #[crate::multiversion(@"v4:avx512fp16", @"v4", @"v3", #[cfg(target_endian = "little")] @"a3.512", @"a2:fp16", "z17", "z16", "z15", "z14", "z13", "p9", "p8", "p7", "r1")]
     pub fn reduce_sum_of_d2(lhs: &[f16], rhs: &[f16]) -> f32 {
         assert!(lhs.len() == rhs.len());
         let n = lhs.len();
-        let mut d2 = 0.0_f32;
+        let mut sum = 0.0_f32;
         for i in 0..n {
             let d = lhs[i]._to_f32() - rhs[i]._to_f32();
-            d2 += d * d;
+            sum += d * d;
         }
-        d2
+        sum
     }
 }
 
@@ -810,11 +801,11 @@ mod reduce_sum_of_xy_sparse {
         assert_eq!(ridx.len(), rval.len());
         let (mut lp, ln) = (0, lidx.len());
         let (mut rp, rn) = (0, ridx.len());
-        let mut xy = 0.0f32;
+        let mut sum = 0.0f32;
         while lp < ln && rp < rn {
             match Ord::cmp(&lidx[lp], &ridx[rp]) {
                 Ordering::Equal => {
-                    xy += lval[lp]._to_f32() * rval[rp]._to_f32();
+                    sum += lval[lp]._to_f32() * rval[rp]._to_f32();
                     lp += 1;
                     rp += 1;
                 }
@@ -826,7 +817,7 @@ mod reduce_sum_of_xy_sparse {
                 }
             }
         }
-        xy
+        sum
     }
 }
 
@@ -845,32 +836,32 @@ mod reduce_sum_of_d2_sparse {
         assert_eq!(ridx.len(), rval.len());
         let (mut lp, ln) = (0, lidx.len());
         let (mut rp, rn) = (0, ridx.len());
-        let mut d2 = 0.0f32;
+        let mut sum = 0.0f32;
         while lp < ln && rp < rn {
             match Ord::cmp(&lidx[lp], &ridx[rp]) {
                 Ordering::Equal => {
                     let d = lval[lp]._to_f32() - rval[rp]._to_f32();
-                    d2 += d * d;
+                    sum += d * d;
                     lp += 1;
                     rp += 1;
                 }
                 Ordering::Less => {
-                    d2 += lval[lp]._to_f32() * lval[lp]._to_f32();
+                    sum += lval[lp]._to_f32() * lval[lp]._to_f32();
                     lp += 1;
                 }
                 Ordering::Greater => {
-                    d2 += rval[rp]._to_f32() * rval[rp]._to_f32();
+                    sum += rval[rp]._to_f32() * rval[rp]._to_f32();
                     rp += 1;
                 }
             }
         }
         for i in lp..ln {
-            d2 += lval[i]._to_f32() * lval[i]._to_f32();
+            sum += lval[i]._to_f32() * lval[i]._to_f32();
         }
         for i in rp..rn {
-            d2 += rval[i]._to_f32() * rval[i]._to_f32();
+            sum += rval[i]._to_f32() * rval[i]._to_f32();
         }
-        d2
+        sum
     }
 }
 

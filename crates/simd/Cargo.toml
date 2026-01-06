@@ -4,6 +4,10 @@ version.workspace = true
 edition.workspace = true
 publish = false
 
+[[bench]]
+name = "bench"
+harness = false
+
 [features]
 init = []
 nightly_f16 = ["zerocopy/float-nightly"]
@@ -16,6 +20,7 @@ seq-macro.workspace = true
 zerocopy.workspace = true
 
 [dev-dependencies]
+criterion = "0.8.1"
 rand.workspace = true
 
 [build-dependencies]

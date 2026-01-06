@@ -60,46 +60,42 @@ typedef float f32;
 
 __attribute__((target("avx512bw,avx512cd,avx512dq,avx512vl,bmi,bmi2,lzcnt,"
                       "movbe,popcnt,avx512fp16"))) float
-fp16_reduce_sum_of_xy_v4_avx512fp16(f16 *restrict a, f16 *restrict b,
-                                    size_t n) {
-  __m512h xy = _mm512_setzero_ph();
+fp16_reduce_sum_of_xy_v4_avx512fp16(size_t n, f16 *restrict a,
+                                    f16 *restrict b) {
+  __m512h sum = _mm512_setzero_ph();
   while (n >= 32) {
     __m512h x = _mm512_loadu_ph(a);
     __m512h y = _mm512_loadu_ph(b);
-    a += 32;
-    b += 32;
-    n -= 32;
-    xy = _mm512_fmadd_ph(x, y, xy);
+    sum = _mm512_fmadd_ph(x, y, sum);
+    n -= 32, a += 32, b += 32;
   }
   if (n > 0) {
     unsigned int mask = _bzhi_u32(0xffffffff, n);
     __m512h x = _mm512_castsi512_ph(_mm512_maskz_loadu_epi16(mask, a));
     __m512h y = _mm512_castsi512_ph(_mm512_maskz_loadu_epi16(mask, b));
-    xy = _mm512_fmadd_ph(x, y, xy);
+    sum = _mm512_fmadd_ph(x, y, sum);
   }
-  return _mm512_reduce_add_ph(xy);
+  return _mm512_reduce_add_ph(sum);
 }
 
 __attribute__((target("avx512bw,avx512cd,avx512dq,avx512vl,bmi,bmi2,lzcnt,"
                       "movbe,popcnt,avx512fp16"))) float
-fp16_reduce_sum_of_d2_v4_avx512fp16(f16 *restrict a, f16 *restrict b,
-                                    size_t n) {
-  __m512h d2 = _mm512_setzero_ph();
+fp16_reduce_sum_of_d2_v4_avx512fp16(size_t n, f16 *restrict a,
+                                    f16 *restrict b) {
+  __m512h sum = _mm512_setzero_ph();
   while (n >= 32) {
     __m512h x = _mm512_loadu_ph(a);
     __m512h y = _mm512_loadu_ph(b);
-    a += 32;
-    b += 32;
-    n -= 32;
     __m512h d = _mm512_sub_ph(x, y);
-    d2 = _mm512_fmadd_ph(d, d, d2);
+    sum = _mm512_fmadd_ph(d, d, sum);
+    n -= 32, a += 32, b += 32;
   }
   if (n > 0) {
     unsigned int mask = _bzhi_u32(0xffffffff, n);
     __m512h x = _mm512_castsi512_ph(_mm512_maskz_loadu_epi16(mask, a));
     __m512h y = _mm512_castsi512_ph(_mm512_maskz_loadu_epi16(mask, b));
     __m512h d = _mm512_sub_ph(x, y);
-    d2 = _mm512_fmadd_ph(d, d, d2);
+    sum = _mm512_fmadd_ph(d, d, sum);
   }
-  return _mm512_reduce_add_ph(d2);
+  return _mm512_reduce_add_ph(sum);
 }

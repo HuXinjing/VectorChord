@@ -109,7 +109,8 @@ pub trait Floating:
     fn vector_abs_inplace(this: &mut [Self]);
 }
 
-mod internal {
+#[doc(hidden)]
+pub mod internal {
     #[cfg(target_arch = "x86_64")]
     simd_macros::define_is_cpu_detected!("x86_64");
 
@@ -211,7 +212,6 @@ mod internal {
     }
 
     #[cfg(target_arch = "aarch64")]
-    #[expect(dead_code)]
     pub fn is_a3_128_detected() -> bool {
         std::arch::is_aarch64_feature_detected!("sve")
     }

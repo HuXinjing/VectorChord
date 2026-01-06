@@ -12,6 +12,33 @@
 //
 // Copyright (c) 2025 TensorChord Inc.
 
+macro_rules! partial_load {
+    (@internal_0) => {
+        ::core::mem::zeroed()
+    };
+    (@internal_0 $x:expr) => {
+        $x
+    };
+    ($N:literal, $n:ident, $($p:ident $(= $x:expr)?),+) => {
+        (
+            $(
+                {
+                    ::core::hint::assert_unchecked($n < $N);
+                    let mut result = [$crate::emulate::partial_load!(@internal_0 $($x)?); $N];
+                    // LLVM loves `memcpy`, which is much slower.
+                    // So we use an explicit loop here.
+                    for i in 0..$n {
+                        result[i] = $p.add(i).read();
+                    }
+                    result
+                },
+            )+
+        )
+    };
+}
+
+pub(crate) use partial_load;
+
 // VP2INTERSECT emulation.
 // Díez-Cañas, G. (2021). Faster-Than-Native Alternatives for x86 VP2INTERSECT
 // Instructions. arXiv preprint arXiv:2112.06342.
@@ -19,10 +46,10 @@
 #[cfg(target_arch = "x86_64")]
 #[crate::target_cpu(enable = "v4")]
 pub fn emulate_mm512_2intersect_epi32(
-    a: std::arch::x86_64::__m512i,
-    b: std::arch::x86_64::__m512i,
-) -> (std::arch::x86_64::__mmask16, std::arch::x86_64::__mmask16) {
-    use std::arch::x86_64::*;
+    a: core::arch::x86_64::__m512i,
+    b: core::arch::x86_64::__m512i,
+) -> (core::arch::x86_64::__mmask16, core::arch::x86_64::__mmask16) {
+    use core::arch::x86_64::*;
 
     let a1 = _mm512_alignr_epi32(a, a, 4);
     let a2 = _mm512_alignr_epi32(a, a, 8);
@@ -73,8 +100,8 @@ pub fn emulate_mm512_2intersect_epi32(
 #[inline]
 #[cfg(target_arch = "x86_64")]
 #[crate::target_cpu(enable = "v3")]
-pub fn emulate_mm256_reduce_add_ps(mut x: std::arch::x86_64::__m256) -> f32 {
-    use std::arch::x86_64::*;
+pub fn emulate_mm256_reduce_add_ps(mut x: core::arch::x86_64::__m256) -> f32 {
+    use core::arch::x86_64::*;
     x = _mm256_add_ps(x, _mm256_permute2f128_ps(x, x, 1));
     x = _mm256_hadd_ps(x, x);
     x = _mm256_hadd_ps(x, x);
@@ -84,8 +111,8 @@ pub fn emulate_mm256_reduce_add_ps(mut x: std::arch::x86_64::__m256) -> f32 {
 #[inline]
 #[cfg(target_arch = "x86_64")]
 #[crate::target_cpu(enable = "v2")]
-pub fn emulate_mm_reduce_add_ps(mut x: std::arch::x86_64::__m128) -> f32 {
-    use std::arch::x86_64::*;
+pub fn emulate_mm_reduce_add_ps(mut x: core::arch::x86_64::__m128) -> f32 {
+    use core::arch::x86_64::*;
     x = _mm_hadd_ps(x, x);
     x = _mm_hadd_ps(x, x);
     _mm_cvtss_f32(x)
@@ -93,43 +120,9 @@ pub fn emulate_mm_reduce_add_ps(mut x: std::arch::x86_64::__m128) -> f32 {
 
 #[inline]
 #[cfg(target_arch = "x86_64")]
-#[crate::target_cpu(enable = "v4")]
-pub fn emulate_mm512_reduce_add_epi16(x: std::arch::x86_64::__m512i) -> i16 {
-    use std::arch::x86_64::*;
-    i16::wrapping_add(
-        _mm256_reduce_add_epi16(_mm512_castsi512_si256(x)),
-        _mm256_reduce_add_epi16(_mm512_extracti32x8_epi32(x, 1)),
-    )
-}
-
-#[inline]
-#[cfg(target_arch = "x86_64")]
 #[crate::target_cpu(enable = "v3")]
-pub fn emulate_mm256_reduce_add_epi16(mut x: std::arch::x86_64::__m256i) -> i16 {
-    use std::arch::x86_64::*;
-    x = _mm256_add_epi16(x, _mm256_permute2f128_si256(x, x, 1));
-    x = _mm256_hadd_epi16(x, x);
-    x = _mm256_hadd_epi16(x, x);
-    let x = _mm256_cvtsi256_si32(x);
-    i16::wrapping_add(x as i16, (x >> 16) as i16)
-}
-
-#[inline]
-#[cfg(target_arch = "x86_64")]
-#[crate::target_cpu(enable = "v2")]
-pub fn emulate_mm_reduce_add_epi16(mut x: std::arch::x86_64::__m128i) -> i16 {
-    use std::arch::x86_64::*;
-    x = _mm_hadd_epi16(x, x);
-    x = _mm_hadd_epi16(x, x);
-    let x = _mm_cvtsi128_si32(x);
-    i16::wrapping_add(x as i16, (x >> 16) as i16)
-}
-
-#[inline]
-#[cfg(target_arch = "x86_64")]
-#[crate::target_cpu(enable = "v3")]
-pub fn emulate_mm256_reduce_add_epi32(mut x: std::arch::x86_64::__m256i) -> i32 {
-    use std::arch::x86_64::*;
+pub fn emulate_mm256_reduce_add_epi32(mut x: core::arch::x86_64::__m256i) -> i32 {
+    use core::arch::x86_64::*;
     x = _mm256_add_epi32(x, _mm256_permute2f128_si256(x, x, 1));
     x = _mm256_hadd_epi32(x, x);
     x = _mm256_hadd_epi32(x, x);
@@ -139,8 +132,8 @@ pub fn emulate_mm256_reduce_add_epi32(mut x: std::arch::x86_64::__m256i) -> i32 
 #[inline]
 #[cfg(target_arch = "x86_64")]
 #[crate::target_cpu(enable = "v2")]
-pub fn emulate_mm_reduce_add_epi32(mut x: std::arch::x86_64::__m128i) -> i32 {
-    use std::arch::x86_64::*;
+pub fn emulate_mm_reduce_add_epi32(mut x: core::arch::x86_64::__m128i) -> i32 {
+    use core::arch::x86_64::*;
     x = _mm_hadd_epi32(x, x);
     x = _mm_hadd_epi32(x, x);
     _mm_cvtsi128_si32(x)
@@ -149,9 +142,9 @@ pub fn emulate_mm_reduce_add_epi32(mut x: std::arch::x86_64::__m128i) -> i32 {
 #[inline]
 #[cfg(target_arch = "x86_64")]
 #[crate::target_cpu(enable = "v3")]
-pub fn emulate_mm256_reduce_min_ps(x: std::arch::x86_64::__m256) -> f32 {
+pub fn emulate_mm256_reduce_min_ps(x: core::arch::x86_64::__m256) -> f32 {
     use crate::aligned::Aligned16;
-    use std::arch::x86_64::*;
+    use core::arch::x86_64::*;
     let lo = _mm256_castps256_ps128(x);
     let hi = _mm256_extractf128_ps(x, 1);
     let min = _mm_min_ps(lo, hi);
@@ -165,9 +158,9 @@ pub fn emulate_mm256_reduce_min_ps(x: std::arch::x86_64::__m256) -> f32 {
 #[inline]
 #[cfg(target_arch = "x86_64")]
 #[crate::target_cpu(enable = "v2")]
-pub fn emulate_mm_reduce_min_ps(x: std::arch::x86_64::__m128) -> f32 {
+pub fn emulate_mm_reduce_min_ps(x: core::arch::x86_64::__m128) -> f32 {
     use crate::aligned::Aligned16;
-    use std::arch::x86_64::*;
+    use core::arch::x86_64::*;
     let min = x;
     let mut x = Aligned16([0.0f32; 4]);
     unsafe {
@@ -179,9 +172,9 @@ pub fn emulate_mm_reduce_min_ps(x: std::arch::x86_64::__m128) -> f32 {
 #[inline]
 #[cfg(target_arch = "x86_64")]
 #[crate::target_cpu(enable = "v3")]
-pub fn emulate_mm256_reduce_max_ps(x: std::arch::x86_64::__m256) -> f32 {
+pub fn emulate_mm256_reduce_max_ps(x: core::arch::x86_64::__m256) -> f32 {
     use crate::aligned::Aligned16;
-    use std::arch::x86_64::*;
+    use core::arch::x86_64::*;
     let lo = _mm256_castps256_ps128(x);
     let hi = _mm256_extractf128_ps(x, 1);
     let max = _mm_max_ps(lo, hi);
@@ -195,9 +188,9 @@ pub fn emulate_mm256_reduce_max_ps(x: std::arch::x86_64::__m256) -> f32 {
 #[inline]
 #[cfg(target_arch = "x86_64")]
 #[crate::target_cpu(enable = "v2")]
-pub fn emulate_mm_reduce_max_ps(x: std::arch::x86_64::__m128) -> f32 {
+pub fn emulate_mm_reduce_max_ps(x: core::arch::x86_64::__m128) -> f32 {
     use crate::aligned::Aligned16;
-    use std::arch::x86_64::*;
+    use core::arch::x86_64::*;
     let max = x;
     let mut x = Aligned16([0.0f32; 4]);
     unsafe {
@@ -209,8 +202,8 @@ pub fn emulate_mm_reduce_max_ps(x: std::arch::x86_64::__m128) -> f32 {
 #[inline]
 #[cfg(target_arch = "x86_64")]
 #[crate::target_cpu(enable = "v3")]
-pub fn emulate_mm256_reduce_add_epi64(mut x: std::arch::x86_64::__m256i) -> i64 {
-    use std::arch::x86_64::*;
+pub fn emulate_mm256_reduce_add_epi64(mut x: core::arch::x86_64::__m256i) -> i64 {
+    use core::arch::x86_64::*;
     x = _mm256_add_epi64(x, _mm256_permute2f128_si256(x, x, 1));
     _mm256_extract_epi64(x, 0) + _mm256_extract_epi64(x, 1)
 }
