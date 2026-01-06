@@ -13,9 +13,7 @@
 // Copyright (c) 2025 TensorChord Inc.
 
 pub mod reduce_sum_of_xy {
-    /// # Safety
-    ///
-    /// * Don't call it. Internal use.
+    #[doc(hidden)]
     #[inline]
     #[cfg(target_arch = "x86_64")]
     #[crate::target_cpu(enable = "v4")]
@@ -75,9 +73,7 @@ pub mod reduce_sum_of_xy {
         }
     }
 
-    /// # Safety
-    ///
-    /// * Don't call it. Internal use.
+    #[doc(hidden)]
     #[inline]
     #[cfg(target_arch = "x86_64")]
     #[crate::target_cpu(enable = "v4")]
@@ -146,9 +142,7 @@ pub mod reduce_sum_of_xy {
         }
     }
 
-    /// # Safety
-    ///
-    /// * Don't call it. Internal use.
+    #[doc(hidden)]
     #[inline]
     #[cfg(target_arch = "x86_64")]
     #[crate::target_cpu(enable = "v3")]
@@ -218,9 +212,7 @@ pub mod reduce_sum_of_xy {
         }
     }
 
-    /// # Safety
-    ///
-    /// * Don't call it. Internal use.
+    #[doc(hidden)]
     #[inline]
     #[cfg(target_arch = "x86_64")]
     #[crate::target_cpu(enable = "v2")]
@@ -412,9 +404,7 @@ pub fn reduce_sum_of_xy(s: &[u8], t: &[u8]) -> u32 {
 }
 
 pub mod reduce_sum_of_x {
-    /// # Safety
-    ///
-    /// * Don't call it. Internal use.
+    #[doc(hidden)]
     #[inline]
     #[cfg(target_arch = "x86_64")]
     #[crate::target_cpu(enable = "v4")]
@@ -460,9 +450,7 @@ pub mod reduce_sum_of_x {
         }
     }
 
-    /// # Safety
-    ///
-    /// * Don't call it. Internal use.
+    #[doc(hidden)]
     #[inline]
     #[cfg(target_arch = "x86_64")]
     #[crate::target_cpu(enable = "v3")]
@@ -509,9 +497,7 @@ pub mod reduce_sum_of_x {
         }
     }
 
-    /// # Safety
-    ///
-    /// * Don't call it. Internal use.
+    #[doc(hidden)]
     #[inline]
     #[cfg(target_arch = "x86_64")]
     #[crate::target_cpu(enable = "v2")]

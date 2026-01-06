@@ -1250,7 +1250,32 @@ mod reduce_sum_of_xy {
     #[test]
     #[cfg_attr(miri, ignore)]
     fn reduce_sum_of_xy_a3_256_test() {
-        //
+        use rand::Rng;
+        const EPSILON: f32 = 0.004;
+        if !crate::is_cpu_detected!("a3.256") {
+            println!("test {} ... skipped (a3.256)", module_path!());
+            return;
+        }
+        let mut rng = rand::rng();
+        for _ in 0..if cfg!(not(miri)) { 256 } else { 1 } {
+            let n = 4016;
+            let lhs = (0..n)
+                .map(|_| rng.random_range(-1.0..=1.0))
+                .collect::<Vec<_>>();
+            let rhs = (0..n)
+                .map(|_| rng.random_range(-1.0..=1.0))
+                .collect::<Vec<_>>();
+            for z in 3984..4016 {
+                let lhs = &lhs[..z];
+                let rhs = &rhs[..z];
+                let specialized = unsafe { reduce_sum_of_xy_a3_256(lhs, rhs) };
+                let fallback = fallback(lhs, rhs);
+                assert!(
+                    (specialized - fallback).abs() < EPSILON,
+                    "specialized = {specialized}, fallback = {fallback}."
+                );
+            }
+        }
     }
 
     #[inline]
@@ -1530,7 +1555,32 @@ mod reduce_sum_of_d2 {
     #[test]
     #[cfg_attr(miri, ignore)]
     fn reduce_sum_of_d2_a3_256_test() {
-        //
+        use rand::Rng;
+        const EPSILON: f32 = 0.02;
+        if !crate::is_cpu_detected!("a3.256") {
+            println!("test {} ... skipped (a3.256)", module_path!());
+            return;
+        }
+        let mut rng = rand::rng();
+        for _ in 0..if cfg!(not(miri)) { 256 } else { 1 } {
+            let n = 4016;
+            let lhs = (0..n)
+                .map(|_| rng.random_range(-1.0..=1.0))
+                .collect::<Vec<_>>();
+            let rhs = (0..n)
+                .map(|_| rng.random_range(-1.0..=1.0))
+                .collect::<Vec<_>>();
+            for z in 3984..4016 {
+                let lhs = &lhs[..z];
+                let rhs = &rhs[..z];
+                let specialized = unsafe { reduce_sum_of_d2_a3_256(lhs, rhs) };
+                let fallback = fallback(lhs, rhs);
+                assert!(
+                    (specialized - fallback).abs() < EPSILON,
+                    "specialized = {specialized}, fallback = {fallback}."
+                );
+            }
+        }
     }
 
     #[inline]

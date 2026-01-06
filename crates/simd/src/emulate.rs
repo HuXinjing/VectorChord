@@ -44,7 +44,7 @@ pub(crate) use partial_load;
 // Instructions. arXiv preprint arXiv:2112.06342.
 #[inline]
 #[cfg(target_arch = "x86_64")]
-#[crate::target_cpu(enable = "v4")]
+#[target_feature(enable = "avx512f")]
 pub fn emulate_mm512_2intersect_epi32(
     a: core::arch::x86_64::__m512i,
     b: core::arch::x86_64::__m512i,
@@ -99,7 +99,7 @@ pub fn emulate_mm512_2intersect_epi32(
 
 #[inline]
 #[cfg(target_arch = "x86_64")]
-#[crate::target_cpu(enable = "v3")]
+#[target_feature(enable = "avx")]
 pub fn emulate_mm256_reduce_add_ps(mut x: core::arch::x86_64::__m256) -> f32 {
     use core::arch::x86_64::*;
     x = _mm256_add_ps(x, _mm256_permute2f128_ps(x, x, 1));
@@ -110,7 +110,7 @@ pub fn emulate_mm256_reduce_add_ps(mut x: core::arch::x86_64::__m256) -> f32 {
 
 #[inline]
 #[cfg(target_arch = "x86_64")]
-#[crate::target_cpu(enable = "v2")]
+#[target_feature(enable = "ssse3")]
 pub fn emulate_mm_reduce_add_ps(mut x: core::arch::x86_64::__m128) -> f32 {
     use core::arch::x86_64::*;
     x = _mm_hadd_ps(x, x);
@@ -120,7 +120,7 @@ pub fn emulate_mm_reduce_add_ps(mut x: core::arch::x86_64::__m128) -> f32 {
 
 #[inline]
 #[cfg(target_arch = "x86_64")]
-#[crate::target_cpu(enable = "v3")]
+#[target_feature(enable = "avx2")]
 pub fn emulate_mm256_reduce_add_epi32(mut x: core::arch::x86_64::__m256i) -> i32 {
     use core::arch::x86_64::*;
     x = _mm256_add_epi32(x, _mm256_permute2f128_si256(x, x, 1));
@@ -131,7 +131,7 @@ pub fn emulate_mm256_reduce_add_epi32(mut x: core::arch::x86_64::__m256i) -> i32
 
 #[inline]
 #[cfg(target_arch = "x86_64")]
-#[crate::target_cpu(enable = "v2")]
+#[target_feature(enable = "ssse3")]
 pub fn emulate_mm_reduce_add_epi32(mut x: core::arch::x86_64::__m128i) -> i32 {
     use core::arch::x86_64::*;
     x = _mm_hadd_epi32(x, x);
@@ -141,7 +141,7 @@ pub fn emulate_mm_reduce_add_epi32(mut x: core::arch::x86_64::__m128i) -> i32 {
 
 #[inline]
 #[cfg(target_arch = "x86_64")]
-#[crate::target_cpu(enable = "v3")]
+#[target_feature(enable = "avx")]
 pub fn emulate_mm256_reduce_min_ps(x: core::arch::x86_64::__m256) -> f32 {
     use crate::aligned::Aligned16;
     use core::arch::x86_64::*;
@@ -157,7 +157,7 @@ pub fn emulate_mm256_reduce_min_ps(x: core::arch::x86_64::__m256) -> f32 {
 
 #[inline]
 #[cfg(target_arch = "x86_64")]
-#[crate::target_cpu(enable = "v2")]
+#[target_feature(enable = "sse")]
 pub fn emulate_mm_reduce_min_ps(x: core::arch::x86_64::__m128) -> f32 {
     use crate::aligned::Aligned16;
     use core::arch::x86_64::*;
@@ -171,7 +171,7 @@ pub fn emulate_mm_reduce_min_ps(x: core::arch::x86_64::__m128) -> f32 {
 
 #[inline]
 #[cfg(target_arch = "x86_64")]
-#[crate::target_cpu(enable = "v3")]
+#[target_feature(enable = "avx")]
 pub fn emulate_mm256_reduce_max_ps(x: core::arch::x86_64::__m256) -> f32 {
     use crate::aligned::Aligned16;
     use core::arch::x86_64::*;
@@ -187,7 +187,7 @@ pub fn emulate_mm256_reduce_max_ps(x: core::arch::x86_64::__m256) -> f32 {
 
 #[inline]
 #[cfg(target_arch = "x86_64")]
-#[crate::target_cpu(enable = "v2")]
+#[target_feature(enable = "sse")]
 pub fn emulate_mm_reduce_max_ps(x: core::arch::x86_64::__m128) -> f32 {
     use crate::aligned::Aligned16;
     use core::arch::x86_64::*;
@@ -201,7 +201,7 @@ pub fn emulate_mm_reduce_max_ps(x: core::arch::x86_64::__m128) -> f32 {
 
 #[inline]
 #[cfg(target_arch = "x86_64")]
-#[crate::target_cpu(enable = "v3")]
+#[target_feature(enable = "avx2")]
 pub fn emulate_mm256_reduce_add_epi64(mut x: core::arch::x86_64::__m256i) -> i64 {
     use core::arch::x86_64::*;
     x = _mm256_add_epi64(x, _mm256_permute2f128_si256(x, x, 1));

@@ -50,17 +50,21 @@ mod mul_add_round {
     #[test]
     #[cfg_attr(miri, ignore)]
     fn mul_add_round_v4_test() {
+        use rand::Rng;
         if !crate::is_cpu_detected!("v4") {
             println!("test {} ... skipped (v4)", module_path!());
             return;
         }
+        let mut rng = rand::rng();
         for _ in 0..if cfg!(not(miri)) { 256 } else { 1 } {
             let n = 4010;
-            let x = (0..n).map(|_| rand::random::<_>()).collect::<Vec<_>>();
+            let x = (0..n)
+                .map(|_| rng.random_range(-1.0..=1.0))
+                .collect::<Vec<_>>();
             for z in 3990..4010 {
                 let x = &x[..z];
-                let k = 20.0;
-                let b = 20.0;
+                let k = 127.0;
+                let b = 127.0;
                 let specialized = unsafe { mul_add_round_v4(x, k, b) };
                 let fallback = fallback(x, k, b);
                 assert_eq!(specialized, fallback);
@@ -118,17 +122,21 @@ mod mul_add_round {
     #[cfg(all(target_arch = "x86_64", test))]
     #[test]
     fn mul_add_round_v3_test() {
+        use rand::Rng;
         if !crate::is_cpu_detected!("v3") {
             println!("test {} ... skipped (v3)", module_path!());
             return;
         }
+        let mut rng = rand::rng();
         for _ in 0..if cfg!(not(miri)) { 256 } else { 1 } {
             let n = 4010;
-            let x = (0..n).map(|_| rand::random::<_>()).collect::<Vec<_>>();
+            let x = (0..n)
+                .map(|_| rng.random_range(-1.0..=1.0))
+                .collect::<Vec<_>>();
             for z in 3990..4010 {
                 let x = &x[..z];
-                let k = 20.0;
-                let b = 20.0;
+                let k = 127.0;
+                let b = 127.0;
                 let specialized = unsafe { mul_add_round_v3(x, k, b) };
                 let fallback = fallback(x, k, b);
                 assert_eq!(specialized, fallback);
@@ -181,17 +189,21 @@ mod mul_add_round {
     #[cfg(all(target_arch = "x86_64", test))]
     #[test]
     fn mul_add_round_v2_fma_test() {
+        use rand::Rng;
         if !crate::is_cpu_detected!("v2") || !crate::is_feature_detected!("fma") {
             println!("test {} ... skipped (v2:fma)", module_path!());
             return;
         }
+        let mut rng = rand::rng();
         for _ in 0..if cfg!(not(miri)) { 256 } else { 1 } {
             let n = 4010;
-            let x = (0..n).map(|_| rand::random::<_>()).collect::<Vec<_>>();
+            let x = (0..n)
+                .map(|_| rng.random_range(-1.0..=1.0))
+                .collect::<Vec<_>>();
             for z in 3990..4010 {
                 let x = &x[..z];
-                let k = 20.0;
-                let b = 20.0;
+                let k = 127.0;
+                let b = 127.0;
                 let specialized = unsafe { mul_add_round_v2_fma(x, k, b) };
                 let fallback = fallback(x, k, b);
                 assert_eq!(specialized, fallback);
@@ -251,17 +263,21 @@ mod mul_add_round {
     #[test]
     #[cfg_attr(miri, ignore)]
     fn mul_add_round_a2_test() {
+        use rand::Rng;
         if !crate::is_cpu_detected!("a2") {
             println!("test {} ... skipped (a2)", module_path!());
             return;
         }
+        let mut rng = rand::rng();
         for _ in 0..if cfg!(not(miri)) { 256 } else { 1 } {
             let n = 4010;
-            let x = (0..n).map(|_| rand::random::<_>()).collect::<Vec<_>>();
+            let x = (0..n)
+                .map(|_| rng.random_range(-1.0..=1.0))
+                .collect::<Vec<_>>();
             for z in 3990..4010 {
                 let x = &x[..z];
-                let k = 20.0;
-                let b = 20.0;
+                let k = 127.0;
+                let b = 127.0;
                 let specialized = unsafe { mul_add_round_a2(x, k, b) };
                 let fallback = fallback(x, k, b);
                 assert_eq!(specialized, fallback);
