@@ -12,7 +12,7 @@
 //
 // Copyright (c) 2025 TensorChord Inc.
 
-pub mod givens {
+mod givens {
     #[crate::multiversion(
         "v4", "v3", "v2", "a2", "z17", "z16", "z15", "z14", "z13", "p9", "p8", "p7", "r1"
     )]
@@ -30,7 +30,7 @@ pub fn givens(lhs: &mut [f32], rhs: &mut [f32]) {
     givens::givens(lhs, rhs)
 }
 
-pub mod flip {
+mod flip {
     #[crate::multiversion(
         "v4", "v3", "v2", "a2", "z17", "z16", "z15", "z14", "z13", "p9", "p8", "p7", "r1"
     )]

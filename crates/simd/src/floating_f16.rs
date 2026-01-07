@@ -163,12 +163,107 @@ mod reduce_or_of_is_zero_x {
 }
 
 mod reduce_sum_of_x {
-    // FIXME: add manually-implemented SIMD version
-
     use crate::{F16, f16};
 
+    #[inline]
+    #[cfg(target_arch = "x86_64")]
+    #[crate::target_cpu(enable = "v4")]
+    fn reduce_sum_of_x_v4(this: &[f16]) -> f32 {
+        use core::arch::x86_64::*;
+        let mut n = this.len();
+        let mut a = this.as_ptr();
+        let mut sum = _mm512_setzero_ps();
+        while n >= 16 {
+            let x = unsafe { _mm512_cvtph_ps(_mm256_loadu_epi16(a.cast())) };
+            sum = _mm512_add_ps(sum, x);
+            (n, a) = unsafe { (n - 16, a.add(16)) };
+        }
+        if n > 0 {
+            let mask = _bzhi_u32(0xffff, n as u32) as u16;
+            let x = unsafe { _mm512_cvtph_ps(_mm256_maskz_loadu_epi16(mask, a.cast())) };
+            sum = _mm512_add_ps(sum, x);
+        }
+        _mm512_reduce_add_ps(sum)
+    }
+
+    #[cfg(all(target_arch = "x86_64", test))]
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn reduce_sum_of_x_v4_test() {
+        use rand::Rng;
+        const EPSILON: f32 = 2.0;
+        if !crate::is_cpu_detected!("v4") {
+            println!("test {} ... skipped (v4)", module_path!());
+            return;
+        }
+        let mut rng = rand::rng();
+        for _ in 0..if cfg!(not(miri)) { 256 } else { 1 } {
+            let n = 4016;
+            let this = (0..n)
+                .map(|_| f16::_from_f32(rng.random_range(-1.0..=1.0)))
+                .collect::<Vec<_>>();
+            let specialized = unsafe { reduce_sum_of_x_v4(&this) };
+            let fallback = fallback(&this);
+            assert!(
+                (specialized - fallback).abs() < EPSILON,
+                "specialized = {specialized}, fallback = {fallback}."
+            );
+        }
+    }
+
+    #[inline]
+    #[cfg(target_arch = "x86_64")]
+    #[crate::target_cpu(enable = "v3")]
+    fn reduce_sum_of_x_v3(this: &[f16]) -> f32 {
+        use crate::emulate::{emulate_mm256_reduce_add_ps, partial_load};
+        use core::arch::x86_64::*;
+        let mut n = this.len();
+        let mut a = this.as_ptr();
+        let mut sum = _mm256_setzero_ps();
+        while n >= 8 {
+            let x = unsafe { _mm256_cvtph_ps(_mm_loadu_si128(a.cast())) };
+            sum = _mm256_add_ps(sum, x);
+            (n, a) = unsafe { (n - 8, a.add(8)) };
+        }
+        if n > 0 {
+            let (_a,) = unsafe { partial_load!(8, n, a) };
+            (a,) = (_a.as_ptr(),);
+            let x = unsafe { _mm256_cvtph_ps(_mm_loadu_si128(a.cast())) };
+            sum = _mm256_add_ps(sum, x);
+        }
+        emulate_mm256_reduce_add_ps(sum)
+    }
+
+    #[cfg(all(target_arch = "x86_64", test))]
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn reduce_sum_of_x_v3_test() {
+        use rand::Rng;
+        const EPSILON: f32 = 2.0;
+        if !crate::is_cpu_detected!("v3") {
+            println!("test {} ... skipped (v3)", module_path!());
+            return;
+        }
+        let mut rng = rand::rng();
+        for _ in 0..if cfg!(not(miri)) { 256 } else { 1 } {
+            let n = 4016;
+            let this = (0..n)
+                .map(|_| f16::_from_f32(rng.random_range(-1.0..=1.0)))
+                .collect::<Vec<_>>();
+            for z in 3984..4016 {
+                let this = &this[..z];
+                let specialized = unsafe { reduce_sum_of_x_v3(this) };
+                let fallback = fallback(this);
+                assert!(
+                    (specialized - fallback).abs() < EPSILON,
+                    "specialized = {specialized}, fallback = {fallback}."
+                );
+            }
+        }
+    }
+
     #[crate::multiversion(
-        "v4", "v3", "v2", "a2", "z17", "z16", "z15", "z14", "z13", "p9", "p8", "p7", "r1"
+        @"v4", @"v3", "v2", "a2", "z17", "z16", "z15", "z14", "z13", "p9", "p8", "p7", "r1"
     )]
     pub fn reduce_sum_of_x(this: &[f16]) -> f32 {
         let n = this.len();
@@ -181,12 +276,108 @@ mod reduce_sum_of_x {
 }
 
 mod reduce_sum_of_abs_x {
-    // FIXME: add manually-implemented SIMD version
-
     use crate::{F16, f16};
 
+    #[inline]
+    #[cfg(target_arch = "x86_64")]
+    #[crate::target_cpu(enable = "v4")]
+    fn reduce_sum_of_abs_x_v4(this: &[f16]) -> f32 {
+        use core::arch::x86_64::*;
+        let mut n = this.len();
+        let mut a = this.as_ptr();
+        let mut sum = _mm512_setzero_ps();
+        while n >= 16 {
+            let x = unsafe { _mm512_cvtph_ps(_mm256_loadu_epi16(a.cast())) };
+            sum = _mm512_add_ps(sum, _mm512_abs_ps(x));
+            (n, a) = unsafe { (n - 16, a.add(16)) };
+        }
+        if n > 0 {
+            let mask = _bzhi_u32(0xffff, n as u32) as u16;
+            let x = unsafe { _mm512_cvtph_ps(_mm256_maskz_loadu_epi16(mask, a.cast())) };
+            sum = _mm512_add_ps(sum, _mm512_abs_ps(x));
+        }
+        _mm512_reduce_add_ps(sum)
+    }
+
+    #[cfg(all(target_arch = "x86_64", test))]
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn reduce_sum_of_abs_x_v4_test() {
+        use rand::Rng;
+        const EPSILON: f32 = 2.0;
+        if !crate::is_cpu_detected!("v4") {
+            println!("test {} ... skipped (v4)", module_path!());
+            return;
+        }
+        let mut rng = rand::rng();
+        for _ in 0..if cfg!(not(miri)) { 256 } else { 1 } {
+            let n = 4016;
+            let this = (0..n)
+                .map(|_| f16::_from_f32(rng.random_range(-1.0..=1.0)))
+                .collect::<Vec<_>>();
+            let specialized = unsafe { reduce_sum_of_abs_x_v4(&this) };
+            let fallback = fallback(&this);
+            assert!(
+                (specialized - fallback).abs() < EPSILON,
+                "specialized = {specialized}, fallback = {fallback}."
+            );
+        }
+    }
+
+    #[inline]
+    #[cfg(target_arch = "x86_64")]
+    #[crate::target_cpu(enable = "v3")]
+    fn reduce_sum_of_abs_x_v3(this: &[f16]) -> f32 {
+        use crate::emulate::{emulate_mm256_reduce_add_ps, partial_load};
+        use core::arch::x86_64::*;
+        let abs = _mm256_castsi256_ps(_mm256_srli_epi32(_mm256_set1_epi32(-1), 1));
+        let mut n = this.len();
+        let mut a = this.as_ptr();
+        let mut sum = _mm256_setzero_ps();
+        while n >= 8 {
+            let x = unsafe { _mm256_cvtph_ps(_mm_loadu_si128(a.cast())) };
+            sum = _mm256_add_ps(sum, _mm256_and_ps(abs, x));
+            (n, a) = unsafe { (n - 8, a.add(8)) };
+        }
+        if n > 0 {
+            let (_a,) = unsafe { partial_load!(8, n, a) };
+            (a,) = (_a.as_ptr(),);
+            let x = unsafe { _mm256_cvtph_ps(_mm_loadu_si128(a.cast())) };
+            sum = _mm256_add_ps(sum, _mm256_and_ps(abs, x));
+        }
+        emulate_mm256_reduce_add_ps(sum)
+    }
+
+    #[cfg(all(target_arch = "x86_64", test))]
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn reduce_sum_of_abs_x_v3_test() {
+        use rand::Rng;
+        const EPSILON: f32 = 2.0;
+        if !crate::is_cpu_detected!("v3") {
+            println!("test {} ... skipped (v3)", module_path!());
+            return;
+        }
+        let mut rng = rand::rng();
+        for _ in 0..if cfg!(not(miri)) { 256 } else { 1 } {
+            let n = 4016;
+            let this = (0..n)
+                .map(|_| f16::_from_f32(rng.random_range(-1.0..=1.0)))
+                .collect::<Vec<_>>();
+            for z in 3984..4016 {
+                let this = &this[..z];
+                let specialized = unsafe { reduce_sum_of_abs_x_v3(this) };
+                let fallback = fallback(this);
+                assert!(
+                    (specialized - fallback).abs() < EPSILON,
+                    "specialized = {specialized}, fallback = {fallback}."
+                );
+            }
+        }
+    }
+
     #[crate::multiversion(
-        "v4", "v3", "v2", "a2", "z17", "z16", "z15", "z14", "z13", "p9", "p8", "p7", "r1"
+        @"v4", @"v3", "v2", "a2", "z17", "z16", "z15", "z14", "z13", "p9", "p8", "p7", "r1"
     )]
     pub fn reduce_sum_of_abs_x(this: &[f16]) -> f32 {
         let n = this.len();
@@ -199,12 +390,107 @@ mod reduce_sum_of_abs_x {
 }
 
 mod reduce_sum_of_x2 {
-    // FIXME: add manually-implemented SIMD version
-
     use crate::{F16, f16};
 
+    #[inline]
+    #[cfg(target_arch = "x86_64")]
+    #[crate::target_cpu(enable = "v4")]
+    fn reduce_sum_of_x2_v4(this: &[f16]) -> f32 {
+        use core::arch::x86_64::*;
+        let mut n = this.len();
+        let mut a = this.as_ptr();
+        let mut sum = _mm512_setzero_ps();
+        while n >= 16 {
+            let x = unsafe { _mm512_cvtph_ps(_mm256_loadu_epi16(a.cast())) };
+            sum = _mm512_fmadd_ps(x, x, sum);
+            (n, a) = unsafe { (n - 16, a.add(16)) };
+        }
+        if n > 0 {
+            let mask = _bzhi_u32(0xffff, n as u32) as u16;
+            let x = unsafe { _mm512_cvtph_ps(_mm256_maskz_loadu_epi16(mask, a.cast())) };
+            sum = _mm512_fmadd_ps(x, x, sum);
+        }
+        _mm512_reduce_add_ps(sum)
+    }
+
+    #[cfg(all(target_arch = "x86_64", test))]
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn reduce_sum_of_x2_v4_test() {
+        use rand::Rng;
+        const EPSILON: f32 = 2.0;
+        if !crate::is_cpu_detected!("v4") {
+            println!("test {} ... skipped (v4)", module_path!());
+            return;
+        }
+        let mut rng = rand::rng();
+        for _ in 0..if cfg!(not(miri)) { 256 } else { 1 } {
+            let n = 4016;
+            let this = (0..n)
+                .map(|_| f16::_from_f32(rng.random_range(-1.0..=1.0)))
+                .collect::<Vec<_>>();
+            let specialized = unsafe { reduce_sum_of_x2_v4(&this) };
+            let fallback = fallback(&this);
+            assert!(
+                (specialized - fallback).abs() < EPSILON,
+                "specialized = {specialized}, fallback = {fallback}."
+            );
+        }
+    }
+
+    #[inline]
+    #[cfg(target_arch = "x86_64")]
+    #[crate::target_cpu(enable = "v3")]
+    fn reduce_sum_of_x2_v3(this: &[f16]) -> f32 {
+        use crate::emulate::{emulate_mm256_reduce_add_ps, partial_load};
+        use core::arch::x86_64::*;
+        let mut n = this.len();
+        let mut a = this.as_ptr();
+        let mut sum = _mm256_setzero_ps();
+        while n >= 8 {
+            let x = unsafe { _mm256_cvtph_ps(_mm_loadu_si128(a.cast())) };
+            sum = _mm256_fmadd_ps(x, x, sum);
+            (n, a) = unsafe { (n - 8, a.add(8)) };
+        }
+        if n > 0 {
+            let (_a,) = unsafe { partial_load!(8, n, a) };
+            (a,) = (_a.as_ptr(),);
+            let x = unsafe { _mm256_cvtph_ps(_mm_loadu_si128(a.cast())) };
+            sum = _mm256_fmadd_ps(x, x, sum);
+        }
+        emulate_mm256_reduce_add_ps(sum)
+    }
+
+    #[cfg(all(target_arch = "x86_64", test))]
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn reduce_sum_of_x2_v3_test() {
+        use rand::Rng;
+        const EPSILON: f32 = 2.0;
+        if !crate::is_cpu_detected!("v3") {
+            println!("test {} ... skipped (v3)", module_path!());
+            return;
+        }
+        let mut rng = rand::rng();
+        for _ in 0..if cfg!(not(miri)) { 256 } else { 1 } {
+            let n = 4016;
+            let this = (0..n)
+                .map(|_| f16::_from_f32(rng.random_range(-1.0..=1.0)))
+                .collect::<Vec<_>>();
+            for z in 3984..4016 {
+                let this = &this[..z];
+                let specialized = unsafe { reduce_sum_of_x2_v3(this) };
+                let fallback = fallback(this);
+                assert!(
+                    (specialized - fallback).abs() < EPSILON,
+                    "specialized = {specialized}, fallback = {fallback}."
+                );
+            }
+        }
+    }
+
     #[crate::multiversion(
-        "v4", "v3", "v2", "a2", "z17", "z16", "z15", "z14", "z13", "p9", "p8", "p7", "r1"
+        @"v4", @"v3", "v2", "a2", "z17", "z16", "z15", "z14", "z13", "p9", "p8", "p7", "r1"
     )]
     pub fn reduce_sum_of_x2(this: &[f16]) -> f32 {
         let n = this.len();
@@ -217,12 +503,118 @@ mod reduce_sum_of_x2 {
 }
 
 mod reduce_min_max_of_x {
-    // FIXME: add manually-implemented SIMD version
-
     use crate::{F16, f16};
 
+    #[inline]
+    #[cfg(target_arch = "x86_64")]
+    #[crate::target_cpu(enable = "v4")]
+    fn reduce_min_max_of_x_v4(this: &[f16]) -> (f32, f32) {
+        use core::arch::x86_64::*;
+        let mut n = this.len();
+        let mut a = this.as_ptr();
+        let mut min = _mm512_set1_ps(f32::INFINITY);
+        let mut max = _mm512_set1_ps(f32::NEG_INFINITY);
+        while n >= 16 {
+            let x = unsafe { _mm512_cvtph_ps(_mm256_loadu_epi16(a.cast())) };
+            min = _mm512_min_ps(x, min);
+            max = _mm512_max_ps(x, max);
+            (n, a) = unsafe { (n - 16, a.add(16)) };
+        }
+        if n > 0 {
+            let mask = _bzhi_u32(0xffff, n as u32) as u16;
+            let x = unsafe { _mm512_cvtph_ps(_mm256_maskz_loadu_epi16(mask, a.cast())) };
+            min = _mm512_mask_min_ps(min, mask, x, min);
+            max = _mm512_mask_max_ps(max, mask, x, max);
+        }
+        let min = _mm512_reduce_min_ps(min);
+        let max = _mm512_reduce_max_ps(max);
+        (min, max)
+    }
+
+    #[cfg(all(target_arch = "x86_64", test))]
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn reduce_min_max_of_x_v4_test() {
+        use rand::Rng;
+        if !crate::is_cpu_detected!("v4") {
+            println!("test {} ... skipped (v4)", module_path!());
+            return;
+        }
+        let mut rng = rand::rng();
+        for _ in 0..if cfg!(not(miri)) { 256 } else { 1 } {
+            let n = 200;
+            let mut x = (0..n)
+                .map(|_| f16::_from_f32(rng.random_range(-1.0..=1.0)))
+                .collect::<Vec<_>>();
+            (x[0], x[1]) = (f16::NAN, -f16::NAN);
+            for z in 50..200 {
+                let x = &x[..z];
+                let specialized = unsafe { reduce_min_max_of_x_v4(x) };
+                let fallback = fallback(x);
+                assert_eq!(specialized.0, fallback.0);
+                assert_eq!(specialized.1, fallback.1);
+            }
+        }
+    }
+
+    #[inline]
+    #[cfg(target_arch = "x86_64")]
+    #[crate::target_cpu(enable = "v3")]
+    fn reduce_min_max_of_x_v3(this: &[f16]) -> (f32, f32) {
+        use crate::emulate::{
+            emulate_mm256_reduce_max_ps, emulate_mm256_reduce_min_ps, partial_load,
+        };
+        use core::arch::x86_64::*;
+        let mut n = this.len();
+        let mut a = this.as_ptr();
+        let mut min = _mm256_set1_ps(f32::INFINITY);
+        let mut max = _mm256_set1_ps(f32::NEG_INFINITY);
+        while n >= 8 {
+            let x = unsafe { _mm256_cvtph_ps(_mm_loadu_si128(a.cast())) };
+            min = _mm256_min_ps(x, min);
+            max = _mm256_max_ps(x, max);
+            (n, a) = unsafe { (n - 8, a.add(8)) };
+        }
+        if n > 0 {
+            let (_a,) = unsafe { partial_load!(8, n, a = f16::NAN) };
+            (a,) = (_a.as_ptr(),);
+            let x = unsafe { _mm256_cvtph_ps(_mm_loadu_si128(a.cast())) };
+            min = _mm256_min_ps(x, min);
+            max = _mm256_max_ps(x, max);
+        }
+        (
+            emulate_mm256_reduce_min_ps(min),
+            emulate_mm256_reduce_max_ps(max),
+        )
+    }
+
+    #[cfg(all(target_arch = "x86_64", test))]
+    #[test]
+    fn reduce_min_max_of_x_v3_test() {
+        use rand::Rng;
+        if !crate::is_cpu_detected!("v3") {
+            println!("test {} ... skipped (v3)", module_path!());
+            return;
+        }
+        let mut rng = rand::rng();
+        for _ in 0..if cfg!(not(miri)) { 256 } else { 1 } {
+            let n = 200;
+            let mut x = (0..n)
+                .map(|_| f16::_from_f32(rng.random_range(-1.0..=1.0)))
+                .collect::<Vec<_>>();
+            (x[0], x[1]) = (f16::NAN, -f16::NAN);
+            for z in 50..200 {
+                let x = &x[..z];
+                let specialized = unsafe { reduce_min_max_of_x_v3(x) };
+                let fallback = fallback(x);
+                assert_eq!(specialized.0, fallback.0,);
+                assert_eq!(specialized.1, fallback.1,);
+            }
+        }
+    }
+
     #[crate::multiversion(
-        "v4", "v3", "v2", "a2", "z17", "z16", "z15", "z14", "z13", "p9", "p8", "p7", "r1"
+        @"v4", @"v3", "v2", "a2", "z17", "z16", "z15", "z14", "z13", "p9", "p8", "p7", "r1"
     )]
     pub fn reduce_min_max_of_x(this: &[f16]) -> (f32, f32) {
         let mut min = f32::INFINITY;
@@ -236,14 +628,16 @@ mod reduce_min_max_of_x {
     }
 }
 
+#[cfg_attr(feature = "internal", simd_macros::public)]
 mod reduce_sum_of_xy {
     use crate::{F16, f16};
 
+    #[cfg_attr(feature = "internal", simd_macros::public)]
     #[inline]
     #[cfg(target_arch = "x86_64")]
     #[crate::target_cpu(enable = "v4")]
     #[target_feature(enable = "avx512fp16")]
-    pub fn reduce_sum_of_xy_v4_avx512fp16(lhs: &[f16], rhs: &[f16]) -> f32 {
+    fn reduce_sum_of_xy_v4_avx512fp16(lhs: &[f16], rhs: &[f16]) -> f32 {
         unsafe extern "C" {
             #[link_name = "fp16_reduce_sum_of_xy_v4_avx512fp16"]
             unsafe fn f(n: usize, a: *const f16, b: *const f16) -> f32;
@@ -287,10 +681,11 @@ mod reduce_sum_of_xy {
         }
     }
 
+    #[cfg_attr(feature = "internal", simd_macros::public)]
     #[inline]
     #[cfg(target_arch = "x86_64")]
     #[crate::target_cpu(enable = "v4")]
-    pub fn reduce_sum_of_xy_v4(lhs: &[f16], rhs: &[f16]) -> f32 {
+    fn reduce_sum_of_xy_v4(lhs: &[f16], rhs: &[f16]) -> f32 {
         assert!(lhs.len() == rhs.len());
         use core::arch::x86_64::*;
         let mut n = lhs.len();
@@ -340,10 +735,11 @@ mod reduce_sum_of_xy {
         }
     }
 
+    #[cfg_attr(feature = "internal", simd_macros::public)]
     #[inline]
     #[cfg(target_arch = "x86_64")]
     #[crate::target_cpu(enable = "v3")]
-    pub fn reduce_sum_of_xy_v3(lhs: &[f16], rhs: &[f16]) -> f32 {
+    fn reduce_sum_of_xy_v3(lhs: &[f16], rhs: &[f16]) -> f32 {
         use crate::emulate::{emulate_mm256_reduce_add_ps, partial_load};
         use core::arch::x86_64::*;
         assert!(lhs.len() == rhs.len());
@@ -399,6 +795,7 @@ mod reduce_sum_of_xy {
         }
     }
 
+    #[cfg_attr(feature = "internal", simd_macros::public)]
     #[inline]
     #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
     #[crate::target_cpu(enable = "a3.512")]
@@ -446,11 +843,12 @@ mod reduce_sum_of_xy {
         }
     }
 
+    #[cfg_attr(feature = "internal", simd_macros::public)]
     #[inline]
     #[cfg(target_arch = "aarch64")]
     #[crate::target_cpu(enable = "a2")]
     #[target_feature(enable = "fp16")]
-    pub fn reduce_sum_of_xy_a2_fp16(lhs: &[f16], rhs: &[f16]) -> f32 {
+    fn reduce_sum_of_xy_a2_fp16(lhs: &[f16], rhs: &[f16]) -> f32 {
         unsafe extern "C" {
             #[link_name = "fp16_reduce_sum_of_xy_a2_fp16"]
             unsafe fn f(n: usize, a: *const f16, b: *const f16) -> f32;
@@ -506,14 +904,16 @@ mod reduce_sum_of_xy {
     }
 }
 
+#[cfg_attr(feature = "internal", simd_macros::public)]
 mod reduce_sum_of_d2 {
     use crate::{F16, f16};
 
+    #[cfg_attr(feature = "internal", simd_macros::public)]
     #[inline]
     #[cfg(target_arch = "x86_64")]
     #[crate::target_cpu(enable = "v4")]
     #[target_feature(enable = "avx512fp16")]
-    pub fn reduce_sum_of_d2_v4_avx512fp16(lhs: &[f16], rhs: &[f16]) -> f32 {
+    fn reduce_sum_of_d2_v4_avx512fp16(lhs: &[f16], rhs: &[f16]) -> f32 {
         unsafe extern "C" {
             #[link_name = "fp16_reduce_sum_of_d2_v4_avx512fp16"]
             unsafe fn f(n: usize, a: *const f16, b: *const f16) -> f32;
@@ -530,7 +930,7 @@ mod reduce_sum_of_d2 {
     #[cfg_attr(miri, ignore)]
     fn reduce_sum_of_d2_v4_avx512fp16_test() {
         use rand::Rng;
-        const EPSILON: f32 = 6.4;
+        const EPSILON: f32 = 2.0;
         if !crate::is_cpu_detected!("v4") || !crate::is_feature_detected!("avx512fp16") {
             println!("test {} ... skipped (v4:avx512fp16)", module_path!());
             return;
@@ -557,10 +957,11 @@ mod reduce_sum_of_d2 {
         }
     }
 
+    #[cfg_attr(feature = "internal", simd_macros::public)]
     #[inline]
     #[cfg(target_arch = "x86_64")]
     #[crate::target_cpu(enable = "v4")]
-    pub fn reduce_sum_of_d2_v4(lhs: &[f16], rhs: &[f16]) -> f32 {
+    fn reduce_sum_of_d2_v4(lhs: &[f16], rhs: &[f16]) -> f32 {
         assert!(lhs.len() == rhs.len());
         use core::arch::x86_64::*;
         let mut n = lhs.len();
@@ -616,10 +1017,11 @@ mod reduce_sum_of_d2 {
         }
     }
 
+    #[cfg_attr(feature = "internal", simd_macros::public)]
     #[inline]
     #[cfg(target_arch = "x86_64")]
     #[crate::target_cpu(enable = "v3")]
-    pub fn reduce_sum_of_d2_v3(lhs: &[f16], rhs: &[f16]) -> f32 {
+    fn reduce_sum_of_d2_v3(lhs: &[f16], rhs: &[f16]) -> f32 {
         use crate::emulate::{emulate_mm256_reduce_add_ps, partial_load};
         assert!(lhs.len() == rhs.len());
         use core::arch::x86_64::*;
@@ -678,6 +1080,7 @@ mod reduce_sum_of_d2 {
         }
     }
 
+    #[cfg_attr(feature = "internal", simd_macros::public)]
     #[inline]
     #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
     #[crate::target_cpu(enable = "a3.512")]
@@ -698,7 +1101,7 @@ mod reduce_sum_of_d2 {
     #[cfg_attr(miri, ignore)]
     fn reduce_sum_of_d2_a3_512_test() {
         use rand::Rng;
-        const EPSILON: f32 = 6.4;
+        const EPSILON: f32 = 2.0;
         if !crate::is_cpu_detected!("a3.512") {
             println!("test {} ... skipped (a3.512)", module_path!());
             return;
@@ -725,11 +1128,12 @@ mod reduce_sum_of_d2 {
         }
     }
 
+    #[cfg_attr(feature = "internal", simd_macros::public)]
     #[inline]
     #[cfg(target_arch = "aarch64")]
     #[crate::target_cpu(enable = "a2")]
     #[target_feature(enable = "fp16")]
-    pub fn reduce_sum_of_d2_a2_fp16(lhs: &[f16], rhs: &[f16]) -> f32 {
+    fn reduce_sum_of_d2_a2_fp16(lhs: &[f16], rhs: &[f16]) -> f32 {
         unsafe extern "C" {
             #[link_name = "fp16_reduce_sum_of_d2_a2_fp16"]
             unsafe fn f(n: usize, a: *const f16, b: *const f16) -> f32;
@@ -746,7 +1150,7 @@ mod reduce_sum_of_d2 {
     #[cfg_attr(miri, ignore)]
     fn reduce_sum_of_d2_a2_fp16_test() {
         use rand::Rng;
-        const EPSILON: f32 = 6.4;
+        const EPSILON: f32 = 2.0;
         if !crate::is_cpu_detected!("a2") || !crate::is_feature_detected!("fp16") {
             println!("test {} ... skipped (a2:fp16)", module_path!());
             return;

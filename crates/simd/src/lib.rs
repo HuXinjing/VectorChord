@@ -24,8 +24,18 @@
 
 mod aligned;
 mod emulate;
+
+#[cfg(not(feature = "internal"))]
 mod floating_f16;
+
+#[cfg(feature = "internal")]
+pub mod floating_f16;
+
+#[cfg(not(feature = "internal"))]
 mod floating_f32;
+
+#[cfg(feature = "internal")]
+pub mod floating_f32;
 
 pub mod bit;
 pub mod byte;
@@ -53,10 +63,12 @@ pub trait F16: Sized {
 impl F16 for f16 {
     const _ZERO: Self = f16::ZERO;
 
+    #[inline(always)]
     fn _from_f32(x: f32) -> Self {
         f16::from_f32(x)
     }
 
+    #[inline(always)]
     fn _to_f32(self) -> f32 {
         self.to_f32()
     }
@@ -66,10 +78,12 @@ impl F16 for f16 {
 impl F16 for f16 {
     const _ZERO: Self = 0.0;
 
+    #[inline(always)]
     fn _from_f32(x: f32) -> Self {
         x as _
     }
 
+    #[inline(always)]
     fn _to_f32(self) -> f32 {
         self as _
     }

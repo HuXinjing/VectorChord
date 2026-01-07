@@ -259,3 +259,21 @@ pub fn define_is_cpu_detected(input: proc_macro::TokenStream) -> proc_macro::Tok
     }
     .into()
 }
+
+#[proc_macro_attribute]
+pub fn public(
+    _attr: proc_macro::TokenStream,
+    item: proc_macro::TokenStream,
+) -> proc_macro::TokenStream {
+    use quote::ToTokens;
+
+    let mut input: syn::Item = syn::parse_macro_input!(item);
+
+    if let syn::Item::Fn(syn::ItemFn { ref mut vis, .. })
+    | syn::Item::Mod(syn::ItemMod { ref mut vis, .. }) = input
+    {
+        *vis = syn::Visibility::Public(Default::default());
+    }
+
+    input.to_token_stream().into()
+}

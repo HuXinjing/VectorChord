@@ -1051,7 +1051,9 @@ mod reduce_min_max_of_x {
     }
 }
 
+#[cfg_attr(feature = "internal", simd_macros::public)]
 mod reduce_sum_of_xy {
+    #[cfg_attr(feature = "internal", simd_macros::public)]
     #[inline]
     #[cfg(target_arch = "x86_64")]
     #[crate::target_cpu(enable = "v4")]
@@ -1108,6 +1110,7 @@ mod reduce_sum_of_xy {
         }
     }
 
+    #[cfg_attr(feature = "internal", simd_macros::public)]
     #[inline]
     #[cfg(target_arch = "x86_64")]
     #[crate::target_cpu(enable = "v3")]
@@ -1172,6 +1175,7 @@ mod reduce_sum_of_xy {
         }
     }
 
+    #[cfg_attr(feature = "internal", simd_macros::public)]
     #[inline]
     #[cfg(target_arch = "x86_64")]
     #[crate::target_cpu(enable = "v2")]
@@ -1231,6 +1235,7 @@ mod reduce_sum_of_xy {
         }
     }
 
+    #[cfg_attr(feature = "internal", simd_macros::public)]
     #[inline]
     #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
     #[crate::target_cpu(enable = "a3.256")]
@@ -1278,6 +1283,7 @@ mod reduce_sum_of_xy {
         }
     }
 
+    #[cfg_attr(feature = "internal", simd_macros::public)]
     #[inline]
     #[cfg(target_arch = "aarch64")]
     #[crate::target_cpu(enable = "a2")]
@@ -1349,7 +1355,9 @@ mod reduce_sum_of_xy {
     }
 }
 
+#[cfg_attr(feature = "internal", simd_macros::public)]
 mod reduce_sum_of_d2 {
+    #[cfg_attr(feature = "internal", simd_macros::public)]
     #[inline]
     #[cfg(target_arch = "x86_64")]
     #[crate::target_cpu(enable = "v4")]
@@ -1408,6 +1416,7 @@ mod reduce_sum_of_d2 {
         }
     }
 
+    #[cfg_attr(feature = "internal", simd_macros::public)]
     #[inline]
     #[cfg(target_arch = "x86_64")]
     #[crate::target_cpu(enable = "v3")]
@@ -1475,6 +1484,7 @@ mod reduce_sum_of_d2 {
         }
     }
 
+    #[cfg_attr(feature = "internal", simd_macros::public)]
     #[inline]
     #[cfg(target_arch = "x86_64")]
     #[crate::target_cpu(enable = "v2")]
@@ -1536,6 +1546,7 @@ mod reduce_sum_of_d2 {
         }
     }
 
+    #[cfg_attr(feature = "internal", simd_macros::public)]
     #[inline]
     #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
     #[crate::target_cpu(enable = "a3.256")]
@@ -1583,6 +1594,7 @@ mod reduce_sum_of_d2 {
         }
     }
 
+    #[cfg_attr(feature = "internal", simd_macros::public)]
     #[inline]
     #[cfg(target_arch = "aarch64")]
     #[crate::target_cpu(enable = "a2")]

@@ -12,13 +12,14 @@
 //
 // Copyright (c) 2025 TensorChord Inc.
 
-pub mod reduce_sum_of_xy {
-    #[doc(hidden)]
+#[cfg_attr(feature = "internal", simd_macros::public)]
+mod reduce_sum_of_xy {
+    #[cfg_attr(feature = "internal", simd_macros::public)]
     #[inline]
     #[cfg(target_arch = "x86_64")]
     #[crate::target_cpu(enable = "v4")]
     #[target_feature(enable = "avx512vnni")]
-    pub fn reduce_sum_of_xy_v4_avx512vnni(lhs: &[u8], rhs: &[u8]) -> u32 {
+    fn reduce_sum_of_xy_v4_avx512vnni(lhs: &[u8], rhs: &[u8]) -> u32 {
         use core::arch::x86_64::*;
         assert_eq!(lhs.len(), rhs.len());
         let mut n = lhs.len();
@@ -79,11 +80,11 @@ pub mod reduce_sum_of_xy {
         }
     }
 
-    #[doc(hidden)]
+    #[cfg_attr(feature = "internal", simd_macros::public)]
     #[inline]
     #[cfg(target_arch = "x86_64")]
     #[crate::target_cpu(enable = "v4")]
-    pub fn reduce_sum_of_xy_v4(lhs: &[u8], rhs: &[u8]) -> u32 {
+    fn reduce_sum_of_xy_v4(lhs: &[u8], rhs: &[u8]) -> u32 {
         use core::arch::x86_64::*;
         assert_eq!(lhs.len(), rhs.len());
         let mut n = lhs.len();
@@ -149,11 +150,11 @@ pub mod reduce_sum_of_xy {
         }
     }
 
-    #[doc(hidden)]
+    #[cfg_attr(feature = "internal", simd_macros::public)]
     #[inline]
     #[cfg(target_arch = "x86_64")]
     #[crate::target_cpu(enable = "v3")]
-    pub fn reduce_sum_of_xy_v3(lhs: &[u8], rhs: &[u8]) -> u32 {
+    fn reduce_sum_of_xy_v3(lhs: &[u8], rhs: &[u8]) -> u32 {
         use crate::emulate::{emulate_mm256_reduce_add_epi32, partial_load};
         use core::arch::x86_64::*;
         assert_eq!(lhs.len(), rhs.len());
@@ -220,11 +221,11 @@ pub mod reduce_sum_of_xy {
         }
     }
 
-    #[doc(hidden)]
+    #[cfg_attr(feature = "internal", simd_macros::public)]
     #[inline]
     #[cfg(target_arch = "x86_64")]
     #[crate::target_cpu(enable = "v2")]
-    pub fn reduce_sum_of_xy_v2(lhs: &[u8], rhs: &[u8]) -> u32 {
+    fn reduce_sum_of_xy_v2(lhs: &[u8], rhs: &[u8]) -> u32 {
         use crate::emulate::{emulate_mm_reduce_add_epi32, partial_load};
         use core::arch::x86_64::*;
         assert_eq!(lhs.len(), rhs.len());
@@ -291,6 +292,7 @@ pub mod reduce_sum_of_xy {
         }
     }
 
+    #[cfg_attr(feature = "internal", simd_macros::public)]
     #[inline]
     #[cfg(target_arch = "aarch64")]
     #[crate::target_cpu(enable = "a2")]
@@ -334,6 +336,7 @@ pub mod reduce_sum_of_xy {
         }
     }
 
+    #[cfg_attr(feature = "internal", simd_macros::public)]
     #[inline]
     #[cfg(target_arch = "aarch64")]
     #[crate::target_cpu(enable = "a2")]

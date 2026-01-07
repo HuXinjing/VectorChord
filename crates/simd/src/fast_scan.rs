@@ -484,8 +484,9 @@ mod scan {
         }
     }
 
-    #[cfg(all(target_arch = "s390x", test, not(miri)))]
+    #[cfg(all(target_arch = "s390x", test))]
     #[test]
+    #[cfg(miri, ignore)]
     fn scan_z13_test() {
         if !crate::is_cpu_detected!("z13") {
             println!("test {} ... skipped (z13)", module_path!());
@@ -605,8 +606,9 @@ mod scan {
     #[cfg(target_arch = "powerpc64")]
     scan_powerpc64!(scan_p9, "p9");
 
-    #[cfg(all(target_arch = "powerpc64", test, not(miri)))]
+    #[cfg(all(target_arch = "powerpc64", test))]
     #[test]
+    #[cfg(miri, ignore)]
     fn scan_p9_test() {
         if !crate::is_cpu_detected!("p9") {
             println!("test {} ... skipped (p9)", module_path!());
@@ -630,8 +632,9 @@ mod scan {
     #[cfg(target_arch = "powerpc64")]
     scan_powerpc64!(scan_p8, "p8");
 
-    #[cfg(all(target_arch = "powerpc64", test, not(miri)))]
+    #[cfg(all(target_arch = "powerpc64", test))]
     #[test]
+    #[cfg(miri, ignore)]
     fn scan_p8_test() {
         if !crate::is_cpu_detected!("p8") {
             println!("test {} ... skipped (p8)", module_path!());
@@ -655,8 +658,9 @@ mod scan {
     #[cfg(target_arch = "powerpc64")]
     scan_powerpc64!(scan_p7, "p7");
 
-    #[cfg(all(target_arch = "powerpc64", test, not(miri)))]
+    #[cfg(all(target_arch = "powerpc64", test))]
     #[test]
+    #[cfg(miri, ignore)]
     fn scan_p7_test() {
         if !crate::is_cpu_detected!("p7") {
             println!("test {} ... skipped (p7)", module_path!());

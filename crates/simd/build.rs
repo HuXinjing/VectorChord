@@ -19,6 +19,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     println!("cargo::rerun-if-changed=cshim");
     let target_arch = var("CARGO_CFG_TARGET_ARCH")?;
     let target_endian = var("CARGO_CFG_TARGET_ENDIAN")?;
+    #[allow(clippy::single_match)]
     match target_arch.as_str() {
         "aarch64" => {
             let mut build = cc::Build::new();
