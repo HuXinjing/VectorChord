@@ -205,8 +205,11 @@ fn build(
     target: &str,
 ) -> Result<PathBuf, Box<dyn Error>> {
     let mut command = Command::new("cargo");
+    command.args(["rustc"]);
+    if !matches!(profile, "dev" | "test") {
+        command.args(["--crate-type", "cdylib"]);
+    }
     command
-        .args(["build"])
         .args(["-p", "vchord", "--lib"])
         .args(["--profile", profile])
         .args(["--target", target])
