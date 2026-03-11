@@ -378,8 +378,8 @@ jobs:
 
           mkdir ~/pgvector-install
           curl -fsSL https://github.com/pgvector/pgvector/archive/refs/tags/v0.8.1.tar.gz | tar -xz -C ~/pgvector-install
-          make -C ~/pgvector-install/pgvector-0.8.1 PG_CONFIG=$(brew --prefix postgresql@${{ matrix.version }})/bin/pg_config CC='sccache clang'
-          sudo make -C ~/pgvector-install/pgvector-0.8.1 PG_CONFIG=$(brew --prefix postgresql@${{ matrix.version }})/bin/pg_config CC='sccache clang' install
+          make -C ~/pgvector-install/pgvector-0.8.1 PG_CONFIG=$(brew --prefix postgresql@${{ matrix.version }})/bin/pg_config CC='sccache clang' OPTFLAGS=""
+          sudo make -C ~/pgvector-install/pgvector-0.8.1 PG_CONFIG=$(brew --prefix postgresql@${{ matrix.version }})/bin/pg_config CC='sccache clang' OPTFLAGS="" install
 
       - name: Checkout
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -619,8 +619,8 @@ jobs:
 
           mkdir ~/pgvector-install
           curl -fsSL https://github.com/pgvector/pgvector/archive/refs/tags/v0.8.1.tar.gz | tar -xz -C ~/pgvector-install
-          make -C ~/pgvector-install/pgvector-0.8.1 PG_CONFIG=/usr/libexec/postgresql${{ matrix.version }}/pg_config CC='sccache clang-18'
-          make -C ~/pgvector-install/pgvector-0.8.1 PG_CONFIG=/usr/libexec/postgresql${{ matrix.version }}/pg_config CC='sccache clang-18' install
+          make -C ~/pgvector-install/pgvector-0.8.1 PG_CONFIG=/usr/libexec/postgresql${{ matrix.version }}/pg_config CC='sccache clang-18' OPTFLAGS=""
+          make -C ~/pgvector-install/pgvector-0.8.1 PG_CONFIG=/usr/libexec/postgresql${{ matrix.version }}/pg_config CC='sccache clang-18' OPTFLAGS="" install
 
       - name: Checkout
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -1022,8 +1022,8 @@ jobs:
           mkdir ~/pgvector-install
           curl -fsSL https://github.com/pgvector/pgvector/archive/refs/tags/v0.8.1.tar.gz | tar -xz -C ~/pgvector-install
           pushd ~/pgvector-install/pgvector-0.8.1
-          make -j$(nproc)
-          sudo make install
+          make OPTFLAGS="" -j$(nproc)
+          sudo make OPTFLAGS="" install
           popd
 
       - name: Checkout

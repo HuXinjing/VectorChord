@@ -476,11 +476,11 @@ mod vchordrq_cached {
     use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
     #[repr(C, align(8))]
-    #[derive(Debug, Clone, PartialEq, FromBytes, IntoBytes, Immutable, KnownLayout)]
+    #[derive(Debug, Clone, FromBytes, IntoBytes, Immutable, KnownLayout)]
     struct VchordrqCachedHeader0 {}
 
     #[repr(C, align(8))]
-    #[derive(Debug, Clone, PartialEq, FromBytes, IntoBytes, Immutable, KnownLayout)]
+    #[derive(Debug, Clone, FromBytes, IntoBytes, Immutable, KnownLayout)]
     struct VchordrqCachedHeader1 {
         mapping_s: usize,
         mapping_e: usize,

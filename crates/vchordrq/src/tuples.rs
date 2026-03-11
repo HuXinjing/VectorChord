@@ -46,7 +46,7 @@ pub trait WithWriter: Tuple {
 }
 
 #[repr(C, align(8))]
-#[derive(Debug, Clone, PartialEq, FromBytes, IntoBytes, Immutable, KnownLayout)]
+#[derive(Debug, Clone, FromBytes, IntoBytes, Immutable, KnownLayout)]
 struct MetaTupleHeader {
     version: u64,
     dim: u32,
@@ -234,13 +234,13 @@ impl<'a> MetaTupleReader<'a> {
 }
 
 #[repr(C, align(8))]
-#[derive(Debug, Clone, PartialEq, FromBytes, IntoBytes, Immutable, KnownLayout)]
+#[derive(Debug, Clone, FromBytes, IntoBytes, Immutable, KnownLayout)]
 struct FreepagesTupleHeader {
     first: u32,
     _padding_0: [Padding; 4],
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone)]
 pub struct FreepagesTuple {}
 
 impl Tuple for FreepagesTuple {
@@ -275,7 +275,7 @@ impl FreepagesTupleWriter<'_> {
 }
 
 #[repr(C, align(8))]
-#[derive(Debug, Clone, PartialEq, FromBytes, IntoBytes, Immutable, KnownLayout)]
+#[derive(Debug, Clone, FromBytes, IntoBytes, Immutable, KnownLayout)]
 struct CentroidTupleHeader0 {
     metadata_s: u16,
     elements_s: u16,
@@ -284,7 +284,7 @@ struct CentroidTupleHeader0 {
 }
 
 #[repr(C, align(8))]
-#[derive(Debug, Clone, PartialEq, FromBytes, IntoBytes, Immutable, KnownLayout)]
+#[derive(Debug, Clone, FromBytes, IntoBytes, Immutable, KnownLayout)]
 struct CentroidTupleHeader1 {
     head: u16,
     elements_s: u16,
@@ -292,7 +292,7 @@ struct CentroidTupleHeader1 {
     _padding_0: [Padding; 2],
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone)]
 pub enum CentroidTuple<V: Vector> {
     _0 {
         metadata: V::Metadata,
@@ -431,7 +431,7 @@ impl<'a, V: Vector> CentroidTupleReader<'a, V> {
 }
 
 #[repr(C, align(8))]
-#[derive(Debug, Clone, PartialEq, FromBytes, IntoBytes, Immutable, KnownLayout)]
+#[derive(Debug, Clone, FromBytes, IntoBytes, Immutable, KnownLayout)]
 struct VectorTupleHeader0 {
     payload: Option<NonZero<u64>>,
     metadata_s: u16,
@@ -441,7 +441,7 @@ struct VectorTupleHeader0 {
 }
 
 #[repr(C, align(8))]
-#[derive(Debug, Clone, PartialEq, FromBytes, IntoBytes, Immutable, KnownLayout)]
+#[derive(Debug, Clone, FromBytes, IntoBytes, Immutable, KnownLayout)]
 struct VectorTupleHeader1 {
     payload: Option<NonZero<u64>>,
     head: u16,
@@ -450,7 +450,7 @@ struct VectorTupleHeader1 {
     _padding_0: [Padding; 2],
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone)]
 pub enum VectorTuple<V: Vector> {
     _0 {
         payload: Option<NonZero<u64>>,
@@ -606,7 +606,7 @@ impl<'a, V: Vector> VectorTupleReader<'a, V> {
 }
 
 #[repr(C, align(8))]
-#[derive(Debug, Clone, PartialEq, FromBytes, IntoBytes, Immutable, KnownLayout)]
+#[derive(Debug, Clone, FromBytes, IntoBytes, Immutable, KnownLayout)]
 struct DirectoryTupleHeader0 {
     elements_s: u16,
     elements_e: u16,
@@ -614,14 +614,14 @@ struct DirectoryTupleHeader0 {
 }
 
 #[repr(C, align(8))]
-#[derive(Debug, Clone, PartialEq, FromBytes, IntoBytes, Immutable, KnownLayout)]
+#[derive(Debug, Clone, FromBytes, IntoBytes, Immutable, KnownLayout)]
 struct DirectoryTupleHeader1 {
     elements_s: u16,
     elements_e: u16,
     _padding_0: [Padding; 4],
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone)]
 pub enum DirectoryTuple {
     _0 { elements: Vec<u32> },
     _1 { elements: Vec<u32> },
@@ -722,20 +722,22 @@ impl WithReader for DirectoryTuple {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy)]
 pub enum DirectoryTupleReader<'a> {
     _0(DirectoryTupleReader0<'a>),
     _1(DirectoryTupleReader1<'a>),
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy)]
 pub struct DirectoryTupleReader0<'a> {
+    #[allow(dead_code)]
     header: &'a DirectoryTupleHeader0,
     elements: &'a [u32],
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy)]
 pub struct DirectoryTupleReader1<'a> {
+    #[allow(dead_code)]
     header: &'a DirectoryTupleHeader1,
     elements: &'a [u32],
 }
@@ -753,7 +755,7 @@ impl<'a> DirectoryTupleReader1<'a> {
 }
 
 #[repr(C, align(8))]
-#[derive(Debug, Clone, PartialEq, FromBytes, IntoBytes, Immutable, KnownLayout)]
+#[derive(Debug, Clone, FromBytes, IntoBytes, Immutable, KnownLayout)]
 struct H1TupleHeader0 {
     metadata: [[f32; 32]; 4],
     delta: [f32; 32],
@@ -769,7 +771,7 @@ struct H1TupleHeader0 {
 }
 
 #[repr(C, align(8))]
-#[derive(Debug, Clone, PartialEq, FromBytes, IntoBytes, Immutable, KnownLayout)]
+#[derive(Debug, Clone, FromBytes, IntoBytes, Immutable, KnownLayout)]
 struct H1TupleHeader1 {
     elements_s: u16,
     elements_e: u16,
@@ -777,7 +779,7 @@ struct H1TupleHeader1 {
 }
 
 #[allow(clippy::large_enum_variant)]
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone)]
 pub enum H1Tuple {
     _0 {
         metadata: [[f32; 32]; 4],
@@ -921,21 +923,22 @@ impl WithReader for H1Tuple {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy)]
 pub enum H1TupleReader<'a> {
     _0(H1TupleReader0<'a>),
     _1(H1TupleReader1<'a>),
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy)]
 pub struct H1TupleReader0<'a> {
     header: &'a H1TupleHeader0,
     prefetch: &'a [[u32; 32]],
     elements: &'a [[u8; 16]],
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy)]
 pub struct H1TupleReader1<'a> {
+    #[allow(dead_code)]
     header: &'a H1TupleHeader1,
     elements: &'a [[u8; 16]],
 }
@@ -974,7 +977,7 @@ impl<'a> H1TupleReader1<'a> {
 }
 
 #[repr(C, align(8))]
-#[derive(Debug, Clone, PartialEq, FromBytes, IntoBytes, Immutable, KnownLayout)]
+#[derive(Debug, Clone, FromBytes, IntoBytes, Immutable, KnownLayout)]
 struct JumpTupleHeader {
     centroid_prefetch_s: u16,
     centroid_prefetch_e: u16,
@@ -986,7 +989,7 @@ struct JumpTupleHeader {
     tuples: u64,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone)]
 pub struct JumpTuple {
     pub centroid_prefetch: Vec<u32>,
     pub centroid_head: u16,
@@ -1096,7 +1099,7 @@ impl JumpTupleWriter<'_> {
 }
 
 #[repr(C, align(8))]
-#[derive(Debug, Clone, PartialEq, FromBytes, IntoBytes, Immutable, KnownLayout)]
+#[derive(Debug, Clone, FromBytes, IntoBytes, Immutable, KnownLayout)]
 struct FrozenTupleHeader0 {
     metadata: [[f32; 32]; 4],
     delta: [f32; 32],
@@ -1110,7 +1113,7 @@ struct FrozenTupleHeader0 {
 }
 
 #[repr(C, align(8))]
-#[derive(Debug, Clone, PartialEq, FromBytes, IntoBytes, Immutable, KnownLayout)]
+#[derive(Debug, Clone, FromBytes, IntoBytes, Immutable, KnownLayout)]
 struct FrozenTupleHeader1 {
     elements_s: u16,
     elements_e: u16,
@@ -1118,7 +1121,7 @@ struct FrozenTupleHeader1 {
 }
 
 #[allow(clippy::large_enum_variant)]
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone)]
 pub enum FrozenTuple {
     _0 {
         metadata: [[f32; 32]; 4],
@@ -1278,13 +1281,13 @@ impl WithWriter for FrozenTuple {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy)]
 pub enum FrozenTupleReader<'a> {
     _0(FrozenTupleReader0<'a>),
     _1(FrozenTupleReader1<'a>),
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy)]
 pub struct FrozenTupleReader0<'a> {
     header: &'a FrozenTupleHeader0,
     prefetch: &'a [[u32; 32]],
@@ -1312,8 +1315,9 @@ impl<'a> FrozenTupleReader0<'a> {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy)]
 pub struct FrozenTupleReader1<'a> {
+    #[allow(dead_code)]
     header: &'a FrozenTupleHeader1,
     elements: &'a [[u8; 16]],
 }
@@ -1353,7 +1357,7 @@ impl FrozenTupleWriter0<'_> {
 }
 
 #[repr(C, align(8))]
-#[derive(Debug, Clone, PartialEq, FromBytes, IntoBytes, Immutable, KnownLayout)]
+#[derive(Debug, Clone, FromBytes, IntoBytes, Immutable, KnownLayout)]
 struct AppendableTupleHeader {
     metadata: [f32; 4],
     delta: f32,
@@ -1367,7 +1371,7 @@ struct AppendableTupleHeader {
     payload: Option<NonZero<u64>>,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone)]
 pub struct AppendableTuple {
     pub metadata: [f32; 4],
     pub delta: f32,
@@ -1441,7 +1445,7 @@ impl WithWriter for AppendableTuple {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy)]
 pub struct AppendableTupleReader<'a> {
     header: &'a AppendableTupleHeader,
     prefetch: &'a [u32],

@@ -47,7 +47,7 @@ pub trait WithWriter: Tuple {
 }
 
 #[repr(C, align(8))]
-#[derive(Debug, Clone, PartialEq, FromBytes, IntoBytes, Immutable, KnownLayout)]
+#[derive(Debug, Clone, FromBytes, IntoBytes, Immutable, KnownLayout)]
 struct MetaTupleHeader {
     version: u64,
     dim: u32,
@@ -206,7 +206,7 @@ impl<'a> MetaTupleWriter<'a> {
 }
 
 #[repr(C, align(8))]
-#[derive(Debug, Clone, PartialEq, FromBytes, IntoBytes, Immutable, KnownLayout)]
+#[derive(Debug, Clone, FromBytes, IntoBytes, Immutable, KnownLayout)]
 struct VertexTupleHeader {
     metadata: [f32; 3],
     elements_s: u16,
@@ -217,7 +217,7 @@ struct VertexTupleHeader {
     _padding_0: [Padding; 4],
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone)]
 pub struct VertexTuple {
     pub metadata: [f32; 3],
     pub elements: Vec<u64>,
@@ -292,7 +292,7 @@ impl WithWriter for VertexTuple {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy)]
 pub struct VertexTupleReader<'a> {
     header: &'a VertexTupleHeader,
     elements: &'a [u64],
@@ -339,7 +339,7 @@ impl VertexTupleWriter<'_> {
 }
 
 #[repr(C, align(8))]
-#[derive(Debug, Clone, PartialEq, FromBytes, IntoBytes, Immutable, KnownLayout)]
+#[derive(Debug, Clone, FromBytes, IntoBytes, Immutable, KnownLayout)]
 struct VectorTupleHeader0 {
     payload: Option<NonZero<u64>>,
     elements_s: u16,
@@ -352,7 +352,7 @@ struct VectorTupleHeader0 {
 }
 
 #[repr(C, align(8))]
-#[derive(Debug, Clone, PartialEq, FromBytes, IntoBytes, Immutable, KnownLayout)]
+#[derive(Debug, Clone, FromBytes, IntoBytes, Immutable, KnownLayout)]
 struct VectorTupleHeader1 {
     payload: Option<NonZero<u64>>,
     elements_s: u16,
@@ -360,7 +360,7 @@ struct VectorTupleHeader1 {
     index: u32,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone)]
 pub enum VectorTuple<V: Vector> {
     _0 {
         payload: Option<NonZero<u64>>,
@@ -528,7 +528,7 @@ impl<'a, V: Vector> Clone for VectorTupleReader<'a, V> {
     }
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug)]
 pub struct VectorTupleReader0<'a, V: Vector> {
     header: &'a VectorTupleHeader0,
     elements: &'a [V::Element],
@@ -562,7 +562,7 @@ impl<'a, V: Vector> VectorTupleReader0<'a, V> {
     }
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug)]
 pub struct VectorTupleReader1<'a, V: Vector> {
     header: &'a VectorTupleHeader1,
     elements: &'a [V::Element],

@@ -137,7 +137,7 @@ impl<'a> MutChecker<'a> {
 #[test]
 fn aliasing_test() {
     #[repr(C, align(8))]
-    #[derive(Debug, Clone, PartialEq, FromBytes, IntoBytes, Immutable, KnownLayout)]
+    #[derive(Debug, Clone, FromBytes, IntoBytes, Immutable, KnownLayout)]
     struct ExampleHeader {
         elements_s: u16,
         elements_e: u16,

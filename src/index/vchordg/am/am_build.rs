@@ -612,7 +612,7 @@ mod vchordg_cached {
     use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
     #[repr(C, align(8))]
-    #[derive(Debug, Clone, PartialEq, FromBytes, IntoBytes, Immutable, KnownLayout)]
+    #[derive(Debug, Clone, FromBytes, IntoBytes, Immutable, KnownLayout)]
     struct VchordgCachedHeader0 {}
 
     pub enum VchordgCached {
