@@ -10,7 +10,7 @@
 // regarding the licenses, please contact us at:
 // vectorchord-inquiry@tensorchord.ai
 //
-// Copyright (c) 2025 TensorChord Inc.
+// Copyright (c) 2025-2026 TensorChord Inc.
 
 #[inline(always)]
 pub fn reduce_sum_of_and(lhs: &[u64], rhs: &[u64]) -> u32 {

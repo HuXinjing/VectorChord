@@ -10,7 +10,7 @@
 // regarding the licenses, please contact us at:
 // vectorchord-inquiry@tensorchord.ai
 //
-// Copyright (c) 2025 TensorChord Inc.
+// Copyright (c) 2025-2026 TensorChord Inc.
 
 // Referenced symbols must exist in the dynamic library when dropping functions.
 // So we should never remove symbols used by schema, otherwise there will be errors in upgrade.

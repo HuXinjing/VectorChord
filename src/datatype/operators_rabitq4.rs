@@ -10,7 +10,7 @@
 // regarding the licenses, please contact us at:
 // vectorchord-inquiry@tensorchord.ai
 //
-// Copyright (c) 2025 TensorChord Inc.
+// Copyright (c) 2025-2026 TensorChord Inc.
 
 use crate::datatype::memory_rabitq4::{Rabitq4Input, Rabitq4Output};
 use pgrx::datum::Array;

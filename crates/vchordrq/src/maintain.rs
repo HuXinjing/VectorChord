@@ -10,7 +10,7 @@
 // regarding the licenses, please contact us at:
 // vectorchord-inquiry@tensorchord.ai
 //
-// Copyright (c) 2025 TensorChord Inc.
+// Copyright (c) 2025-2026 TensorChord Inc.
 
 use crate::closure_lifetime_binder::{id_0, id_1, id_2, id_3};
 use crate::operator::{Operator, Vector};

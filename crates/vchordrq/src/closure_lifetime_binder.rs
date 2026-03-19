@@ -10,7 +10,7 @@
 // regarding the licenses, please contact us at:
 // vectorchord-inquiry@tensorchord.ai
 //
-// Copyright (c) 2025 TensorChord Inc.
+// Copyright (c) 2025-2026 TensorChord Inc.
 
 // Use stable language features as an alternative to `closure_lifetime_binder`.
 // See https://github.com/rust-lang/rust/issues/97362.
