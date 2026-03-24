@@ -17,14 +17,14 @@ use std::cell::RefMut;
 use std::fs;
 use std::path::Path;
 
-// Safety: The directory name must start with "pgsql_tmp" to be excluded by pg_basebackup
+// The directory name must start with "pgsql_tmp" to be excluded by pg_basebackup
 const RECORDER_DIR: &str = "pgsql_tmp_vchord_sampling";
 const RECORDER_VERSION: u32 = 1;
 
 static CONNECTION: PgRefCell<Option<rusqlite::Connection>> =
     PgRefCell::<Option<rusqlite::Connection>>::new(None);
 
-fn get<'a>() -> Option<RefMut<'a, rusqlite::Connection>> {
+fn get<'a>(create: bool) -> Option<RefMut<'a, rusqlite::Connection>> {
     if unsafe { !pgrx::pg_sys::IsBackendPid(pgrx::pg_sys::MyProcPid) } {
         return None;
     }
@@ -36,10 +36,16 @@ fn get<'a>() -> Option<RefMut<'a, rusqlite::Connection>> {
     if connection.is_none()
         && let Err(err) = || -> rusqlite::Result<()> {
             if !Path::new(RECORDER_DIR).exists() {
-                let _ = fs::create_dir_all(RECORDER_DIR);
+                if create {
+                    let _ = fs::create_dir_all(RECORDER_DIR);
+                }
             }
             let p = format!("{RECORDER_DIR}/database_{database_oid}.sqlite");
-            let mut conn = rusqlite::Connection::open(&p)?;
+            let mut flags = rusqlite::OpenFlags::default();
+            if !create {
+                flags.remove(rusqlite::OpenFlags::SQLITE_OPEN_CREATE);
+            }
+            let mut conn = rusqlite::Connection::open_with_flags(&p, flags)?;
             conn.pragma_update(Some("main"), "journal_mode", "WAL")?;
             conn.pragma_update(Some("main"), "synchronous", "NORMAL")?;
             let tx = conn.transaction()?;
@@ -72,7 +78,7 @@ fn get<'a>() -> Option<RefMut<'a, rusqlite::Connection>> {
 }
 
 pub fn push(index: u32, sample: &str, max_records: u32) {
-    let mut connection = match get() {
+    let mut connection = match get(true) {
         Some(c) => c,
         None => return,
     };
@@ -105,7 +111,7 @@ pub fn push(index: u32, sample: &str, max_records: u32) {
 }
 
 pub fn delete_index(index: u32) {
-    let connection = match get() {
+    let connection = match get(false) {
         Some(c) => c,
         None => return,
     };
@@ -122,7 +128,7 @@ pub fn delete_database(database_oid: u32) {
 }
 
 pub fn dump(index: u32) -> Vec<String> {
-    let connection = match get() {
+    let connection = match get(false) {
         Some(c) => c,
         None => return Vec::new(),
     };
