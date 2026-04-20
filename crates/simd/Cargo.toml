@@ -26,7 +26,7 @@ criterion = "0.8.2"
 rand.workspace = true
 
 [build-dependencies]
-cc = "1.2.59"
+cc = "1.2.60"
 
 [lints]
 workspace = true

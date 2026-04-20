@@ -446,7 +446,8 @@ mod scan {
 
             use core::arch::s390x::*;
             use std::mem::transmute;
-            use {vector_unsigned_char as u8x16, vector_unsigned_short as u16x8};
+            use vector_unsigned_char as u8x16;
+            use vector_unsigned_short as u16x8;
 
             let _0001_u16x8 = vec_splat_u16::<0x0001>();
             let _00ff_u16x8 = vec_splat_u16::<0x00ff>();
@@ -532,7 +533,8 @@ mod scan {
 
                     use core::arch::powerpc64::*;
                     use std::mem::transmute;
-                    use {vector_unsigned_char as u8x16, vector_unsigned_short as u16x8};
+                    use vector_unsigned_char as u8x16;
+                    use vector_unsigned_short as u16x8;
 
                     #[cfg(target_endian = "big")]
                     let revb = transmute::<[u8; 16], u8x16>([

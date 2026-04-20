@@ -3,6 +3,7 @@ name = "vchord"
 version.workspace = true
 edition.workspace = true
 publish = false
+autotests = false
 
 [lib]
 name = "vchord"
@@ -52,7 +53,7 @@ wyhash.workspace = true
 zerocopy.workspace = true
 
 [target.'cfg(all(any(target_arch = "x86_64", target_arch = "aarch64"), any(target_os = "linux", target_os = "macos")))'.dependencies]
-mimalloc = { version = "0.1.48", features = ["local_dynamic_tls"] }
+mimalloc = { version = "0.1.49", features = ["local_dynamic_tls"] }
 
 [lints]
 workspace = true
@@ -67,11 +68,11 @@ edition = "2024"
 
 [workspace.dependencies]
 bumpalo = "3.20.2"
-dary_heap = "0.3.8"
+dary_heap = "0.3.9"
 paste = "1.0.15"
-rand = "0.10.0"
+rand = "0.10.1"
 rand_chacha = "0.10.0"
-rayon = "1.11.0"
+rayon = "1.12.0"
 seq-macro = "0.3.6"
 serde = { version = "1.0.228", features = ["derive"] }
 validator = { version = "0.20.0", features = ["derive"] }

@@ -43,7 +43,8 @@ pub enum Opfamily {
 
 impl Opfamily {
     fn input(self, vector: BorrowedVector<'_>) -> OwnedVector {
-        use {BorrowedVector as B, OwnedVector as O};
+        use BorrowedVector as B;
+        use OwnedVector as O;
         match (self, vector) {
             (Self::VectorL2, B::Vecf32(x)) => O::Vecf32(x.own()),
             (Self::VectorL2, _) => unreachable!(),
