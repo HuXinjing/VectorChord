@@ -1,5 +1,41 @@
 <div align="center">
 
+# VectorChord TileMaxSim
+
+**An open-source VectorChord fork focused on exact multi-vector retrieval in PostgreSQL.**
+
+</div>
+
+This fork extends VectorChord's `vchordrq` index with a bounded candidate stage
+and exact late-interaction TileMaxSim reranking. It is intended for applications
+that store one array of token vectors per document and need PostgreSQL-native
+multi-vector search.
+
+## What this fork adds
+
+- Exact TileMaxSim reranking on CPU, plus an optional CUDA sidecar backend.
+- A configurable upper bound on reranking candidates to keep work predictable.
+- External tensor-source registration for deployments that keep full-precision
+  token tensors outside the indexed PostgreSQL value.
+- PostgreSQL-aware permission, MVCC, row-visibility, cancellation, and timeout
+  handling for the external-tensor search path.
+- Planner statistics and cost estimation for multi-vector queries.
+- Deterministic correctness, registry, sidecar-protocol, and planner-cost tests.
+
+The implementation is currently under active development. Its SQL interfaces
+and deployment packaging may change before a stable release. This repository
+contains only the public implementation and public-facing project information;
+private planning and application documentation are intentionally excluded.
+
+This work is based on
+[supervc-stack/VectorChord](https://github.com/supervc-stack/VectorChord). The
+original VectorChord README is retained below for upstream installation,
+licensing, and project information.
+
+---
+
+<div align="center">
+
 # VectorChord
 
 **Ready for the Billion-Scale Era. Host 100M vectors on a single i4i.xlarge ($247/mo) and [scale seamlessly to 1B+](https://blog.vectorchord.ai/scaling-vector-search-to-1-billion-on-postgresql).**
