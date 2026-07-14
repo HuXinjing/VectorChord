@@ -826,15 +826,17 @@ pub unsafe extern "C-unwind" fn vchordrq_parallel_build_main(
             .cast::<u8>()
             .cast_const()
     };
-    let heap_lockmode;
-    let index_lockmode;
-    if unsafe { !(*vchordrqshared).isconcurrent } {
-        heap_lockmode = pgrx::pg_sys::ShareLock as pgrx::pg_sys::LOCKMODE;
-        index_lockmode = pgrx::pg_sys::AccessExclusiveLock as pgrx::pg_sys::LOCKMODE;
+    let (heap_lockmode, index_lockmode) = if unsafe { !(*vchordrqshared).isconcurrent } {
+        (
+            pgrx::pg_sys::ShareLock as pgrx::pg_sys::LOCKMODE,
+            pgrx::pg_sys::AccessExclusiveLock as pgrx::pg_sys::LOCKMODE,
+        )
     } else {
-        heap_lockmode = pgrx::pg_sys::ShareUpdateExclusiveLock as pgrx::pg_sys::LOCKMODE;
-        index_lockmode = pgrx::pg_sys::RowExclusiveLock as pgrx::pg_sys::LOCKMODE;
-    }
+        (
+            pgrx::pg_sys::ShareUpdateExclusiveLock as pgrx::pg_sys::LOCKMODE,
+            pgrx::pg_sys::RowExclusiveLock as pgrx::pg_sys::LOCKMODE,
+        )
+    };
     let heap = unsafe { pgrx::pg_sys::table_open((*vchordrqshared).heaprelid, heap_lockmode) };
     let index = unsafe { pgrx::pg_sys::index_open((*vchordrqshared).indexrelid, index_lockmode) };
     let index_info = unsafe { pgrx::pg_sys::BuildIndexInfo(index) };

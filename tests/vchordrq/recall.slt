@@ -80,6 +80,9 @@ SHOW vchordrq.query_sampling_enable;
 on
 
 statement ok
+SET enable_seqscan = off;
+
+statement ok
 SELECT * from t ORDER BY val <-> '[0.50, 0.25, 1.00]';
 
 statement ok
@@ -162,6 +165,9 @@ query I
 SELECT COUNT(*) from public.vchordrq_sampled_queries;
 ----
 3
+
+statement ok
+RESET enable_seqscan;
 
 statement ok
 RESET search_path;
