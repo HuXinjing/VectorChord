@@ -34,12 +34,80 @@ from devtools import tilemaxsim_reference_sidecar as protocol
 from devtools.test_tilemaxsim_reference_sidecar import decode_response
 from services.tilemaxsim_cuda_sidecar import ContentAddressedResolver, PayloadCache
 from services.tilemaxsim_gpu_cache import (
+    FixedBlockAllocator,
     FreeExtentAllocator,
     GpuArenaSpec,
     GpuResourcePool,
     GpuTensorCache,
     GpuTensorLoad,
 )
+
+
+class _LegacyBuddyAllocator:
+    """Former power-of-two allocator retained only as an ablation baseline."""
+
+    def __init__(self, capacity: int, block_bytes: int = 256 * 1024) -> None:
+        self.block_bytes = block_bytes
+        self.block_count = capacity // block_bytes
+        self.capacity = self.block_count * block_bytes
+        self._free: dict[int, set[tuple[int, int, int]]] = {}
+        self._allocated: dict[int, tuple[int, int, int]] = {}
+        start = 0
+        remaining = self.block_count
+        while remaining:
+            order = remaining.bit_length() - 1
+            size = 1 << order
+            self._free.setdefault(order, set()).add((start, start, order))
+            start += size
+            remaining -= size
+
+    @property
+    def free_bytes(self) -> int:
+        return sum(
+            len(items) * (1 << order) * self.block_bytes
+            for order, items in self._free.items()
+        )
+
+    def allocation_bytes(self, payload_bytes: int) -> int:
+        raw = math.ceil(payload_bytes / self.block_bytes)
+        return (1 << (raw - 1).bit_length()) * self.block_bytes
+
+    def allocate(self, payload_bytes: int) -> tuple[int, ...] | None:
+        required = self.allocation_bytes(payload_bytes) // self.block_bytes
+        order = required.bit_length() - 1
+        available_order = next(
+            (
+                candidate
+                for candidate in range(order, self.block_count.bit_length())
+                if self._free.get(candidate)
+            ),
+            None,
+        )
+        if available_order is None:
+            return None
+        start, root_start, root_order = self._free[available_order].pop()
+        while available_order > order:
+            available_order -= 1
+            buddy = start + (1 << available_order)
+            self._free.setdefault(available_order, set()).add(
+                (buddy, root_start, root_order)
+            )
+        self._allocated[start] = (order, root_start, root_order)
+        return tuple(range(start, start + required))
+
+    def release(self, blocks: tuple[int, ...]) -> None:
+        start = blocks[0]
+        order, root_start, root_order = self._allocated.pop(start)
+        while order < root_order:
+            buddy = root_start + ((start - root_start) ^ (1 << order))
+            item = (buddy, root_start, root_order)
+            free = self._free.setdefault(order, set())
+            if item not in free:
+                break
+            free.remove(item)
+            start = min(start, buddy)
+            order += 1
+        self._free.setdefault(order, set()).add((start, root_start, root_order))
 
 
 def percentile(samples: list[float], fraction: float) -> float:
@@ -53,7 +121,11 @@ def load_records(path: Path) -> list[dict[str, object]]:
 
 
 def request(record: dict[str, object], contract: str) -> protocol.ExternalTensorRequest:
-    dtype = protocol.DTYPE_F16 if record["tensor_dtype"] == "float16" else protocol.DTYPE_F32
+    dtype = (
+        protocol.DTYPE_F16
+        if record["tensor_dtype"] == "float16"
+        else protocol.DTYPE_F32
+    )
     return protocol.ExternalTensorRequest(
         contract,
         str(record["tensor_ref"]),
@@ -76,7 +148,10 @@ def evict_paths(paths: list[Path]) -> None:
 
 
 def storage_ablation(
-    selected: list[dict[str, object]], contract: str, legacy_root: Path, shard_root: Path
+    selected: list[dict[str, object]],
+    contract: str,
+    legacy_root: Path,
+    shard_root: Path,
 ) -> dict[str, object]:
     requests = [request(record, contract) for record in selected]
     legacy_paths = [
@@ -143,7 +218,9 @@ def h2d_ablation(
     total_bytes = 768 * 1024**2
     workspace_bytes = 256 * 1024**2
 
-    pool = GpuResourcePool([GpuArenaSpec(f"cuda:{device}", total_bytes)], workspace_bytes)
+    pool = GpuResourcePool(
+        [GpuArenaSpec(f"cuda:{device}", total_bytes)], workspace_bytes
+    )
     try:
         cache = GpuTensorCache(pool, allow_eviction=True)
         started = time.perf_counter()
@@ -165,13 +242,13 @@ def h2d_ablation(
     finally:
         pool.close()
 
-    pool = GpuResourcePool([GpuArenaSpec(f"cuda:{device}", total_bytes)], workspace_bytes)
+    pool = GpuResourcePool(
+        [GpuArenaSpec(f"cuda:{device}", total_bytes)], workspace_bytes
+    )
     try:
         cache = GpuTensorCache(pool, allow_eviction=True)
         loads = [
-            GpuTensorLoad(
-                key, item.rows, item.dimension, item.dtype, resolved.payload
-            )
+            GpuTensorLoad(key, item.rows, item.dimension, item.dtype, resolved.payload)
             for key, item, resolved in zip(keys, requests, payloads, strict=True)
         ]
         started = time.perf_counter()
@@ -201,53 +278,82 @@ def allocator_ablation(records: list[dict[str, object]]) -> dict[str, object]:
     sizes = [int(record["canonical_bytes"]) for record in records]
     rng = random.Random(991)
     capacity = 256 * 1024**2
-    extent = FreeExtentAllocator(capacity)
-    extent_live: list[tuple[int, int]] = []
-    extent_failures = 0
-    extent_fragmentation_failures = 0
+    events: list[tuple[str, int, int]] = []
+    abstract_live: list[int] = []
+    next_identifier = 0
     for _ in range(20_000):
-        if extent_live and rng.random() < 0.48:
-            extent.release(*extent_live.pop(rng.randrange(len(extent_live))))
+        if abstract_live and rng.random() < 0.48:
+            index = rng.randrange(len(abstract_live))
+            identifier = abstract_live.pop(index)
+            events.append(("release", identifier, 0))
         else:
             size = rng.choice(sizes)
-            required = extent.allocation_bytes(size)
-            allocated = extent.allocate(size)
-            if allocated is None:
-                extent_failures += 1
-                extent_fragmentation_failures += int(extent.free_bytes >= required)
-            else:
-                extent_live.append(allocated)
-    from services.tilemaxsim_gpu_cache import FixedBlockAllocator
+            identifier = next_identifier
+            next_identifier += 1
+            abstract_live.append(identifier)
+            events.append(("allocate", identifier, size))
 
-    rng = random.Random(991)
-    slab = FixedBlockAllocator(capacity)
-    slab_live: list[tuple[int, ...]] = []
-    slab_failures = 0
-    slab_fragmentation_failures = 0
-    requested = 0
-    allocated_bytes = 0
-    for _ in range(20_000):
-        if slab_live and rng.random() < 0.48:
-            slab.release(slab_live.pop(rng.randrange(len(slab_live))))
-        else:
-            size = rng.choice(sizes)
-            required = slab.allocation_bytes(size)
-            allocated = slab.allocate(size)
-            if allocated is None:
-                slab_failures += 1
-                slab_fragmentation_failures += int(slab.free_bytes >= required)
+    def run_trace(
+        allocator: FreeExtentAllocator | FixedBlockAllocator | _LegacyBuddyAllocator,
+    ) -> dict[str, object]:
+        live: dict[int, tuple[int, ...] | tuple[int, int]] = {}
+        failures = 0
+        fragmentation_failures = 0
+        requested_bytes = 0
+        allocated_bytes = 0
+        started = time.perf_counter()
+        for operation, identifier, size in events:
+            if operation == "release":
+                allocation = live.pop(identifier, None)
+                if allocation is None:
+                    continue
+                if isinstance(allocator, FreeExtentAllocator):
+                    allocator.release(*allocation)
+                else:
+                    allocator.release(allocation)
+                continue
+            required = allocator.allocation_bytes(size)
+            allocation = allocator.allocate(size)
+            if allocation is None:
+                failures += 1
+                fragmentation_failures += int(allocator.free_bytes >= required)
             else:
-                slab_live.append(allocated)
-                requested += size
-                allocated_bytes += len(allocated) * slab.block_bytes
+                live[identifier] = allocation
+                requested_bytes += size
+                allocated_bytes += (
+                    allocation[1]
+                    if isinstance(allocator, FreeExtentAllocator)
+                    else len(allocation) * allocator.block_bytes
+                )
+        return {
+            "allocation_failures": failures,
+            "fragmentation_failures": fragmentation_failures,
+            "internal_waste_ratio": (
+                (allocated_bytes - requested_bytes) / allocated_bytes
+            ),
+            "trace_ms": (time.perf_counter() - started) * 1000,
+        }
+
+    extent = FreeExtentAllocator(capacity)
+    legacy = _LegacyBuddyAllocator(capacity)
+    page_runs = FixedBlockAllocator(capacity)
+    legacy_full_bytes = sum(legacy.allocation_bytes(size) for size in sizes)
+    page_run_full_bytes = sum(page_runs.allocation_bytes(size) for size in sizes)
     return {
         "operations": 20_000,
         "capacity_bytes": capacity,
-        "extent_allocation_failures": extent_failures,
-        "extent_fragmentation_failures": extent_fragmentation_failures,
-        "slab_allocation_failures": slab_failures,
-        "slab_fragmentation_failures": slab_fragmentation_failures,
-        "slab_internal_waste_ratio": (allocated_bytes - requested) / allocated_bytes,
+        "exact_byte_extents": run_trace(extent),
+        "legacy_power_of_two_buddy": {
+            "block_bytes": legacy.block_bytes,
+            "full_corpus_allocated_bytes": legacy_full_bytes,
+            **run_trace(legacy),
+        },
+        "segregated_page_runs": {
+            "block_bytes": page_runs.block_bytes,
+            "full_corpus_allocated_bytes": page_run_full_bytes,
+            "full_corpus_space_saved_bytes": legacy_full_bytes - page_run_full_bytes,
+            **run_trace(page_runs),
+        },
     }
 
 
@@ -274,7 +380,9 @@ class LegacyLru:
 def policy_ablation(records: list[dict[str, object]]) -> dict[str, object]:
     rng = random.Random(77)
     universe = records[:5000]
-    sizes = {str(record["tensor_ref"]): int(record["canonical_bytes"]) for record in universe}
+    sizes = {
+        str(record["tensor_ref"]): int(record["canonical_bytes"]) for record in universe
+    }
     hot = list(sizes)[:100]
     cold = list(sizes)[100:]
     # Warm every hot object before injecting scans so TinyLFU admission is
@@ -330,9 +438,16 @@ def encode_frame(
         )
         body.extend(tensor_ref)
         body.extend(checksum)
-    return protocol.HEADER.pack(
-        protocol.MAGIC, protocol.EXTERNAL_VERSION, protocol.REQUEST_KIND, request_id, len(body)
-    ) + body
+    return (
+        protocol.HEADER.pack(
+            protocol.MAGIC,
+            protocol.EXTERNAL_VERSION,
+            protocol.REQUEST_KIND,
+            request_id,
+            len(body),
+        )
+        + body
+    )
 
 
 def request_round_trip(
@@ -361,10 +476,13 @@ def daemon_ablation(
     rust_binary: Path,
     device: int,
     repeats: int,
+    gpu_block_kib: int = 32,
 ) -> dict[str, object]:
     rng = np.random.default_rng(31)
     query = rng.standard_normal((44, int(records[0]["tensor_dim"]))).astype("<f2")
-    query /= np.linalg.norm(query.astype(np.float32), axis=1, keepdims=True).astype("<f2")
+    query /= np.linalg.norm(query.astype(np.float32), axis=1, keepdims=True).astype(
+        "<f2"
+    )
     frame = encode_frame(records, contract, query, 7001)
     shard_paths = sorted((shard_root / "shards").glob("*.vts"))
     results = {}
@@ -383,6 +501,8 @@ def daemon_ablation(
                     f"{device}=0.75",
                     "--gpu-workspace-gb",
                     "0.25",
+                    "--gpu-block-kib",
+                    str(gpu_block_kib),
                     "--host-cache-gb",
                     "0.25",
                     "--contract-root",
@@ -401,6 +521,8 @@ def daemon_ablation(
                     f"{device}=0.75",
                     "--gpu-workspace-gb",
                     "0.25",
+                    "--gpu-block-kib",
+                    str(gpu_block_kib),
                     "--host-cache-gb",
                     "0.25",
                     "--contract-root",
@@ -455,9 +577,9 @@ def daemon_ablation(
     }
     rust_top = {
         key
-        for key, _ in sorted(rust_scores.items(), key=lambda item: item[1], reverse=True)[
-            :top_count
-        ]
+        for key, _ in sorted(
+            rust_scores.items(), key=lambda item: item[1], reverse=True
+        )[:top_count]
     }
     results["correctness"] = {
         "max_abs_score_delta": max(deltas, default=0.0),
@@ -473,6 +595,7 @@ def prewarm_ablation(
     shard_root: Path,
     rust_binary: Path,
     device: int,
+    gpu_block_kib: int = 32,
 ) -> dict[str, object]:
     shard_paths = sorted((shard_root / "shards").glob("*.vts"))
     results = {}
@@ -488,6 +611,8 @@ def prewarm_ablation(
                 f"{device}=20",
                 "--gpu-workspace-gb",
                 "2",
+                "--gpu-block-kib",
+                str(gpu_block_kib),
                 "--host-cache-gb",
                 "0.1",
                 "--contract-root",
@@ -509,6 +634,8 @@ def prewarm_ablation(
                 f"{device}=20",
                 "--gpu-workspace-gb",
                 "2",
+                "--gpu-block-kib",
+                str(gpu_block_kib),
                 "--host-cache-gb",
                 "0.1",
                 "--contract-root",
@@ -590,6 +717,7 @@ def main() -> None:
     parser.add_argument("--device", required=True, type=int)
     parser.add_argument("--sample-size", type=int, default=100)
     parser.add_argument("--repeats", type=int, default=20)
+    parser.add_argument("--gpu-block-kib", type=int, default=32)
     parser.add_argument("--output", required=True, type=Path)
     parser.add_argument("--full-prewarm", action="store_true")
     args = parser.parse_args()
@@ -601,7 +729,9 @@ def main() -> None:
             "logical_bytes": sum(int(record["canonical_bytes"]) for record in records),
             "sample_size": len(selected),
         },
-        "storage": storage_ablation(selected, args.contract, args.legacy_root, args.shard_root),
+        "storage": storage_ablation(
+            selected, args.contract, args.legacy_root, args.shard_root
+        ),
         "h2d": h2d_ablation(selected, args.contract, args.shard_root, args.device),
         "allocator": allocator_ablation(records),
         "policy": policy_ablation(records),
@@ -612,6 +742,7 @@ def main() -> None:
             args.rust_binary,
             args.device,
             args.repeats,
+            args.gpu_block_kib,
         ),
     }
     if args.full_prewarm:
@@ -621,6 +752,7 @@ def main() -> None:
             args.shard_root,
             args.rust_binary,
             args.device,
+            args.gpu_block_kib,
         )
     args.output.parent.mkdir(parents=True, exist_ok=True)
     with args.output.open("w", encoding="utf-8") as stream:

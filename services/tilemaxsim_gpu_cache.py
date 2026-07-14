@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import re
 import threading
+from bisect import bisect_left, insort
 from collections import OrderedDict
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
@@ -34,7 +35,11 @@ from devtools import tilemaxsim_reference_sidecar as protocol
 _GPU_MEMORY_GB = re.compile(r"^(?:cuda:)?([0-9]+)=([0-9]+(?:\.[0-9]+)?)$")
 _MEMORY_GB = re.compile(r"^[0-9]+(?:\.[0-9]+)?$")
 GIB = 1024**3
-DEFAULT_BLOCK_BYTES = 256 * 1024
+# A 32 KiB page keeps the allocator metadata small while avoiding the 8.82%
+# rounding loss observed with the former 256 KiB default on 472--483 KiB
+# document tensors. The native daemon exposes the same default via
+# ``--gpu-block-kib``.
+DEFAULT_BLOCK_BYTES = 32 * 1024
 DEFAULT_STAGING_BYTES = 64 * 1024 * 1024
 
 
@@ -131,11 +136,12 @@ class FreeExtentAllocator:
 
 
 class FixedBlockAllocator:
-    """Fixed-base-block buddy/slab allocator used by resident tensors.
+    """Best-fit page-run allocator over one process-owned GPU arena.
 
-    A tensor gets one contiguous power-of-two slab.  This preserves the dense
-    memory layout required by the Tensor Core kernel while bounding internal
-    fragmentation and guaranteeing that released buddies coalesce.
+    Tensors keep the dense layout required by the TileMaxSim kernel, but their
+    runs are rounded only to the base page instead of the next power of two.
+    Free runs are indexed by both address and exact size.  Allocation therefore
+    finds the smallest suitable run, while release coalesces adjacent runs.
     """
 
     def __init__(self, capacity: int, block_bytes: int = DEFAULT_BLOCK_BYTES) -> None:
@@ -148,20 +154,50 @@ class FixedBlockAllocator:
         if self.block_count == 0:
             raise ValueError("arena must contain at least one GPU block")
         self.capacity = self.block_count * block_bytes
-        self._free: dict[int, set[tuple[int, int, int]]] = {}
-        self._allocated: dict[int, tuple[int, int, int]] = {}
-        start = 0
-        remaining = self.block_count
-        while remaining:
-            order = remaining.bit_length() - 1
-            size = 1 << order
-            self._free.setdefault(order, set()).add((start, start, order))
-            start += size
-            remaining -= size
+        self._free_by_start: dict[int, int] = {}
+        self._free_by_size: dict[int, set[int]] = {}
+        self._starts: list[int] = []
+        self._sizes: list[int] = []
+        self._allocated: dict[int, int] = {}
+        self._free_blocks = 0
+        self._add_free_run(0, self.block_count)
+
+    def _add_free_run(self, start: int, blocks: int) -> None:
+        if blocks <= 0 or start < 0 or start + blocks > self.block_count:
+            raise ValueError("free GPU run is outside the arena")
+        if start in self._free_by_start:
+            raise ValueError("duplicate free GPU run")
+        self._free_by_start[start] = blocks
+        insort(self._starts, start)
+        bucket = self._free_by_size.get(blocks)
+        if bucket is None:
+            bucket = set()
+            self._free_by_size[blocks] = bucket
+            insort(self._sizes, blocks)
+        bucket.add(start)
+        self._free_blocks += blocks
+
+    def _remove_free_run(self, start: int, blocks: int) -> None:
+        if self._free_by_start.get(start) != blocks:
+            raise ValueError("free GPU run directory is inconsistent")
+        del self._free_by_start[start]
+        start_index = bisect_left(self._starts, start)
+        if start_index == len(self._starts) or self._starts[start_index] != start:
+            raise ValueError("free GPU address index is inconsistent")
+        self._starts.pop(start_index)
+        bucket = self._free_by_size[blocks]
+        bucket.remove(start)
+        if not bucket:
+            del self._free_by_size[blocks]
+            size_index = bisect_left(self._sizes, blocks)
+            if size_index == len(self._sizes) or self._sizes[size_index] != blocks:
+                raise ValueError("free GPU size index is inconsistent")
+            self._sizes.pop(size_index)
+        self._free_blocks -= blocks
 
     @property
     def free_blocks(self) -> int:
-        return sum(len(items) * (1 << order) for order, items in self._free.items())
+        return self._free_blocks
 
     @property
     def free_bytes(self) -> int:
@@ -169,44 +205,28 @@ class FixedBlockAllocator:
 
     @property
     def largest_free_extent(self) -> int:
-        return max(
-            (1 << order) * self.block_bytes
-            for order, items in self._free.items()
-            if items
-        ) if self.free_blocks else 0
+        return self._sizes[-1] * self.block_bytes if self._sizes else 0
 
     def blocks_for(self, payload_bytes: int) -> int:
         if payload_bytes <= 0:
             raise ValueError("payload size must be positive")
-        raw = ceil(payload_bytes / self.block_bytes)
-        return 1 << (raw - 1).bit_length()
+        return ceil(payload_bytes / self.block_bytes)
 
     def allocation_bytes(self, payload_bytes: int) -> int:
         return self.blocks_for(payload_bytes) * self.block_bytes
 
     def allocate(self, payload_bytes: int) -> tuple[int, ...] | None:
         required = self.blocks_for(payload_bytes)
-        order = required.bit_length() - 1
-        available_order = next(
-            (
-                candidate
-                for candidate in range(order, self.block_count.bit_length())
-                if self._free.get(candidate)
-            ),
-            None,
-        )
-        if available_order is None:
+        size_index = bisect_left(self._sizes, required)
+        if size_index == len(self._sizes):
             return None
-        start, root_start, root_order = self._free[available_order].pop()
-        while available_order > order:
-            available_order -= 1
-            buddy = start + (1 << available_order)
-            self._free.setdefault(available_order, set()).add(
-                (buddy, root_start, root_order)
-            )
-        blocks = tuple(range(start, start + required))
-        self._allocated[start] = (order, root_start, root_order)
-        return blocks
+        available = self._sizes[size_index]
+        start = min(self._free_by_size[available])
+        self._remove_free_run(start, available)
+        if available > required:
+            self._add_free_run(start + required, available - required)
+        self._allocated[start] = required
+        return tuple(range(start, start + required))
 
     def release(self, blocks: tuple[int, ...]) -> None:
         if (
@@ -215,23 +235,27 @@ class FixedBlockAllocator:
             or blocks != tuple(range(blocks[0], blocks[0] + len(blocks)))
         ):
             raise ValueError("released GPU blocks are invalid")
-        allocation = self._allocated.pop(blocks[0], None)
-        if allocation is None:
+        allocated_blocks = self._allocated.pop(blocks[0], None)
+        if allocated_blocks is None:
             raise ValueError("GPU block was released more than once")
-        order, root_start, root_order = allocation
-        if len(blocks) != 1 << order:
-            raise ValueError("released GPU slab has the wrong size")
+        if len(blocks) != allocated_blocks:
+            raise ValueError("released GPU page run has the wrong size")
         start = blocks[0]
-        while order < root_order:
-            buddy = root_start + (((start - root_start) ^ (1 << order)))
-            item = (buddy, root_start, root_order)
-            free = self._free.setdefault(order, set())
-            if item not in free:
-                break
-            free.remove(item)
-            start = min(start, buddy)
-            order += 1
-        self._free.setdefault(order, set()).add((start, root_start, root_order))
+        length = allocated_blocks
+        insertion = bisect_left(self._starts, start)
+        if insertion:
+            previous_start = self._starts[insertion - 1]
+            previous_length = self._free_by_start[previous_start]
+            if previous_start + previous_length == start:
+                self._remove_free_run(previous_start, previous_length)
+                start = previous_start
+                length += previous_length
+        next_start = start + length
+        next_length = self._free_by_start.get(next_start)
+        if next_length is not None:
+            self._remove_free_run(next_start, next_length)
+            length += next_length
+        self._add_free_run(start, length)
 
 
 class TinyLfuSketch:
@@ -269,8 +293,7 @@ class TinyLfuSketch:
 
     def estimate(self, key: tuple[object, ...]) -> int:
         return min(
-            self.tables[row][index]
-            for row, index in enumerate(self._indices(key))
+            self.tables[row][index] for row, index in enumerate(self._indices(key))
         )
 
 
@@ -335,7 +358,9 @@ class GpuArena:
                 staging_bytes = min(self.capacity, DEFAULT_STAGING_BYTES)
                 staging_bytes = max(
                     self.allocator.block_bytes,
-                    staging_bytes // self.allocator.block_bytes * self.allocator.block_bytes,
+                    staging_bytes
+                    // self.allocator.block_bytes
+                    * self.allocator.block_bytes,
                 )
                 self.host_staging = torch.empty(
                     staging_bytes, dtype=torch.uint8, pin_memory=True
@@ -359,7 +384,11 @@ class GpuArena:
         dimension: int,
         dtype: int,
     ) -> torch.Tensor:
-        if self.storage is None or self.host_staging is None or self.copy_stream is None:
+        if (
+            self.storage is None
+            or self.host_staging is None
+            or self.copy_stream is None
+        ):
             raise RuntimeError("GPU arena is closed")
         scalar_dtype = torch.float32 if dtype == protocol.DTYPE_F32 else torch.float16
         block_bytes = self.allocator.block_bytes
@@ -374,60 +403,82 @@ class GpuArena:
             ).narrow(0, 0, payload_bytes)
         return raw.view(scalar_dtype).reshape(rows, dimension)
 
-    def copy_many_from_host(
-        self, items: list[tuple[tuple[int, ...], bytes]]
-    ) -> None:
+    def copy_many_from_host(self, items: list[tuple[tuple[int, ...], bytes]]) -> None:
         if self.storage is None:
             raise RuntimeError("GPU arena is closed")
         if not items:
             return
         block_bytes = self.allocator.block_bytes
-        flattened: list[tuple[int, bytes, int, int]] = []
+        runs: list[tuple[int, int, bytes]] = []
         for blocks, payload in items:
-            for ordinal, block in enumerate(blocks):
-                start = ordinal * block_bytes
-                length = min(block_bytes, max(0, len(payload) - start))
-                flattened.append((block, payload, start, length))
-        flattened.sort(key=lambda item: item[0])
+            if (
+                not blocks
+                or blocks != tuple(range(blocks[0], blocks[0] + len(blocks)))
+                or len(payload) > len(blocks) * block_bytes
+            ):
+                raise RuntimeError("GPU upload requires one valid contiguous page run")
+            runs.append((blocks[0], len(blocks), payload))
+        runs.sort(key=lambda item: item[0])
         staging = self.host_staging
         staging_array = staging.numpy()
-        staging_blocks = staging.numel() // block_bytes
+        staging_bytes = staging.numel()
         copy_calls = 0
         with torch.cuda.device(self.device):
             stream = self.copy_stream
-            for chunk_start in range(0, len(flattened), staging_blocks):
-                chunk = flattened[chunk_start : chunk_start + staging_blocks]
-                for index, (_, payload, source_start, source_length) in enumerate(
-                    chunk
-                ):
-                    if not source_length:
-                        continue
-                    start = index * block_bytes
-                    staging_array[start : start + source_length] = np.frombuffer(
-                        payload,
-                        dtype=np.uint8,
-                        count=source_length,
-                        offset=source_start,
-                    )
-                with torch.cuda.stream(stream):
-                    run_start = 0
-                    for index in range(1, len(chunk) + 1):
-                        if (
-                            index < len(chunk)
-                            and chunk[index][0] == chunk[index - 1][0] + 1
-                        ):
-                            continue
-                        first_block = chunk[run_start][0]
-                        count = index - run_start
-                        length = count * block_bytes
-                        self.storage.narrow(
-                            0, first_block * block_bytes, length
-                        ).copy_(
-                            staging.narrow(0, run_start * block_bytes, length),
-                            non_blocking=True,
+            run_index = 0
+            while run_index < len(runs):
+                first_block, run_blocks, payload = runs[run_index]
+                allocation_bytes = run_blocks * block_bytes
+                if allocation_bytes > staging_bytes:
+                    source_offset = 0
+                    while source_offset < len(payload):
+                        length = min(staging_bytes, len(payload) - source_offset)
+                        staging_array[:length] = np.frombuffer(
+                            payload,
+                            dtype=np.uint8,
+                            count=length,
+                            offset=source_offset,
                         )
+                        with torch.cuda.stream(stream):
+                            self.storage.narrow(
+                                0,
+                                first_block * block_bytes + source_offset,
+                                length,
+                            ).copy_(staging.narrow(0, 0, length), non_blocking=True)
+                        stream.synchronize()
                         copy_calls += 1
-                        run_start = index
+                        source_offset += length
+                    run_index += 1
+                    continue
+
+                batch_first_block = first_block
+                expected_block = first_block
+                staging_offset = 0
+                while run_index < len(runs):
+                    start_block, count, current_payload = runs[run_index]
+                    current_allocation = count * block_bytes
+                    if (
+                        start_block != expected_block
+                        or staging_offset + current_allocation > staging_bytes
+                    ):
+                        break
+                    payload_end = staging_offset + len(current_payload)
+                    staging_array[staging_offset:payload_end] = np.frombuffer(
+                        current_payload, dtype=np.uint8
+                    )
+                    allocation_end = staging_offset + current_allocation
+                    staging_array[payload_end:allocation_end] = 0
+                    staging_offset = allocation_end
+                    expected_block += count
+                    run_index += 1
+                with torch.cuda.stream(stream):
+                    self.storage.narrow(
+                        0, batch_first_block * block_bytes, staging_offset
+                    ).copy_(
+                        staging.narrow(0, 0, staging_offset),
+                        non_blocking=True,
+                    )
+                    copy_calls += 1
                 stream.synchronize()
         self.h2d_batches += 1
         self.h2d_copy_calls += copy_calls
@@ -793,8 +844,8 @@ class GpuTensorCache:
                     if cached is not None:
                         cached.references += 1
                         cached.pinned = cached.pinned or load.pin
-                        cached.priority = (
-                            self.inflation + frequency / self._entry_cost(cached)
+                        cached.priority = self.inflation + frequency / self._entry_cost(
+                            cached
                         )
                         self.entries.move_to_end(load.key)
                         handles[index] = GpuTensorHandle(cached)
@@ -835,7 +886,9 @@ class GpuTensorCache:
                     new_entries.append((index, entry, load.payload))
                     admitted += 1
 
-                by_arena: dict[int, tuple[GpuArena, list[tuple[tuple[int, ...], bytes]]]] = {}
+                by_arena: dict[
+                    int, tuple[GpuArena, list[tuple[tuple[int, ...], bytes]]]
+                ] = {}
                 for _, entry, payload in new_entries:
                     bucket = by_arena.setdefault(id(entry.arena), (entry.arena, []))
                     bucket[1].append((entry.blocks, payload))
@@ -897,7 +950,12 @@ class GpuTensorCache:
 
     def status(self) -> dict[str, object]:
         with self.lock:
+            allocated_bytes = sum(
+                entry.allocated_bytes for entry in self.entries.values()
+            )
+            payload_bytes = sum(entry.payload_bytes for entry in self.entries.values())
             return {
+                "allocator": "segregated-page-runs",
                 "entries": len(self.entries),
                 "pinned_entries": sum(entry.pinned for entry in self.entries.values()),
                 "active_references": sum(
@@ -910,5 +968,8 @@ class GpuTensorCache:
                 "policy": "tinylfu-gdsf",
                 "gdsf_inflation": self.inflation,
                 "loaded_bytes": self.loaded_bytes,
+                "allocated_bytes": allocated_bytes,
+                "payload_bytes": payload_bytes,
+                "internal_waste_bytes": allocated_bytes - payload_bytes,
                 "arenas": self.pool.status(),
             }

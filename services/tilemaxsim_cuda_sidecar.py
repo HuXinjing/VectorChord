@@ -107,9 +107,9 @@ class PayloadCache:
     def __init__(self, maximum_bytes: int) -> None:
         self.maximum_bytes = maximum_bytes
         self.current_bytes = 0
-        self.entries: OrderedDict[
-            tuple[object, ...], tuple[bytes, float]
-        ] = OrderedDict()
+        self.entries: OrderedDict[tuple[object, ...], tuple[bytes, float]] = (
+            OrderedDict()
+        )
         self.lock = threading.Lock()
         self.sketch = TinyLfuSketch()
         self.inflation = 0.0
@@ -370,9 +370,7 @@ class ContentAddressedResolver:
     def _validate_shard_entry(
         request: protocol.ExternalTensorRequest, digest: str, entry: ShardEntry
     ) -> None:
-        dtype_name = (
-            "float32" if request.dtype == protocol.DTYPE_F32 else "float16"
-        )
+        dtype_name = "float32" if request.dtype == protocol.DTYPE_F32 else "float16"
         if (
             entry.digest != digest
             or entry.rows != request.rows
@@ -402,7 +400,9 @@ class ContentAddressedResolver:
             offset = 0
             descriptor = root.shard_fds[name]
             while offset < shard.size:
-                chunk = os.pread(descriptor, min(8 * 1024 * 1024, shard.size - offset), offset)
+                chunk = os.pread(
+                    descriptor, min(8 * 1024 * 1024, shard.size - offset), offset
+                )
                 if not chunk:
                     raise protocol.SidecarError(
                         protocol.STATUS_COMPUTE_ERROR,
@@ -470,7 +470,9 @@ class ContentAddressedResolver:
                     protocol.STATUS_INVALID_REQUEST,
                     "resolved shard tensor checksum mismatch",
                 )
-            dtype = protocol.DTYPE_F32 if entry.dtype == "float32" else protocol.DTYPE_F16
+            dtype = (
+                protocol.DTYPE_F32 if entry.dtype == "float32" else protocol.DTYPE_F16
+            )
             validate_finite_payload(tensor, entry.rows, entry.dimension, dtype)
             result[key] = tensor
         return result
@@ -493,7 +495,9 @@ class ContentAddressedResolver:
                 missing[key] = request
                 hits[key] = False
 
-        shard_groups: dict[tuple[str, str], list[tuple[tuple[object, ...], ShardEntry]]] = {}
+        shard_groups: dict[
+            tuple[str, str], list[tuple[tuple[object, ...], ShardEntry]]
+        ] = {}
         legacy: list[tuple[tuple[object, ...], protocol.ExternalTensorRequest]] = []
         for key, request in missing.items():
             contract = request.model_contract_id
@@ -511,7 +515,15 @@ class ContentAddressedResolver:
             self._validate_shard_entry(request, digest, entry)
             shard_groups.setdefault((contract, entry.shard), []).append((key, entry))
 
-        jobs: list[tuple[_OpenShardRoot, str, int, int, list[tuple[tuple[object, ...], ShardEntry]]]] = []
+        jobs: list[
+            tuple[
+                _OpenShardRoot,
+                str,
+                int,
+                int,
+                list[tuple[tuple[object, ...], ShardEntry]],
+            ]
+        ] = []
         for (contract, shard_name), entries in shard_groups.items():
             root = self.shard_roots[contract]
             if self.verify_full_shards:
@@ -520,11 +532,13 @@ class ContentAddressedResolver:
                 jobs.append((root, shard_name, start, end, grouped))
         if jobs:
             with ThreadPoolExecutor(max_workers=min(8, len(jobs))) as workers:
-                for resolved in workers.map(lambda job: self._read_shard_range(*job), jobs):
+                for resolved in workers.map(
+                    lambda job: self._read_shard_range(*job), jobs
+                ):
                     payloads.update(resolved)
 
         def read_legacy(
-            item: tuple[tuple[object, ...], protocol.ExternalTensorRequest]
+            item: tuple[tuple[object, ...], protocol.ExternalTensorRequest],
         ) -> tuple[tuple[object, ...], bytes]:
             key, request = item
             digest = str(key[1])
@@ -1511,16 +1525,16 @@ def prewarm_resident_cache(
                 record_access=False,
                 count_stats=False,
             )
-            if batch.bypassed or batch.deferred or any(
-                handle is None for handle in batch.handles
+            if (
+                batch.bypassed
+                or batch.deferred
+                or any(handle is None for handle in batch.handles)
             ):
                 raise protocol.SidecarError(
                     protocol.STATUS_RESOURCE_LIMIT,
                     "resident manifest exceeds the configured GPU block arenas",
                 )
-            acquired.extend(
-                handle for handle in batch.handles if handle is not None
-            )
+            acquired.extend(handle for handle in batch.handles if handle is not None)
         finally:
             for handle in acquired:
                 gpu_cache.release(handle)
@@ -1614,6 +1628,12 @@ def main() -> None:
         default=2 * 1024**3,
         help="per-GPU portion of the configured GB reserved for scoring temporaries",
     )
+    parser.add_argument(
+        "--gpu-block-kib",
+        type=positive_int,
+        default=32,
+        help="base page size inside each preallocated GPU tensor arena",
+    )
     parser.add_argument("--contract-root", action="append", default=[])
     parser.add_argument(
         "--resident-manifest",
@@ -1673,7 +1693,11 @@ def main() -> None:
     metrics = JsonMetrics()
     pool: GpuResourcePool | None = None
     try:
-        pool = GpuResourcePool(args.gpu_memory_gb, args.gpu_workspace_gb)
+        pool = GpuResourcePool(
+            args.gpu_memory_gb,
+            args.gpu_workspace_gb,
+            args.gpu_block_kib * 1024,
+        )
         engine = TorchTileMaxsimEngine(
             str(pool.primary_device),
             args.gpu_workspace_gb,

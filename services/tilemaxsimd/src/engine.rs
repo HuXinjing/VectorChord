@@ -394,8 +394,15 @@ impl Engine {
             .map(|(index, device)| {
                 serde_json::json!({
                     "index": index,
+                    "gpu_allocator": "segregated-page-runs",
                     "gpu_tensor_bytes": device.cache.capacity(),
                     "gpu_block_bytes": device.cache.block_bytes(),
+                    "gpu_free_bytes": device.cache.free_bytes(),
+                    "gpu_largest_free_extent_bytes": device.cache.largest_free_extent(),
+                    "gpu_allocated_bytes": device.cache.allocated_bytes(),
+                    "gpu_payload_bytes": device.cache.payload_bytes(),
+                    "gpu_internal_waste_bytes": device.cache.allocated_bytes()
+                        - device.cache.payload_bytes(),
                     "gpu_entries": device.cache.entry_count(),
                     "gpu_pinned_entries": device.cache.pinned_entries(),
                     "gpu_hits": device.cache.hits,

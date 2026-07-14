@@ -2,14 +2,16 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::hash::{Hash, Hasher};
 
 #[derive(Debug)]
-pub struct BuddyAllocator {
+pub struct PageRunAllocator {
     block_bytes: usize,
     block_count: usize,
-    free: BTreeMap<u32, BTreeSet<(usize, usize, u32)>>,
-    allocated: HashMap<usize, (u32, usize, u32)>,
+    free_by_start: BTreeMap<usize, usize>,
+    free_by_size: BTreeMap<usize, BTreeSet<usize>>,
+    allocated: HashMap<usize, usize>,
+    free_blocks: usize,
 }
 
-impl BuddyAllocator {
+impl PageRunAllocator {
     pub fn new(capacity: usize, block_bytes: usize) -> Result<Self, &'static str> {
         if capacity == 0 || block_bytes == 0 || !block_bytes.is_multiple_of(256) {
             return Err("invalid fixed-block arena");
@@ -18,22 +20,59 @@ impl BuddyAllocator {
         if block_count == 0 {
             return Err("fixed-block arena is too small");
         }
-        let mut free = BTreeMap::<u32, BTreeSet<_>>::new();
-        let mut start = 0;
-        let mut remaining = block_count;
-        while remaining != 0 {
-            let order = usize::BITS - 1 - remaining.leading_zeros();
-            let size = 1_usize << order;
-            free.entry(order).or_default().insert((start, start, order));
-            start += size;
-            remaining -= size;
-        }
-        Ok(Self {
+        let mut allocator = Self {
             block_bytes,
             block_count,
-            free,
+            free_by_start: BTreeMap::new(),
+            free_by_size: BTreeMap::new(),
             allocated: HashMap::new(),
-        })
+            free_blocks: 0,
+        };
+        allocator.add_free_run(0, block_count)?;
+        Ok(allocator)
+    }
+
+    fn add_free_run(&mut self, start: usize, blocks: usize) -> Result<(), &'static str> {
+        if blocks == 0
+            || start
+                .checked_add(blocks)
+                .is_none_or(|end| end > self.block_count)
+        {
+            return Err("free GPU page run is outside the arena");
+        }
+        if self.free_by_start.insert(start, blocks).is_some() {
+            return Err("duplicate free GPU page run");
+        }
+        self.free_by_size.entry(blocks).or_default().insert(start);
+        self.free_blocks = self
+            .free_blocks
+            .checked_add(blocks)
+            .ok_or("free GPU page count overflow")?;
+        Ok(())
+    }
+
+    fn remove_free_run(&mut self, start: usize, blocks: usize) -> Result<(), &'static str> {
+        if self.free_by_start.remove(&start) != Some(blocks) {
+            return Err("free GPU address index is inconsistent");
+        }
+        let remove_size = {
+            let starts = self
+                .free_by_size
+                .get_mut(&blocks)
+                .ok_or("free GPU size index is inconsistent")?;
+            if !starts.remove(&start) {
+                return Err("free GPU size index is inconsistent");
+            }
+            starts.is_empty()
+        };
+        if remove_size {
+            self.free_by_size.remove(&blocks);
+        }
+        self.free_blocks = self
+            .free_blocks
+            .checked_sub(blocks)
+            .ok_or("free GPU page count underflow")?;
+        Ok(())
     }
 
     pub fn capacity(&self) -> usize {
@@ -48,41 +87,28 @@ impl BuddyAllocator {
         if payload_bytes == 0 {
             return None;
         }
-        let raw = payload_bytes.div_ceil(self.block_bytes);
-        raw.checked_next_power_of_two()?
+        payload_bytes
+            .div_ceil(self.block_bytes)
             .checked_mul(self.block_bytes)
     }
 
     pub fn largest_free(&self) -> usize {
-        self.free
-            .iter()
-            .rev()
-            .find(|(_, entries)| !entries.is_empty())
-            .map_or(0, |(order, _)| (1_usize << order) * self.block_bytes)
+        self.free_by_size
+            .last_key_value()
+            .map_or(0, |(blocks, _)| blocks * self.block_bytes)
     }
 
     pub fn allocate(&mut self, payload_bytes: usize) -> Option<(usize, usize)> {
         let allocation_bytes = self.allocation_bytes(payload_bytes)?;
-        let blocks = allocation_bytes / self.block_bytes;
-        let order = blocks.trailing_zeros();
-        let available_order = self
-            .free
-            .range(order..)
-            .find(|(_, entries)| !entries.is_empty())
-            .map(|(candidate, _)| *candidate)?;
-        let item = self.free.get_mut(&available_order)?.pop_first()?;
-        let (start, root_start, root_order) = item;
-        let mut current_order = available_order;
-        while current_order > order {
-            current_order -= 1;
-            let buddy = start + (1_usize << current_order);
-            self.free
-                .entry(current_order)
-                .or_default()
-                .insert((buddy, root_start, root_order));
+        let required = allocation_bytes / self.block_bytes;
+        let (&available, starts) = self.free_by_size.range(required..).next()?;
+        let start = *starts.first()?;
+        self.remove_free_run(start, available).ok()?;
+        if available > required {
+            self.add_free_run(start + required, available - required)
+                .ok()?;
         }
-        self.allocated
-            .insert(start, (order, root_start, root_order));
+        self.allocated.insert(start, required);
         Some((start * self.block_bytes, allocation_bytes))
     }
 
@@ -91,24 +117,61 @@ impl BuddyAllocator {
             return Err("unaligned fixed-block release");
         }
         let mut start = offset / self.block_bytes;
-        let (mut order, root_start, root_order) = self
+        let mut blocks = self
             .allocated
             .remove(&start)
-            .ok_or("fixed-block slab was released twice")?;
-        while order < root_order {
-            let buddy = root_start + ((start - root_start) ^ (1_usize << order));
-            let buddy_item = (buddy, root_start, root_order);
-            let entries = self.free.entry(order).or_default();
-            if !entries.remove(&buddy_item) {
-                break;
-            }
-            start = start.min(buddy);
-            order += 1;
+            .ok_or("fixed-block page run was released twice")?;
+        let previous = self
+            .free_by_start
+            .range(..start)
+            .next_back()
+            .map(|(&previous_start, &previous_blocks)| (previous_start, previous_blocks));
+        if let Some((previous_start, previous_blocks)) = previous
+            && previous_start + previous_blocks == start
+        {
+            self.remove_free_run(previous_start, previous_blocks)?;
+            start = previous_start;
+            blocks += previous_blocks;
         }
-        self.free
-            .entry(order)
-            .or_default()
-            .insert((start, root_start, root_order));
+        let next_start = start + blocks;
+        if let Some(&next_blocks) = self.free_by_start.get(&next_start) {
+            self.remove_free_run(next_start, next_blocks)?;
+            blocks += next_blocks;
+        }
+        self.add_free_run(start, blocks)
+    }
+
+    pub fn free_bytes(&self) -> usize {
+        self.free_blocks * self.block_bytes
+    }
+
+    pub fn allocated_bytes(&self) -> usize {
+        self.allocated
+            .values()
+            .map(|blocks| blocks * self.block_bytes)
+            .sum()
+    }
+
+    #[cfg(test)]
+    pub fn validate(&self) -> Result<(), &'static str> {
+        let address_blocks = self.free_by_start.values().sum::<usize>();
+        let size_blocks = self
+            .free_by_size
+            .iter()
+            .map(|(blocks, starts)| blocks * starts.len())
+            .sum::<usize>();
+        if address_blocks != self.free_blocks || size_blocks != self.free_blocks {
+            return Err("free GPU page accounting is inconsistent");
+        }
+        for (&start, &blocks) in &self.free_by_start {
+            if !self
+                .free_by_size
+                .get(&blocks)
+                .is_some_and(|starts| starts.contains(&start))
+            {
+                return Err("free GPU page indexes disagree");
+            }
+        }
         Ok(())
     }
 }
@@ -187,7 +250,7 @@ pub enum Admission {
 }
 
 pub struct GpuCache {
-    allocator: BuddyAllocator,
+    allocator: PageRunAllocator,
     entries: HashMap<String, CacheEntry>,
     sketch: TinyLfu,
     inflation: f64,
@@ -200,7 +263,7 @@ pub struct GpuCache {
 impl GpuCache {
     pub fn new(capacity: usize, block_bytes: usize) -> Result<Self, &'static str> {
         Ok(Self {
-            allocator: BuddyAllocator::new(capacity, block_bytes)?,
+            allocator: PageRunAllocator::new(capacity, block_bytes)?,
             entries: HashMap::new(),
             sketch: TinyLfu::new(4096),
             inflation: 0.0,
@@ -225,6 +288,22 @@ impl GpuCache {
 
     pub fn pinned_entries(&self) -> usize {
         self.entries.values().filter(|entry| entry.pinned).count()
+    }
+
+    pub fn free_bytes(&self) -> usize {
+        self.allocator.free_bytes()
+    }
+
+    pub fn largest_free_extent(&self) -> usize {
+        self.allocator.largest_free()
+    }
+
+    pub fn allocated_bytes(&self) -> usize {
+        self.allocator.allocated_bytes()
+    }
+
+    pub fn payload_bytes(&self) -> usize {
+        self.entries.values().map(|entry| entry.payload_bytes).sum()
     }
 
     pub fn get(&mut self, key: &str) -> Option<CacheEntry> {
@@ -360,20 +439,56 @@ impl GpuCache {
 mod tests {
     use super::*;
 
+    fn next_test_random(state: &mut u64) -> u64 {
+        // Deterministic xorshift64 sequence for allocator churn tests. This is
+        // test data, not a pointer, address, secret, or production RNG.
+        *state ^= *state << 13;
+        *state ^= *state >> 7;
+        *state ^= *state << 17;
+        *state
+    }
+
     #[test]
-    fn buddy_coalesces_fixed_slabs() {
-        let mut allocator = BuddyAllocator::new(8 * 256, 256).unwrap();
+    fn page_runs_use_exact_blocks_and_coalesce() {
+        let mut allocator = PageRunAllocator::new(8 * 256, 256).unwrap();
         let first = allocator.allocate(300).unwrap();
         let second = allocator.allocate(300).unwrap();
         let third = allocator.allocate(700).unwrap();
         assert_eq!(first, (0, 512));
         assert_eq!(second, (512, 512));
-        assert_eq!(third, (1024, 1024));
+        assert_eq!(third, (1024, 768));
+        assert_eq!(allocator.free_bytes(), 256);
         allocator.release(second.0).unwrap();
         allocator.release(first.0).unwrap();
         assert_eq!(allocator.largest_free(), 1024);
         allocator.release(third.0).unwrap();
         assert_eq!(allocator.largest_free(), 2048);
+        allocator.validate().unwrap();
+    }
+
+    #[test]
+    fn page_run_indexes_stay_consistent_under_churn() {
+        let mut allocator = PageRunAllocator::new(64 * 256, 256).unwrap();
+        let mut live = Vec::new();
+        let mut state = 0x5eed_u64;
+        for _ in 0..20_000 {
+            let random = next_test_random(&mut state);
+            if !live.is_empty() && random & 3 == 0 {
+                let index = random as usize % live.len();
+                let (offset, _) = live.swap_remove(index);
+                allocator.release(offset).unwrap();
+            } else {
+                let payload = ((random >> 16) as usize % (12 * 256)) + 1;
+                if let Some(allocation) = allocator.allocate(payload) {
+                    live.push(allocation);
+                }
+            }
+            allocator.validate().unwrap();
+            assert_eq!(
+                allocator.free_bytes() + allocator.allocated_bytes(),
+                allocator.capacity()
+            );
+        }
     }
 
     #[test]

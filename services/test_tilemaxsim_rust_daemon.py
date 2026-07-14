@@ -222,7 +222,7 @@ class RustDaemonTest(unittest.TestCase):
             [device],
             [first, second],
             query,
-            gpu_memory_gb="0.0012",
+            gpu_memory_gb="0.0010",
             workspace_gb="0.0005",
         )
         events = [json.loads(line) for line in output.splitlines() if line.startswith("{")]

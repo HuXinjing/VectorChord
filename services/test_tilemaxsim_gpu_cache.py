@@ -70,20 +70,35 @@ class GpuCacheUnitTest(unittest.TestCase):
         allocator.release(*second)
         self.assertEqual(allocator.extents, [(0, 4096)])
 
-    def test_fixed_block_buddy_allocator_coalesces_slabs(self) -> None:
+    def test_fixed_block_allocator_uses_exact_runs_and_coalesces(self) -> None:
         allocator = FixedBlockAllocator(8 * 256, block_bytes=256)
         first = allocator.allocate(300)
         second = allocator.allocate(300)
         third = allocator.allocate(700)
         self.assertEqual(first, (0, 1))
         self.assertEqual(second, (2, 3))
-        self.assertEqual(third, (4, 5, 6, 7))
+        self.assertEqual(third, (4, 5, 6))
+        self.assertEqual(allocator.free_bytes, 256)
         assert first is not None and second is not None and third is not None
         allocator.release(second)
         allocator.release(first)
         self.assertEqual(allocator.largest_free_extent, 4 * 256)
         allocator.release(third)
         self.assertEqual(allocator.largest_free_extent, 8 * 256)
+
+    def test_fixed_block_allocator_reuses_best_fit_run(self) -> None:
+        allocator = FixedBlockAllocator(12 * 256, block_bytes=256)
+        first = allocator.allocate(2 * 256)
+        separator = allocator.allocate(256)
+        second = allocator.allocate(3 * 256)
+        tail = allocator.allocate(6 * 256)
+        assert first is not None and separator is not None
+        assert second is not None and tail is not None
+        allocator.release(first)
+        allocator.release(second)
+        reused = allocator.allocate(3 * 256)
+        self.assertEqual(reused, second)
+        self.assertEqual(allocator.largest_free_extent, 2 * 256)
 
     @unittest.skipUnless(torch.cuda.is_available(), "CUDA is unavailable")
     def test_pool_rejects_budget_larger_than_currently_free_memory(self) -> None:
@@ -182,9 +197,7 @@ class GpuCacheUnitTest(unittest.TestCase):
     @unittest.skipUnless(torch.cuda.is_available(), "CUDA is unavailable")
     def test_batch_admission_uses_one_h2d_batch(self) -> None:
         device = available_device()
-        pool = GpuResourcePool(
-            [GpuArenaSpec(device, 4 * 1024 * 1024)], 2 * 1024 * 1024
-        )
+        pool = GpuResourcePool([GpuArenaSpec(device, 4 * 1024 * 1024)], 2 * 1024 * 1024)
         try:
             cache = GpuTensorCache(pool, allow_eviction=True)
             first = np.ones((128, 320), dtype="<f2")
@@ -192,10 +205,18 @@ class GpuCacheUnitTest(unittest.TestCase):
             batch = cache.acquire_many(
                 [
                     GpuTensorLoad(
-                        ("model", "first"), 128, 320, protocol.DTYPE_F16, first.tobytes()
+                        ("model", "first"),
+                        128,
+                        320,
+                        protocol.DTYPE_F16,
+                        first.tobytes(),
                     ),
                     GpuTensorLoad(
-                        ("model", "second"), 128, 320, protocol.DTYPE_F16, second.tobytes()
+                        ("model", "second"),
+                        128,
+                        320,
+                        protocol.DTYPE_F16,
+                        second.tobytes(),
                     ),
                 ]
             )
@@ -215,7 +236,9 @@ class GpuCacheUnitTest(unittest.TestCase):
     def test_tinylfu_rejects_one_off_tensor_instead_of_polluting_hot_slab(self) -> None:
         device = available_device()
         pool = GpuResourcePool(
-            [GpuArenaSpec(device, 768 * 1024)], 512 * 1024
+            [GpuArenaSpec(device, 768 * 1024)],
+            512 * 1024,
+            block_bytes=256 * 1024,
         )
         try:
             cache = GpuTensorCache(pool, allow_eviction=True)

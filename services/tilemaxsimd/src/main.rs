@@ -33,7 +33,7 @@ struct Args {
     host_cache_gb: usize,
     #[arg(long = "contract-root", required = true, value_parser = parse_contract_root)]
     contract_roots: Vec<(String, PathBuf)>,
-    #[arg(long, default_value_t = 256)]
+    #[arg(long, default_value_t = 32)]
     gpu_block_kib: usize,
     #[arg(long, default_value_t = 64 * 1024 * 1024)]
     max_request_bytes: usize,

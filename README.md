@@ -35,25 +35,33 @@ numbers.
 | --- | ---: | ---: | ---: |
 | Immutable shards and batched reads | 333.38 ms, sequential files | 56.52 ms | 5.90x faster |
 | Shards versus batched legacy files | 87.56 ms | 56.52 ms | 1.55x faster |
-| Batched host-to-device transfer | 43.07 ms, 100 transfers | 22.50 ms, one transfer | 1.91x faster |
+| Batched host-to-device transfer | 37.06 ms, 100 transfers | 14.19 ms, one transfer | 2.61x faster |
 | TinyLFU/GDSF admission | 69.98% LRU hit rate | 76.18% hit rate | +6.20 percentage points |
-| Rust/CUDA cold request | 874.63 ms, Python/Triton | 122.19 ms | 7.16x faster |
-| Rust/CUDA warm request p50 | 14.46 ms, Python/Triton | 1.77 ms | 8.17x faster |
-| Rust/CUDA warm request p95 | 21.57 ms, Python/Triton | 1.83 ms | 11.79x faster |
+| Rust/CUDA cold request | 855.34 ms, Python/Triton | 93.86 ms | 9.11x faster |
+| Rust/CUDA warm request p50 | 14.26 ms, Python/Triton | 2.09 ms | 6.82x faster |
+| Rust/CUDA warm request p95 | 14.84 ms, Python/Triton | 2.20 ms | 6.75x faster |
 
 A full resident-cache run assigned 20 GiB to one GPU: 18 GiB for tensors and
 2 GiB for the TileMaxSim workspace. All 34,027 unique tensors were pinned before
-the service became ready. Process-to-ready time was 26.32 seconds for the
-Python/Triton sidecar and 17.40 seconds for the Rust/CUDA daemon, a 33.9%
+the service became ready. Process-to-ready time was 23.07 seconds for the
+Python/Triton sidecar and 14.86 seconds for the Rust/CUDA daemon, a 35.6%
 reduction. This is a one-time prewarm cost; resident warm requests do not read
 the tensors from disk.
 
-The fixed-block buddy/slab allocator removed external-fragmentation failures in
-a deterministic 20,000-operation allocation trace (220 with variable extents,
-zero with slabs). It traded that unpredictability for 8.82% internal rounding
-waste; total capacity failures were 220 for variable extents and 236 for slabs.
-The allocator therefore improves predictability rather than claiming to create
-additional memory.
+The GPU cache now suballocates exact contiguous page runs from one CUDA arena,
+using best-fit size buckets and address-ordered coalescing. On the full corpus,
+the 32 KiB default reduced allocated tensor space from 17.840 GB with the former
+256 KiB power-of-two buddy allocator to 16.725 GB. It recovered 1.115 GB of GPU
+space and reduced internal rounding waste from 8.82% to 2.74%. The default can
+be overridden with `--gpu-block-kib`.
+
+In a deterministic 20,000-event churn trace, the former buddy allocator had 815
+failed cache-allocation attempts, while the segregated page-run allocator had
+637; neither recorded an external-fragmentation failure on this workload. Exact
+byte extents had 585 failures, all caused by external fragmentation. Page-run
+metadata processing added about 1.4 microseconds per event versus the buddy
+baseline. These are cache-admission attempts, not failed search requests: the
+runtime evicts unpinned entries or streams oversized working sets in chunks.
 
 Rust/CUDA and Python/Triton produced identical top-10 results. The maximum
 absolute score difference was 5.25e-6 and the mean difference was 3.45e-6.
