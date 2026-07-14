@@ -5,6 +5,10 @@ all-features = true
 ignore = [
     "RUSTSEC-2021-0127", # serde_cbor is unmaintained
     "RUSTSEC-2024-0436", # paste - no longer maintained
+    # Build-time-only transitive dependency of validator_derive 0.20.0. The
+    # advisory has no maintained compatible release yet; remove this exception
+    # as soon as validator publishes a replacement.
+    "RUSTSEC-2026-0173",
 ]
 
 [licenses]

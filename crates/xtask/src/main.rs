@@ -242,32 +242,31 @@ fn parse(rustc_cfg: &RustcCfg, obj: impl AsRef<Path>) -> Result<Vec<String>, Box
     eprintln!("Reading {obj:?}");
     let contents = std::fs::read(obj)?;
     let object = object::File::parse(contents.as_slice())?;
-    let exports;
-    if rustc_cfg.is_macos {
-        exports = object
+    let exports = if rustc_cfg.is_macos {
+        object
             .exports()?
             .into_iter()
             .flat_map(|x| std::str::from_utf8(x.name()))
             .flat_map(|x| x.strip_prefix("_"))
             .filter(|x| x.starts_with("__pgrx_internals"))
             .map(str::to_string)
-            .collect();
+            .collect()
     } else if rustc_cfg.is_emscripten {
-        exports = object
+        object
             .symbols()
             .flat_map(|x| x.name().ok())
             .filter(|x| x.starts_with("__pgrx_internals"))
             .map(str::to_string)
-            .collect();
+            .collect()
     } else {
-        exports = object
+        object
             .exports()?
             .into_iter()
             .flat_map(|x| std::str::from_utf8(x.name()))
             .filter(|x| x.starts_with("__pgrx_internals"))
             .map(str::to_string)
-            .collect();
-    }
+            .collect()
+    };
     Ok(exports)
 }
 

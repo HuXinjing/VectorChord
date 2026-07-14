@@ -8,6 +8,7 @@ use super::rerank::{CandidateTensorSource, ExactMaxsimBackend, RerankError, Rera
 use distance::Distance;
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
+#[cfg(unix)]
 use std::mem::size_of_val;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;

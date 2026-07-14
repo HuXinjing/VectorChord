@@ -65,6 +65,10 @@ pub(super) trait ExactMaxsimBackend {
 #[derive(Debug)]
 pub(super) enum RerankError {
     TensorMismatch,
+    #[allow(
+        dead_code,
+        reason = "constructed only by the dynamically selected external descriptor source"
+    )]
     ModelContractMismatch,
     InvalidDescriptor(&'static str),
     Registry(String),

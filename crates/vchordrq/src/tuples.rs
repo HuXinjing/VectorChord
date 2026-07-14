@@ -1583,6 +1583,12 @@ mod tests {
         }
     }
 
+    fn aligned_copy(bytes: &[u8]) -> Vec<u64> {
+        let mut storage = vec![0_u64; bytes.len().div_ceil(size_of::<u64>())];
+        storage.as_mut_bytes()[..bytes.len()].copy_from_slice(bytes);
+        storage
+    }
+
     #[test]
     fn meta_statistics_reuse_padding_without_moving_fields() {
         assert_eq!(size_of::<MetaTupleHeader>(), 56);
@@ -1608,9 +1614,11 @@ mod tests {
     #[test]
     fn meta_statistics_roundtrip_full_48_bit_range() {
         for expected in [0, 1, u32::MAX as u64 + 1, MAX_INDEXED_VECTORS] {
-            let bytes = meta(Some(expected)).serialize();
+            let serialized = meta(Some(expected)).serialize();
+            let storage = aligned_copy(&serialized);
+            let bytes = &storage.as_bytes()[..serialized.len()];
             assert_eq!(
-                MetaTuple::deserialize_ref(&bytes).indexed_vectors(),
+                MetaTuple::deserialize_ref(bytes).indexed_vectors(),
                 Some(expected)
             );
         }
@@ -1618,12 +1626,14 @@ mod tests {
 
     #[test]
     fn old_meta_padding_reads_as_missing_statistics_and_can_be_upgraded() {
-        let mut bytes = meta(None).serialize();
-        assert_eq!(MetaTuple::deserialize_ref(&bytes).indexed_vectors(), None);
+        let serialized = meta(None).serialize();
+        let mut storage = aligned_copy(&serialized);
+        let bytes = &mut storage.as_mut_bytes()[..serialized.len()];
+        assert_eq!(MetaTuple::deserialize_ref(bytes).indexed_vectors(), None);
 
-        MetaTuple::deserialize_mut(&mut bytes).set_indexed_vectors(42);
+        MetaTuple::deserialize_mut(bytes).set_indexed_vectors(42);
         assert_eq!(
-            MetaTuple::deserialize_ref(&bytes).indexed_vectors(),
+            MetaTuple::deserialize_ref(bytes).indexed_vectors(),
             Some(42)
         );
     }
