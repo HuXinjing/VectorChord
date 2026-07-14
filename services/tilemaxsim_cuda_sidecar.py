@@ -57,9 +57,12 @@ from services.tilemaxsim_gpu_cache import (
     GpuResourcePool,
     GpuTensorCache,
     GpuTensorHandle,
+    GpuTensorLoad,
+    TinyLfuSketch,
     parse_gpu_memory_gb,
     parse_memory_gb,
 )
+from services.tilemaxsim_shard import INDEX_NAME, ShardEntry, ShardIndex, parse_index
 
 try:
     from services.tilemaxsim_triton import ragged_tilemaxsim_fp16
@@ -89,23 +92,47 @@ class ResolvedPayload:
     cache_hit: bool
 
 
+@dataclass
+class _OpenShardRoot:
+    index: ShardIndex
+    directory_fd: int
+    shard_fds: dict[str, int]
+    verification_locks: dict[str, threading.Lock]
+    verified: set[str]
+
+
 class PayloadCache:
-    """Thread-safe byte-bounded LRU for checksum-verified canonical payloads."""
+    """Byte-bounded host cache with TinyLFU admission and GDSF eviction."""
 
     def __init__(self, maximum_bytes: int) -> None:
         self.maximum_bytes = maximum_bytes
         self.current_bytes = 0
-        self.entries: OrderedDict[tuple[object, ...], bytes] = OrderedDict()
+        self.entries: OrderedDict[
+            tuple[object, ...], tuple[bytes, float]
+        ] = OrderedDict()
         self.lock = threading.Lock()
+        self.sketch = TinyLfuSketch()
+        self.inflation = 0.0
+        self.hits = 0
+        self.misses = 0
+        self.evictions = 0
+        self.admission_rejections = 0
 
     def get(self, key: tuple[object, ...]) -> bytes | None:
         if self.maximum_bytes == 0:
             return None
         with self.lock:
-            payload = self.entries.get(key)
-            if payload is not None:
+            frequency = self.sketch.increment(key)
+            entry = self.entries.get(key)
+            if entry is not None:
+                payload, _ = entry
+                priority = self.inflation + frequency / len(payload)
+                self.entries[key] = (payload, priority)
                 self.entries.move_to_end(key)
-            return payload
+                self.hits += 1
+                return payload
+            self.misses += 1
+            return None
 
     def put(self, key: tuple[object, ...], payload: bytes) -> None:
         if self.maximum_bytes == 0 or len(payload) > self.maximum_bytes:
@@ -113,12 +140,39 @@ class PayloadCache:
         with self.lock:
             previous = self.entries.pop(key, None)
             if previous is not None:
-                self.current_bytes -= len(previous)
-            self.entries[key] = payload
+                self.current_bytes -= len(previous[0])
+            frequency = max(1, self.sketch.estimate(key))
+            candidate_priority = self.inflation + frequency / len(payload)
+            while self.current_bytes + len(payload) > self.maximum_bytes:
+                victim_key, (victim_payload, victim_priority) = min(
+                    self.entries.items(), key=lambda item: item[1][1]
+                )
+                if candidate_priority < victim_priority:
+                    if previous is not None:
+                        self.entries[key] = previous
+                        self.current_bytes += len(previous[0])
+                    self.admission_rejections += 1
+                    return
+                self.entries.pop(victim_key)
+                self.current_bytes -= len(victim_payload)
+                self.inflation = max(self.inflation, victim_priority)
+                candidate_priority = self.inflation + frequency / len(payload)
+                self.evictions += 1
+            self.entries[key] = (payload, candidate_priority)
             self.current_bytes += len(payload)
-            while self.current_bytes > self.maximum_bytes:
-                _, evicted = self.entries.popitem(last=False)
-                self.current_bytes -= len(evicted)
+
+    def status(self) -> dict[str, object]:
+        with self.lock:
+            return {
+                "entries": len(self.entries),
+                "bytes": self.current_bytes,
+                "maximum_bytes": self.maximum_bytes,
+                "hits": self.hits,
+                "misses": self.misses,
+                "evictions": self.evictions,
+                "admission_rejections": self.admission_rejections,
+                "policy": "tinylfu-gdsf",
+            }
 
 
 class ContentAddressedResolver:
@@ -131,20 +185,85 @@ class ContentAddressedResolver:
     agree before a payload is returned.
     """
 
-    def __init__(self, roots: dict[str, Path], cache_bytes: int) -> None:
+    def __init__(
+        self,
+        roots: dict[str, Path],
+        cache_bytes: int,
+        verify_full_shards: bool = False,
+    ) -> None:
         self.root_fds: dict[str, int] = {}
+        self.shard_roots: dict[str, _OpenShardRoot] = {}
+        self.batch_read_calls = 0
+        self.batch_read_bytes = 0
+        self.batch_lock = threading.Lock()
+        self.verify_full_shards = verify_full_shards
         try:
             for contract, path in roots.items():
-                self.root_fds[contract] = os.open(
+                root_fd = os.open(
                     os.fspath(path),
                     os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW,
                 )
+                self.root_fds[contract] = root_fd
+                self._open_shard_root(contract, root_fd)
         except Exception:
             self.close()
             raise
         self.cache = PayloadCache(cache_bytes)
 
+    def _open_shard_root(self, contract: str, root_fd: int) -> None:
+        try:
+            index_fd = os.open(
+                INDEX_NAME,
+                os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW,
+                dir_fd=root_fd,
+            )
+        except FileNotFoundError:
+            return
+        try:
+            with os.fdopen(index_fd, "r", encoding="utf-8", closefd=True) as stream:
+                index = parse_index(json.load(stream))
+        except Exception:
+            raise
+        shard_directory_fd = -1
+        shard_fds: dict[str, int] = {}
+        try:
+            shard_directory_fd = os.open(
+                "shards",
+                os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW,
+                dir_fd=root_fd,
+            )
+            for relative, shard in index.shards.items():
+                name = relative.removeprefix("shards/")
+                descriptor = os.open(
+                    name,
+                    os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW,
+                    dir_fd=shard_directory_fd,
+                )
+                metadata = os.fstat(descriptor)
+                if not stat.S_ISREG(metadata.st_mode) or metadata.st_size != shard.size:
+                    os.close(descriptor)
+                    raise ValueError(f"immutable shard metadata disagrees: {relative}")
+                shard_fds[relative] = descriptor
+            self.shard_roots[contract] = _OpenShardRoot(
+                index,
+                shard_directory_fd,
+                shard_fds,
+                {name: threading.Lock() for name in shard_fds},
+                set(),
+            )
+        except Exception:
+            for descriptor in shard_fds.values():
+                os.close(descriptor)
+            if shard_directory_fd >= 0:
+                os.close(shard_directory_fd)
+            raise
+
     def close(self) -> None:
+        for root in self.shard_roots.values():
+            for descriptor in root.shard_fds.values():
+                os.close(descriptor)
+            os.close(root.directory_fd)
+        self.shard_roots.clear()
         for descriptor in self.root_fds.values():
             os.close(descriptor)
         self.root_fds.clear()
@@ -247,25 +366,206 @@ class ContentAddressedResolver:
         )
         return key
 
-    def resolve(self, request: protocol.ExternalTensorRequest) -> ResolvedPayload:
-        key = self.key(request)
-        digest = str(key[1])
-        root_fd = self.root_fds[request.model_contract_id]
-        expected_bytes = protocol.checked_tensor_bytes(
-            request.rows, request.dimension, request.dtype
+    @staticmethod
+    def _validate_shard_entry(
+        request: protocol.ExternalTensorRequest, digest: str, entry: ShardEntry
+    ) -> None:
+        dtype_name = (
+            "float32" if request.dtype == protocol.DTYPE_F32 else "float16"
         )
-        cached = self.cache.get(key)
-        if cached is not None:
-            return ResolvedPayload(cached, True)
-        payload = self._read_exact_file(root_fd, digest, expected_bytes)
-        actual = hashlib.sha256(payload).hexdigest()
-        if not hmac.compare_digest(actual, digest):
-            raise protocol.SidecarError(
-                protocol.STATUS_INVALID_REQUEST, "resolved tensor checksum mismatch"
+        if (
+            entry.digest != digest
+            or entry.rows != request.rows
+            or entry.dimension != request.dimension
+            or entry.dtype != dtype_name
+            or entry.length
+            != protocol.checked_tensor_bytes(
+                request.rows, request.dimension, request.dtype
             )
-        validate_finite_payload(payload, request.rows, request.dimension, request.dtype)
-        self.cache.put(key, payload)
-        return ResolvedPayload(payload, False)
+        ):
+            raise protocol.SidecarError(
+                protocol.STATUS_INVALID_REQUEST,
+                "shard entry disagrees with the tensor descriptor",
+            )
+
+    @staticmethod
+    def _verify_shard(root: _OpenShardRoot, name: str) -> None:
+        if name in root.verified:
+            return
+        lock = root.verification_locks[name]
+        with lock:
+            if name in root.verified:
+                return
+            shard = root.index.shards[name]
+            expected = shard.checksum.removeprefix("sha256:")
+            digest = hashlib.sha256()
+            offset = 0
+            descriptor = root.shard_fds[name]
+            while offset < shard.size:
+                chunk = os.pread(descriptor, min(8 * 1024 * 1024, shard.size - offset), offset)
+                if not chunk:
+                    raise protocol.SidecarError(
+                        protocol.STATUS_COMPUTE_ERROR,
+                        "immutable tensor shard ended early",
+                    )
+                digest.update(chunk)
+                offset += len(chunk)
+            if not hmac.compare_digest(digest.hexdigest(), expected):
+                raise protocol.SidecarError(
+                    protocol.STATUS_INVALID_REQUEST,
+                    "immutable tensor shard checksum mismatch",
+                )
+            root.verified.add(name)
+
+    @staticmethod
+    def _coalesced_ranges(
+        entries: list[tuple[tuple[object, ...], ShardEntry]],
+        maximum_gap: int = 64 * 1024,
+        maximum_span: int = 8 * 1024 * 1024,
+    ) -> list[tuple[int, int, list[tuple[tuple[object, ...], ShardEntry]]]]:
+        ranges = []
+        current: list[tuple[tuple[object, ...], ShardEntry]] = []
+        start = 0
+        end = 0
+        for item in sorted(entries, key=lambda value: value[1].offset):
+            entry = item[1]
+            entry_end = entry.offset + entry.length
+            if current and (
+                entry.offset - end > maximum_gap or entry_end - start > maximum_span
+            ):
+                ranges.append((start, end, current))
+                current = []
+            if not current:
+                start = entry.offset
+                end = entry_end
+            else:
+                end = max(end, entry_end)
+            current.append(item)
+        if current:
+            ranges.append((start, end, current))
+        return ranges
+
+    def _read_shard_range(
+        self,
+        root: _OpenShardRoot,
+        shard_name: str,
+        start: int,
+        end: int,
+        entries: list[tuple[tuple[object, ...], ShardEntry]],
+    ) -> dict[tuple[object, ...], bytes]:
+        payload = os.pread(root.shard_fds[shard_name], end - start, start)
+        if len(payload) != end - start:
+            raise protocol.SidecarError(
+                protocol.STATUS_COMPUTE_ERROR, "immutable tensor shard ended early"
+            )
+        with self.batch_lock:
+            self.batch_read_calls += 1
+            self.batch_read_bytes += len(payload)
+        result = {}
+        for key, entry in entries:
+            tensor = payload[entry.offset - start : entry.offset - start + entry.length]
+            actual = hashlib.sha256(tensor).hexdigest()
+            if not hmac.compare_digest(actual, entry.digest):
+                raise protocol.SidecarError(
+                    protocol.STATUS_INVALID_REQUEST,
+                    "resolved shard tensor checksum mismatch",
+                )
+            dtype = protocol.DTYPE_F32 if entry.dtype == "float32" else protocol.DTYPE_F16
+            validate_finite_payload(tensor, entry.rows, entry.dimension, dtype)
+            result[key] = tensor
+        return result
+
+    def resolve_many(
+        self, requests: list[protocol.ExternalTensorRequest]
+    ) -> list[ResolvedPayload]:
+        if not requests:
+            return []
+        keys = [self.key(request) for request in requests]
+        payloads: dict[tuple[object, ...], bytes] = {}
+        hits: dict[tuple[object, ...], bool] = {}
+        missing: dict[tuple[object, ...], protocol.ExternalTensorRequest] = {}
+        for key, request in zip(keys, requests, strict=True):
+            cached = self.cache.get(key)
+            if cached is not None:
+                payloads[key] = cached
+                hits[key] = True
+            elif key not in missing:
+                missing[key] = request
+                hits[key] = False
+
+        shard_groups: dict[tuple[str, str], list[tuple[tuple[object, ...], ShardEntry]]] = {}
+        legacy: list[tuple[tuple[object, ...], protocol.ExternalTensorRequest]] = []
+        for key, request in missing.items():
+            contract = request.model_contract_id
+            shard_root = self.shard_roots.get(contract)
+            if shard_root is None:
+                legacy.append((key, request))
+                continue
+            digest = str(key[1])
+            entry = shard_root.index.entries.get(digest)
+            if entry is None:
+                raise protocol.SidecarError(
+                    protocol.STATUS_COMPUTE_ERROR,
+                    "content-addressed tensor is missing from the shard index",
+                )
+            self._validate_shard_entry(request, digest, entry)
+            shard_groups.setdefault((contract, entry.shard), []).append((key, entry))
+
+        jobs: list[tuple[_OpenShardRoot, str, int, int, list[tuple[tuple[object, ...], ShardEntry]]]] = []
+        for (contract, shard_name), entries in shard_groups.items():
+            root = self.shard_roots[contract]
+            if self.verify_full_shards:
+                self._verify_shard(root, shard_name)
+            for start, end, grouped in self._coalesced_ranges(entries):
+                jobs.append((root, shard_name, start, end, grouped))
+        if jobs:
+            with ThreadPoolExecutor(max_workers=min(8, len(jobs))) as workers:
+                for resolved in workers.map(lambda job: self._read_shard_range(*job), jobs):
+                    payloads.update(resolved)
+
+        def read_legacy(
+            item: tuple[tuple[object, ...], protocol.ExternalTensorRequest]
+        ) -> tuple[tuple[object, ...], bytes]:
+            key, request = item
+            digest = str(key[1])
+            expected_bytes = protocol.checked_tensor_bytes(
+                request.rows, request.dimension, request.dtype
+            )
+            payload = self._read_exact_file(
+                self.root_fds[request.model_contract_id], digest, expected_bytes
+            )
+            actual = hashlib.sha256(payload).hexdigest()
+            if not hmac.compare_digest(actual, digest):
+                raise protocol.SidecarError(
+                    protocol.STATUS_INVALID_REQUEST,
+                    "resolved tensor checksum mismatch",
+                )
+            validate_finite_payload(
+                payload, request.rows, request.dimension, request.dtype
+            )
+            return key, payload
+
+        if legacy:
+            with ThreadPoolExecutor(max_workers=min(8, len(legacy))) as workers:
+                for key, payload in workers.map(read_legacy, legacy):
+                    payloads[key] = payload
+        for key in missing:
+            self.cache.put(key, payloads[key])
+        return [ResolvedPayload(payloads[key], hits[key]) for key in keys]
+
+    def resolve(self, request: protocol.ExternalTensorRequest) -> ResolvedPayload:
+        return self.resolve_many([request])[0]
+
+    def status(self) -> dict[str, object]:
+        with self.batch_lock:
+            return {
+                "shard_contracts": len(self.shard_roots),
+                "verified_shards": sum(
+                    len(root.verified) for root in self.shard_roots.values()
+                ),
+                "batch_read_calls": self.batch_read_calls,
+                "batch_read_bytes": self.batch_read_bytes,
+            }
 
 
 class TorchTileMaxsimEngine:
@@ -751,15 +1051,28 @@ class TileMaxsimService:
                 metrics["source"] = "inline"
             else:
                 metrics["source"] = "content_addressed"
-                for candidate in request.candidates:
-                    document_tokens += candidate.descriptor.rows
-                    if time.monotonic() >= deadline:
-                        raise protocol.SidecarError(
-                            protocol.STATUS_COMPUTE_ERROR,
-                            "request deadline expired during tensor resolution",
-                        )
-                    if self.gpu_cache is None:
-                        resolved = self.resolver.resolve(candidate.descriptor)
+                document_tokens = sum(
+                    candidate.descriptor.rows for candidate in request.candidates
+                )
+                if time.monotonic() >= deadline:
+                    raise protocol.SidecarError(
+                        protocol.STATUS_COMPUTE_ERROR,
+                        "request deadline expired during tensor resolution",
+                    )
+                if self.gpu_cache is None:
+                    descriptors = [
+                        candidate.descriptor for candidate in request.candidates
+                    ]
+                    if hasattr(self.resolver, "resolve_many"):
+                        resolved_payloads = self.resolver.resolve_many(descriptors)
+                    else:
+                        resolved_payloads = [
+                            self.resolver.resolve(descriptor)
+                            for descriptor in descriptors
+                        ]
+                    for candidate, resolved in zip(
+                        request.candidates, resolved_payloads, strict=True
+                    ):
                         cache_hits += int(resolved.cache_hit)
                         documents.append(
                             (
@@ -768,45 +1081,109 @@ class TileMaxsimService:
                                 resolved.payload,
                             )
                         )
+                else:
+                    keys = [
+                        self.resolver.key(candidate.descriptor)
+                        for candidate in request.candidates
+                    ]
+                    probed, miss_indices = self.gpu_cache.probe_many(keys)
+                    for candidate, handle in zip(
+                        request.candidates, probed, strict=True
+                    ):
+                        if handle is not None:
+                            resident_documents.append((candidate.candidate_id, handle))
+                    gpu_cache_hits = len(request.candidates) - len(miss_indices)
+                    gpu_cache_misses = len(miss_indices)
+                    missing_candidates = [
+                        request.candidates[index] for index in miss_indices
+                    ]
+                    missing_descriptors = [
+                        candidate.descriptor for candidate in missing_candidates
+                    ]
+                    if hasattr(self.resolver, "resolve_many"):
+                        resolved_payloads = self.resolver.resolve_many(
+                            missing_descriptors
+                        )
                     else:
-                        key = self.resolver.key(candidate.descriptor)
-                        loaded_payload: bytes | None = None
-
-                        def load_payload() -> bytes:
-                            nonlocal cache_hits, loaded_payload
-                            if loaded_payload is None:
-                                resolved = self.resolver.resolve(candidate.descriptor)
-                                cache_hits += int(resolved.cache_hit)
-                                loaded_payload = resolved.payload
-                            return loaded_payload
-
-                        while True:
-                            try:
-                                handle, gpu_hit = self.gpu_cache.acquire(
-                                    key,
-                                    candidate.descriptor.rows,
-                                    candidate.descriptor.dimension,
-                                    candidate.descriptor.dtype,
-                                    load_payload,
-                                    pin=self.pin_gpu_entries,
+                        resolved_payloads = [
+                            self.resolver.resolve(descriptor)
+                            for descriptor in missing_descriptors
+                        ]
+                    cache_hits += sum(item.cache_hit for item in resolved_payloads)
+                    pending = [
+                        (
+                            candidate,
+                            GpuTensorLoad(
+                                key,
+                                candidate.descriptor.rows,
+                                candidate.descriptor.dimension,
+                                candidate.descriptor.dtype,
+                                resolved.payload,
+                                self.pin_gpu_entries,
+                            ),
+                            False,
+                        )
+                        for candidate, key, resolved in zip(
+                            missing_candidates,
+                            (keys[index] for index in miss_indices),
+                            resolved_payloads,
+                            strict=True,
+                        )
+                    ]
+                    admission_rejections = 0
+                    while pending:
+                        batch = self.gpu_cache.acquire_many(
+                            [item[1] for item in pending],
+                            enforce_admission=(
+                                not self.pin_gpu_entries
+                                and not any(item[2] for item in pending)
+                            ),
+                            record_access=False,
+                            count_stats=False,
+                        )
+                        for (candidate, load, _force), handle in zip(
+                            pending, batch.handles, strict=True
+                        ):
+                            if handle is not None:
+                                resident_documents.append(
+                                    (candidate.candidate_id, handle)
                                 )
-                                break
-                            except protocol.SidecarError as error:
-                                if (
-                                    error.status != protocol.STATUS_RESOURCE_LIMIT
-                                    or not resident_documents
-                                ):
-                                    raise
-                                # A request may be larger than the configured
-                                # GPU cache. Score and release the current
-                                # working set, then admit the remaining
-                                # candidates through the same bounded arenas.
-                                flush_resident_documents()
-                        gpu_cache_hits += int(gpu_hit)
-                        gpu_cache_misses += int(not gpu_hit)
-                        resident_documents.append((candidate.candidate_id, handle))
-                if self.gpu_cache is not None:
-                    flush_resident_documents()
+                        for index in batch.bypassed:
+                            candidate, load, _force = pending[index]
+                            stream_bytes = (
+                                request.query_rows * request.dimension * 4
+                                + load.rows * request.dimension * 4
+                                + request.query_rows * load.rows * 4
+                            )
+                            if stream_bytes <= self.engine.max_device_bytes:
+                                documents.append(
+                                    (candidate.candidate_id, load.rows, load.payload)
+                                )
+                        admission_rejections += len(batch.bypassed)
+                        deferred = [pending[index] for index in batch.deferred]
+                        forced = [
+                            (pending[index][0], pending[index][1], True)
+                            for index in batch.bypassed
+                            if (
+                                request.query_rows * request.dimension * 4
+                                + pending[index][1].rows * request.dimension * 4
+                                + request.query_rows * pending[index][1].rows * 4
+                                > self.engine.max_device_bytes
+                            )
+                        ]
+                        made_progress = len(deferred) < len(pending)
+                        if resident_documents:
+                            flush_resident_documents()
+                            made_progress = True
+                        if deferred and not made_progress:
+                            raise protocol.SidecarError(
+                                protocol.STATUS_RESOURCE_LIMIT,
+                                "GPU block cache cannot make progress with its configured capacity",
+                            )
+                        pending = forced + deferred
+                    if resident_documents:
+                        flush_resident_documents()
+                    metrics["gpu_admission_rejections"] = admission_rejections
             metrics["cache_hits"] = cache_hits
             metrics["host_cache_hits"] = cache_hits
             metrics["gpu_cache_hits"] = gpu_cache_hits
@@ -828,6 +1205,22 @@ class TileMaxsimService:
                 results = resident_results
                 queue_ms = resident_queue_ms
                 compute_ms = resident_compute_ms
+                if documents:
+                    stream_results, stream_queue_ms, stream_compute_ms = (
+                        self.engine.score(
+                            request.query_payload,
+                            request.query_rows,
+                            request.dimension,
+                            request.dtype,
+                            documents,
+                            deadline,
+                            lambda: self._peer_disconnected(connection),
+                        )
+                    )
+                    results.extend(stream_results)
+                    queue_ms += stream_queue_ms
+                    compute_ms += stream_compute_ms
+                    metrics["streamed_candidates"] = len(documents)
             else:
                 results, queue_ms, compute_ms = self.engine.score(
                     request.query_payload,
@@ -1082,10 +1475,67 @@ def prewarm_resident_cache(
     resolver: ContentAddressedResolver,
     gpu_cache: GpuTensorCache,
     metrics: JsonMetrics,
+    batch_size: int = 256,
 ) -> None:
     completed = 0
     loaded_bytes = 0
     started = time.monotonic()
+    pending: list[tuple[protocol.ExternalTensorRequest, int]] = []
+
+    def flush() -> None:
+        nonlocal completed, loaded_bytes
+        if not pending:
+            return
+        keys = [resolver.key(request) for request, _ in pending]
+        probed, miss_indices = gpu_cache.probe_many(keys)
+        acquired = [handle for handle in probed if handle is not None]
+        try:
+            missing = [pending[index][0] for index in miss_indices]
+            resolved = resolver.resolve_many(missing)
+            loads = [
+                GpuTensorLoad(
+                    keys[index],
+                    request.rows,
+                    request.dimension,
+                    request.dtype,
+                    payload.payload,
+                    True,
+                )
+                for index, request, payload in zip(
+                    miss_indices, missing, resolved, strict=True
+                )
+            ]
+            batch = gpu_cache.acquire_many(
+                loads,
+                enforce_admission=False,
+                record_access=False,
+                count_stats=False,
+            )
+            if batch.bypassed or batch.deferred or any(
+                handle is None for handle in batch.handles
+            ):
+                raise protocol.SidecarError(
+                    protocol.STATUS_RESOURCE_LIMIT,
+                    "resident manifest exceeds the configured GPU block arenas",
+                )
+            acquired.extend(
+                handle for handle in batch.handles if handle is not None
+            )
+        finally:
+            for handle in acquired:
+                gpu_cache.release(handle)
+        completed += len(pending)
+        loaded_bytes += sum(size for _, size in pending)
+        if completed % 1000 < len(pending):
+            metrics.emit(
+                {
+                    "event": "tilemaxsim_prewarm_progress",
+                    "entries": completed,
+                    "logical_bytes": loaded_bytes,
+                }
+            )
+        pending.clear()
+
     for contract, path in manifests:
         with path.open(encoding="utf-8") as stream:
             for line_number, line in enumerate(stream, 1):
@@ -1123,26 +1573,10 @@ def prewarm_resident_cache(
                     raise ValueError(
                         f"{path}:{line_number}: canonical_bytes disagrees with shape"
                     )
-                key = resolver.key(request)
-                handle, _ = gpu_cache.acquire(
-                    key,
-                    rows,
-                    dimension,
-                    dtype,
-                    lambda request=request: resolver.resolve(request).payload,
-                    pin=True,
-                )
-                gpu_cache.release(handle)
-                completed += 1
-                loaded_bytes += expected_bytes
-                if completed % 1000 == 0:
-                    metrics.emit(
-                        {
-                            "event": "tilemaxsim_prewarm_progress",
-                            "entries": completed,
-                            "logical_bytes": loaded_bytes,
-                        }
-                    )
+                pending.append((request, expected_bytes))
+                if len(pending) >= batch_size:
+                    flush()
+    flush()
     if completed == 0:
         raise ValueError("resident manifests contain no tensor descriptors")
     metrics.emit(
@@ -1204,8 +1638,14 @@ def main() -> None:
     parser.add_argument("--request-timeout-ms", type=positive_int, default=2000)
     parser.add_argument("--max-inflight", type=positive_int, default=8)
     parser.add_argument("--max-cuda-inflight", type=positive_int, default=1)
+    parser.add_argument("--prewarm-batch-size", type=positive_int, default=256)
     parser.add_argument("--backlog", type=positive_int, default=64)
     parser.add_argument("--allow-tf32", action="store_true")
+    parser.add_argument(
+        "--verify-full-shards",
+        action="store_true",
+        help="verify complete immutable shard digests lazily in addition to every tensor digest",
+    )
     parser.add_argument("--once", action="store_true")
     args = parser.parse_args()
 
@@ -1227,7 +1667,9 @@ def main() -> None:
         max_tensor_bytes=args.max_tensor_bytes,
         max_candidates=args.max_candidates,
     )
-    resolver = ContentAddressedResolver(roots, args.host_cache_gb)
+    resolver = ContentAddressedResolver(
+        roots, args.host_cache_gb, args.verify_full_shards
+    )
     metrics = JsonMetrics()
     pool: GpuResourcePool | None = None
     try:
@@ -1246,7 +1688,13 @@ def main() -> None:
             args.max_cuda_inflight,
         )
         if args.gpu_cache_mode == "resident":
-            prewarm_resident_cache(manifests, resolver, gpu_cache, metrics)
+            prewarm_resident_cache(
+                manifests,
+                resolver,
+                gpu_cache,
+                metrics,
+                args.prewarm_batch_size,
+            )
         service = TileMaxsimService(
             limits,
             resolver,

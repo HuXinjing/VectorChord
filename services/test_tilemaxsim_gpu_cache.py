@@ -23,10 +23,12 @@ import torch
 from devtools import tilemaxsim_reference_sidecar as protocol
 from services.tilemaxsim_cuda_sidecar import ResidentTorchTileMaxsimEngine
 from services.tilemaxsim_gpu_cache import (
+    FixedBlockAllocator,
     FreeExtentAllocator,
     GpuArenaSpec,
     GpuResourcePool,
     GpuTensorCache,
+    GpuTensorLoad,
     parse_gpu_memory_gb,
     parse_memory_gb,
 )
@@ -67,6 +69,21 @@ class GpuCacheUnitTest(unittest.TestCase):
         allocator.release(*first)
         allocator.release(*second)
         self.assertEqual(allocator.extents, [(0, 4096)])
+
+    def test_fixed_block_buddy_allocator_coalesces_slabs(self) -> None:
+        allocator = FixedBlockAllocator(8 * 256, block_bytes=256)
+        first = allocator.allocate(300)
+        second = allocator.allocate(300)
+        third = allocator.allocate(700)
+        self.assertEqual(first, (0, 1))
+        self.assertEqual(second, (2, 3))
+        self.assertEqual(third, (4, 5, 6, 7))
+        assert first is not None and second is not None and third is not None
+        allocator.release(second)
+        allocator.release(first)
+        self.assertEqual(allocator.largest_free_extent, 4 * 256)
+        allocator.release(third)
+        self.assertEqual(allocator.largest_free_extent, 8 * 256)
 
     @unittest.skipUnless(torch.cuda.is_available(), "CUDA is unavailable")
     def test_pool_rejects_budget_larger_than_currently_free_memory(self) -> None:
@@ -159,6 +176,76 @@ class GpuCacheUnitTest(unittest.TestCase):
             )
             cache.release(second)
             self.assertTrue(second_hit)
+        finally:
+            pool.close()
+
+    @unittest.skipUnless(torch.cuda.is_available(), "CUDA is unavailable")
+    def test_batch_admission_uses_one_h2d_batch(self) -> None:
+        device = available_device()
+        pool = GpuResourcePool(
+            [GpuArenaSpec(device, 4 * 1024 * 1024)], 2 * 1024 * 1024
+        )
+        try:
+            cache = GpuTensorCache(pool, allow_eviction=True)
+            first = np.ones((128, 320), dtype="<f2")
+            second = np.full((128, 320), 2, dtype="<f2")
+            batch = cache.acquire_many(
+                [
+                    GpuTensorLoad(
+                        ("model", "first"), 128, 320, protocol.DTYPE_F16, first.tobytes()
+                    ),
+                    GpuTensorLoad(
+                        ("model", "second"), 128, 320, protocol.DTYPE_F16, second.tobytes()
+                    ),
+                ]
+            )
+            self.assertEqual(batch.admitted, 2)
+            self.assertFalse(batch.bypassed)
+            self.assertFalse(batch.deferred)
+            for handle in batch.handles:
+                assert handle is not None
+                cache.release(handle)
+            arena_status = pool.status()[0]
+            self.assertEqual(arena_status["h2d_batches"], 1)
+            self.assertEqual(arena_status["h2d_copy_calls"], 1)
+        finally:
+            pool.close()
+
+    @unittest.skipUnless(torch.cuda.is_available(), "CUDA is unavailable")
+    def test_tinylfu_rejects_one_off_tensor_instead_of_polluting_hot_slab(self) -> None:
+        device = available_device()
+        pool = GpuResourcePool(
+            [GpuArenaSpec(device, 768 * 1024)], 512 * 1024
+        )
+        try:
+            cache = GpuTensorCache(pool, allow_eviction=True)
+            tensor = np.ones((128, 320), dtype="<f2").tobytes()
+            handle, _ = cache.acquire(
+                ("model", "hot"), 128, 320, protocol.DTYPE_F16, lambda: tensor
+            )
+            cache.release(handle)
+            for _ in range(3):
+                handles, misses = cache.probe_many([("model", "hot")])
+                self.assertFalse(misses)
+                assert handles[0] is not None
+                cache.release(handles[0])
+            cold = cache.acquire_many(
+                [
+                    GpuTensorLoad(
+                        ("model", "cold"),
+                        128,
+                        320,
+                        protocol.DTYPE_F16,
+                        tensor,
+                    )
+                ]
+            )
+            self.assertEqual(cold.bypassed, (0,))
+            self.assertEqual(cache.status()["admission_rejections"], 1)
+            handles, misses = cache.probe_many([("model", "hot")])
+            self.assertFalse(misses)
+            assert handles[0] is not None
+            cache.release(handles[0])
         finally:
             pool.close()
 

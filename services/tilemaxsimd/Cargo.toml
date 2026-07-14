@@ -1,0 +1,19 @@
+[package]
+name = "tilemaxsimd"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+anyhow = "1.0"
+clap = { version = "4.5", features = ["derive"] }
+hex = "0.4"
+libc = "0.2"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+sha2 = "0.10"
+
+[build-dependencies]
+cc = { version = "1.2", features = ["parallel"] }
+
+[workspace]

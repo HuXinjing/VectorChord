@@ -1,4 +1,7 @@
 /target
+/services/tilemaxsimd/target
+**/__pycache__/
+.ruff_cache/
 **/*.rs.bk
 .vscode
 .ignore
