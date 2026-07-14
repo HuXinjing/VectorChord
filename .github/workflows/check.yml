@@ -38,10 +38,14 @@ jobs:
         run: taplo fmt --check
 
       - name: Rustfmt
-        run: cargo fmt --check -- --config-path /dev/null --config imports_granularity=Module
+        run: |
+          cargo fmt --check -- --config-path /dev/null --config imports_granularity=Module
+          cargo fmt --check --manifest-path services/tilemaxsimd/Cargo.toml
 
       - name: Deny
-        run: cargo deny check
+        run: |
+          cargo deny check
+          cargo deny --manifest-path services/tilemaxsimd/Cargo.toml check
 
       - name: License Header
         run: |
@@ -66,15 +70,47 @@ jobs:
           RS_HEADER=$(echo "$HEADER" | awk '{ if ($0 ~ /^$/) print "//"; else print "// " $0 }')
           C_HEADER=$(echo "$HEADER" | awk '{ if ($0 ~ /^$/) print "//"; else print "// " $0 }')
           PY_HEADER=$(echo "$HEADER" | awk '{ if ($0 ~ /^$/) print "#"; else print "# " $0 }')
+          FORK_RS_HEADER="// Copyright (c) 2026 HuXinjing"
+          FORK_PY_HEADER="# Copyright (c) 2026 HuXinjing"
 
-          RS_FILES=$(find . -type f -name "*.rs" -not -path "./target/*")
-          C_FILES=$(find . -type f -name "*.c" -not -path "./target/*")
-          PY_FILES=$(find . -type f -name "*.py" -not -path "./target/*")
+          RS_FILES=$(find . -type f -name "*.rs" -not -path "*/target/*")
+          C_FILES=$(find . -type f -name "*.c" -not -path "*/target/*")
+          CU_FILES=$(find . -type f -name "*.cu" -not -path "*/target/*")
+          PY_FILES=$(find . -type f -name "*.py" -not -path "*/target/*")
 
           FLAG="0"
 
+          is_fork_file() {
+            case "$1" in
+              ./crates/vchordrq/src/maxsim_cost.rs | \
+              ./crates/vchordrq/src/statistics.rs | \
+              ./devtools/*tilemaxsim* | \
+              ./services/* | \
+              ./services/tilemaxsimd/* | \
+              ./src/index/vchordrq/scanners/maxsim/candidate.rs | \
+              ./src/index/vchordrq/scanners/maxsim/exact.rs | \
+              ./src/index/vchordrq/scanners/maxsim/external.rs | \
+              ./src/index/vchordrq/scanners/maxsim/gpu.rs | \
+              ./src/index/vchordrq/scanners/maxsim/profile.rs | \
+              ./src/index/vchordrq/scanners/maxsim/rerank.rs | \
+              ./src/index/vchordrq/scanners/maxsim/search.rs)
+                return 0
+                ;;
+              *)
+                return 1
+                ;;
+            esac
+          }
+
           for p in $RS_FILES; do
-            if ! head -n "$COUNT" "$p" | cmp -s - <(echo "$RS_HEADER"); then
+            if is_fork_file "$p"; then
+              EXPECTED="$FORK_RS_HEADER"
+              HEADER_LINES=1
+            else
+              EXPECTED="$RS_HEADER"
+              HEADER_LINES="$COUNT"
+            fi
+            if ! head -n "$HEADER_LINES" "$p" | cmp -s - <(echo "$EXPECTED"); then
               echo "license header mismatch in file $p"
               FLAG="1"
             fi
@@ -87,8 +123,22 @@ jobs:
             fi
           done
 
+          for p in $CU_FILES; do
+            if ! head -n 1 "$p" | cmp -s - <(echo "$FORK_RS_HEADER"); then
+              echo "fork copyright header mismatch in file $p"
+              FLAG="1"
+            fi
+          done
+
           for p in $PY_FILES; do
-            if ! head -n "$COUNT" "$p" | cmp -s - <(echo "$PY_HEADER"); then
+            if is_fork_file "$p"; then
+              EXPECTED="$FORK_PY_HEADER"
+              HEADER_LINES=1
+            else
+              EXPECTED="$PY_HEADER"
+              HEADER_LINES="$COUNT"
+            fi
+            if ! head -n "$HEADER_LINES" "$p" | cmp -s - <(echo "$EXPECTED"); then
               echo "license header mismatch in file $p"
               FLAG="1"
             fi
@@ -101,6 +151,85 @@ jobs:
       - name: SQL
         run: |
           ! grep -P '\t' -r ./sql
+
+  tilemaxsimd:
+    runs-on: ubuntu-24.04
+    container:
+      image: nvidia/cuda:12.6.3-devel-ubuntu24.04
+
+    env:
+      CARGO_TERM_COLOR: always
+      RUST_BACKTRACE: "1"
+
+    steps:
+      - name: Set up Environment
+        run: |
+          apt-get update
+          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            build-essential ca-certificates curl git
+          rm -rf /var/lib/apt/lists/*
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+            | sh -s -- -y --profile minimal --default-toolchain stable
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Format
+        working-directory: services/tilemaxsimd
+        run: cargo fmt --all -- --check
+
+      - name: Unit Test
+        working-directory: services/tilemaxsimd
+        run: cargo test --locked
+
+      - name: Clippy
+        working-directory: services/tilemaxsimd
+        run: cargo clippy --locked --all-targets -- -D warnings
+
+      - name: Release Build and CLI Smoke Test
+        working-directory: services/tilemaxsimd
+        run: |
+          cargo build --release --locked
+          target/release/vchord-tilemaxsimd --help
+          target/release/vchord-tilemaxsimd --version
+          target/release/vchord-tilemaxsimctl --help
+          target/release/vchord-tilemaxsimctl status --help
+
+  tilemaxsimd_container:
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Build Non-root Runtime Image
+        run: docker build -f services/Dockerfile.tilemaxsimd -t vchord-tilemaxsimd:ci .
+
+      - name: Inspect Image and CLIs
+        run: |
+          test "$(docker inspect --format '{{.Config.User}}' vchord-tilemaxsimd:ci)" = "65532:65532"
+          docker run --rm vchord-tilemaxsimd:ci --help
+          docker run --rm vchord-tilemaxsimd:ci --version
+          docker run --rm --entrypoint vchord-tilemaxsimctl vchord-tilemaxsimd:ci --help
+
+  tilemaxsimd_gpu:
+    if: ${{ vars.VECTORCHORD_GPU_CI == 'true' }}
+    runs-on: [self-hosted, linux, x64, tilemaxsim-gpu]
+
+    env:
+      VECTORCHORD_TILEMAXSIM_SOAK_SECONDS: "3600"
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Release Build
+        working-directory: services/tilemaxsimd
+        run: cargo build --release --locked
+
+      - name: GPU Integration and Fault Tests
+        run: python -m unittest services.test_tilemaxsim_rust_daemon
 
   miri:
     if: |

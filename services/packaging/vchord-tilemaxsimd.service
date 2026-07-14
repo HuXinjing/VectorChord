@@ -1,0 +1,36 @@
+[Unit]
+Description=VectorChord TileMaxSim GPU service
+After=local-fs.target
+Before=postgresql.service
+
+[Service]
+Type=simple
+User=vectorchord
+Group=vectorchord
+EnvironmentFile=/etc/vectorchord/tilemaxsimd.conf
+RuntimeDirectory=vectorchord
+RuntimeDirectoryMode=0750
+UMask=0077
+ExecStart=/usr/local/bin/vchord-tilemaxsimd $TILEMAXSIMD_ARGS
+ExecStartPost=/usr/local/bin/vchord-tilemaxsimctl status --socket /run/vectorchord/tilemaxsim.sock --ready-file /run/vectorchord/tilemaxsim.ready --timeout-ms 5000
+Restart=on-failure
+RestartSec=2s
+TimeoutStartSec=infinity
+TimeoutStopSec=35s
+KillSignal=SIGTERM
+LimitMEMLOCK=infinity
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+PrivateTmp=yes
+ProtectControlGroups=yes
+ProtectHome=yes
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+ProtectSystem=strict
+RestrictAddressFamilies=AF_UNIX
+RestrictSUIDSGID=yes
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=multi-user.target

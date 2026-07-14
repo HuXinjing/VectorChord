@@ -17,6 +17,22 @@ RUN cargo build --release --locked
 
 FROM ${CUDA_RUNTIME_IMAGE}
 
-COPY --from=build /build/tilemaxsimd/target/release/tilemaxsimd /usr/local/bin/tilemaxsimd
+ARG TILEMAXSIM_UID=65532
+ARG TILEMAXSIM_GID=65532
 
-ENTRYPOINT ["/usr/local/bin/tilemaxsimd"]
+RUN groupadd --gid ${TILEMAXSIM_GID} vectorchord \
+    && useradd --uid ${TILEMAXSIM_UID} --gid ${TILEMAXSIM_GID} \
+        --no-create-home --home-dir /nonexistent --shell /usr/sbin/nologin vectorchord \
+    && install --directory --owner ${TILEMAXSIM_UID} --group ${TILEMAXSIM_GID} \
+        --mode 0750 /run/vectorchord
+
+COPY --from=build --chown=${TILEMAXSIM_UID}:${TILEMAXSIM_GID} /build/tilemaxsimd/target/release/vchord-tilemaxsimd /usr/local/bin/vchord-tilemaxsimd
+COPY --from=build --chown=${TILEMAXSIM_UID}:${TILEMAXSIM_GID} /build/tilemaxsimd/target/release/vchord-tilemaxsimctl /usr/local/bin/vchord-tilemaxsimctl
+
+LABEL org.opencontainers.image.source="https://github.com/HuXinjing/VectorChord"
+
+USER ${TILEMAXSIM_UID}:${TILEMAXSIM_GID}
+WORKDIR /var/lib/vectorchord
+STOPSIGNAL SIGTERM
+
+ENTRYPOINT ["/usr/local/bin/vchord-tilemaxsimd"]

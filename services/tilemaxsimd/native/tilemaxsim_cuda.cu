@@ -1,3 +1,5 @@
+// Copyright (c) 2026 HuXinjing
+
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 #include <math_constants.h>

@@ -1,7 +1,10 @@
+// Copyright (c) 2026 HuXinjing
+
 fn main() {
     println!("cargo:rerun-if-changed=native/tilemaxsim_cuda.cu");
     cc::Build::new()
         .cuda(true)
+        .debug(false)
         .flag("-O3")
         .flag("--use_fast_math")
         .flag("-lineinfo")

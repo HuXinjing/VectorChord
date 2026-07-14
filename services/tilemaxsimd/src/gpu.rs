@@ -1,3 +1,5 @@
+// Copyright (c) 2026 HuXinjing
+
 use anyhow::{Result, anyhow, bail};
 use std::ffi::{CStr, c_char, c_int, c_uchar, c_void};
 use std::ptr::NonNull;

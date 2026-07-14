@@ -1,3 +1,5 @@
+// Copyright (c) 2026 HuXinjing
+
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::hash::{Hash, Hasher};
 

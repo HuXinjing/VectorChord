@@ -1,0 +1,122 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: vectorchord-postgres
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: vectorchord-postgres
+  template:
+    metadata:
+      labels:
+        app: vectorchord-postgres
+    spec:
+      terminationGracePeriodSeconds: 35
+      securityContext:
+        fsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: postgres
+          image: example/vectorchord-postgres:replace-me
+          args:
+            - postgres
+            - -c
+            - shared_preload_libraries=vchord
+            - -c
+            - vchordrq.maxsim_backend=gpu
+            - -c
+            - vchordrq.maxsim_gpu_endpoint=/run/vectorchord/tilemaxsim.sock
+          securityContext:
+            runAsUser: 999
+            runAsGroup: 999
+            allowPrivilegeEscalation: false
+          volumeMounts:
+            - name: runtime
+              mountPath: /run/vectorchord
+            - name: tensors
+              mountPath: /var/lib/vectorchord/tensors
+              readOnly: true
+        - name: tilemaxsimd
+          image: example/vectorchord-tilemaxsimd:replace-me
+          args:
+            - --socket
+            - /run/vectorchord/tilemaxsim.sock
+            - --socket-mode
+            - "660"
+            - --gpu-memory-gb
+            - 0=20
+            - --gpu-workspace-gb
+            - "2"
+            - --host-cache-gb
+            - "8"
+            - --contract-root
+            - model@1=/var/lib/vectorchord/tensors/model-v1
+            - --allow-peer-uid
+            - "999"
+            - --max-batch-tokens
+            - "250000"
+            - --max-batch-mb
+            - "256"
+            - --ready-file
+            - /run/vectorchord/tilemaxsim.ready
+            - --pid-file
+            - /run/vectorchord/tilemaxsimd.pid
+          resources:
+            limits:
+              nvidia.com/gpu: 1
+          startupProbe:
+            exec:
+              command:
+                - vchord-tilemaxsimctl
+                - status
+                - --socket
+                - /run/vectorchord/tilemaxsim.sock
+                - --ready-file
+                - /run/vectorchord/tilemaxsim.ready
+                - --quiet
+            failureThreshold: 120
+            periodSeconds: 5
+          readinessProbe:
+            exec:
+              command:
+                - vchord-tilemaxsimctl
+                - status
+                - --socket
+                - /run/vectorchord/tilemaxsim.sock
+                - --ready-file
+                - /run/vectorchord/tilemaxsim.ready
+                - --quiet
+            periodSeconds: 5
+          livenessProbe:
+            exec:
+              command:
+                - vchord-tilemaxsimctl
+                - status
+                - --socket
+                - /run/vectorchord/tilemaxsim.sock
+                - --quiet
+            periodSeconds: 10
+            timeoutSeconds: 2
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 65532
+            runAsGroup: 65532
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
+          volumeMounts:
+            - name: runtime
+              mountPath: /run/vectorchord
+            - name: tensors
+              mountPath: /var/lib/vectorchord/tensors
+              readOnly: true
+      volumes:
+        - name: runtime
+          emptyDir: {}
+        - name: tensors
+          persistentVolumeClaim:
+            claimName: tilemaxsim-tensors

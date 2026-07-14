@@ -1,3 +1,5 @@
+// Copyright (c) 2026 HuXinjing
+
 use anyhow::{Result, anyhow, bail};
 use std::collections::HashSet;
 
@@ -25,6 +27,8 @@ pub struct Request {
     pub dtype: u8,
     pub query: Vec<u8>,
     pub candidates: Vec<Descriptor>,
+    pub tensor_tokens: usize,
+    pub tensor_bytes: usize,
 }
 
 struct Reader<'a> {
@@ -201,6 +205,8 @@ pub fn parse(frame: &[u8]) -> Result<Request> {
         dtype,
         query,
         candidates,
+        tensor_tokens: total_tokens,
+        tensor_bytes: total_bytes,
     })
 }
 
@@ -235,4 +241,58 @@ pub fn failure(request_id: u64, status: u32, message: &str) -> Vec<u8> {
     frame.extend_from_slice(&(message.len() as u32).to_le_bytes());
     frame.extend_from_slice(message);
     frame
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn empty_request() -> Vec<u8> {
+        let contract = b"health";
+        let body_bytes = 4 + 4 + 4 + 1 + 1 + 2 + 4 + contract.len() + 2;
+        let mut frame = Vec::with_capacity(HEADER_BYTES + body_bytes);
+        frame.extend_from_slice(MAGIC);
+        frame.extend_from_slice(&VERSION_EXTERNAL.to_le_bytes());
+        frame.extend_from_slice(&REQUEST_KIND.to_le_bytes());
+        frame.extend_from_slice(&7_u64.to_le_bytes());
+        frame.extend_from_slice(&(body_bytes as u64).to_le_bytes());
+        frame.extend_from_slice(&1_u32.to_le_bytes());
+        frame.extend_from_slice(&1_u32.to_le_bytes());
+        frame.extend_from_slice(&0_u32.to_le_bytes());
+        frame.push(2);
+        frame.push(1);
+        frame.extend_from_slice(&0_u16.to_le_bytes());
+        frame.extend_from_slice(&(contract.len() as u32).to_le_bytes());
+        frame.extend_from_slice(contract);
+        frame.extend_from_slice(&0_u16.to_le_bytes());
+        frame
+    }
+
+    #[test]
+    fn zero_candidate_probe_is_a_valid_bounded_request() {
+        let request = parse(&empty_request()).unwrap();
+        assert_eq!(request.request_id, 7);
+        assert_eq!(request.query_rows, 1);
+        assert_eq!(request.dimension, 1);
+        assert_eq!(request.dtype, 2);
+        assert!(request.candidates.is_empty());
+        assert_eq!(request.tensor_tokens, 1);
+        assert_eq!(request.tensor_bytes, 2);
+    }
+
+    #[test]
+    fn arbitrary_short_frames_fail_without_panicking() {
+        // Fixed seed and LCG constants make malformed-frame coverage reproducible.
+        let mut state = 0x9e37_79b9_7f4a_7c15_u64;
+        for length in 0..512 {
+            let mut frame = vec![0_u8; length];
+            for byte in &mut frame {
+                state = state
+                    .wrapping_mul(6_364_136_223_846_793_005)
+                    .wrapping_add(1_442_695_040_888_963_407);
+                *byte = (state >> 32) as u8;
+            }
+            let _ = parse(&frame);
+        }
+    }
 }

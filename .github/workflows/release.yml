@@ -101,10 +101,11 @@ jobs:
           mkdir -p ~/debian/usr/share/doc/postgresql-${VERSION}-vchord/
           echo "Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/
           Upstream-Name: VectorChord
-          Source: https://github.com/tensorchord/VectorChord
+          Source: https://github.com/HuXinjing/VectorChord
 
           Files: *
-          Copyright: Copyright (c) 2025-2026 TensorChord Inc.
+          Copyright: 2025-2026 TensorChord Inc.
+                     2026 HuXinjing
           License: AGPL-3.0-only OR Elastic-2.0
 
           License: AGPL-3.0-only

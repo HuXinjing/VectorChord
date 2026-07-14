@@ -1,0 +1,3 @@
+# Replace the GPU size, model contract, tensor path, and PostgreSQL UID.
+# Values named GB are GiB (1024^3 bytes). Keep this assignment on one line.
+TILEMAXSIMD_ARGS="--socket /run/vectorchord/tilemaxsim.sock --socket-mode 660 --gpu-memory-gb 0=20 --gpu-workspace-gb 2 --host-cache-gb 8 --contract-root model@1=/var/lib/vectorchord/tensors/model-v1 --max-inflight 8 --backlog 64 --max-queued-requests 64 --max-batch-tokens 250000 --max-batch-mb 256 --request-timeout-ms 2000 --allow-peer-uid 999 --ready-file /run/vectorchord/tilemaxsim.ready --pid-file /run/vectorchord/tilemaxsimd.pid --shutdown-grace-ms 30000"

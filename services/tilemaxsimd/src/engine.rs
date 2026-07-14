@@ -1,8 +1,12 @@
+// Copyright (c) 2026 HuXinjing
+
 use crate::cache::{Admission, GpuCache};
 use crate::gpu::Gpu;
 use crate::protocol::{Descriptor, Request};
 use crate::shard::{ShardStore, cache_key};
 use anyhow::{Result, anyhow, bail};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Instant;
 
 struct MissingTensor {
     candidate_index: usize,
@@ -131,7 +135,22 @@ impl Engine {
         Ok(())
     }
 
-    pub fn score(&mut self, request: &Request) -> Result<Vec<(u32, f32)>> {
+    pub fn score_until(
+        &mut self,
+        request: &Request,
+        deadline: Instant,
+        canceled: &AtomicBool,
+    ) -> Result<Vec<(u32, f32)>> {
+        self.score_controlled(request, Some(deadline), Some(canceled))
+    }
+
+    fn score_controlled(
+        &mut self,
+        request: &Request,
+        deadline: Option<Instant>,
+        canceled: Option<&AtomicBool>,
+    ) -> Result<Vec<(u32, f32)>> {
+        check_request_control(deadline, canceled)?;
         if request.candidates.is_empty() {
             return Ok(Vec::new());
         }
@@ -180,6 +199,7 @@ impl Engine {
             self.release_chunk(chunk)?;
         }
 
+        check_request_control(deadline, canceled)?;
         let payloads = self.store.resolve_many(&missing_descriptors)?;
         let mut pending = missing_indices
             .into_iter()
@@ -194,6 +214,7 @@ impl Engine {
             .collect::<Vec<_>>();
 
         while !pending.is_empty() {
+            check_request_control(deadline, canceled)?;
             let mut chunks = (0..self.devices.len())
                 .map(|_| Vec::<ResidentTensor>::new())
                 .collect::<Vec<_>>();
@@ -293,6 +314,7 @@ impl Engine {
             for chunk in &chunks {
                 self.release_chunk(chunk)?;
             }
+            check_request_control(deadline, canceled)?;
             pending.drain(..consumed);
         }
 
@@ -424,6 +446,16 @@ impl Engine {
             "batch_read_bytes": self.store.batch_read_bytes,
         })
     }
+}
+
+fn check_request_control(deadline: Option<Instant>, canceled: Option<&AtomicBool>) -> Result<()> {
+    if canceled.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
+        bail!("request canceled because the client disconnected");
+    }
+    if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+        bail!("request deadline expired");
+    }
+    Ok(())
 }
 
 fn validate_entry(descriptor: &Descriptor, entry: &crate::cache::CacheEntry) -> Result<()> {

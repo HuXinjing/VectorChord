@@ -1,3 +1,5 @@
+// Copyright (c) 2026 HuXinjing
+
 use crate::cache::TinyLfu;
 use crate::protocol::Descriptor;
 use anyhow::{Context, Result, anyhow, bail};

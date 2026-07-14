@@ -69,6 +69,12 @@ The benchmark driver is
 [`services/benchmark_tilemaxsim_ablation.py`](services/benchmark_tilemaxsim_ablation.py);
 run it with `--help` for the corpus, cache-root, device, and output arguments.
 
+The native daemon's build, CLI, security, cache sizing, systemd, container,
+Kubernetes, upgrade, and backup procedures are documented in
+[`services/tilemaxsimd/README.md`](services/tilemaxsimd/README.md). Both
+`vchord-tilemaxsimd --help` and `vchord-tilemaxsimctl --help` are complete,
+versioned command references suitable for installation alongside PostgreSQL.
+
 The implementation is currently under active development. Its SQL interfaces
 and deployment packaging may change before a stable release. This repository
 contains only the public implementation and public-facing project information;
@@ -76,6 +82,8 @@ private planning and application documentation are intentionally excluded.
 
 This work is based on
 [supervc-stack/VectorChord](https://github.com/supervc-stack/VectorChord). The
+fork-specific TileMaxSim implementation is Copyright (c) 2026 HuXinjing;
+upstream notices remain only on inherited source. The
 original VectorChord README is retained below for upstream installation,
 licensing, and project information.
 
