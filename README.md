@@ -22,6 +22,45 @@ multi-vector search.
 - Planner statistics and cost estimation for multi-vector queries.
 - Deterministic correctness, registry, sidecar-protocol, and planner-cost tests.
 
+## Performance ablation
+
+We measured each cache-path optimization independently on the same development
+machine. The corpus contained 34,054 tensor descriptors (34,027 unique tensors,
+16.28 GB of logical FP16 tensor data). The request-level tests sampled 100
+candidates containing 47.81 MB of tensor data. Absolute latency depends on the
+storage and GPU, so the same-run comparisons are more useful than the raw
+numbers.
+
+| Optimization | Baseline | Optimized | Result |
+| --- | ---: | ---: | ---: |
+| Immutable shards and batched reads | 333.38 ms, sequential files | 56.52 ms | 5.90x faster |
+| Shards versus batched legacy files | 87.56 ms | 56.52 ms | 1.55x faster |
+| Batched host-to-device transfer | 43.07 ms, 100 transfers | 22.50 ms, one transfer | 1.91x faster |
+| TinyLFU/GDSF admission | 69.98% LRU hit rate | 76.18% hit rate | +6.20 percentage points |
+| Rust/CUDA cold request | 874.63 ms, Python/Triton | 122.19 ms | 7.16x faster |
+| Rust/CUDA warm request p50 | 14.46 ms, Python/Triton | 1.77 ms | 8.17x faster |
+| Rust/CUDA warm request p95 | 21.57 ms, Python/Triton | 1.83 ms | 11.79x faster |
+
+A full resident-cache run assigned 20 GiB to one GPU: 18 GiB for tensors and
+2 GiB for the TileMaxSim workspace. All 34,027 unique tensors were pinned before
+the service became ready. Process-to-ready time was 26.32 seconds for the
+Python/Triton sidecar and 17.40 seconds for the Rust/CUDA daemon, a 33.9%
+reduction. This is a one-time prewarm cost; resident warm requests do not read
+the tensors from disk.
+
+The fixed-block buddy/slab allocator removed external-fragmentation failures in
+a deterministic 20,000-operation allocation trace (220 with variable extents,
+zero with slabs). It traded that unpredictability for 8.82% internal rounding
+waste; total capacity failures were 220 for variable extents and 236 for slabs.
+The allocator therefore improves predictability rather than claiming to create
+additional memory.
+
+Rust/CUDA and Python/Triton produced identical top-10 results. The maximum
+absolute score difference was 5.25e-6 and the mean difference was 3.45e-6.
+The benchmark driver is
+[`services/benchmark_tilemaxsim_ablation.py`](services/benchmark_tilemaxsim_ablation.py);
+run it with `--help` for the corpus, cache-root, device, and output arguments.
+
 The implementation is currently under active development. Its SQL interfaces
 and deployment packaging may change before a stable release. This repository
 contains only the public implementation and public-facing project information;
