@@ -18,6 +18,9 @@ Version 1 consumes inline tensors. Version 2 resolves canonical tensor payloads
 from an operations-configured, per-model content-addressed cache. Applications may
 populate that cache from any object store; object-store credentials and routing
 never enter PostgreSQL or this protocol.
+
+The service is disabled unless the operator explicitly assigns at least one
+``GPU=GB`` arena. It acquires every configured arena before binding its socket.
 """
 
 from __future__ import annotations
@@ -49,6 +52,19 @@ if __package__ in (None, ""):
     sys.path.insert(0, os.fspath(Path(__file__).resolve().parents[1]))
 
 from devtools import tilemaxsim_reference_sidecar as protocol
+from services.tilemaxsim_gpu_cache import (
+    GpuArenaSpec,
+    GpuResourcePool,
+    GpuTensorCache,
+    GpuTensorHandle,
+    parse_gpu_memory_gb,
+    parse_memory_gb,
+)
+
+try:
+    from services.tilemaxsim_triton import ragged_tilemaxsim_fp16
+except ImportError:
+    ragged_tilemaxsim_fp16 = None
 
 
 def validate_finite_payload(
@@ -214,7 +230,7 @@ class ContentAddressedResolver:
             if directory_fd >= 0:
                 os.close(directory_fd)
 
-    def resolve(self, request: protocol.ExternalTensorRequest) -> ResolvedPayload:
+    def key(self, request: protocol.ExternalTensorRequest) -> tuple[object, ...]:
         root_fd = self.root_fds.get(request.model_contract_id)
         if root_fd is None:
             raise protocol.SidecarError(
@@ -222,15 +238,21 @@ class ContentAddressedResolver:
                 "model contract has no configured tensor cache root",
             )
         digest = self._digest(request)
-        expected_bytes = protocol.checked_tensor_bytes(
-            request.rows, request.dimension, request.dtype
-        )
         key = (
             request.model_contract_id,
             digest,
             request.rows,
             request.dimension,
             request.dtype,
+        )
+        return key
+
+    def resolve(self, request: protocol.ExternalTensorRequest) -> ResolvedPayload:
+        key = self.key(request)
+        digest = str(key[1])
+        root_fd = self.root_fds[request.model_contract_id]
+        expected_bytes = protocol.checked_tensor_bytes(
+            request.rows, request.dimension, request.dtype
         )
         cached = self.cache.get(key)
         if cached is not None:
@@ -393,6 +415,190 @@ class TorchTileMaxsimEngine:
         )
 
 
+class ResidentTorchTileMaxsimEngine:
+    """Score tensors already owned by one or more process GPU arenas."""
+
+    def __init__(
+        self,
+        pool: GpuResourcePool,
+        max_workspace_bytes: int,
+        allow_tf32: bool,
+        max_cuda_inflight: int,
+    ) -> None:
+        self.pool = pool
+        self.device = pool.primary_device
+        self.max_workspace_bytes = max_workspace_bytes
+        self.compute_slots = threading.BoundedSemaphore(max_cuda_inflight)
+        torch.backends.cuda.matmul.allow_tf32 = allow_tf32
+        torch.backends.cudnn.allow_tf32 = allow_tf32
+        with torch.inference_mode():
+            for arena in pool.arenas:
+                left = torch.zeros((1, 1), dtype=torch.float32, device=arena.device)
+                _ = left @ left
+            for arena in pool.arenas:
+                torch.cuda.synchronize(arena.device)
+
+    @staticmethod
+    def _cpu_tensor(
+        payload: bytes, rows: int, dimension: int, dtype: int
+    ) -> torch.Tensor:
+        scalar_dtype = torch.float32 if dtype == protocol.DTYPE_F32 else torch.float16
+        return torch.frombuffer(bytearray(payload), dtype=scalar_dtype).reshape(
+            rows, dimension
+        )
+
+    def _groups(
+        self,
+        query_rows: int,
+        dimension: int,
+        dtype: int,
+        documents: list[tuple[int, GpuTensorHandle]],
+    ) -> Iterable[list[tuple[int, GpuTensorHandle]]]:
+        scalar_bytes = 4 if dtype == protocol.DTYPE_F32 else 2
+        query_bytes = query_rows * dimension * scalar_bytes
+        group: list[tuple[int, GpuTensorHandle]] = []
+        group_rows = 0
+        for document in documents:
+            rows = document[1].rows
+            next_rows = group_rows + rows
+            # The resident document remains inside the arena. torch.cat makes
+            # one device-local contiguous scoring view; the other temporaries
+            # are the query and q-by-document-token similarity matrix.
+            required = (
+                query_bytes
+                + next_rows * dimension * scalar_bytes
+                + query_rows * next_rows * scalar_bytes
+            )
+            if required > self.max_workspace_bytes and group:
+                yield group
+                group = []
+                group_rows = 0
+                next_rows = rows
+                required = (
+                    query_bytes
+                    + rows * dimension * scalar_bytes
+                    + query_rows * rows * scalar_bytes
+                )
+            if required > self.max_workspace_bytes:
+                raise protocol.SidecarError(
+                    protocol.STATUS_RESOURCE_LIMIT,
+                    "one resident candidate exceeds the configured GPU workspace",
+                )
+            group.append(document)
+            group_rows = next_rows
+        if group:
+            yield group
+
+    def score(
+        self,
+        query_payload: bytes,
+        query_rows: int,
+        dimension: int,
+        dtype: int,
+        documents: list[tuple[int, GpuTensorHandle]],
+        deadline: float,
+        cancelled: Callable[[], bool],
+    ) -> tuple[list[tuple[int, float]], float, float]:
+        if not documents:
+            return [], 0.0, 0.0
+        query_cpu = self._cpu_tensor(query_payload, query_rows, dimension, dtype)
+        by_device: dict[str, list[tuple[int, GpuTensorHandle]]] = {}
+        for document in documents:
+            handle = document[1]
+            if handle.dimension != dimension or handle.dtype != dtype:
+                raise protocol.SidecarError(
+                    protocol.STATUS_INVALID_REQUEST,
+                    "resident tensor contract disagrees with the query",
+                )
+            by_device.setdefault(str(handle.device), []).append(document)
+
+        queue_started = time.monotonic()
+        remaining = deadline - time.monotonic()
+        if remaining <= 0 or not self.compute_slots.acquire(timeout=remaining):
+            raise protocol.SidecarError(
+                protocol.STATUS_COMPUTE_ERROR,
+                "request deadline expired while waiting for CUDA capacity",
+            )
+        queue_ms = (time.monotonic() - queue_started) * 1000.0
+        compute_started = time.monotonic()
+        pending: list[tuple[list[tuple[int, GpuTensorHandle]], torch.Tensor]] = []
+        try:
+            with torch.inference_mode():
+                for arena in self.pool.arenas:
+                    device_documents = by_device.get(str(arena.device), [])
+                    if not device_documents:
+                        continue
+                    if cancelled():
+                        raise protocol.SidecarError(
+                            protocol.STATUS_COMPUTE_ERROR,
+                            "request peer disconnected",
+                        )
+                    if time.monotonic() >= deadline:
+                        raise protocol.SidecarError(
+                            protocol.STATUS_COMPUTE_ERROR, "request deadline expired"
+                        )
+                    query_device = query_cpu.to(arena.device)
+                    if dtype == protocol.DTYPE_F16 and ragged_tilemaxsim_fp16:
+                        offsets = torch.tensor(
+                            [
+                                handle.offset_bytes // 2
+                                for _, handle in device_documents
+                            ],
+                            dtype=torch.int64,
+                            device=arena.device,
+                        )
+                        rows = torch.tensor(
+                            [handle.rows for _, handle in device_documents],
+                            dtype=torch.int32,
+                            device=arena.device,
+                        )
+                        assert arena.storage is not None
+                        device_scores = ragged_tilemaxsim_fp16(
+                            query_device,
+                            arena.storage.view(torch.float16),
+                            offsets,
+                            rows,
+                            max(handle.rows for _, handle in device_documents),
+                        )
+                        pending.append((device_documents, device_scores))
+                        continue
+                    for group in self._groups(
+                        query_rows, dimension, dtype, device_documents
+                    ):
+                        document_device = torch.cat(
+                            [handle.tensor() for _, handle in group]
+                        )
+                        similarities = query_device @ document_device.transpose(0, 1)
+                        scores = []
+                        offset = 0
+                        for _, handle in group:
+                            scores.append(
+                                similarities[:, offset : offset + handle.rows]
+                                .amax(dim=1)
+                                .sum(dtype=torch.float32)
+                            )
+                            offset += handle.rows
+                        pending.append((group, torch.stack(scores)))
+
+                results: list[tuple[int, float]] = []
+                for group, device_scores in pending:
+                    host_scores = device_scores.to(device="cpu", dtype=torch.float32)
+                    for (candidate_id, _), score in zip(
+                        group, host_scores.tolist(), strict=True
+                    ):
+                        if not math.isfinite(score):
+                            raise protocol.SidecarError(
+                                protocol.STATUS_COMPUTE_ERROR,
+                                "TileMaxSim result is non-finite",
+                            )
+                        results.append((candidate_id, score))
+                for arena in self.pool.arenas:
+                    torch.cuda.synchronize(arena.device)
+        finally:
+            self.compute_slots.release()
+        return results, queue_ms, (time.monotonic() - compute_started) * 1000.0
+
+
 class JsonMetrics:
     def __init__(self) -> None:
         self.lock = threading.Lock()
@@ -410,12 +616,22 @@ class TileMaxsimService:
         engine: TorchTileMaxsimEngine,
         request_timeout_ms: int,
         metrics: JsonMetrics,
+        gpu_cache: GpuTensorCache | None = None,
+        resident_engine: ResidentTorchTileMaxsimEngine | None = None,
+        pin_gpu_entries: bool = False,
     ) -> None:
         self.limits = limits
         self.resolver = resolver
         self.engine = engine
         self.request_timeout_seconds = request_timeout_ms / 1000.0
         self.metrics = metrics
+        self.gpu_cache = gpu_cache
+        self.resident_engine = resident_engine
+        self.pin_gpu_entries = pin_gpu_entries
+        if (gpu_cache is None) != (resident_engine is None):
+            raise ValueError(
+                "GPU cache and resident engine must be configured together"
+            )
 
     @staticmethod
     def _peer_disconnected(connection: socket.socket) -> bool:
@@ -453,6 +669,7 @@ class TileMaxsimService:
         version = protocol.VERSION
         started = time.monotonic()
         metrics: dict[str, object] = {"event": "tilemaxsim_request"}
+        resident_documents: list[tuple[int, GpuTensorHandle]] = []
         if peer_credentials is not None:
             metrics["peer_pid"], metrics["peer_uid"], metrics["peer_gid"] = (
                 peer_credentials
@@ -480,7 +697,42 @@ class TileMaxsimService:
             )
             resolve_started = time.monotonic()
             cache_hits = 0
+            gpu_cache_hits = 0
+            gpu_cache_misses = 0
+            gpu_chunks = 0
+            resident_results: list[tuple[int, float]] = []
+            resident_queue_ms = 0.0
+            resident_compute_ms = 0.0
+            document_tokens = 0
             documents: list[tuple[int, int, bytes]] = []
+
+            def flush_resident_documents() -> None:
+                nonlocal gpu_chunks, resident_queue_ms, resident_compute_ms
+                if not resident_documents:
+                    return
+                assert self.resident_engine is not None
+                try:
+                    batch_results, batch_queue_ms, batch_compute_ms = (
+                        self.resident_engine.score(
+                            request.query_payload,
+                            request.query_rows,
+                            request.dimension,
+                            request.dtype,
+                            resident_documents,
+                            deadline,
+                            lambda: self._peer_disconnected(connection),
+                        )
+                    )
+                    resident_results.extend(batch_results)
+                    resident_queue_ms += batch_queue_ms
+                    resident_compute_ms += batch_compute_ms
+                    gpu_chunks += 1
+                finally:
+                    assert self.gpu_cache is not None
+                    for _, resident_handle in resident_documents:
+                        self.gpu_cache.release(resident_handle)
+                    resident_documents.clear()
+
             if isinstance(request, protocol.InlineTensorRequest):
                 for candidate in request.candidates:
                     validate_finite_payload(
@@ -493,38 +745,99 @@ class TileMaxsimService:
                     (candidate.candidate_id, candidate.rows, candidate.payload)
                     for candidate in request.candidates
                 ]
+                document_tokens = sum(
+                    candidate.rows for candidate in request.candidates
+                )
                 metrics["source"] = "inline"
             else:
                 metrics["source"] = "content_addressed"
                 for candidate in request.candidates:
+                    document_tokens += candidate.descriptor.rows
                     if time.monotonic() >= deadline:
                         raise protocol.SidecarError(
                             protocol.STATUS_COMPUTE_ERROR,
                             "request deadline expired during tensor resolution",
                         )
-                    resolved = self.resolver.resolve(candidate.descriptor)
-                    cache_hits += int(resolved.cache_hit)
-                    documents.append(
-                        (
-                            candidate.candidate_id,
-                            candidate.descriptor.rows,
-                            resolved.payload,
+                    if self.gpu_cache is None:
+                        resolved = self.resolver.resolve(candidate.descriptor)
+                        cache_hits += int(resolved.cache_hit)
+                        documents.append(
+                            (
+                                candidate.candidate_id,
+                                candidate.descriptor.rows,
+                                resolved.payload,
+                            )
                         )
-                    )
+                    else:
+                        key = self.resolver.key(candidate.descriptor)
+                        loaded_payload: bytes | None = None
+
+                        def load_payload() -> bytes:
+                            nonlocal cache_hits, loaded_payload
+                            if loaded_payload is None:
+                                resolved = self.resolver.resolve(candidate.descriptor)
+                                cache_hits += int(resolved.cache_hit)
+                                loaded_payload = resolved.payload
+                            return loaded_payload
+
+                        while True:
+                            try:
+                                handle, gpu_hit = self.gpu_cache.acquire(
+                                    key,
+                                    candidate.descriptor.rows,
+                                    candidate.descriptor.dimension,
+                                    candidate.descriptor.dtype,
+                                    load_payload,
+                                    pin=self.pin_gpu_entries,
+                                )
+                                break
+                            except protocol.SidecarError as error:
+                                if (
+                                    error.status != protocol.STATUS_RESOURCE_LIMIT
+                                    or not resident_documents
+                                ):
+                                    raise
+                                # A request may be larger than the configured
+                                # GPU cache. Score and release the current
+                                # working set, then admit the remaining
+                                # candidates through the same bounded arenas.
+                                flush_resident_documents()
+                        gpu_cache_hits += int(gpu_hit)
+                        gpu_cache_misses += int(not gpu_hit)
+                        resident_documents.append((candidate.candidate_id, handle))
+                if self.gpu_cache is not None:
+                    flush_resident_documents()
             metrics["cache_hits"] = cache_hits
+            metrics["host_cache_hits"] = cache_hits
+            metrics["gpu_cache_hits"] = gpu_cache_hits
+            metrics["gpu_cache_misses"] = gpu_cache_misses
+            metrics["gpu_chunks"] = gpu_chunks
             metrics["resolve_ms"] = round(
-                (time.monotonic() - resolve_started) * 1000.0, 3
+                max(
+                    0.0,
+                    (time.monotonic() - resolve_started) * 1000.0
+                    - resident_queue_ms
+                    - resident_compute_ms,
+                ),
+                3,
             )
-            metrics["document_tokens"] = sum(rows for _, rows, _ in documents)
-            results, queue_ms, compute_ms = self.engine.score(
-                request.query_payload,
-                request.query_rows,
-                request.dimension,
-                request.dtype,
-                documents,
-                deadline,
-                lambda: self._peer_disconnected(connection),
-            )
+            metrics["document_tokens"] = document_tokens
+            if self.gpu_cache is not None and isinstance(
+                request, protocol.ParsedExternalTensorRequest
+            ):
+                results = resident_results
+                queue_ms = resident_queue_ms
+                compute_ms = resident_compute_ms
+            else:
+                results, queue_ms, compute_ms = self.engine.score(
+                    request.query_payload,
+                    request.query_rows,
+                    request.dimension,
+                    request.dtype,
+                    documents,
+                    deadline,
+                    lambda: self._peer_disconnected(connection),
+                )
             metrics["queue_ms"] = round(queue_ms, 3)
             metrics["compute_ms"] = round(compute_ms, 3)
             metrics["status"] = "ok"
@@ -535,8 +848,6 @@ class TileMaxsimService:
                 request_id, error.status, str(error), version
             )
         except torch.OutOfMemoryError:
-            if self.engine.device.type == "cuda":
-                torch.cuda.empty_cache()
             metrics.update(status="error", error_class="CudaOutOfMemory")
             return protocol.error_response(
                 request_id,
@@ -553,6 +864,9 @@ class TileMaxsimService:
                 version,
             )
         finally:
+            if self.gpu_cache is not None:
+                for _, handle in resident_documents:
+                    self.gpu_cache.release(handle)
             metrics["total_ms"] = round((time.monotonic() - started) * 1000.0, 3)
             self.metrics.emit(metrics)
 
@@ -655,14 +969,15 @@ def serve(
         listener.listen(backlog)
         listener.settimeout(0.25)
         bound_identity = socket_path.lstat().st_dev, socket_path.lstat().st_ino
-        service.metrics.emit(
-            {
-                "event": "tilemaxsim_ready",
-                "device": str(service.engine.device),
-                "max_inflight": max_inflight,
-                "socket": os.fspath(socket_path),
-            }
-        )
+        ready: dict[str, object] = {
+            "event": "tilemaxsim_ready",
+            "device": str(service.engine.device),
+            "max_inflight": max_inflight,
+            "socket": os.fspath(socket_path),
+        }
+        if service.gpu_cache is not None:
+            ready["gpu_cache"] = service.gpu_cache.status()
+        service.metrics.emit(ready)
         accepted = 0
         while not stop.is_set():
             if not slots.acquire(timeout=0.25):
@@ -714,6 +1029,20 @@ def nonnegative_int(value: str) -> int:
     return parsed
 
 
+def memory_gb(value: str) -> int:
+    try:
+        return parse_memory_gb(value)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError(str(error)) from error
+
+
+def gpu_memory_gb(value: str) -> GpuArenaSpec:
+    try:
+        return parse_gpu_memory_gb(value)
+    except (ValueError, RuntimeError) as error:
+        raise argparse.ArgumentTypeError(str(error)) from error
+
+
 def contract_roots(
     values: list[str], parser: argparse.ArgumentParser
 ) -> dict[str, Path]:
@@ -731,12 +1060,133 @@ def contract_roots(
     return roots
 
 
+def contract_manifests(
+    values: list[str], parser: argparse.ArgumentParser
+) -> list[tuple[str, Path]]:
+    manifests = []
+    for value in values:
+        if "=" not in value:
+            parser.error("--resident-manifest must be MODEL_CONTRACT_ID=/absolute/path")
+        contract, raw_path = value.split("=", 1)
+        path = Path(raw_path)
+        if not contract or not path.is_absolute():
+            parser.error(
+                "--resident-manifest must contain a nonempty ID and absolute path"
+            )
+        manifests.append((contract, path))
+    return manifests
+
+
+def prewarm_resident_cache(
+    manifests: list[tuple[str, Path]],
+    resolver: ContentAddressedResolver,
+    gpu_cache: GpuTensorCache,
+    metrics: JsonMetrics,
+) -> None:
+    completed = 0
+    loaded_bytes = 0
+    started = time.monotonic()
+    for contract, path in manifests:
+        with path.open(encoding="utf-8") as stream:
+            for line_number, line in enumerate(stream, 1):
+                try:
+                    record = json.loads(line)
+                except json.JSONDecodeError as error:
+                    raise ValueError(f"{path}:{line_number}: invalid JSON") from error
+                if not isinstance(record, dict):
+                    raise ValueError(f"{path}:{line_number}: record must be an object")
+                dtype_name = record.get("tensor_dtype")
+                if dtype_name == "float16":
+                    dtype = protocol.DTYPE_F16
+                elif dtype_name == "float32":
+                    dtype = protocol.DTYPE_F32
+                else:
+                    raise ValueError(f"{path}:{line_number}: unsupported tensor_dtype")
+                tensor_ref = record.get("tensor_ref")
+                checksum = record.get("tensor_checksum")
+                rows = record.get("tensor_rows")
+                dimension = record.get("tensor_dim")
+                if not isinstance(tensor_ref, str) or not tensor_ref:
+                    raise ValueError(f"{path}:{line_number}: invalid tensor_ref")
+                if not isinstance(checksum, str) or not checksum:
+                    raise ValueError(f"{path}:{line_number}: invalid tensor_checksum")
+                if not isinstance(rows, int) or rows <= 0:
+                    raise ValueError(f"{path}:{line_number}: invalid tensor_rows")
+                if not isinstance(dimension, int) or dimension <= 0:
+                    raise ValueError(f"{path}:{line_number}: invalid tensor_dim")
+                request = protocol.ExternalTensorRequest(
+                    contract, tensor_ref, rows, dimension, dtype, checksum
+                )
+                expected_bytes = protocol.checked_tensor_bytes(rows, dimension, dtype)
+                declared_bytes = record.get("canonical_bytes")
+                if declared_bytes is not None and declared_bytes != expected_bytes:
+                    raise ValueError(
+                        f"{path}:{line_number}: canonical_bytes disagrees with shape"
+                    )
+                key = resolver.key(request)
+                handle, _ = gpu_cache.acquire(
+                    key,
+                    rows,
+                    dimension,
+                    dtype,
+                    lambda request=request: resolver.resolve(request).payload,
+                    pin=True,
+                )
+                gpu_cache.release(handle)
+                completed += 1
+                loaded_bytes += expected_bytes
+                if completed % 1000 == 0:
+                    metrics.emit(
+                        {
+                            "event": "tilemaxsim_prewarm_progress",
+                            "entries": completed,
+                            "logical_bytes": loaded_bytes,
+                        }
+                    )
+    if completed == 0:
+        raise ValueError("resident manifests contain no tensor descriptors")
+    metrics.emit(
+        {
+            "event": "tilemaxsim_prewarm_complete",
+            "entries": completed,
+            "logical_bytes": loaded_bytes,
+            "elapsed_ms": round((time.monotonic() - started) * 1000.0, 3),
+            "gpu_cache": gpu_cache.status(),
+        }
+    )
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--socket", required=True, type=Path)
     parser.add_argument("--socket-mode", type=parse_mode, default=0o600)
-    parser.add_argument("--device", default="cuda:0")
+    parser.add_argument(
+        "--gpu-cache-mode",
+        choices=("lru", "resident"),
+        default="lru",
+        help="use evictable GPU arenas or pin a full descriptor manifest",
+    )
+    parser.add_argument(
+        "--gpu-memory-gb",
+        action="append",
+        type=gpu_memory_gb,
+        default=[],
+        metavar="GPU=GB",
+        help="repeatable strict allocation, for example 1=20; enables TileMaxSim",
+    )
+    parser.add_argument(
+        "--gpu-workspace-gb",
+        type=memory_gb,
+        default=2 * 1024**3,
+        help="per-GPU portion of the configured GB reserved for scoring temporaries",
+    )
     parser.add_argument("--contract-root", action="append", default=[])
+    parser.add_argument(
+        "--resident-manifest",
+        action="append",
+        default=[],
+        metavar="MODEL_CONTRACT_ID=/ABSOLUTE/PATH",
+    )
     parser.add_argument(
         "--max-request-bytes", type=positive_int, default=64 * 1024 * 1024
     )
@@ -746,10 +1196,10 @@ def main() -> None:
     )
     parser.add_argument("--max-candidates", type=positive_int, default=65_536)
     parser.add_argument(
-        "--max-device-bytes", type=positive_int, default=8 * 1024 * 1024 * 1024
-    )
-    parser.add_argument(
-        "--cache-bytes", type=nonnegative_int, default=8 * 1024 * 1024 * 1024
+        "--host-cache-gb",
+        type=memory_gb,
+        default=8 * 1024**3,
+        help="decoded host-memory tensor cache size in GB",
     )
     parser.add_argument("--request-timeout-ms", type=positive_int, default=2000)
     parser.add_argument("--max-inflight", type=positive_int, default=8)
@@ -760,23 +1210,52 @@ def main() -> None:
     args = parser.parse_args()
 
     roots = contract_roots(args.contract_root, parser)
+    manifests = contract_manifests(args.resident_manifest, parser)
+    if not args.gpu_memory_gb:
+        parser.error(
+            "TileMaxSim is disabled until at least one --gpu-memory-gb GPU=GB is configured"
+        )
+    if args.gpu_cache_mode == "resident" and not manifests:
+        parser.error(
+            "--gpu-cache-mode resident requires at least one --resident-manifest"
+        )
+    if args.gpu_cache_mode == "lru" and manifests:
+        parser.error("--resident-manifest is valid only in resident mode")
     limits = protocol.Limits(
         max_request_bytes=args.max_request_bytes,
         max_batch_tokens=args.max_batch_tokens,
         max_tensor_bytes=args.max_tensor_bytes,
         max_candidates=args.max_candidates,
     )
-    resolver = ContentAddressedResolver(roots, args.cache_bytes)
+    resolver = ContentAddressedResolver(roots, args.host_cache_gb)
     metrics = JsonMetrics()
+    pool: GpuResourcePool | None = None
     try:
+        pool = GpuResourcePool(args.gpu_memory_gb, args.gpu_workspace_gb)
         engine = TorchTileMaxsimEngine(
-            args.device,
-            args.max_device_bytes,
+            str(pool.primary_device),
+            args.gpu_workspace_gb,
             args.allow_tf32,
             args.max_cuda_inflight,
         )
+        gpu_cache = GpuTensorCache(pool, allow_eviction=args.gpu_cache_mode == "lru")
+        resident_engine = ResidentTorchTileMaxsimEngine(
+            pool,
+            args.gpu_workspace_gb,
+            args.allow_tf32,
+            args.max_cuda_inflight,
+        )
+        if args.gpu_cache_mode == "resident":
+            prewarm_resident_cache(manifests, resolver, gpu_cache, metrics)
         service = TileMaxsimService(
-            limits, resolver, engine, args.request_timeout_ms, metrics
+            limits,
+            resolver,
+            engine,
+            args.request_timeout_ms,
+            metrics,
+            gpu_cache,
+            resident_engine,
+            pin_gpu_entries=args.gpu_cache_mode == "resident",
         )
         stop = threading.Event()
 
@@ -795,6 +1274,8 @@ def main() -> None:
             args.once,
         )
     finally:
+        if pool is not None:
+            pool.close()
         resolver.close()
 
 

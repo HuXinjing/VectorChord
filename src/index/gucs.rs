@@ -92,6 +92,8 @@ static mut VCHORDRQ_MAXSIM_THRESHOLD_CONFIG: *mut pgrx::pg_sys::config_generic =
 
 static VCHORDRQ_MAXSIM_CANDIDATE_LIMIT: GucSetting<i32> = GucSetting::<i32>::new(-1);
 
+static VCHORDRQ_MAXSIM_PROFILE: GucSetting<bool> = GucSetting::<bool>::new(false);
+
 static VCHORDRQ_MAXSIM_PLANNER_QUERY_TOKENS: GucSetting<i32> = GucSetting::<i32>::new(32);
 
 static VCHORDRQ_MAXSIM_PLANNER_DOCUMENT_TOKENS: GucSetting<i32> = GucSetting::<i32>::new(256);
@@ -188,6 +190,14 @@ pub fn init() {
         &VCHORDRQ_MAXSIM_CANDIDATE_LIMIT,
         -1,
         i32::MAX,
+        GucContext::Userset,
+        GucFlags::default(),
+    );
+    GucRegistry::define_bool_guc(
+        c"vchordrq.maxsim_profile",
+        c"Emit one client NOTICE with MaxSim phase timings and counters.",
+        c"Disabled by default; emitted profiles contain no tensor references or application IDs.",
+        &VCHORDRQ_MAXSIM_PROFILE,
         GucContext::Userset,
         GucFlags::default(),
     );
@@ -584,6 +594,10 @@ pub fn vchordrq_maxsim_threshold(index: pgrx::pg_sys::Relation) -> u32 {
 pub fn vchordrq_maxsim_candidate_limit() -> Option<u32> {
     let value = VCHORDRQ_MAXSIM_CANDIDATE_LIMIT.get();
     if value < 0 { None } else { Some(value as u32) }
+}
+
+pub fn vchordrq_maxsim_profile() -> bool {
+    VCHORDRQ_MAXSIM_PROFILE.get()
 }
 
 pub fn vchordrq_maxsim_planner_query_tokens() -> u32 {

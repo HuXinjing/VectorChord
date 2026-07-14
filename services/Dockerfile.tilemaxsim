@@ -5,6 +5,8 @@ WORKDIR /opt/vectorchord
 
 COPY devtools/tilemaxsim_reference_sidecar.py devtools/tilemaxsim_reference_sidecar.py
 COPY services/tilemaxsim_cuda_sidecar.py services/tilemaxsim_cuda_sidecar.py
+COPY services/tilemaxsim_gpu_cache.py services/tilemaxsim_gpu_cache.py
+COPY services/tilemaxsim_triton.py services/tilemaxsim_triton.py
 
 ENV PYTHONPATH=/opt/vectorchord \
     PYTHONUNBUFFERED=1

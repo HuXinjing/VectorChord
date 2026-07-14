@@ -1,0 +1,91 @@
+# Candidate-only TileMaxSim binds external tensor descriptors directly to an
+# application relation. It must not require or inspect a VectorChord ANN index.
+
+statement ok
+CREATE TABLE tilemaxsim_source_test (
+  id integer PRIMARY KEY,
+  model_contract text NOT NULL,
+  embedding vector(2)
+);
+
+statement ok
+CREATE TABLE tilemaxsim_descriptor_test (
+  source_id integer PRIMARY KEY,
+  tensor_ref text NOT NULL,
+  tensor_rows integer NOT NULL,
+  tensor_dim integer NOT NULL,
+  tensor_dtype text NOT NULL,
+  tensor_checksum text NOT NULL
+);
+
+statement ok
+INSERT INTO tilemaxsim_source_test VALUES
+  (1, 'colqwen@test', '[1,0]'),
+  (2, 'colqwen@test', '[0,1]');
+
+statement ok
+INSERT INTO tilemaxsim_descriptor_test VALUES
+  (1, 'tensor://1', 2, 2, 'float32', 'sha256:test1'),
+  (2, 'tensor://2', 2, 2, 'float32', 'sha256:test2');
+
+statement ok
+SELECT vchordrq_register_tilemaxsim_source(
+  source_relation => 'tilemaxsim_source_test'::regclass,
+  model_contract_id => ' colqwen@test ',
+  storage => 'EXTERNAL_RELATION',
+  model_contract_column => 'model_contract',
+  public_id_column => 'id',
+  tensor_ref_column => 'tensor_ref',
+  tensor_rows_column => 'tensor_rows',
+  tensor_dim_column => 'tensor_dim',
+  tensor_dtype_column => 'tensor_dtype',
+  tensor_checksum_column => 'tensor_checksum',
+  descriptor_relation => 'tilemaxsim_descriptor_test'::regclass,
+  descriptor_public_id_column => 'source_id'
+);
+
+query TTTT
+SELECT registered_source::text, source_storage,
+       descriptor_relation::text, public_id_column::text
+FROM vchordrq_tilemaxsim_source_info('tilemaxsim_source_test'::regclass);
+----
+tilemaxsim_source_test external_relation tilemaxsim_descriptor_test id
+
+# Candidate validation occurs before external tensor or sidecar access.
+statement error candidate_ids must not contain duplicates
+SELECT * FROM vchordrq_tilemaxsim_rerank(
+  'tilemaxsim_source_test'::regclass,
+  ARRAY['[1,0]'::vector],
+  ARRAY[1,1]::bigint[],
+  1
+);
+
+statement error top_k must be positive and no greater than candidate_ids length
+SELECT * FROM vchordrq_tilemaxsim_rerank(
+  'tilemaxsim_source_test'::regclass,
+  ARRAY['[1,0]'::halfvec],
+  ARRAY[1,2]::bigint[],
+  3
+);
+
+# Attribute OIDs survive renames and the resolver returns the live name.
+statement ok
+ALTER TABLE tilemaxsim_descriptor_test RENAME tensor_ref TO tensor_location;
+
+query T
+SELECT tensor_ref_column::text
+FROM vchordrq_tilemaxsim_source_info('tilemaxsim_source_test'::regclass);
+----
+tensor_location
+
+# Dropping a bound descriptor column removes the binding through sql_drop.
+statement ok
+ALTER TABLE tilemaxsim_descriptor_test DROP COLUMN tensor_checksum;
+
+query I
+SELECT count(*) FROM _vchordrq_tilemaxsim_sources;
+----
+0
+
+statement ok
+DROP TABLE tilemaxsim_source_test, tilemaxsim_descriptor_test;
