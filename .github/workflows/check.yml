@@ -32,7 +32,7 @@ jobs:
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
       - name: Typos
-        uses: crate-ci/typos@master
+        uses: crate-ci/typos@3bc303c295c081add5df4a4d52a1e117f2fb2dce
 
       - name: Taplo
         run: taplo fmt --check
@@ -45,7 +45,7 @@ jobs:
 
       - name: License Header
         run: |
-          HEADER=$(cat <<EOF
+          UPSTREAM_HEADER=$(cat <<EOF
           This software is licensed under a dual license model:
 
           GNU Affero General Public License v3 (AGPLv3): You may use, modify, and
@@ -61,34 +61,51 @@ jobs:
           Copyright (c) 2025-2026 TensorChord Inc.
           EOF
           )
-          COUNT=$(echo "$HEADER" | wc -l)
+          FORK_HEADER=$(cat <<EOF
+          This software is licensed under a dual license model:
 
-          RS_HEADER=$(echo "$HEADER" | awk '{ if ($0 ~ /^$/) print "//"; else print "// " $0 }')
-          C_HEADER=$(echo "$HEADER" | awk '{ if ($0 ~ /^$/) print "//"; else print "// " $0 }')
-          PY_HEADER=$(echo "$HEADER" | awk '{ if ($0 ~ /^$/) print "#"; else print "# " $0 }')
+          GNU Affero General Public License v3 (AGPLv3): You may use, modify, and
+          distribute this software under the terms of the AGPLv3.
 
-          RS_FILES=$(find . -type f -name "*.rs" -not -path "./target/*")
-          C_FILES=$(find . -type f -name "*.c" -not -path "./target/*")
-          PY_FILES=$(find . -type f -name "*.py" -not -path "./target/*")
+          Elastic License v2 (ELv2): You may also use, modify, and distribute this
+          software under the Elastic License v2, which has specific restrictions.
+
+          Copyright (c) 2026 Hu Xinjing
+          EOF
+          )
+          UPSTREAM_COUNT=$(echo "$UPSTREAM_HEADER" | wc -l)
+          FORK_COUNT=$(echo "$FORK_HEADER" | wc -l)
+
+          UPSTREAM_RS=$(echo "$UPSTREAM_HEADER" | awk '{ if ($0 ~ /^$/) print "//"; else print "// " $0 }')
+          UPSTREAM_PY=$(echo "$UPSTREAM_HEADER" | awk '{ if ($0 ~ /^$/) print "#"; else print "# " $0 }')
+          FORK_RS=$(echo "$FORK_HEADER" | awk '{ if ($0 ~ /^$/) print "//"; else print "// " $0 }')
+          FORK_PY=$(echo "$FORK_HEADER" | awk '{ if ($0 ~ /^$/) print "#"; else print "# " $0 }')
+
+          RS_FILES=$(find . -type f -name "*.rs" -not -path "*/target/*")
+          C_FILES=$(find . -type f \( -name "*.c" -o -name "*.cu" \) -not -path "*/target/*")
+          PY_FILES=$(find . -type f -name "*.py" -not -path "*/target/*")
 
           FLAG="0"
 
           for p in $RS_FILES; do
-            if ! head -n "$COUNT" "$p" | cmp -s - <(echo "$RS_HEADER"); then
+            if ! head -n "$UPSTREAM_COUNT" "$p" | cmp -s - <(echo "$UPSTREAM_RS") && \
+               ! head -n "$FORK_COUNT" "$p" | cmp -s - <(echo "$FORK_RS"); then
               echo "license header mismatch in file $p"
               FLAG="1"
             fi
           done
 
           for p in $C_FILES; do
-            if ! head -n "$COUNT" "$p" | cmp -s - <(echo "$C_HEADER"); then
+            if ! head -n "$UPSTREAM_COUNT" "$p" | cmp -s - <(echo "$UPSTREAM_RS") && \
+               ! head -n "$FORK_COUNT" "$p" | cmp -s - <(echo "$FORK_RS"); then
               echo "license header mismatch in file $p"
               FLAG="1"
             fi
           done
 
           for p in $PY_FILES; do
-            if ! head -n "$COUNT" "$p" | cmp -s - <(echo "$PY_HEADER"); then
+            if ! head -n "$UPSTREAM_COUNT" "$p" | cmp -s - <(echo "$UPSTREAM_PY") && \
+               ! head -n "$FORK_COUNT" "$p" | cmp -s - <(echo "$FORK_PY"); then
               echo "license header mismatch in file $p"
               FLAG="1"
             fi
@@ -110,6 +127,27 @@ jobs:
             services/benchmark_tilemaxsim_cuda.py \
             services/build_tilemaxsim_tensor_cache.py \
             services/test_tilemaxsim_cuda_sidecar.py
+
+  tilemaxsimd:
+    if: |
+      (github.event_name == 'push' && !contains(github.event.head_commit.message, 'job: -tilemaxsimd')) ||
+      (github.event_name == 'pull_request' && !contains(github.event.pull_request.body, 'job: -tilemaxsimd')) ||
+      github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Free space for the CUDA build image
+        run: |
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup
+          docker builder prune --all --force
+
+      - name: Validate production Dockerfile
+        run: docker build --check -f services/Dockerfile.tilemaxsimd .
+
+      - name: Build, lint, and test native TileMaxSim
+        run: docker build --target test -f services/Dockerfile.tilemaxsimd .
 
   miri:
     if: |
@@ -325,6 +363,47 @@ jobs:
           if [ "${{ matrix.version }}" -ge "17" ]; then
             sqllogictest --db $(whoami) --user $(whoami) './tests/vchordrq/pg17/*.slt' --label pg${{ matrix.version }}
           fi
+
+      - name: Release schema install and upgrade
+        if: matrix.version == '14' && matrix.arch == 'x86_64'
+        run: |
+          EXTENSION_DIR="$(pg_config --sharedir)/extension"
+          cmp sql/install/vchord--1.2.0.sql build/sharedir/extension/vchord--0.0.0.sql
+          sudo install -m 0644 sql/install/vchord--1.1.1.sql "$EXTENSION_DIR/"
+          sudo install -m 0644 sql/install/vchord--1.2.0.sql "$EXTENSION_DIR/"
+          sudo install -m 0644 sql/upgrade/vchord--1.1.1--1.2.0.sql "$EXTENSION_DIR/"
+
+          dropdb --if-exists vchord_upgrade_test
+          createdb vchord_upgrade_test
+          psql -v ON_ERROR_STOP=1 -d vchord_upgrade_test <<'SQL'
+          CREATE EXTENSION vector;
+          CREATE EXTENSION vchord VERSION '1.1.1';
+          CREATE TABLE items(id bigserial PRIMARY KEY, embedding vector(3));
+          INSERT INTO items(embedding)
+          VALUES (ARRAY[1, 0, 0]::vector), (ARRAY[0, 1, 0]::vector);
+          CREATE INDEX items_vchord_idx
+          ON items USING vchordrq (embedding vector_l2_ops);
+          ALTER EXTENSION vchord UPDATE TO '1.2.0';
+          SET enable_seqscan = off;
+          SELECT id FROM items
+          ORDER BY embedding <-> ARRAY[1, 0, 0]::vector
+          LIMIT 1;
+          SQL
+          test "$(psql -At -d vchord_upgrade_test -c \
+            "SELECT extversion FROM pg_extension WHERE extname = 'vchord'")" = "1.2.0"
+          test "$(psql -At -d vchord_upgrade_test -c \
+            "SELECT to_regprocedure('vchordrq_tilemaxsim_rerank(regclass,vector[],bigint[],integer)') IS NOT NULL")" = "t"
+
+          dropdb --if-exists vchord_fresh_install_test
+          createdb vchord_fresh_install_test
+          psql -v ON_ERROR_STOP=1 -d vchord_fresh_install_test <<'SQL'
+          CREATE EXTENSION vector;
+          CREATE EXTENSION vchord VERSION '1.2.0';
+          SQL
+          test "$(psql -At -d vchord_fresh_install_test -c \
+            "SELECT extversion FROM pg_extension WHERE extname = 'vchord'")" = "1.2.0"
+          test "$(psql -At -d vchord_fresh_install_test -c \
+            "SELECT to_regprocedure('vchordrq_tilemaxsim_rerank(regclass,vector[],bigint[],integer)') IS NOT NULL")" = "t"
 
       - name: Logging
         if: always()

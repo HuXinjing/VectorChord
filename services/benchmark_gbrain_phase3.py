@@ -6,10 +6,6 @@
 # Elastic License v2 (ELv2): You may also use, modify, and distribute this
 # software under the Elastic License v2, which has specific restrictions.
 #
-# We welcome any commercial collaboration or support. For inquiries
-# regarding the licenses, please contact us at:
-# vectorchord-inquiry@tensorchord.ai
-#
 # Copyright (c) 2026 Hu Xinjing
 
 """Measure native Phase 3A ranking against a committed GBrain TileMaxSim gold."""

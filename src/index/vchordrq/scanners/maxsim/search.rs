@@ -12,15 +12,14 @@
 //
 // Copyright (c) 2025-2026 TensorChord Inc.
 
-use super::MaxsimBuilder;
 use super::candidate::{HeapKey, PageCandidate};
 use super::external::{
     CandidateTensorDescriptorSource, ExternalTensorDescriptor, ExternalTensorSourceBinding,
     ExternalTensorStorage, resolve_external_tensor_source, validate_descriptor,
 };
 use super::gpu::{GpuExternalTileMaxsimBackend, UnixSocketTransport};
-use super::profile;
 use super::rerank::RerankError;
+use super::{MaxsimBuilder, profile};
 use crate::index::fetcher::{
     Fetcher, FilterableTuple, HeapFetcher, Tuple, TupleAttribute, ctid_to_key,
 };

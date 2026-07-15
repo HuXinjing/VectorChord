@@ -3,10 +3,10 @@
 // GNU Affero General Public License v3 (AGPLv3): You may use, modify, and
 // distribute this software under the terms of the AGPLv3.
 //
-// Elastic License v2 (ELv2): This software is also available under the ELv2,
-// which has specific restrictions.
+// Elastic License v2 (ELv2): You may also use, modify, and distribute this
+// software under the Elastic License v2, which has specific restrictions.
 //
-// Copyright (c) 2025-2026 TensorChord Inc.
+// Copyright (c) 2026 Hu Xinjing
 
 use super::candidate::PageCandidate;
 use super::rerank::RerankError;

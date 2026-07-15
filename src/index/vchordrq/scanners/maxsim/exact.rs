@@ -1,10 +1,10 @@
 // This software is licensed under a dual license model:
 //
 // GNU Affero General Public License v3 (AGPLv3): You may use, modify, and
-// distribute this software under the AGPLv3.
+// distribute this software under the terms of the AGPLv3.
 //
 // Elastic License v2 (ELv2): You may also use, modify, and distribute this
-// software under the ELv2, which has specific restrictions.
+// software under the Elastic License v2, which has specific restrictions.
 //
 // Copyright (c) 2026 Hu Xinjing
 

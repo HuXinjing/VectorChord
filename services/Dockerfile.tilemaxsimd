@@ -15,10 +15,23 @@ WORKDIR /build/tilemaxsimd
 COPY services/tilemaxsimd/ .
 RUN cargo build --release --locked
 
+FROM build AS test
+RUN rustup component add clippy rustfmt \
+    && cargo fmt --check \
+    && cargo clippy --all-targets --locked -- -D warnings \
+    && cargo test --locked
+
 FROM ${CUDA_RUNTIME_IMAGE}
 
 COPY --from=build /build/tilemaxsimd/target/release/tilemaxsimd /usr/local/bin/tilemaxsimd
 COPY --from=build /build/tilemaxsimd/target/release/tilemaxsimctl /usr/local/bin/tilemaxsimctl
+RUN groupadd --system vectorchord \
+    && useradd --system --gid vectorchord --home-dir /nonexistent \
+        --shell /usr/sbin/nologin vectorchord \
+    && install -d -o vectorchord -g vectorchord -m 0750 \
+        /run/vectorchord /var/lib/vectorchord
+
+USER vectorchord:vectorchord
 
 STOPSIGNAL SIGTERM
 HEALTHCHECK --interval=10s --timeout=2s --start-period=5m --retries=3 \

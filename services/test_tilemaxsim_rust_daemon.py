@@ -312,6 +312,21 @@ class RustDaemonTest(unittest.TestCase):
         self.run_daemon([device])
 
     @unittest.skipUnless(torch.cuda.is_available(), "CUDA is unavailable")
+    def test_exact_scores_are_repeatable_across_cuda_contexts(self) -> None:
+        device = max(
+            range(torch.cuda.device_count()),
+            key=lambda index: torch.cuda.mem_get_info(index)[0],
+        )
+        generator = np.random.default_rng(20260715)
+        document = generator.normal(size=(79, 64)).astype("<f2")
+        query = generator.normal(size=(31, 64)).astype("<f2")
+        observed = [
+            self.run_daemon([device], [document], query)[1][0][1]
+            for _ in range(5)
+        ]
+        self.assertEqual(observed, [observed[0]] * len(observed))
+
+    @unittest.skipUnless(torch.cuda.is_available(), "CUDA is unavailable")
     def test_published_object_is_queryable_without_daemon_restart(self) -> None:
         binary = self._release_binary()
         if not binary.exists():
@@ -401,6 +416,95 @@ class RustDaemonTest(unittest.TestCase):
                 if process.poll() is None:
                     process.terminate()
                     process.wait(timeout=5)
+
+    @unittest.skipUnless(torch.cuda.is_available(), "CUDA is unavailable")
+    def test_sigkill_restart_recovers_stale_socket_and_cache_root(self) -> None:
+        binary = self._release_binary()
+        if not binary.exists():
+            self.skipTest("release tilemaxsimd binary has not been built")
+        device = max(
+            range(torch.cuda.device_count()),
+            key=lambda index: torch.cuda.mem_get_info(index)[0],
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            shard_root = root / "cache"
+            shard_root.mkdir()
+            document = np.asarray([[1.0, 0.0], [0.0, 1.0]], dtype="<f2")
+            payload = document.tobytes()
+            digest = hashlib.sha256(payload).hexdigest()
+            writer = ImmutableShardWriter(
+                shard_root, target_bytes=4096, alignment=256, fsync=False
+            )
+            try:
+                writer.add(digest, payload, 2, 2, "float16")
+                writer.finish()
+            finally:
+                writer.close()
+            socket_path = root / "tilemaxsimd.sock"
+            command = [
+                os.fspath(binary),
+                "--socket", os.fspath(socket_path),
+                "--gpu-memory-gb", f"{device}=0.05",
+                "--gpu-workspace-gb", "0.02",
+                "--host-cache-gb", "0.01",
+                "--contract-root", f"model@1={shard_root}",
+            ]
+
+            crashed = subprocess.Popen(
+                command,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+            )
+            for _ in range(1000):
+                if socket_path.exists() or crashed.poll() is not None:
+                    break
+                time.sleep(0.01)
+            self.assertIsNone(crashed.poll())
+            crashed.kill()
+            crashed.wait(timeout=5)
+            self.assertTrue(socket_path.exists())
+
+            status_socket_path = root / "restarted-status.sock"
+            restarted = subprocess.Popen(
+                [
+                    *command,
+                    "--status-socket", os.fspath(status_socket_path),
+                    "--once",
+                ],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+            )
+            try:
+                for _ in range(1000):
+                    if status_socket_path.exists() or restarted.poll() is not None:
+                        break
+                    time.sleep(0.01)
+                self.assertIsNone(restarted.poll())
+                frame, _ = external_request_frame(
+                    903,
+                    protocol.DTYPE_F16,
+                    document.tolist(),
+                    "model@1",
+                    [(88, f"sha256://{digest}", document.tolist())],
+                )
+                with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
+                    connection.connect(os.fspath(socket_path))
+                    connection.sendall(frame)
+                    header = protocol.receive_exact(connection, protocol.HEADER.size)
+                    body_bytes = protocol.HEADER.unpack(header)[4]
+                    response = header + protocol.receive_exact(connection, body_bytes)
+                output, _ = restarted.communicate(timeout=10)
+                self.assertEqual(restarted.returncode, 0, output)
+                request_id, status, results = decode_response(response)
+                self.assertEqual((request_id, status), (903, 0))
+                self.assertEqual(results[0][0], 88)
+            finally:
+                if restarted.poll() is None:
+                    restarted.terminate()
+                    restarted.wait(timeout=5)
 
     @unittest.skipUnless(torch.cuda.is_available(), "CUDA is unavailable")
     def test_external_v3_scheduled_round_trip_hashes_tenant_and_preserves_priority(self) -> None:
@@ -582,6 +686,95 @@ class RustDaemonTest(unittest.TestCase):
                 if process.poll() is None:
                     process.terminate()
                     process.wait(timeout=10)
+
+    @unittest.skipUnless(torch.cuda.is_available(), "CUDA is unavailable")
+    def test_overload_rejects_one_tenant_without_crashing_daemon(self) -> None:
+        binary = self._release_binary()
+        if not binary.exists():
+            self.skipTest("release tilemaxsimd binary has not been built")
+        device = max(
+            range(torch.cuda.device_count()),
+            key=lambda index: torch.cuda.mem_get_info(index)[0],
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            shard_root = root / "cache"
+            shard_root.mkdir()
+            document = np.asarray([[1.0, 0.0], [0.0, 1.0]], dtype="<f2")
+            payload = document.tobytes()
+            digest = hashlib.sha256(payload).hexdigest()
+            writer = ImmutableShardWriter(
+                shard_root, target_bytes=4096, alignment=256, fsync=False
+            )
+            try:
+                writer.add(digest, payload, 2, 2, "float16")
+                writer.finish()
+            finally:
+                writer.close()
+            frames = [
+                scheduled_external_request_frame(
+                    request_id,
+                    protocol.DTYPE_F16,
+                    document.tolist(),
+                    "model@1",
+                    [(11, f"sha256://{digest}", document.tolist())],
+                    "noisy-tenant",
+                    0,
+                    8_000,
+                )[0]
+                for request_id in (2_001, 2_002)
+            ]
+            socket_path = root / "tilemaxsimd.sock"
+            process = subprocess.Popen(
+                [
+                    os.fspath(binary),
+                    "--socket", os.fspath(socket_path),
+                    "--gpu-memory-gb", f"{device}=0.05",
+                    "--gpu-workspace-gb", "0.02",
+                    "--host-cache-gb", "0.01",
+                    "--contract-root", f"model@1={shard_root}",
+                    "--max-queued-requests", "1",
+                    "--max-tenant-queued-requests", "1",
+                    "--scheduler-batch-window-ms", "500",
+                ],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+            )
+
+            def receive(connection: socket.socket) -> tuple[int, int]:
+                header = protocol.receive_exact(connection, protocol.HEADER.size)
+                body_bytes = protocol.HEADER.unpack(header)[4]
+                response = header + protocol.receive_exact(connection, body_bytes)
+                request_id, status, _ = decode_response(response)
+                return request_id, status
+
+            first = None
+            try:
+                for _ in range(1000):
+                    if socket_path.exists() or process.poll() is not None:
+                        break
+                    time.sleep(0.01)
+                self.assertIsNone(process.poll())
+                first = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                first.settimeout(10)
+                first.connect(os.fspath(socket_path))
+                first.sendall(frames[0])
+                time.sleep(0.05)
+                with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as second:
+                    second.settimeout(10)
+                    second.connect(os.fspath(socket_path))
+                    second.sendall(frames[1])
+                    self.assertEqual(receive(second), (2_002, 2))
+                self.assertEqual(receive(first), (2_001, 0))
+                self.assertIsNone(process.poll())
+            finally:
+                if first is not None:
+                    first.close()
+                if process.poll() is None:
+                    process.terminate()
+                    output, _ = process.communicate(timeout=10)
+                    self.assertEqual(process.returncode, 0, output)
 
 
 if __name__ == "__main__":

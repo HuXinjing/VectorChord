@@ -6,11 +6,7 @@
 # Elastic License v2 (ELv2): You may also use, modify, and distribute this
 # software under the Elastic License v2, which has specific restrictions.
 #
-# We welcome any commercial collaboration or support. For inquiries
-# regarding the licenses, please contact us at:
-# vectorchord-inquiry@tensorchord.ai
-#
-# Copyright (c) 2025-2026 TensorChord Inc.
+# Copyright (c) 2026 Hu Xinjing
 
 """Reproducible synthetic load probe for the CUDA TileMaxSim executor."""
 
