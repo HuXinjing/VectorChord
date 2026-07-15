@@ -203,6 +203,18 @@ pub struct ShardStore {
     verify_full_shards: bool,
 }
 
+#[derive(Clone, Debug, Default)]
+pub struct HostCacheStatus {
+    pub capacity_bytes: usize,
+    pub used_bytes: usize,
+    pub entries: usize,
+    pub tenants: usize,
+    pub hits: u64,
+    pub misses: u64,
+    pub evictions: u64,
+    pub admission_rejections: u64,
+}
+
 impl ShardStore {
     pub fn open(
         roots: &[(String, PathBuf)],
@@ -372,13 +384,17 @@ impl ShardStore {
             .collect()
     }
 
-    pub fn host_status(&self) -> (u64, u64, u64, u64) {
-        (
-            self.host_cache.hits,
-            self.host_cache.misses,
-            self.host_cache.evictions,
-            self.host_cache.admission_rejections,
-        )
+    pub fn host_status(&self) -> HostCacheStatus {
+        HostCacheStatus {
+            capacity_bytes: self.host_cache.maximum_bytes,
+            used_bytes: self.host_cache.current_bytes,
+            entries: self.host_cache.entries.len(),
+            tenants: self.host_cache.tenant_bytes.len(),
+            hits: self.host_cache.hits,
+            misses: self.host_cache.misses,
+            evictions: self.host_cache.evictions,
+            admission_rejections: self.host_cache.admission_rejections,
+        }
     }
 }
 

@@ -80,7 +80,10 @@ The status Unix socket serves:
 
 - `GET /livez`: the status server is alive;
 - `GET /healthz`: the protocol listener and scheduler are ready;
-- `GET /metrics`: bounded Prometheus scheduler and outcome counters.
+- `GET /metrics`: bounded Prometheus resource, scheduler, cache, transfer,
+  storage, latency, timeout, and outcome metrics. GPU labels contain only the
+  configured numeric device/slot; application scheduling-domain names are
+  never exported.
 
 Use the image's dependency-free probe from systemd, Docker, or Kubernetes:
 
@@ -93,6 +96,30 @@ tilemaxsimctl \
 Readiness is removed before shutdown. Unexpected scheduler or status-thread
 exit makes the whole daemon fail, so a supervisor cannot keep routing requests
 to a process whose CUDA worker has disappeared.
+
+The most useful production signals are:
+
+- `tilemaxsim_pending_requests` and `tilemaxsim_scheduler_queue_depth` for
+  saturation;
+- `tilemaxsim_admission_rejections_total` and `tilemaxsim_timeouts_total` for
+  overload or an undersized deadline;
+- `tilemaxsim_gpu_cache_events_total`, `tilemaxsim_gpu_h2d_bytes_total`, and
+  `tilemaxsim_storage_read_bytes_total` for cache churn and cold-load traffic;
+- `tilemaxsim_gpu_cache_bytes` for free space, largest free extent, payload,
+  allocator waste, and pinned capacity;
+- `tilemaxsim_host_cache_bytes` and `tilemaxsim_host_cache_events_total` for
+  the L1 cache;
+- `tilemaxsim_request_duration_seconds`, `tilemaxsim_queue_duration_seconds`,
+  and `tilemaxsim_gpu_duration_seconds` for rate-derived mean latency;
+- `tilemaxsim_requests_admitted_total{priority_class=...}` and
+  `tilemaxsim_scheduler_requeues_total` for priority/cooperative scheduling.
+
+At minimum, alert when readiness is zero, any admission-rejection rate is
+nonzero under expected load, timeout ratio exceeds the application SLO, queue
+depth remains above 80% of its limit, or cache admission rejections rise while
+`largest_free_extent / free` is small. A rising miss/eviction/H2D rate with
+stable traffic means the assigned GPU cache is too small or the access set has
+poor locality; it is not a PostgreSQL HNSW symptom.
 
 ## Immutable tensor storage
 
@@ -107,10 +134,26 @@ tensor_dim      = 320
 tensor_dtype    = float16
 ```
 
-The shard publisher must write complete immutable records and atomically
-publish its index. SIGHUP reloads shard indexes but never changes the configured
-contract-to-root mapping. The daemon validates contract, digest, shape, dtype,
-length, and finite values before GPU admission.
+Online writers publish canonical tensor bytes through VectorChord's publisher,
+so application code never owns or duplicates the disk layout:
+
+```shell
+install -d -m 0750 /var/lib/vectorchord/tensors
+tilemaxsimctl publish-object \
+  --root /var/lib/vectorchord/tensors \
+  --rows 747 \
+  --dimension 320 \
+  --dtype float16 \
+  --expected-sha256 0123...cdef < document.tensor.f16
+```
+
+The command fsyncs a temporary object, publishes it by immutable hard link, and
+returns the JSON descriptor. Repeating the same publication is idempotent. A
+daemon that already has the contract root open can read the new content address
+without restart or SIGHUP. SIGHUP is needed only for a newly published bulk
+shard index. It never changes the configured contract-to-root mapping. The
+daemon validates contract, digest, shape, dtype, length, and checksum before GPU
+admission.
 
 ## Batching, scheduling, and failure semantics
 

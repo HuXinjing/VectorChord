@@ -43,6 +43,7 @@ unsafe extern "C" {
 
 pub struct Gpu {
     native: NonNull<NativeGpu>,
+    device: i32,
     tensor_bytes: usize,
 }
 
@@ -73,8 +74,13 @@ impl Gpu {
         let tensor_bytes = unsafe { vctm_gpu_tensor_bytes(native.as_ptr()) };
         Ok(Self {
             native,
+            device,
             tensor_bytes,
         })
+    }
+
+    pub fn device(&self) -> i32 {
+        self.device
     }
 
     pub fn tensor_bytes(&self) -> usize {
