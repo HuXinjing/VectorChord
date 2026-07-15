@@ -125,6 +125,8 @@ struct Args {
     scheduler_quantum_candidates: usize,
     #[arg(long, default_value_t = 250_000)]
     scheduler_quantum_tokens: u64,
+    #[arg(long, default_value_t = 4_000_000_000)]
+    scheduler_quantum_fmas: u64,
     #[arg(long = "tenant-weight", value_parser = parse_tenant_weight)]
     tenant_weights: Vec<(String, f64)>,
 }
@@ -237,6 +239,7 @@ fn main() -> Result<()> {
         || args.priority_aging_ms == 0
         || args.scheduler_quantum_candidates == 0
         || args.scheduler_quantum_tokens == 0
+        || args.scheduler_quantum_fmas == 0
     {
         bail!("connection, queue, timeout, and priority-aging limits must be positive");
     }
@@ -337,6 +340,7 @@ fn main() -> Result<()> {
         batch_window: Duration::from_millis(args.scheduler_batch_window_ms),
         quantum_candidates: args.scheduler_quantum_candidates,
         quantum_tokens: args.scheduler_quantum_tokens,
+        quantum_fmas: args.scheduler_quantum_fmas,
         socket_io_timeout: Duration::from_millis(args.socket_io_timeout_ms),
         tenant_weights,
     };
@@ -384,6 +388,7 @@ fn main() -> Result<()> {
             "max_queued_requests": args.max_queued_requests,
             "max_tenant_queued_requests": args.max_tenant_queued_requests,
             "max_inflight_request_bytes": args.max_inflight_request_gb,
+            "scheduler_quantum_fmas": args.scheduler_quantum_fmas,
             "status_socket": args.status_socket,
             "cache": ready_cache,
         })
@@ -433,6 +438,7 @@ fn main() -> Result<()> {
                     maximum: args.max_request_bytes,
                     io_timeout: Duration::from_millis(args.socket_io_timeout_ms),
                     server_timeout: Duration::from_millis(args.request_timeout_ms),
+                    maximum_candidate_fmas: args.scheduler_quantum_fmas,
                 };
                 match thread::Builder::new()
                     .name("tilemaxsim-reader".to_owned())
@@ -526,6 +532,7 @@ struct SchedulerConfig {
     batch_window: Duration,
     quantum_candidates: usize,
     quantum_tokens: u64,
+    quantum_fmas: u64,
     socket_io_timeout: Duration,
     tenant_weights: std::collections::HashMap<String, f64>,
 }
@@ -797,6 +804,7 @@ struct ReaderConfig {
     maximum: usize,
     io_timeout: Duration,
     server_timeout: Duration,
+    maximum_candidate_fmas: u64,
 }
 
 fn read_and_enqueue(
@@ -843,6 +851,23 @@ fn read_and_enqueue(
             return;
         }
     };
+    if request.candidates.iter().any(|candidate| {
+        candidate_fmas(request.query_rows, request.dimension, candidate.rows)
+            > config.maximum_candidate_fmas
+    }) {
+        metrics.failed.fetch_add(1, Ordering::Relaxed);
+        metrics.invalid_requests.fetch_add(1, Ordering::Relaxed);
+        write_response_nonfatal(
+            &mut connection,
+            &protocol::failure(
+                version,
+                request_id,
+                1,
+                "one candidate exceeds the configured CUDA kernel work limit",
+            ),
+        );
+        return;
+    }
     let client_timeout = if request.timeout_ms == 0 {
         config.server_timeout
     } else {
@@ -1203,6 +1228,9 @@ fn next_quantum_end(work: &Work, config: &SchedulerConfig) -> usize {
         work.next_candidate,
         config.quantum_candidates,
         config.quantum_tokens,
+        config.quantum_fmas,
+        work.request.query_rows,
+        work.request.dimension,
     )
 }
 
@@ -1211,28 +1239,47 @@ fn quantum_end(
     start: usize,
     maximum_candidates: usize,
     maximum_tokens: u64,
+    maximum_fmas: u64,
+    query_rows: u32,
+    dimension: u32,
 ) -> usize {
     let mut end = start;
     let mut tokens = 0_u64;
+    let mut fmas = 0_u64;
     while end < candidates.len() && end - start < maximum_candidates {
         let rows = u64::from(candidates[end].rows);
-        if end > start && tokens.saturating_add(rows) > maximum_tokens {
+        let candidate_fmas = candidate_fmas(query_rows, dimension, candidates[end].rows);
+        if end > start
+            && (tokens.saturating_add(rows) > maximum_tokens
+                || fmas.saturating_add(candidate_fmas) > maximum_fmas)
+        {
             break;
         }
         tokens = tokens.saturating_add(rows);
+        fmas = fmas.saturating_add(candidate_fmas);
         end += 1;
     }
     end
 }
 
+fn candidate_fmas(query_rows: u32, dimension: u32, document_rows: u32) -> u64 {
+    u64::from(query_rows)
+        .saturating_mul(u64::from(document_rows))
+        .saturating_mul(u64::from(dimension))
+}
+
 fn estimated_next_work(work: &Work, config: &SchedulerConfig) -> u64 {
     let end = next_quantum_end(work, config);
-    let document_rows = work.request.candidates[work.next_candidate..end]
+    work.request.candidates[work.next_candidate..end]
         .iter()
-        .map(|candidate| u64::from(candidate.rows))
-        .sum::<u64>();
-    u64::from(work.request.query_rows)
-        .saturating_mul(document_rows)
+        .map(|candidate| {
+            candidate_fmas(
+                work.request.query_rows,
+                work.request.dimension,
+                candidate.rows,
+            )
+        })
+        .fold(0_u64, u64::saturating_add)
         .max(1)
 }
 
@@ -2016,8 +2063,8 @@ fn load_resident_manifests(values: &[(String, PathBuf)]) -> Result<Vec<protocol:
 #[cfg(test)]
 mod tests {
     use super::{
-        ByteAdmission, PendingAdmission, RuntimeMetrics, is_fatal_cuda_diagnostic, kib_to_bytes,
-        quantum_end, render_metrics, tenant_hash,
+        ByteAdmission, PendingAdmission, RuntimeMetrics, candidate_fmas, is_fatal_cuda_diagnostic,
+        kib_to_bytes, quantum_end, render_metrics, tenant_hash,
     };
     use crate::engine::{DeviceStatus, EngineStatus};
     use crate::protocol::Descriptor;
@@ -2041,9 +2088,11 @@ mod tests {
             dtype: 2,
         };
         let candidates = vec![descriptor(60), descriptor(60), descriptor(60)];
-        assert_eq!(quantum_end(&candidates, 0, 8, 100), 1);
-        assert_eq!(quantum_end(&candidates, 0, 2, 1_000), 2);
-        assert_eq!(quantum_end(&candidates, 2, 8, 10), 3);
+        assert_eq!(quantum_end(&candidates, 0, 8, 100, 1_000, 5, 2), 1);
+        assert_eq!(quantum_end(&candidates, 0, 2, 1_000, 2_000, 5, 2), 2);
+        assert_eq!(quantum_end(&candidates, 2, 8, 10, 1_000, 5, 2), 3);
+        assert_eq!(candidate_fmas(5, 2, 60), 600);
+        assert_eq!(candidate_fmas(u32::MAX, u32::MAX, u32::MAX), u64::MAX);
     }
 
     #[test]

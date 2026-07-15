@@ -184,6 +184,7 @@ tilemaxsimd \
   --scheduler-policy fair-priority \
   --max-queued-requests 128 \
   --max-tenant-queued-requests 16 \
+  --scheduler-quantum-fmas 4000000000 \
   --tenant-weight foreground=2 \
   --tenant-cache-reservation foreground=4
 ```
@@ -202,6 +203,9 @@ The in-flight request budget is also expressed in GiB. A reader must reserve
 its complete declared frame after the fixed header is validated, and keeps that
 permit through completion, timeout, or disconnect. This bounds aggregate query
 and descriptor memory even when many clients submit maximum-size frames at once.
+The FMA quantum additionally bounds one non-preemptible CUDA launch by actual
+`query rows × document rows × dimension` work. A single candidate above that
+operator-configured limit is rejected instead of monopolizing a shared GPU.
 
 PostgreSQL sends protocol v3 scheduling metadata only when
 `vchordrq.maxsim_tenant` is set; otherwise it retains protocol v2 compatibility.
