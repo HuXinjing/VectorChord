@@ -306,6 +306,97 @@ class RustDaemonTest(unittest.TestCase):
         self.run_daemon([device])
 
     @unittest.skipUnless(torch.cuda.is_available(), "CUDA is unavailable")
+    def test_published_object_is_queryable_without_daemon_restart(self) -> None:
+        binary = self._release_binary()
+        if not binary.exists():
+            self.skipTest("release tilemaxsimd binary has not been built")
+        device = max(
+            range(torch.cuda.device_count()),
+            key=lambda index: torch.cuda.mem_get_info(index)[0],
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            object_root = root / "objects-root"
+            object_root.mkdir()
+            socket_path = root / "tilemaxsimd.sock"
+            process = subprocess.Popen(
+                [
+                    os.fspath(binary),
+                    "--socket", os.fspath(socket_path),
+                    "--gpu-memory-gb", f"{device}=0.05",
+                    "--gpu-workspace-gb", "0.02",
+                    "--host-cache-gb", "0.01",
+                    "--contract-root", f"model@1={object_root}",
+                    "--once",
+                ],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+            )
+            try:
+                for _ in range(1000):
+                    if socket_path.exists() or process.poll() is not None:
+                        break
+                    time.sleep(0.01)
+                self.assertIsNone(process.poll())
+                document = np.asarray(
+                    [[1.0, 0.0], [0.0, 1.0]], dtype="<f2"
+                )
+                payload = document.tobytes()
+                digest = hashlib.sha256(payload).hexdigest()
+                published = subprocess.run(
+                    [
+                        os.fspath(binary.with_name("tilemaxsimctl")),
+                        "publish-object",
+                        "--root", os.fspath(object_root),
+                        "--rows", "2",
+                        "--dimension", "2",
+                        "--dtype", "float16",
+                        "--expected-sha256", digest,
+                    ],
+                    input=payload,
+                    capture_output=True,
+                    timeout=5,
+                    check=False,
+                )
+                self.assertEqual(published.returncode, 0, published.stderr.decode())
+                descriptor = json.loads(published.stdout)
+                self.assertEqual(descriptor["tensor_ref"], f"sha256://{digest}")
+
+                frame, _ = external_request_frame(
+                    902,
+                    protocol.DTYPE_F16,
+                    document.tolist(),
+                    "model@1",
+                    [(77, descriptor["tensor_ref"], document.tolist())],
+                )
+                with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
+                    connection.connect(os.fspath(socket_path))
+                    connection.sendall(frame)
+                    header = protocol.receive_exact(connection, protocol.HEADER.size)
+                    body_bytes = protocol.HEADER.unpack(header)[4]
+                    response = header + protocol.receive_exact(connection, body_bytes)
+                output, _ = process.communicate(timeout=10)
+                self.assertEqual(process.returncode, 0, output)
+                request_id, status, results = decode_response(response)
+                self.assertEqual((request_id, status), (902, 0))
+                self.assertEqual(results[0][0], 77)
+                self.assertAlmostEqual(results[0][1], 2.0, delta=0.02)
+                events = [
+                    json.loads(line) for line in output.splitlines()
+                    if line.startswith("{")
+                ]
+                request = next(
+                    event for event in events
+                    if event.get("event") == "tilemaxsim_rust_request"
+                )
+                self.assertEqual(request["cache"]["batch_read_calls"], 1)
+            finally:
+                if process.poll() is None:
+                    process.terminate()
+                    process.wait(timeout=5)
+
+    @unittest.skipUnless(torch.cuda.is_available(), "CUDA is unavailable")
     def test_external_v3_scheduled_round_trip_hashes_tenant_and_preserves_priority(self) -> None:
         device = max(
             range(torch.cuda.device_count()),
