@@ -1,5 +1,5 @@
-ARG CUDA_DEVEL_IMAGE=nvidia/cuda:12.6.3-devel-ubuntu24.04
-ARG CUDA_RUNTIME_IMAGE=nvidia/cuda:12.6.3-runtime-ubuntu24.04
+ARG CUDA_DEVEL_IMAGE=nvidia/cuda:12.6.3-devel-ubuntu24.04@sha256:392c0df7b577ecae17a17f6ba7f2009c217bb4422f8431c053ae9af61a8c148a
+ARG RUNTIME_IMAGE=ubuntu:24.04@sha256:4fbb8e6a8395de5a7550b33509421a2bafbc0aab6c06ba2cef9ebffbc7092d90
 
 FROM ${CUDA_DEVEL_IMAGE} AS build
 
@@ -21,11 +21,23 @@ RUN rustup component add clippy rustfmt \
     && cargo clippy --all-targets --locked -- -D warnings \
     && cargo test --locked
 
-FROM ${CUDA_RUNTIME_IMAGE}
+FROM ${RUNTIME_IMAGE} AS runtime-base
+
+# nvcc links cudart statically for this daemon. The release binary needs only
+# glibc/libstdc++ from Ubuntu; libcuda and the devices are injected by the
+# NVIDIA container runtime. Keeping CUDA toolkits out of the final image avoids
+# shipping an unused 1.4 GiB runtime and materially reduces its attack surface.
+RUN apt-get update \
+    && DEBIAN_FRONTEND=noninteractive apt-get upgrade -y \
+    && rm -rf /var/lib/apt/lists/*
+
+FROM runtime-base
 
 COPY --from=build /build/tilemaxsimd/target/release/tilemaxsimd /usr/local/bin/tilemaxsimd
 COPY --from=build /build/tilemaxsimd/target/release/tilemaxsimctl /usr/local/bin/tilemaxsimctl
-RUN groupadd --system vectorchord \
+RUN /usr/local/bin/tilemaxsimd --help >/dev/null \
+    && /usr/local/bin/tilemaxsimctl --help >/dev/null \
+    && groupadd --system vectorchord \
     && useradd --system --gid vectorchord --home-dir /nonexistent \
         --shell /usr/sbin/nologin vectorchord \
     && install -d -o vectorchord -g vectorchord -m 0750 \

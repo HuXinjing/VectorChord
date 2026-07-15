@@ -41,7 +41,9 @@ jobs:
         run: cargo fmt --check -- --config-path /dev/null --config imports_granularity=Module
 
       - name: Deny
-        run: cargo deny check
+        run: |
+          cargo deny check
+          cargo deny --manifest-path services/tilemaxsimd/Cargo.toml check
 
       - name: License Header
         run: |
@@ -148,6 +150,9 @@ jobs:
 
       - name: Build, lint, and test native TileMaxSim
         run: docker build --target test -f services/Dockerfile.tilemaxsimd .
+
+      - name: Validate VectorChord PostgreSQL Dockerfile
+        run: docker build --check -f services/Dockerfile.postgres .
 
   miri:
     if: |
@@ -368,7 +373,7 @@ jobs:
         if: matrix.version == '14' && matrix.arch == 'x86_64'
         run: |
           EXTENSION_DIR="$(pg_config --sharedir)/extension"
-          cmp sql/install/vchord--1.2.0.sql build/sharedir/extension/vchord--0.0.0.sql
+          cmp sql/install/vchord--1.2.0.sql build/sharedir/extension/vchord--1.2.0.sql
           sudo install -m 0644 sql/install/vchord--1.1.1.sql "$EXTENSION_DIR/"
           sudo install -m 0644 sql/install/vchord--1.2.0.sql "$EXTENSION_DIR/"
           sudo install -m 0644 sql/upgrade/vchord--1.1.1--1.2.0.sql "$EXTENSION_DIR/"

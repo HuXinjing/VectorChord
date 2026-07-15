@@ -141,7 +141,7 @@ jobs:
 
   tilemaxsimd:
     runs-on: ubuntu-24.04
-    needs: ["semver"]
+    needs: ["semver", "build"]
     steps:
       - name: Checkout
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -161,8 +161,57 @@ jobs:
           SEMVER: ${{ needs.semver.outputs.SEMVER }}
         run: |
           IMAGE=$(echo "ghcr.io/${GITHUB_REPOSITORY_OWNER}/vectorchord-tilemaxsimd" | tr '[:upper:]' '[:lower:]')
+          docker build --target test -f services/Dockerfile.tilemaxsimd .
           docker build -f services/Dockerfile.tilemaxsimd -t "${IMAGE}:${SEMVER}" .
+          docker run --rm -v /var/run/docker.sock:/var/run/docker.sock \
+            aquasec/trivy:0.72.0@sha256:cffe3f5161a47a6823fbd23d985795b3ed72a4c806da4c4df16266c02accdd6f \
+            image --scanners vuln --severity HIGH,CRITICAL --ignore-unfixed \
+            --exit-code 1 "${IMAGE}:${SEMVER}"
           docker push "${IMAGE}:${SEMVER}"
+
+  postgres-image:
+    runs-on: ubuntu-24.04
+    needs: ["semver", "build"]
+    strategy:
+      matrix:
+        version: ["16"]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Log in to the fork container registry
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: echo "$GH_TOKEN" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+
+      - name: Build and publish VectorChord PostgreSQL image
+        env:
+          SEMVER: ${{ needs.semver.outputs.SEMVER }}
+        run: |
+          IMAGE=$(echo "ghcr.io/${GITHUB_REPOSITORY_OWNER}/vectorchord-postgres" | tr '[:upper:]' '[:lower:]')
+          docker build \
+            --build-arg POSTGRES_VERSION=${{ matrix.version }} \
+            -f services/Dockerfile.postgres \
+            -t "${IMAGE}:pg${{ matrix.version }}-${SEMVER}" \
+            -t "${IMAGE}:${{ matrix.version }}-${SEMVER}" .
+          CID=$(docker run -d \
+            -e POSTGRES_HOST_AUTH_METHOD=trust \
+            "${IMAGE}:pg${{ matrix.version }}-${SEMVER}" \
+            -c shared_preload_libraries=vchord)
+          trap 'docker rm -f "$CID" >/dev/null 2>&1 || true' EXIT
+          for attempt in $(seq 1 60); do
+            if docker exec "$CID" pg_isready -U postgres >/dev/null 2>&1; then break; fi
+            sleep 1
+          done
+          docker exec "$CID" psql -v ON_ERROR_STOP=1 -U postgres -d postgres \
+            -c 'CREATE EXTENSION vchord CASCADE' \
+            -c "SELECT extversion FROM pg_extension WHERE extname = 'vchord'"
+          docker run --rm -v /var/run/docker.sock:/var/run/docker.sock \
+            aquasec/trivy:0.72.0@sha256:cffe3f5161a47a6823fbd23d985795b3ed72a4c806da4c4df16266c02accdd6f \
+            image --scanners vuln --severity HIGH,CRITICAL --ignore-unfixed \
+            --exit-code 1 "${IMAGE}:pg${{ matrix.version }}-${SEMVER}"
+          docker push "${IMAGE}:pg${{ matrix.version }}-${SEMVER}"
+          docker push "${IMAGE}:${{ matrix.version }}-${SEMVER}"
 
   pgxn:
     if: ${{ vars.PUBLISH_PGXN == 'true' }}

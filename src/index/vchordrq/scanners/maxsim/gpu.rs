@@ -16,7 +16,9 @@ use super::rerank::{CandidateTensorSource, ExactMaxsimBackend, RerankError, Rera
 use distance::Distance;
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
+use std::io::{Read, Write};
 use std::mem::size_of_val;
+use std::net::{TcpStream, ToSocketAddrs};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use vchordrq::types::OwnedVector;
@@ -955,7 +957,7 @@ impl TileMaxsimTransport for UnixSocketTransport {
         let deadline = Instant::now()
             .checked_add(timeout)
             .ok_or_else(|| RerankError::Transport("invalid timeout".into()))?;
-        let mut stream = connect_interruptible(&self.endpoint, deadline)?;
+        let mut stream = connect_endpoint_interruptible(&self.endpoint, deadline)?;
         let poll = remaining_until(deadline)?.min(Duration::from_millis(50));
         stream
             .set_read_timeout(Some(poll))
@@ -983,6 +985,102 @@ impl TileMaxsimTransport for UnixSocketTransport {
         read_interruptible(&mut stream, &mut response[HEADER_LEN..], deadline)?;
         Ok(response)
     }
+}
+
+#[cfg(unix)]
+enum TransportStream {
+    Unix(std::os::unix::net::UnixStream),
+    Tcp(TcpStream),
+}
+
+#[cfg(unix)]
+impl TransportStream {
+    fn set_read_timeout(&self, timeout: Option<Duration>) -> std::io::Result<()> {
+        match self {
+            Self::Unix(stream) => stream.set_read_timeout(timeout),
+            Self::Tcp(stream) => stream.set_read_timeout(timeout),
+        }
+    }
+
+    fn set_write_timeout(&self, timeout: Option<Duration>) -> std::io::Result<()> {
+        match self {
+            Self::Unix(stream) => stream.set_write_timeout(timeout),
+            Self::Tcp(stream) => stream.set_write_timeout(timeout),
+        }
+    }
+}
+
+#[cfg(unix)]
+impl Read for TransportStream {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        match self {
+            Self::Unix(stream) => stream.read(buffer),
+            Self::Tcp(stream) => stream.read(buffer),
+        }
+    }
+}
+
+#[cfg(unix)]
+impl Write for TransportStream {
+    fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+        match self {
+            Self::Unix(stream) => stream.write(buffer),
+            Self::Tcp(stream) => stream.write(buffer),
+        }
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        match self {
+            Self::Unix(stream) => stream.flush(),
+            Self::Tcp(stream) => stream.flush(),
+        }
+    }
+}
+
+#[cfg(unix)]
+fn connect_endpoint_interruptible(
+    endpoint: &str,
+    deadline: Instant,
+) -> Result<TransportStream, RerankError> {
+    let Some(authority) = endpoint.strip_prefix("tcp://") else {
+        return connect_interruptible(endpoint, deadline).map(TransportStream::Unix);
+    };
+    if authority.is_empty()
+        || authority.contains('/')
+        || authority.contains('@')
+        || !authority.contains(':')
+    {
+        return Err(RerankError::Transport(
+            "TCP endpoint must be tcp://HOST:PORT without credentials or a path".into(),
+        ));
+    }
+    let remaining = remaining_until(deadline)?;
+    let addresses = authority
+        .to_socket_addrs()
+        .map_err(|error| RerankError::Transport(error.to_string()))?
+        .collect::<Vec<_>>();
+    if addresses.is_empty() {
+        return Err(RerankError::Transport(
+            "TCP endpoint resolved to no addresses".into(),
+        ));
+    }
+    let mut last_error = None;
+    for address in addresses {
+        pgrx::check_for_interrupts!();
+        let attempt = remaining_until(deadline)?.min(remaining);
+        match TcpStream::connect_timeout(&address, attempt) {
+            Ok(stream) => {
+                stream.set_nodelay(true).ok();
+                return Ok(TransportStream::Tcp(stream));
+            }
+            Err(error) => last_error = Some(error),
+        }
+    }
+    Err(RerankError::Transport(
+        last_error
+            .map(|error| error.to_string())
+            .unwrap_or_else(|| "TCP connection failed".to_owned()),
+    ))
 }
 
 #[cfg(unix)]
@@ -1173,12 +1271,10 @@ fn last_transport_error() -> RerankError {
 
 #[cfg(unix)]
 fn write_interruptible(
-    stream: &mut std::os::unix::net::UnixStream,
+    stream: &mut TransportStream,
     mut bytes: &[u8],
     deadline: Instant,
 ) -> Result<(), RerankError> {
-    use std::io::Write;
-
     while !bytes.is_empty() {
         match stream.write(bytes) {
             Ok(0) => return Err(RerankError::Transport("connection closed".into())),
@@ -1202,12 +1298,10 @@ fn write_interruptible(
 
 #[cfg(unix)]
 fn read_interruptible(
-    stream: &mut std::os::unix::net::UnixStream,
+    stream: &mut TransportStream,
     mut bytes: &mut [u8],
     deadline: Instant,
 ) -> Result<(), RerankError> {
-    use std::io::Read;
-
     while !bytes.is_empty() {
         match stream.read(bytes) {
             Ok(0) => return Err(RerankError::Transport("connection closed".into())),
