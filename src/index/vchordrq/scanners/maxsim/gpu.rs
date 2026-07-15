@@ -28,6 +28,7 @@ use vchordrq::types::OwnedVector;
 const MAGIC: &[u8; 4] = b"VCTM";
 const VERSION: u16 = 1;
 const EXTERNAL_VERSION: u16 = 2;
+const SCHEDULED_EXTERNAL_VERSION: u16 = 3;
 const REQUEST_KIND: u16 = 1;
 const RESPONSE_KIND: u16 = 2;
 const HEADER_LEN: usize = 24;
@@ -134,6 +135,13 @@ pub(super) struct GpuExternalTileMaxsimBackend<T> {
     timeout: Duration,
     max_batch_tokens: usize,
     max_batch_bytes: usize,
+    scheduling: Option<TileMaxsimScheduling>,
+}
+
+#[derive(Clone, Debug)]
+pub(super) struct TileMaxsimScheduling {
+    pub tenant: String,
+    pub priority: i32,
 }
 
 impl<T> GpuExternalTileMaxsimBackend<T> {
@@ -150,7 +158,13 @@ impl<T> GpuExternalTileMaxsimBackend<T> {
             timeout,
             max_batch_tokens,
             max_batch_bytes,
+            scheduling: None,
         }
+    }
+
+    pub(super) fn with_scheduling(mut self, tenant: String, priority: i32) -> Self {
+        self.scheduling = Some(TileMaxsimScheduling { tenant, priority });
+        self
     }
 }
 
@@ -170,6 +184,8 @@ impl<T: TileMaxsimTransport> GpuExternalTileMaxsimBackend<T> {
             source,
             self.max_batch_tokens,
             self.max_batch_bytes,
+            self.scheduling.as_ref(),
+            self.timeout,
         )?;
         if encoded.heap_keys.is_empty() {
             return Ok(RerankResults {
@@ -184,13 +200,14 @@ impl<T: TileMaxsimTransport> GpuExternalTileMaxsimBackend<T> {
         let response =
             self.transport
                 .round_trip(&encoded.frame, self.timeout, max_response_bytes)?;
-        decode_response_for_version(&response, EXTERNAL_VERSION, request_id, &encoded.heap_keys)
+        decode_response_for_version(&response, encoded.version, request_id, &encoded.heap_keys)
     }
 }
 
 struct EncodedRequest {
     frame: Vec<u8>,
     heap_keys: Vec<HeapKey>,
+    version: u16,
 }
 
 fn encode_external_request<S: CandidateTensorDescriptorSource>(
@@ -201,10 +218,13 @@ fn encode_external_request<S: CandidateTensorDescriptorSource>(
     source: &mut S,
     max_batch_tokens: usize,
     max_batch_bytes: usize,
+    scheduling: Option<&TileMaxsimScheduling>,
+    timeout: Duration,
 ) -> Result<EncodedRequest, RerankError> {
     const MAX_MODEL_CONTRACT_BYTES: usize = 512;
     const MAX_TENSOR_REF_BYTES: usize = 4096;
     const MAX_CHECKSUM_BYTES: usize = 512;
+    const MAX_TENANT_BYTES: usize = 256;
 
     if model_contract_id.is_empty()
         || model_contract_id.len() > MAX_MODEL_CONTRACT_BYTES
@@ -213,6 +233,17 @@ fn encode_external_request<S: CandidateTensorDescriptorSource>(
         return Err(RerankError::InvalidDescriptor(
             "model contract is empty, oversized, or contains control characters",
         ));
+    }
+    if let Some(scheduling) = scheduling {
+        if scheduling.tenant.is_empty()
+            || scheduling.tenant.len() > MAX_TENANT_BYTES
+            || scheduling.tenant.chars().any(char::is_control)
+            || !(-100..=100).contains(&scheduling.priority)
+        {
+            return Err(RerankError::Configuration(
+                "TileMaxSim scheduler tenant or priority is invalid",
+            ));
+        }
     }
     let (dtype, dimension) = tensor_metadata(query)?;
     let external_dtype = match dtype {
@@ -240,7 +271,23 @@ fn encode_external_request<S: CandidateTensorDescriptorSource>(
     writer.u16(0)?;
     writer
         .u32(u32::try_from(model_contract_id.len()).map_err(|_| RerankError::RequestTooLarge)?)?;
+    let version = if let Some(scheduling) = scheduling {
+        writer.i32(scheduling.priority)?;
+        writer.u32(
+            u32::try_from(timeout.as_millis().clamp(1, 600_000))
+                .map_err(|_| RerankError::RequestTooLarge)?,
+        )?;
+        writer.u32(
+            u32::try_from(scheduling.tenant.len()).map_err(|_| RerankError::RequestTooLarge)?,
+        )?;
+        SCHEDULED_EXTERNAL_VERSION
+    } else {
+        EXTERNAL_VERSION
+    };
     writer.bytes(model_contract_id.as_bytes())?;
+    if let Some(scheduling) = scheduling {
+        writer.bytes(scheduling.tenant.as_bytes())?;
+    }
     encode_tensor_values(&mut writer, query, dtype)?;
 
     let mut heap_keys = Vec::new();
@@ -291,7 +338,7 @@ fn encode_external_request<S: CandidateTensorDescriptorSource>(
         .checked_sub(HEADER_LEN)
         .ok_or_else(|| RerankError::Protocol("invalid request length".into()))?;
     writer.patch_bytes(0, MAGIC);
-    writer.patch_u16(4, EXTERNAL_VERSION);
+    writer.patch_u16(4, version);
     writer.patch_u16(6, REQUEST_KIND);
     writer.patch_u64(8, request_id);
     writer.patch_u64(
@@ -301,6 +348,7 @@ fn encode_external_request<S: CandidateTensorDescriptorSource>(
     Ok(EncodedRequest {
         frame: writer.finish(),
         heap_keys,
+        version,
     })
 }
 
@@ -422,6 +470,7 @@ fn encode_request<S: CandidateTensorSource>(
     Ok(EncodedRequest {
         frame: writer.finish(),
         heap_keys,
+        version: VERSION,
     })
 }
 
@@ -599,6 +648,10 @@ impl BoundedWriter {
     }
 
     fn u32(&mut self, value: u32) -> Result<(), RerankError> {
+        self.bytes(&value.to_le_bytes())
+    }
+
+    fn i32(&mut self, value: i32) -> Result<(), RerankError> {
         self.bytes(&value.to_le_bytes())
     }
 
@@ -1287,6 +1340,8 @@ mod tests {
             &mut source,
             100,
             4096,
+            None,
+            Duration::from_secs(2),
         )
         .unwrap();
 
@@ -1329,6 +1384,66 @@ mod tests {
             tensor_ref.as_bytes()
         );
         assert_eq!(encoded.heap_keys, vec![page]);
+    }
+
+    #[test]
+    fn scheduled_external_request_encodes_tenant_priority_and_timeout() {
+        let page = [0, 0, 8];
+        let candidate = PageCandidate {
+            approximate_distance: Distance::ZERO,
+            heap_key: page,
+        };
+        let query = vec![half_vector(&[1.0, -0.5])];
+        let mut candidates = vec![candidate].into_iter();
+        let mut source = MockDescriptorSource(BTreeMap::from([(
+            page,
+            external_descriptor(
+                candidate,
+                9002,
+                "sha256://opaque",
+                2,
+                2,
+                ExternalTensorDtype::F16,
+            ),
+        )]));
+        let scheduling = TileMaxsimScheduling {
+            tenant: "tenant-a".to_owned(),
+            priority: 17,
+        };
+        let encoded = encode_external_request(
+            20,
+            "contract@1",
+            &query,
+            &mut candidates,
+            &mut source,
+            100,
+            4096,
+            Some(&scheduling),
+            Duration::from_millis(4_000),
+        )
+        .unwrap();
+
+        assert_eq!(encoded.version, SCHEDULED_EXTERNAL_VERSION);
+        assert_eq!(
+            u16::from_le_bytes(encoded.frame[4..6].try_into().unwrap()),
+            SCHEDULED_EXTERNAL_VERSION
+        );
+        assert_eq!(
+            i32::from_le_bytes(encoded.frame[44..48].try_into().unwrap()),
+            17
+        );
+        assert_eq!(
+            u32::from_le_bytes(encoded.frame[48..52].try_into().unwrap()),
+            4_000
+        );
+        let tenant_len =
+            u32::from_le_bytes(encoded.frame[52..56].try_into().unwrap()) as usize;
+        let contract_len =
+            u32::from_le_bytes(encoded.frame[40..44].try_into().unwrap()) as usize;
+        assert_eq!(
+            &encoded.frame[56 + contract_len..56 + contract_len + tenant_len],
+            b"tenant-a"
+        );
     }
 
     #[test]
@@ -1402,6 +1517,8 @@ mod tests {
                 &mut make_source(3, 1),
                 100,
                 4096,
+                None,
+                Duration::from_secs(2),
             ),
             Err(RerankError::TensorMismatch)
         ));
@@ -1416,6 +1533,8 @@ mod tests {
                 &mut make_source(2, 100),
                 1000,
                 64,
+                None,
+                Duration::from_secs(2),
             ),
             Err(RerankError::RequestTooLarge)
         ));

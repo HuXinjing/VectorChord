@@ -92,6 +92,8 @@ static mut VCHORDRQ_MAXSIM_THRESHOLD_CONFIG: *mut pgrx::pg_sys::config_generic =
 
 static VCHORDRQ_MAXSIM_CANDIDATE_LIMIT: GucSetting<i32> = GucSetting::<i32>::new(-1);
 
+static VCHORDRQ_MAXSIM_PROFILE: GucSetting<bool> = GucSetting::<bool>::new(false);
+
 static VCHORDRQ_MAXSIM_PLANNER_QUERY_TOKENS: GucSetting<i32> = GucSetting::<i32>::new(32);
 
 static VCHORDRQ_MAXSIM_PLANNER_DOCUMENT_TOKENS: GucSetting<i32> = GucSetting::<i32>::new(256);
@@ -103,6 +105,11 @@ static VCHORDRQ_MAXSIM_GPU_ENDPOINT: GucSetting<Option<CString>> =
     GucSetting::<Option<CString>>::new(Some(c""));
 
 static VCHORDRQ_MAXSIM_GPU_TIMEOUT_MS: GucSetting<i32> = GucSetting::<i32>::new(2000);
+
+static VCHORDRQ_MAXSIM_TENANT: GucSetting<Option<CString>> =
+    GucSetting::<Option<CString>>::new(Some(c""));
+
+static VCHORDRQ_MAXSIM_PRIORITY: GucSetting<i32> = GucSetting::<i32>::new(0);
 
 static VCHORDRQ_MAXSIM_GPU_MAX_BATCH_TOKENS: GucSetting<i32> = GucSetting::<i32>::new(1_000_000);
 
@@ -191,6 +198,14 @@ pub fn init() {
         GucContext::Userset,
         GucFlags::default(),
     );
+    GucRegistry::define_bool_guc(
+        c"vchordrq.maxsim_profile",
+        c"Emit one client NOTICE with MaxSim phase timings and counters.",
+        c"Disabled by default; emitted profiles contain no tensor references or application IDs.",
+        &VCHORDRQ_MAXSIM_PROFILE,
+        GucContext::Userset,
+        GucFlags::default(),
+    );
     GucRegistry::define_int_guc(
         c"vchordrq.maxsim_planner_query_tokens",
         c"Expected MaxSim query-token count used by the planner.",
@@ -235,6 +250,24 @@ pub fn init() {
         1,
         600_000,
         GucContext::Suset,
+        GucFlags::default(),
+    );
+    GucRegistry::define_string_guc(
+        c"vchordrq.maxsim_tenant",
+        c"Logical tenant used only by the TileMaxSim GPU scheduler.",
+        c"Authorization and source filtering must be completed before setting this request-local value.",
+        &VCHORDRQ_MAXSIM_TENANT,
+        GucContext::Userset,
+        GucFlags::default(),
+    );
+    GucRegistry::define_int_guc(
+        c"vchordrq.maxsim_priority",
+        c"TileMaxSim request priority; larger values run first subject to tenant fairness and aging.",
+        c"The allowed request-local range is -100 through 100.",
+        &VCHORDRQ_MAXSIM_PRIORITY,
+        -100,
+        100,
+        GucContext::Userset,
         GucFlags::default(),
     );
     GucRegistry::define_int_guc(
@@ -586,6 +619,10 @@ pub fn vchordrq_maxsim_candidate_limit() -> Option<u32> {
     if value < 0 { None } else { Some(value as u32) }
 }
 
+pub fn vchordrq_maxsim_profile() -> bool {
+    VCHORDRQ_MAXSIM_PROFILE.get()
+}
+
 pub fn vchordrq_maxsim_planner_query_tokens() -> u32 {
     VCHORDRQ_MAXSIM_PLANNER_QUERY_TOKENS.get() as u32
 }
@@ -604,6 +641,17 @@ pub fn vchordrq_maxsim_gpu_endpoint() -> Option<CString> {
 
 pub fn vchordrq_maxsim_gpu_timeout_ms() -> u32 {
     VCHORDRQ_MAXSIM_GPU_TIMEOUT_MS.get() as u32
+}
+
+pub fn vchordrq_maxsim_tenant() -> Option<String> {
+    VCHORDRQ_MAXSIM_TENANT.get().and_then(|tenant| {
+        let tenant = tenant.to_string_lossy().into_owned();
+        (!tenant.is_empty()).then_some(tenant)
+    })
+}
+
+pub fn vchordrq_maxsim_priority() -> i32 {
+    VCHORDRQ_MAXSIM_PRIORITY.get()
 }
 
 pub fn vchordrq_maxsim_gpu_max_batch_tokens() -> u32 {

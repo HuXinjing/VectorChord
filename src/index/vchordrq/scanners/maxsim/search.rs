@@ -19,6 +19,7 @@ use super::external::{
     ExternalTensorStorage, resolve_external_tensor_source, validate_descriptor,
 };
 use super::gpu::{GpuExternalTileMaxsimBackend, UnixSocketTransport};
+use super::profile;
 use super::rerank::RerankError;
 use crate::index::fetcher::{
     Fetcher, FilterableTuple, HeapFetcher, Tuple, TupleAttribute, ctid_to_key,
@@ -59,6 +60,8 @@ fn execute_external_search(
     candidate_limit: i32,
     top_k: i32,
 ) -> Result<std::vec::IntoIter<(i64, f32)>, RerankError> {
+    let profile_guard = profile::ProfileGuard::start(gucs::vchordrq_maxsim_profile());
+    let total_timer = profile::ProfileTimer::start();
     validate_search_limits(candidate_limit, top_k)?;
     if !matches!(gucs::vchordrq_maxsim_backend(), PostgresMaxsimBackend::Gpu) {
         return Err(RerankError::Configuration(
@@ -66,6 +69,7 @@ fn execute_external_search(
         ));
     }
 
+    let preflight_timer = profile::ProfileTimer::start();
     let binding = resolve_external_tensor_source(index_oid)?;
     let index_lock = RelationLock::open(index_oid, pgrx::pg_sys::AccessShareLock as _)?;
     let heap_lock = RelationLock::open(binding.heap_oid, pgrx::pg_sys::AccessShareLock as _)?;
@@ -94,21 +98,41 @@ fn execute_external_search(
     }
     let query_vectors =
         unsafe { opfamily.input_vectors(query.datum()) }.ok_or(RerankError::TensorMismatch)?;
+    profile::update(|profile| {
+        profile.query_tokens = query_vectors.len() as u64;
+    });
 
     // The registry resolution happens before the index read, and this
     // privilege-only SELECT is planned/executed before any candidate CTID is
     // generated. It fails early when the caller cannot project the registered
     // descriptor columns. The same query shape is used for the actual fetch.
     preflight_descriptor_access(&binding)?;
+    let preflight_elapsed = preflight_timer.elapsed();
+    profile::update(|profile| {
+        profile.preflight_us += profile::duration_us(preflight_elapsed);
+    });
 
+    let candidate_timer = profile::ProfileTimer::start();
     let candidates = generate_candidates(
         index_lock.raw(),
         opfamily,
         query.datum(),
         candidate_limit as u32,
     )?;
+    let candidate_elapsed = candidate_timer.elapsed();
+    profile::update(|profile| {
+        profile.candidate_generation_us += profile::duration_us(candidate_elapsed);
+        profile.generated_candidates = candidates.len() as u64;
+    });
+    let visibility_timer = profile::ProfileTimer::start();
     let resolved =
         resolve_visible_candidates(index_lock.raw(), heap_lock.raw(), candidates.into_iter())?;
+    let visibility_elapsed = visibility_timer.elapsed();
+    profile::update(|profile| {
+        profile.visibility_us += profile::duration_us(visibility_elapsed);
+        profile.visible_candidates = resolved.len() as u64;
+    });
+    let descriptor_timer = profile::ProfileTimer::start();
     let (mut source, public_ids) = load_visible_descriptors(&binding, &resolved)?;
     let visible_candidates = resolved
         .into_iter()
@@ -118,6 +142,11 @@ fn execute_external_search(
                 .then_some(resolved.candidate)
         })
         .collect::<Vec<_>>();
+    let descriptor_elapsed = descriptor_timer.elapsed();
+    profile::update(|profile| {
+        profile.descriptor_us += profile::duration_us(descriptor_elapsed);
+        profile.descriptors = public_ids.len() as u64;
+    });
     let endpoint = gucs::vchordrq_maxsim_gpu_endpoint()
         .map(|endpoint| endpoint.to_string_lossy().into_owned())
         .unwrap_or_default();
@@ -129,7 +158,11 @@ fn execute_external_search(
         gucs::vchordrq_maxsim_gpu_max_batch_tokens() as usize,
         gucs::vchordrq_maxsim_gpu_max_batch_bytes() as usize,
     );
+    if let Some(tenant) = gucs::vchordrq_maxsim_tenant() {
+        backend = backend.with_scheduling(tenant, gucs::vchordrq_maxsim_priority());
+    }
     let mut candidate_iter = visible_candidates.into_iter();
+    let sidecar_timer = profile::ProfileTimer::start();
     let exact = backend.rerank(&query_vectors, &mut candidate_iter, &mut source)?;
     let mut rows = exact
         .map(|result| {
@@ -139,17 +172,28 @@ fn execute_external_search(
             Ok((result.distance, public_id))
         })
         .collect::<Result<Vec<_>, RerankError>>()?;
+    let sidecar_elapsed = sidecar_timer.elapsed();
+    profile::update(|profile| {
+        profile.sidecar_us += profile::duration_us(sidecar_elapsed);
+    });
+    let result_finalize_timer = profile::ProfileTimer::start();
     rows.sort_unstable_by(|(left_distance, left_id), (right_distance, right_id)| {
         left_distance
             .cmp(right_distance)
             .then_with(|| left_id.cmp(right_id))
     });
     rows.truncate(top_k as usize);
-    Ok(rows
+    let output = rows
         .into_iter()
         .map(|(distance, public_id)| (public_id, -distance.to_f32()))
-        .collect::<Vec<_>>()
-        .into_iter())
+        .collect::<Vec<_>>();
+    let result_finalize_elapsed = result_finalize_timer.elapsed();
+    profile::update(|profile| {
+        profile.result_finalize_us += profile::duration_us(result_finalize_elapsed);
+        profile.returned_rows = output.len() as u64;
+    });
+    profile_guard.finish(total_timer.elapsed());
+    Ok(output.into_iter())
 }
 
 #[derive(Clone, Copy)]
