@@ -58,6 +58,7 @@ struct Entry {
 }
 
 struct ContractStore {
+    root: PathBuf,
     shards: HashMap<String, ShardFile>,
     entries: HashMap<String, Entry>,
 }
@@ -258,11 +259,26 @@ impl ShardStore {
                 .contracts
                 .get(&descriptor.contract)
                 .ok_or_else(|| anyhow!("model contract has no immutable shard root"))?;
-            let entry = contract
-                .entries
-                .get(&descriptor.digest)
-                .ok_or_else(|| anyhow!("tensor is missing from the immutable shard index"))?
-                .clone();
+            let Some(entry) = contract.entries.get(&descriptor.digest).cloned() else {
+                let expected =
+                    tensor_bytes(descriptor.rows, descriptor.dimension, descriptor.dtype)?;
+                let mut file = open_object(&contract.root, &descriptor.digest)
+                    .with_context(|| "tensor is missing from immutable shards and objects")?;
+                if file.metadata()?.len() != expected as u64 {
+                    bail!("immutable tensor object length disagrees with its descriptor");
+                }
+                let mut payload = Vec::with_capacity(expected);
+                file.read_to_end(&mut payload)?;
+                if hex::encode(Sha256::digest(&payload)) != descriptor.digest {
+                    bail!("immutable tensor object checksum mismatch");
+                }
+                self.batch_read_calls += 1;
+                self.batch_read_bytes += payload.len() as u64;
+                let payload: Arc<[u8]> = payload.into();
+                output[index] = Some(Arc::clone(&payload));
+                self.host_cache.put(tenant, key, payload);
+                continue;
+            };
             if entry.rows != descriptor.rows
                 || entry.dimension != descriptor.dimension
                 || entry.dtype != descriptor.dtype
@@ -368,6 +384,18 @@ impl ShardStore {
 
 fn open_contract(root: &Path) -> Result<ContractStore> {
     let index_path = root.join(INDEX_NAME);
+    let root_metadata = std::fs::symlink_metadata(root)
+        .with_context(|| format!("cannot inspect immutable tensor root {}", root.display()))?;
+    if root_metadata.file_type().is_symlink() || !root_metadata.is_dir() {
+        bail!("immutable tensor root must be a real directory");
+    }
+    if !index_path.try_exists()? {
+        return Ok(ContractStore {
+            root: root.to_path_buf(),
+            shards: HashMap::new(),
+            entries: HashMap::new(),
+        });
+    }
     let mut index_file = nofollow(&index_path)?;
     let mut document = String::new();
     index_file.read_to_string(&mut document)?;
@@ -444,7 +472,38 @@ fn open_contract(root: &Path) -> Result<ContractStore> {
             bail!("duplicate tensor digest in shard index");
         }
     }
-    Ok(ContractStore { shards, entries })
+    Ok(ContractStore {
+        root: root.to_path_buf(),
+        shards,
+        entries,
+    })
+}
+
+fn object_path(root: &Path, digest: &str) -> Result<PathBuf> {
+    if digest.len() != 64
+        || !digest
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+    {
+        bail!("invalid tensor object digest");
+    }
+    Ok(root
+        .join("objects")
+        .join(&digest[..2])
+        .join(format!("{digest}.tensor")))
+}
+
+fn open_object(root: &Path, digest: &str) -> Result<File> {
+    let path = object_path(root, digest)?;
+    let objects = root.join("objects");
+    let prefix = objects.join(&digest[..2]);
+    for directory in [&objects, &prefix] {
+        let metadata = std::fs::symlink_metadata(directory)?;
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            bail!("immutable tensor object path contains a non-directory component");
+        }
+    }
+    nofollow(&path)
 }
 
 fn nofollow(path: &Path) -> Result<File> {
@@ -496,4 +555,37 @@ pub fn cache_key(descriptor: &Descriptor) -> String {
         descriptor.dimension,
         descriptor.dtype
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+
+    #[test]
+    fn content_addressed_objects_are_visible_without_index_reload() {
+        let root =
+            std::env::temp_dir().join(format!("tilemaxsim-object-store-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let mut store =
+            ShardStore::open(&[("model@1".to_owned(), root.clone())], 1024, 100, false).unwrap();
+        let payload = [0_u8, 60, 0, 0];
+        let digest = hex::encode(Sha256::digest(payload));
+        let directory = root.join("objects").join(&digest[..2]);
+        fs::create_dir_all(&directory).unwrap();
+        fs::write(directory.join(format!("{digest}.tensor")), payload).unwrap();
+        let descriptor = Descriptor {
+            candidate_id: 1,
+            contract: "model@1".to_owned(),
+            digest,
+            rows: 1,
+            dimension: 2,
+            dtype: 2,
+        };
+
+        let resolved = store.resolve_many(&[descriptor], "tenant-a").unwrap();
+        assert_eq!(&*resolved[0], &payload);
+        fs::remove_dir_all(root).unwrap();
+    }
 }
