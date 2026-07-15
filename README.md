@@ -4,6 +4,8 @@
 
 **An open-source VectorChord fork focused on exact multi-vector retrieval in PostgreSQL.**
 
+English | [简体中文](README.zh-CN.md)
+
 </div>
 
 This fork extends VectorChord's `vchordrq` index with exact late-interaction
@@ -136,6 +138,76 @@ The reproducible drivers are
 [`services/benchmark_gbrain_scoped_tilemaxsim.py`](services/benchmark_gbrain_scoped_tilemaxsim.py)
 and
 [`services/benchmark_postgres_single_vector.py`](services/benchmark_postgres_single_vector.py).
+
+## Limitations
+
+This fork is suitable for controlled production pilots, but the following
+limits must be addressed or explicitly accepted before a general-availability
+deployment with strict latency, availability, or multi-tenant SLOs.
+
+### Retrieval scalability
+
+- TileMaxSim is an exact scorer, not a tensor-native approximate-nearest-
+  neighbour index. Mandatory source, ACL, document-type, and other caller-
+  authorized filters may safely reduce its input, but lexical or graph matches
+  are not high-recall semantic gates for ordinary queries.
+- Keeping all tensors resident on a GPU removes storage transfer but not the
+  exact scoring arithmetic. On the development corpus, exhaustive scoring of
+  34,054 descriptors with an 18 GiB resident tensor arena averaged 1.08 seconds;
+  a high-recall application scope averaged 45.56 ms. Larger low-latency
+  deployments need a tensor-native ANN or another measured high-recall
+  candidate generator before exact TileMaxSim.
+- A cache smaller than the active working set remains correct, but can thrash.
+  The 3 GiB tensor-arena stress run returned the same exact top-K while averaging
+  18.47 seconds for exhaustive scans. Capacity planning must therefore cover
+  the hot working set, or the application must preserve a high-recall scope.
+
+### Scheduling and multi-user operation
+
+- Fairness, priority, admission limits, and cache quotas are enforced by each
+  daemon independently. Multiple GPU replicas do not yet share a global queue,
+  global entitlement ledger, or work-aware load balancer, so skew between
+  replicas is possible.
+- Preemption is cooperative between CUDA kernel launches. The daemon cannot
+  interrupt a kernel that is already executing; the configured FMA quantum
+  bounds that non-preemptible interval.
+- GPU failover preserves correctness through durable tensor storage, but a new
+  replica starts with a cold cache. Availability and warm latency are separate
+  SLOs and should be tested independently.
+- Tenant identifiers and priorities are scheduling hints only. VectorChord does
+  not implement application tenancy, identity, ACL policy, graph governance, or
+  privileged-user membership. The authenticated caller must enforce those
+  policies and pass only an authorized hard scope.
+
+### Deployment, security, and disaster recovery
+
+- The TileMaxSim TCP protocol currently has no built-in TLS or client
+  authentication. Keep it on a private network and restrict callers with a
+  firewall or Kubernetes NetworkPolicy; use a mutually authenticated proxy if
+  traffic crosses a trust boundary.
+- Container images, health probes, metrics, PostgreSQL integration, and HA-
+  friendly TCP serving are provided, but manifests alone do not prove a
+  production installation. Operators must rehearse PostgreSQL switchover,
+  GPU-pod loss, rolling upgrades, restore, and migration with their actual
+  storage and Kubernetes environment.
+- This repository does not configure continuous PostgreSQL WAL archiving,
+  point-in-time recovery, or cross-site disaster recovery. Those remain
+  database-platform responsibilities and require a verified restore test.
+- Metrics endpoints are available, but ready-made SLO dashboards and alert
+  rules are not included. Production deployments need alerts for queueing,
+  rejection, timeout, cache churn, disk capacity, GPU health, and cold-cache
+  failover latency.
+- Tensor-object garbage collection and very large registries require explicit
+  operational testing and maintenance planning. Filesystem scans and database
+  locking can become visible at sufficiently large object counts.
+
+### Release status
+
+The SQL surface, external-tensor protocol, image tags, and deployment packaging
+remain under active development and may change before a stable release. The
+real-GPU and fault-path tests in this repository validate bounded execution and
+correctness; they are not a substitute for a multi-hour, many-user soak and
+chaos test on the target hardware.
 
 ## Bounded multi-tenant GPU scheduling
 
