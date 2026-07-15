@@ -291,7 +291,7 @@ fn generate(
             .exports()?
             .into_iter()
             .flat_map(|x| std::str::from_utf8(x.name()))
-            .filter(|x| !["_start", "_IO_stdin_used", "main"].contains(x))
+            .filter(|x| should_stub_postmaster_export(x))
             .map(str::to_string)
             .collect::<Vec<String>>()
     } else {
@@ -349,6 +349,45 @@ fn generate(
     }
     let command_stdout = String::from_utf8(command_output.stdout)?.replace("\t", "    ");
     Ok(command_stdout)
+}
+
+fn should_stub_postmaster_export(symbol: &str) -> bool {
+    // These symbols are supplied by the C runtime or linker when the schema
+    // helper executable is linked. Defining a PostgreSQL stub for any of them
+    // creates duplicate symbols on some targets (notably powerpc64le).
+    !matches!(
+        symbol,
+        "_start"
+            | "_IO_stdin_used"
+            | "main"
+            | "__data_start"
+            | "data_start"
+            | "__bss_start"
+            | "_edata"
+            | "_end"
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::should_stub_postmaster_export;
+
+    #[test]
+    fn schema_helper_does_not_stub_crt_or_linker_symbols() {
+        for symbol in [
+            "_start",
+            "_IO_stdin_used",
+            "main",
+            "__data_start",
+            "data_start",
+            "__bss_start",
+            "_edata",
+            "_end",
+        ] {
+            assert!(!should_stub_postmaster_export(symbol), "{symbol}");
+        }
+        assert!(should_stub_postmaster_export("PostgresMain"));
+    }
 }
 
 fn install_by_copying(
