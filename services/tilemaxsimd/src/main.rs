@@ -20,7 +20,7 @@ use std::io::{BufRead, Read, Write};
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::{FileTypeExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
@@ -372,13 +372,22 @@ fn main() -> Result<()> {
     let mut readers = Vec::new();
     let mut accepted = 0_usize;
     let mut status_failed = false;
+    let mut scheduler_failed = false;
+    let mut fatal_error = None;
     while !SHUTDOWN_REQUESTED.load(Ordering::Relaxed) {
+        if scheduler.is_finished() {
+            scheduler_failed = true;
+            metrics.ready.store(false, Ordering::Release);
+            SHUTDOWN_REQUESTED.store(true, Ordering::Release);
+            break;
+        }
         if status_server
             .as_ref()
             .is_some_and(thread::JoinHandle::is_finished)
         {
             status_failed = true;
             metrics.ready.store(false, Ordering::Release);
+            SHUTDOWN_REQUESTED.store(true, Ordering::Release);
             break;
         }
         if RELOAD_REQUESTED.swap(false, Ordering::AcqRel) {
@@ -400,26 +409,33 @@ fn main() -> Result<()> {
                 let reader_admission = Arc::clone(&pending_admission);
                 let reader_metrics = Arc::clone(&metrics);
                 let reader_frame_admission = Arc::clone(&frame_admission);
-                let maximum = args.max_request_bytes;
-                let io_timeout = Duration::from_millis(args.socket_io_timeout_ms);
-                let request_timeout = Duration::from_millis(args.request_timeout_ms);
-                readers.push(
-                    thread::Builder::new()
-                        .name("tilemaxsim-reader".to_owned())
-                        .spawn(move || {
-                            let _permit = ReaderPermit(reader_count);
-                            read_and_enqueue(
-                                connection,
-                                &reader_sender,
-                                maximum,
-                                io_timeout,
-                                request_timeout,
-                                reader_admission,
-                                reader_metrics,
-                                reader_frame_admission,
-                            );
-                        })?,
-                );
+                let reader_config = ReaderConfig {
+                    maximum: args.max_request_bytes,
+                    io_timeout: Duration::from_millis(args.socket_io_timeout_ms),
+                    server_timeout: Duration::from_millis(args.request_timeout_ms),
+                };
+                match thread::Builder::new()
+                    .name("tilemaxsim-reader".to_owned())
+                    .spawn(move || {
+                        let _permit = ReaderPermit(reader_count);
+                        read_and_enqueue(
+                            connection,
+                            &reader_sender,
+                            reader_config,
+                            reader_admission,
+                            reader_metrics,
+                            reader_frame_admission,
+                        );
+                    }) {
+                    Ok(reader) => readers.push(reader),
+                    Err(error) => {
+                        live_readers.fetch_sub(1, Ordering::Release);
+                        metrics.ready.store(false, Ordering::Release);
+                        SHUTDOWN_REQUESTED.store(true, Ordering::Release);
+                        fatal_error = Some(error.into());
+                        break;
+                    }
+                }
                 if args.once && accepted == 1 {
                     SHUTDOWN_REQUESTED.store(true, Ordering::Relaxed);
                 }
@@ -428,9 +444,15 @@ fn main() -> Result<()> {
                 thread::sleep(Duration::from_millis(5));
             }
             Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
-            Err(error) => return Err(error.into()),
+            Err(error) => {
+                metrics.ready.store(false, Ordering::Release);
+                SHUTDOWN_REQUESTED.store(true, Ordering::Release);
+                fatal_error = Some(error.into());
+                break;
+            }
         }
     }
+    SHUTDOWN_REQUESTED.store(true, Ordering::Release);
     drop(listener);
     for reader in readers {
         if reader.join().is_err() {
@@ -439,21 +461,28 @@ fn main() -> Result<()> {
     }
     drop(sender);
     metrics.ready.store(false, Ordering::Release);
-    scheduler
+    let scheduler_result = scheduler
         .join()
-        .map_err(|_| anyhow!("TileMaxSim scheduler thread panicked"))??;
-    if let Some(status_server) = status_server {
-        if status_server.join().is_err() {
-            eprintln!("TileMaxSim status thread panicked during shutdown");
-        }
-    }
-    if status_failed {
-        bail!("TileMaxSim status server exited unexpectedly");
+        .map_err(|_| anyhow!("TileMaxSim scheduler thread panicked"))
+        .and_then(|result| result);
+    if status_server.is_some_and(|status_server| status_server.join().is_err()) {
+        eprintln!("TileMaxSim status thread panicked during shutdown");
     }
     match fs::remove_file(&args.socket) {
         Ok(()) => {}
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => return Err(error.into()),
+    }
+    if status_failed {
+        bail!("TileMaxSim status server exited unexpectedly");
+    }
+    if scheduler_failed {
+        scheduler_result?;
+        bail!("TileMaxSim scheduler exited unexpectedly");
+    }
+    scheduler_result?;
+    if let Some(error) = fatal_error {
+        return Err(error);
     }
     Ok(())
 }
@@ -631,26 +660,32 @@ fn reap_readers(readers: &mut Vec<thread::JoinHandle<()>>) {
     }
 }
 
-fn read_and_enqueue(
-    mut connection: UnixStream,
-    sender: &mpsc::SyncSender<Work>,
+#[derive(Clone, Copy)]
+struct ReaderConfig {
     maximum: usize,
     io_timeout: Duration,
     server_timeout: Duration,
+}
+
+fn read_and_enqueue(
+    mut connection: UnixStream,
+    sender: &mpsc::SyncSender<Work>,
+    config: ReaderConfig,
     pending_admission: Arc<PendingAdmission>,
     metrics: Arc<RuntimeMetrics>,
     frame_admission: Arc<ByteAdmission>,
 ) {
     let accepted_at = Instant::now();
-    if let Err(error) = connection.set_read_timeout(Some(io_timeout)) {
+    if let Err(error) = connection.set_read_timeout(Some(config.io_timeout)) {
         eprintln!("cannot configure TileMaxSim socket read timeout: {error}");
         return;
     }
-    if let Err(error) = connection.set_write_timeout(Some(io_timeout)) {
+    if let Err(error) = connection.set_write_timeout(Some(config.io_timeout)) {
         eprintln!("cannot configure TileMaxSim socket write timeout: {error}");
         return;
     }
-    let (frame, frame_permit) = match read_request(&mut connection, maximum, &frame_admission) {
+    let (frame, frame_permit) =
+        match read_request(&mut connection, config.maximum, &frame_admission) {
         Ok(frame) => frame,
         Err(error) => {
             metrics.failed.fetch_add(1, Ordering::Relaxed);
@@ -660,7 +695,7 @@ fn read_and_enqueue(
             );
             return;
         }
-    };
+        };
     let version = header_version(&frame);
     let request_id = header_request_id(&frame);
     let request = match protocol::parse(&frame) {
@@ -675,9 +710,9 @@ fn read_and_enqueue(
         }
     };
     let client_timeout = if request.timeout_ms == 0 {
-        server_timeout
+        config.server_timeout
     } else {
-        Duration::from_millis(u64::from(request.timeout_ms)).min(server_timeout)
+        Duration::from_millis(u64::from(request.timeout_ms)).min(config.server_timeout)
     };
     let deadline = accepted_at
         .checked_add(client_timeout)
@@ -1065,7 +1100,13 @@ fn handle_status_connection(connection: &mut UnixStream, metrics: &RuntimeMetric
         return;
     };
     let request = String::from_utf8_lossy(&request[..count]);
-    let (status, content_type, body) = if request.starts_with("GET /healthz ") {
+    let (status, content_type, body) = if request.starts_with("GET /livez ") {
+        (
+            "200 OK",
+            "application/json",
+            serde_json::json!({"live": true}).to_string(),
+        )
+    } else if request.starts_with("GET /healthz ") {
         let ready = metrics.ready.load(Ordering::Acquire);
         (
             if ready {
@@ -1173,10 +1214,11 @@ fn header_version(frame: &[u8]) -> u16 {
     }
 }
 
-fn acquire_instance_lock(socket: &PathBuf) -> Result<fs::File> {
+fn acquire_instance_lock(socket: &Path) -> Result<fs::File> {
     let lock_path = PathBuf::from(format!("{}.lock", socket.display()));
     let mut lock = OpenOptions::new()
         .create(true)
+        .truncate(false)
         .read(true)
         .write(true)
         .open(&lock_path)

@@ -174,6 +174,7 @@ class RustDaemonTest(unittest.TestCase):
                 self.assertTrue(socket_path.exists())
                 self.assertTrue(status_socket_path.exists())
                 for path, expected in (
+                    ("/livez", b'200 OK'),
                     ("/healthz", b'200 OK'),
                     ("/metrics", b"tilemaxsim_ready 1"),
                 ):
@@ -186,6 +187,18 @@ class RustDaemonTest(unittest.TestCase):
                         while part := status.recv(4096):
                             response_parts.append(part)
                     self.assertIn(expected, b"".join(response_parts))
+                probe = subprocess.run(
+                    [
+                        os.fspath(binary.with_name("tilemaxsimctl")),
+                        "--socket",
+                        os.fspath(status_socket_path),
+                    ],
+                    capture_output=True,
+                    text=True,
+                    timeout=5,
+                    check=False,
+                )
+                self.assertEqual(probe.returncode, 0, probe.stderr)
                 with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
                     connection.connect(os.fspath(socket_path))
                     connection.sendall(frame)
@@ -214,6 +227,75 @@ class RustDaemonTest(unittest.TestCase):
                 if process.poll() is None:
                     process.terminate()
                     process.wait(timeout=5)
+
+    def test_gpu_assignment_is_required_before_startup(self) -> None:
+        binary = self._release_binary()
+        if not binary.exists():
+            self.skipTest("release tilemaxsimd binary has not been built")
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            socket_path = root / "tilemaxsimd.sock"
+            completed = subprocess.run(
+                [
+                    os.fspath(binary),
+                    "--socket",
+                    os.fspath(socket_path),
+                    "--contract-root",
+                    f"model@1={root}",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=5,
+                check=False,
+            )
+            self.assertNotEqual(completed.returncode, 0)
+            self.assertIn("--gpu-memory-gb", completed.stderr)
+            self.assertFalse(socket_path.exists())
+
+    @unittest.skipUnless(torch.cuda.is_available(), "CUDA is unavailable")
+    def test_unavailable_configured_gpu_fails_before_socket_ready(self) -> None:
+        binary = self._release_binary()
+        if not binary.exists():
+            self.skipTest("release tilemaxsimd binary has not been built")
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            writer = ImmutableShardWriter(
+                root, target_bytes=4096, alignment=256, fsync=False
+            )
+            payload = np.asarray([[1.0, 0.0]], dtype="<f2").tobytes()
+            writer.add(
+                hashlib.sha256(payload).hexdigest(),
+                payload,
+                1,
+                2,
+                "float16",
+            )
+            writer.finish()
+            writer.close()
+            socket_path = root / "tilemaxsimd.sock"
+            completed = subprocess.run(
+                [
+                    os.fspath(binary),
+                    "--socket",
+                    os.fspath(socket_path),
+                    "--gpu-memory-gb",
+                    f"{torch.cuda.device_count() + 100}=0.05",
+                    "--gpu-workspace-gb",
+                    "0.02",
+                    "--host-cache-gb",
+                    "0.01",
+                    "--contract-root",
+                    f"model@1={root}",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=5,
+                check=False,
+            )
+            output = completed.stdout + completed.stderr
+            self.assertNotEqual(completed.returncode, 0, output)
+            self.assertIn("cudaSetDevice", output)
+            self.assertFalse(socket_path.exists())
 
     @unittest.skipUnless(torch.cuda.is_available(), "CUDA is unavailable")
     def test_external_v2_shard_round_trip_matches_protocol_oracle(self) -> None:
