@@ -49,6 +49,18 @@ use vector::rabitq4::Rabitq4Owned;
 use vector::rabitq8::Rabitq8Owned;
 use vector::vect::VectOwned;
 
+fn retain_top_k<T: Ord>(best: &mut std::collections::BinaryHeap<T>, limit: usize, item: T) {
+    if limit == 0 {
+        return;
+    }
+    if best.len() < limit {
+        best.push(item);
+    } else if best.peek().is_some_and(|worst| item < *worst) {
+        best.pop();
+        best.push(item);
+    }
+}
+
 pub struct MaxsimBuilder {
     opfamily: Opfamily,
     orderbys: Vec<Option<Vec<OwnedVector>>>,
@@ -928,4 +940,21 @@ where
     F: for<'a> FnMut(&(A, AlwaysEqual<PackedRefMut8<'a, (B, C, D)>>)) -> R,
 {
     f
+}
+
+#[cfg(test)]
+mod tests {
+    use super::retain_top_k;
+    use std::collections::BinaryHeap;
+
+    #[test]
+    fn bounded_top_k_keeps_global_order_and_ties() {
+        let mut best = BinaryHeap::new();
+        for item in [(3, 30), (1, 20), (1, 10), (2, 40), (0, 50)] {
+            retain_top_k(&mut best, 3, item);
+        }
+        let mut rows = best.into_vec();
+        rows.sort_unstable();
+        assert_eq!(rows, vec![(0, 50), (1, 10), (1, 20)]);
+    }
 }

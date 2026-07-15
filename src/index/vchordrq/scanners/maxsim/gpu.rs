@@ -22,7 +22,7 @@ use std::cmp::Reverse;
 use std::collections::BinaryHeap;
 use std::mem::size_of_val;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use vchordrq::types::OwnedVector;
 
 const MAGIC: &[u8; 4] = b"VCTM";
@@ -33,6 +33,11 @@ const REQUEST_KIND: u16 = 1;
 const RESPONSE_KIND: u16 = 2;
 const HEADER_LEN: usize = 24;
 const MAX_REMOTE_ERROR_BYTES: usize = 64 * 1024;
+const MAX_EXTERNAL_CANDIDATES_PER_BATCH: usize = 65_536;
+const MAX_MODEL_CONTRACT_BYTES: usize = 512;
+const MAX_TENSOR_REF_BYTES: usize = 4096;
+const MAX_CHECKSUM_BYTES: usize = 512;
+const MAX_TENANT_BYTES: usize = 256;
 
 static NEXT_REQUEST_ID: AtomicU64 = AtomicU64::new(1);
 static LAST_FALLBACK_WARNING_SECONDS: AtomicU64 = AtomicU64::new(0);
@@ -169,39 +174,95 @@ impl<T> GpuExternalTileMaxsimBackend<T> {
 }
 
 impl<T: TileMaxsimTransport> GpuExternalTileMaxsimBackend<T> {
+    #[cfg(test)]
     pub(super) fn rerank<S: CandidateTensorDescriptorSource>(
         &mut self,
         query: &[OwnedVector],
         candidates: &mut dyn Iterator<Item = PageCandidate>,
         source: &mut S,
     ) -> Result<RerankResults, RerankError> {
-        let request_id = NEXT_REQUEST_ID.fetch_add(1, Ordering::Relaxed);
-        let encoded = encode_external_request(
-            request_id,
-            &self.model_contract_id,
-            query,
-            candidates,
-            source,
-            self.max_batch_tokens,
-            self.max_batch_bytes,
-            self.scheduling.as_ref(),
-            self.timeout,
-        )?;
-        if encoded.heap_keys.is_empty() {
-            return Ok(RerankResults {
-                inner: BinaryHeap::new(),
-            });
-        }
-        let max_response_bytes = HEADER_LEN
-            .checked_add(8)
-            .and_then(|size| size.checked_add(encoded.heap_keys.len().checked_mul(8)?))
-            .map(|size| size.max(HEADER_LEN + 8 + MAX_REMOTE_ERROR_BYTES))
-            .ok_or(RerankError::RequestTooLarge)?;
-        let response =
-            self.transport
-                .round_trip(&encoded.frame, self.timeout, max_response_bytes)?;
-        decode_response_for_version(&response, encoded.version, request_id, &encoded.heap_keys)
+        let mut inner = BinaryHeap::new();
+        self.rerank_batches(query, candidates, source, |batch| {
+            inner.extend(batch.inner);
+            Ok(())
+        })?;
+        Ok(RerankResults { inner })
     }
+
+    /// Execute one logical rerank as bounded sidecar requests.
+    ///
+    /// The callback is invoked after every complete batch so callers that only
+    /// need a global top-k do not have to retain every score. `self.timeout` is
+    /// a deadline for the whole logical query, rather than a fresh timeout for
+    /// each IPC request.
+    pub(super) fn rerank_batches<S, F>(
+        &mut self,
+        query: &[OwnedVector],
+        candidates: &mut dyn Iterator<Item = PageCandidate>,
+        source: &mut S,
+        mut consume: F,
+    ) -> Result<(), RerankError>
+    where
+        S: CandidateTensorDescriptorSource,
+        F: FnMut(RerankResults) -> Result<(), RerankError>,
+    {
+        let deadline = Instant::now()
+            .checked_add(self.timeout)
+            .ok_or_else(|| RerankError::Transport("logical request deadline overflow".into()))?;
+        let mut pending = None;
+
+        loop {
+            let descriptors = collect_external_batch(
+                &self.model_contract_id,
+                query,
+                candidates,
+                source,
+                self.max_batch_tokens,
+                self.max_batch_bytes,
+                self.scheduling.as_ref(),
+                &mut pending,
+            )?;
+            if descriptors.is_empty() {
+                return Ok(());
+            }
+
+            let remaining = remaining_logical_timeout(deadline)?;
+            let request_id = NEXT_REQUEST_ID.fetch_add(1, Ordering::Relaxed);
+            let encoded = encode_external_descriptors(
+                request_id,
+                &self.model_contract_id,
+                query,
+                &descriptors,
+                self.max_batch_tokens,
+                self.max_batch_bytes,
+                self.scheduling.as_ref(),
+                remaining,
+            )?;
+            let max_response_bytes = HEADER_LEN
+                .checked_add(8)
+                .and_then(|size| size.checked_add(encoded.heap_keys.len().checked_mul(8)?))
+                .map(|size| size.max(HEADER_LEN + 8 + MAX_REMOTE_ERROR_BYTES))
+                .ok_or(RerankError::RequestTooLarge)?;
+            let response = self.transport.round_trip(
+                &encoded.frame,
+                remaining_logical_timeout(deadline)?,
+                max_response_bytes,
+            )?;
+            consume(decode_response_for_version(
+                &response,
+                encoded.version,
+                request_id,
+                &encoded.heap_keys,
+            )?)?;
+        }
+    }
+}
+
+fn remaining_logical_timeout(deadline: Instant) -> Result<Duration, RerankError> {
+    deadline
+        .checked_duration_since(Instant::now())
+        .filter(|remaining| !remaining.is_zero())
+        .ok_or_else(|| RerankError::Transport("logical request timed out".into()))
 }
 
 struct EncodedRequest {
@@ -210,6 +271,7 @@ struct EncodedRequest {
     version: u16,
 }
 
+#[cfg(test)]
 fn encode_external_request<S: CandidateTensorDescriptorSource>(
     request_id: u64,
     model_contract_id: &str,
@@ -221,11 +283,34 @@ fn encode_external_request<S: CandidateTensorDescriptorSource>(
     scheduling: Option<&TileMaxsimScheduling>,
     timeout: Duration,
 ) -> Result<EncodedRequest, RerankError> {
-    const MAX_MODEL_CONTRACT_BYTES: usize = 512;
-    const MAX_TENSOR_REF_BYTES: usize = 4096;
-    const MAX_CHECKSUM_BYTES: usize = 512;
-    const MAX_TENANT_BYTES: usize = 256;
+    let mut descriptors = Vec::new();
+    for candidate in candidates {
+        if let Some(descriptor) = source.fetch(candidate)? {
+            descriptors.push(descriptor);
+        }
+    }
+    encode_external_descriptors(
+        request_id,
+        model_contract_id,
+        query,
+        &descriptors,
+        max_batch_tokens,
+        max_batch_bytes,
+        scheduling,
+        timeout,
+    )
+}
 
+fn encode_external_descriptors(
+    request_id: u64,
+    model_contract_id: &str,
+    query: &[OwnedVector],
+    descriptors: &[ExternalTensorDescriptor],
+    max_batch_tokens: usize,
+    max_batch_bytes: usize,
+    scheduling: Option<&TileMaxsimScheduling>,
+    timeout: Duration,
+) -> Result<EncodedRequest, RerankError> {
     if model_contract_id.is_empty()
         || model_contract_id.len() > MAX_MODEL_CONTRACT_BYTES
         || model_contract_id.chars().any(char::is_control)
@@ -290,13 +375,13 @@ fn encode_external_request<S: CandidateTensorDescriptorSource>(
     }
     encode_tensor_values(&mut writer, query, dtype)?;
 
-    let mut heap_keys = Vec::new();
-    for candidate in candidates {
-        let Some(descriptor) = source.fetch(candidate)? else {
-            continue;
-        };
+    if descriptors.len() > MAX_EXTERNAL_CANDIDATES_PER_BATCH {
+        return Err(RerankError::RequestTooLarge);
+    }
+    let mut heap_keys = Vec::with_capacity(descriptors.len());
+    for descriptor in descriptors {
         validate_external_for_request(
-            &descriptor,
+            descriptor,
             dimension,
             external_dtype,
             MAX_TENSOR_REF_BYTES,
@@ -350,6 +435,137 @@ fn encode_external_request<S: CandidateTensorDescriptorSource>(
         heap_keys,
         version,
     })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn collect_external_batch<S: CandidateTensorDescriptorSource>(
+    model_contract_id: &str,
+    query: &[OwnedVector],
+    candidates: &mut dyn Iterator<Item = PageCandidate>,
+    source: &mut S,
+    max_batch_tokens: usize,
+    max_batch_bytes: usize,
+    scheduling: Option<&TileMaxsimScheduling>,
+    pending: &mut Option<ExternalTensorDescriptor>,
+) -> Result<Vec<ExternalTensorDescriptor>, RerankError> {
+    validate_external_request_identity(model_contract_id, scheduling)?;
+    let (dtype, dimension) = tensor_metadata(query)?;
+    let external_dtype = match dtype {
+        TensorDtype::F32 => ExternalTensorDtype::F32,
+        TensorDtype::F16 => ExternalTensorDtype::F16,
+    };
+    let query_rows = u32::try_from(query.len()).map_err(|_| RerankError::RequestTooLarge)?;
+    let query_bytes = tensor_bytes(query_rows, dimension, dtype)?;
+    let mut total_tokens = query.len();
+    let mut declared_tensor_bytes = query_bytes;
+    let mut frame_bytes = external_request_base_bytes(model_contract_id, scheduling, query_bytes)?;
+    if total_tokens > max_batch_tokens
+        || declared_tensor_bytes > max_batch_bytes
+        || frame_bytes > max_batch_bytes
+    {
+        return Err(RerankError::RequestTooLarge);
+    }
+
+    let mut batch = Vec::new();
+    while batch.len() < MAX_EXTERNAL_CANDIDATES_PER_BATCH {
+        let descriptor = if let Some(descriptor) = pending.take() {
+            descriptor
+        } else {
+            let mut fetched = None;
+            for candidate in &mut *candidates {
+                if let Some(descriptor) = source.fetch(candidate)? {
+                    fetched = Some(descriptor);
+                    break;
+                }
+            }
+            let Some(descriptor) = fetched else {
+                break;
+            };
+            descriptor
+        };
+
+        validate_external_for_request(
+            &descriptor,
+            dimension,
+            external_dtype,
+            MAX_TENSOR_REF_BYTES,
+            MAX_CHECKSUM_BYTES,
+        )?;
+        let next_tokens = total_tokens
+            .checked_add(descriptor.rows as usize)
+            .ok_or(RerankError::RequestTooLarge)?;
+        let next_declared_bytes = declared_tensor_bytes
+            .checked_add(tensor_bytes(descriptor.rows, dimension, dtype)?)
+            .ok_or(RerankError::RequestTooLarge)?;
+        let descriptor_frame_bytes = 16usize
+            .checked_add(descriptor.tensor_ref.len())
+            .and_then(|size| size.checked_add(descriptor.checksum.len()))
+            .ok_or(RerankError::RequestTooLarge)?;
+        let next_frame_bytes = frame_bytes
+            .checked_add(descriptor_frame_bytes)
+            .ok_or(RerankError::RequestTooLarge)?;
+        if next_tokens > max_batch_tokens
+            || next_declared_bytes > max_batch_bytes
+            || next_frame_bytes > max_batch_bytes
+        {
+            if batch.is_empty() {
+                return Err(RerankError::RequestTooLarge);
+            }
+            *pending = Some(descriptor);
+            break;
+        }
+
+        total_tokens = next_tokens;
+        declared_tensor_bytes = next_declared_bytes;
+        frame_bytes = next_frame_bytes;
+        batch.push(descriptor);
+    }
+    Ok(batch)
+}
+
+fn validate_external_request_identity(
+    model_contract_id: &str,
+    scheduling: Option<&TileMaxsimScheduling>,
+) -> Result<(), RerankError> {
+    if model_contract_id.is_empty()
+        || model_contract_id.len() > MAX_MODEL_CONTRACT_BYTES
+        || model_contract_id.chars().any(char::is_control)
+    {
+        return Err(RerankError::InvalidDescriptor(
+            "model contract is empty, oversized, or contains control characters",
+        ));
+    }
+    if let Some(scheduling) = scheduling {
+        if scheduling.tenant.is_empty()
+            || scheduling.tenant.len() > MAX_TENANT_BYTES
+            || scheduling.tenant.chars().any(char::is_control)
+            || !(-100..=100).contains(&scheduling.priority)
+        {
+            return Err(RerankError::Configuration(
+                "TileMaxSim scheduler tenant or priority is invalid",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn external_request_base_bytes(
+    model_contract_id: &str,
+    scheduling: Option<&TileMaxsimScheduling>,
+    query_bytes: usize,
+) -> Result<usize, RerankError> {
+    let fixed = if scheduling.is_some() {
+        56usize
+    } else {
+        44usize
+    };
+    fixed
+        .checked_add(model_contract_id.len())
+        .and_then(|size| {
+            size.checked_add(scheduling.map_or(0, |scheduling| scheduling.tenant.len()))
+        })
+        .and_then(|size| size.checked_add(query_bytes))
+        .ok_or(RerankError::RequestTooLarge)
 }
 
 fn tensor_bytes(rows: u32, dimension: u32, dtype: TensorDtype) -> Result<usize, RerankError> {
@@ -737,8 +953,6 @@ impl TileMaxsimTransport for UnixSocketTransport {
         timeout: Duration,
         max_response_bytes: usize,
     ) -> Result<Vec<u8>, RerankError> {
-        use std::time::Instant;
-
         if self.endpoint.is_empty() {
             return Err(RerankError::Transport("endpoint is empty".into()));
         }
@@ -778,7 +992,7 @@ impl TileMaxsimTransport for UnixSocketTransport {
 #[cfg(unix)]
 fn connect_interruptible(
     endpoint: &str,
-    deadline: std::time::Instant,
+    deadline: Instant,
 ) -> Result<std::os::unix::net::UnixStream, RerankError> {
     use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 
@@ -904,10 +1118,7 @@ fn update_fd_flag(
 }
 
 #[cfg(unix)]
-fn wait_for_connect(
-    fd: std::os::fd::RawFd,
-    deadline: std::time::Instant,
-) -> Result<(), RerankError> {
+fn wait_for_connect(fd: std::os::fd::RawFd, deadline: Instant) -> Result<(), RerankError> {
     loop {
         pgrx::check_for_interrupts!();
         let remaining = remaining_until(deadline)?;
@@ -952,9 +1163,9 @@ fn wait_for_connect(
 }
 
 #[cfg(unix)]
-fn remaining_until(deadline: std::time::Instant) -> Result<Duration, RerankError> {
+fn remaining_until(deadline: Instant) -> Result<Duration, RerankError> {
     deadline
-        .checked_duration_since(std::time::Instant::now())
+        .checked_duration_since(Instant::now())
         .filter(|remaining| !remaining.is_zero())
         .ok_or_else(|| RerankError::Transport("request timed out".into()))
 }
@@ -968,7 +1179,7 @@ fn last_transport_error() -> RerankError {
 fn write_interruptible(
     stream: &mut std::os::unix::net::UnixStream,
     mut bytes: &[u8],
-    deadline: std::time::Instant,
+    deadline: Instant,
 ) -> Result<(), RerankError> {
     use std::io::Write;
 
@@ -986,7 +1197,7 @@ fn write_interruptible(
             Err(error) => return Err(RerankError::Transport(error.to_string())),
         }
         pgrx::check_for_interrupts!();
-        if std::time::Instant::now() >= deadline {
+        if Instant::now() >= deadline {
             return Err(RerankError::Transport("request timed out".into()));
         }
     }
@@ -997,7 +1208,7 @@ fn write_interruptible(
 fn read_interruptible(
     stream: &mut std::os::unix::net::UnixStream,
     mut bytes: &mut [u8],
-    deadline: std::time::Instant,
+    deadline: Instant,
 ) -> Result<(), RerankError> {
     use std::io::Read;
 
@@ -1015,7 +1226,7 @@ fn read_interruptible(
             Err(error) => return Err(RerankError::Transport(error.to_string())),
         }
         pgrx::check_for_interrupts!();
-        if std::time::Instant::now() >= deadline {
+        if Instant::now() >= deadline {
             return Err(RerankError::Transport("request timed out".into()));
         }
     }
@@ -1046,7 +1257,9 @@ mod tests {
     };
     use super::super::rerank::CandidateTensor;
     use super::*;
+    use std::cell::RefCell;
     use std::collections::BTreeMap;
+    use std::rc::Rc;
     use vector::vect::VectOwned;
 
     struct MockTensorSource(BTreeMap<HeapKey, Vec<OwnedVector>>);
@@ -1098,6 +1311,52 @@ mod tests {
                 version,
                 request_id,
                 &self.similarities,
+            ))
+        }
+    }
+
+    #[derive(Default)]
+    struct BatchObservations {
+        candidate_counts: Vec<u32>,
+        transport_timeouts: Vec<Duration>,
+        scheduled_timeouts_ms: Vec<u32>,
+    }
+
+    struct BatchingTransport {
+        observations: Rc<RefCell<BatchObservations>>,
+        delay: Duration,
+    }
+
+    impl TileMaxsimTransport for BatchingTransport {
+        fn round_trip(
+            &mut self,
+            request: &[u8],
+            timeout: Duration,
+            _max_response_bytes: usize,
+        ) -> Result<Vec<u8>, RerankError> {
+            let request_id = u64::from_le_bytes(request[8..16].try_into().unwrap());
+            let version = u16::from_le_bytes(request[4..6].try_into().unwrap());
+            let candidate_count = u32::from_le_bytes(request[32..36].try_into().unwrap());
+            let call = {
+                let mut observations = self.observations.borrow_mut();
+                let call = observations.candidate_counts.len();
+                observations.candidate_counts.push(candidate_count);
+                observations.transport_timeouts.push(timeout);
+                if version == SCHEDULED_EXTERNAL_VERSION {
+                    observations
+                        .scheduled_timeouts_ms
+                        .push(u32::from_le_bytes(request[48..52].try_into().unwrap()));
+                }
+                call
+            };
+            std::thread::sleep(self.delay);
+            let similarities = (0..candidate_count)
+                .map(|candidate_id| (candidate_id, call as f32 * 10.0 + candidate_id as f32))
+                .collect::<Vec<_>>();
+            Ok(success_response_with_version(
+                version,
+                request_id,
+                &similarities,
             ))
         }
     }
@@ -1436,10 +1695,8 @@ mod tests {
             u32::from_le_bytes(encoded.frame[48..52].try_into().unwrap()),
             4_000
         );
-        let tenant_len =
-            u32::from_le_bytes(encoded.frame[52..56].try_into().unwrap()) as usize;
-        let contract_len =
-            u32::from_le_bytes(encoded.frame[40..44].try_into().unwrap()) as usize;
+        let tenant_len = u32::from_le_bytes(encoded.frame[52..56].try_into().unwrap()) as usize;
+        let contract_len = u32::from_le_bytes(encoded.frame[40..44].try_into().unwrap()) as usize;
         assert_eq!(
             &encoded.frame[56 + contract_len..56 + contract_len + tenant_len],
             b"tenant-a"
@@ -1483,6 +1740,139 @@ mod tests {
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].heap_key, page);
         assert_eq!(results[0].distance.to_f32(), -3.5);
+    }
+
+    #[test]
+    fn external_backend_splits_one_logical_query_and_shares_its_deadline() {
+        let pages = [[0, 0, 1], [0, 0, 2], [0, 0, 3]];
+        let candidates = pages.map(|heap_key| PageCandidate {
+            approximate_distance: Distance::ZERO,
+            heap_key,
+        });
+        let query = vec![vector(&[1.0, 0.0])];
+        let mut candidate_iter = candidates.into_iter();
+        let mut source =
+            MockDescriptorSource(BTreeMap::from_iter(candidates.into_iter().enumerate().map(
+                |(index, candidate)| {
+                    (
+                        candidate.heap_key,
+                        external_descriptor(
+                            candidate,
+                            index as i64,
+                            &format!("object://immutable/tensor-{index}"),
+                            2,
+                            2,
+                            ExternalTensorDtype::F32,
+                        ),
+                    )
+                },
+            )));
+        let observations = Rc::new(RefCell::new(BatchObservations::default()));
+        let transport = BatchingTransport {
+            observations: Rc::clone(&observations),
+            delay: Duration::from_millis(5),
+        };
+        let results = GpuExternalTileMaxsimBackend::new(
+            transport,
+            "contract@1".into(),
+            Duration::from_millis(100),
+            5,
+            4096,
+        )
+        .with_scheduling("tenant-a".into(), 9)
+        .rerank(&query, &mut candidate_iter, &mut source)
+        .unwrap()
+        .collect::<Vec<_>>();
+
+        assert_eq!(results.len(), 3);
+        let observations = observations.borrow();
+        assert_eq!(observations.candidate_counts, vec![2, 1]);
+        assert!(observations.transport_timeouts[1] < observations.transport_timeouts[0]);
+        assert!(observations.scheduled_timeouts_ms[1] < observations.scheduled_timeouts_ms[0]);
+    }
+
+    #[test]
+    fn external_backend_rejects_a_single_unsplittable_tensor() {
+        let page = [0, 0, 1];
+        let candidate = PageCandidate {
+            approximate_distance: Distance::ZERO,
+            heap_key: page,
+        };
+        let query = vec![vector(&[1.0, 0.0])];
+        let mut candidates = vec![candidate].into_iter();
+        let mut source = MockDescriptorSource(BTreeMap::from([(
+            page,
+            external_descriptor(
+                candidate,
+                1,
+                "object://immutable/tensor",
+                5,
+                2,
+                ExternalTensorDtype::F32,
+            ),
+        )]));
+        let observations = Rc::new(RefCell::new(BatchObservations::default()));
+        let transport = BatchingTransport {
+            observations: Rc::clone(&observations),
+            delay: Duration::ZERO,
+        };
+        let result = GpuExternalTileMaxsimBackend::new(
+            transport,
+            "contract@1".into(),
+            Duration::from_millis(100),
+            5,
+            4096,
+        )
+        .rerank(&query, &mut candidates, &mut source);
+
+        assert!(matches!(result, Err(RerankError::RequestTooLarge)));
+        assert!(observations.borrow().candidate_counts.is_empty());
+    }
+
+    #[test]
+    fn external_backend_does_not_refresh_timeout_for_later_batches() {
+        let pages = [[0, 0, 1], [0, 0, 2], [0, 0, 3]];
+        let candidates = pages.map(|heap_key| PageCandidate {
+            approximate_distance: Distance::ZERO,
+            heap_key,
+        });
+        let query = vec![vector(&[1.0, 0.0])];
+        let mut candidate_iter = candidates.into_iter();
+        let mut source =
+            MockDescriptorSource(BTreeMap::from_iter(candidates.into_iter().enumerate().map(
+                |(index, candidate)| {
+                    (
+                        candidate.heap_key,
+                        external_descriptor(
+                            candidate,
+                            index as i64,
+                            &format!("object://immutable/tensor-{index}"),
+                            2,
+                            2,
+                            ExternalTensorDtype::F32,
+                        ),
+                    )
+                },
+            )));
+        let observations = Rc::new(RefCell::new(BatchObservations::default()));
+        let transport = BatchingTransport {
+            observations: Rc::clone(&observations),
+            delay: Duration::from_millis(20),
+        };
+        let result = GpuExternalTileMaxsimBackend::new(
+            transport,
+            "contract@1".into(),
+            Duration::from_millis(5),
+            5,
+            4096,
+        )
+        .rerank(&query, &mut candidate_iter, &mut source);
+
+        assert!(matches!(
+            result,
+            Err(RerankError::Transport(message)) if message == "logical request timed out"
+        ));
+        assert_eq!(observations.borrow().candidate_counts, vec![2]);
     }
 
     #[test]

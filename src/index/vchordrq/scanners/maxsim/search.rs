@@ -34,7 +34,7 @@ use distance::Distance;
 use pgrx::datum::{DatumWithOid, FromDatum};
 use pgrx::iter::TableIterator;
 use pgrx::{AnyArray, IntoDatum, name};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, BinaryHeap};
 use std::time::Duration;
 
 const MAX_EXPLICIT_CANDIDATES: i32 = 65_536;
@@ -163,15 +163,19 @@ fn execute_external_search(
     }
     let mut candidate_iter = visible_candidates.into_iter();
     let sidecar_timer = profile::ProfileTimer::start();
-    let exact = backend.rerank(&query_vectors, &mut candidate_iter, &mut source)?;
-    let mut rows = exact
-        .map(|result| {
+    let result_limit = top_k as usize;
+    let mut best = BinaryHeap::with_capacity(result_limit.saturating_add(1));
+    backend.rerank_batches(&query_vectors, &mut candidate_iter, &mut source, |batch| {
+        for result in batch {
             let public_id = public_ids.get(&result.heap_key).copied().ok_or_else(|| {
                 RerankError::Protocol("sidecar result has no visible public ID".into())
             })?;
-            Ok((result.distance, public_id))
-        })
-        .collect::<Result<Vec<_>, RerankError>>()?;
+            let row = (result.distance, public_id);
+            super::retain_top_k(&mut best, result_limit, row);
+        }
+        Ok(())
+    })?;
+    let mut rows = best.into_vec();
     let sidecar_elapsed = sidecar_timer.elapsed();
     profile::update(|profile| {
         profile.sidecar_us += profile::duration_us(sidecar_elapsed);
