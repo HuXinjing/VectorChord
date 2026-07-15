@@ -327,6 +327,18 @@ class RustDaemonTest(unittest.TestCase):
         self.assertEqual(observed, [observed[0]] * len(observed))
 
     @unittest.skipUnless(torch.cuda.is_available(), "CUDA is unavailable")
+    def test_query_rows_can_cross_the_cuda_grid_y_limit(self) -> None:
+        device = max(
+            range(torch.cuda.device_count()),
+            key=lambda index: torch.cuda.mem_get_info(index)[0],
+        )
+        document = np.asarray([[1.0, 0.0]], dtype="<f2")
+        query = np.zeros((65_536, 2), dtype="<f2")
+        query[:, 0] = 1.0
+        _, results = self.run_daemon([device], [document], query)
+        self.assertAlmostEqual(results[0][1], 65_536.0, delta=0.02)
+
+    @unittest.skipUnless(torch.cuda.is_available(), "CUDA is unavailable")
     def test_published_object_is_queryable_without_daemon_restart(self) -> None:
         binary = self._release_binary()
         if not binary.exists():
@@ -463,7 +475,7 @@ class RustDaemonTest(unittest.TestCase):
                 time.sleep(0.01)
             self.assertIsNone(crashed.poll())
             crashed.kill()
-            crashed.wait(timeout=5)
+            crashed.communicate(timeout=5)
             self.assertTrue(socket_path.exists())
 
             status_socket_path = root / "restarted-status.sock"
