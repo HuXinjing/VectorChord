@@ -18,5 +18,10 @@ RUN cargo build --release --locked
 FROM ${CUDA_RUNTIME_IMAGE}
 
 COPY --from=build /build/tilemaxsimd/target/release/tilemaxsimd /usr/local/bin/tilemaxsimd
+COPY --from=build /build/tilemaxsimd/target/release/tilemaxsimctl /usr/local/bin/tilemaxsimctl
+
+STOPSIGNAL SIGTERM
+HEALTHCHECK --interval=10s --timeout=2s --start-period=5m --retries=3 \
+    CMD ["/usr/local/bin/tilemaxsimctl", "--socket", "/run/vectorchord/tilemaxsim-status.sock"]
 
 ENTRYPOINT ["/usr/local/bin/tilemaxsimd"]

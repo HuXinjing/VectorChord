@@ -193,6 +193,11 @@ The optional status socket serves HTTP `GET /healthz` and Prometheus
 completed/error/timeout/disconnect outcomes, and global/per-tenant admission
 rejections without exporting tenant identifiers.
 
+`GET /livez` reports process liveness separately from readiness. The packaged
+`tilemaxsimctl` probe can wait on the status socket without curl or a TCP port.
+An opt-in hardened systemd unit and environment example are provided under
+`deploy/systemd`; the CUDA container uses the same probe for its health check.
+
 The in-flight request budget is also expressed in GiB. A reader must reserve
 its complete declared frame after the fixed header is validated, and keeps that
 permit through completion, timeout, or disconnect. This bounds aggregate query

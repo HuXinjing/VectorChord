@@ -1,0 +1,34 @@
+[Unit]
+Description=VectorChord native CUDA TileMaxSim daemon
+Documentation=https://github.com/HuXinjing/VectorChord
+After=local-fs.target
+StartLimitIntervalSec=60
+StartLimitBurst=3
+
+[Service]
+Type=exec
+User=vectorchord
+Group=vectorchord
+RuntimeDirectory=vectorchord
+RuntimeDirectoryMode=0750
+StateDirectory=vectorchord
+StateDirectoryMode=0750
+EnvironmentFile=/etc/vectorchord/tilemaxsimd.env
+ExecStart=/usr/local/bin/tilemaxsimd $TILEMAXSIMD_ARGS
+ExecStartPost=/usr/local/bin/tilemaxsimctl --socket /run/vectorchord/tilemaxsim-status.sock --wait-timeout-ms 300000
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=on-failure
+RestartSec=2
+TimeoutStopSec=120
+KillSignal=SIGTERM
+UMask=0027
+LimitMEMLOCK=infinity
+LimitNOFILE=1048576
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/run/vectorchord /var/lib/vectorchord
+
+[Install]
+WantedBy=multi-user.target
