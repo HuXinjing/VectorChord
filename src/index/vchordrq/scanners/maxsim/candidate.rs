@@ -12,11 +12,13 @@
 //
 // Copyright (c) 2025-2026 TensorChord Inc.
 
+use super::profile;
 use crate::index::fetcher::pointer_to_kv;
 use always_equal::AlwaysEqual;
 use distance::Distance;
 use std::cmp::Reverse;
-use std::collections::BinaryHeap;
+use std::collections::hash_map::Entry;
+use std::collections::{BinaryHeap, HashMap};
 use std::num::NonZero;
 
 pub(super) type HeapKey = [u16; 3];
@@ -41,10 +43,10 @@ pub(super) trait PageCandidateGenerator {
 }
 
 #[derive(Default)]
-pub(super) struct LegacyPageCandidateGenerator;
+pub(super) struct DensePageCandidateGenerator;
 
-impl PageCandidateGenerator for LegacyPageCandidateGenerator {
-    type Candidates = LegacyPageCandidates;
+impl PageCandidateGenerator for DensePageCandidateGenerator {
+    type Candidates = PageCandidates;
 
     fn generate(
         &mut self,
@@ -52,60 +54,120 @@ impl PageCandidateGenerator for LegacyPageCandidateGenerator {
         token_searches: &mut dyn Iterator<Item = TokenSearchResult>,
         candidate_limit: usize,
     ) -> Self::Candidates {
-        let mut updates = Vec::new();
+        let mut page_lookup = HashMap::new();
+        let mut page_keys = Vec::new();
+        let mut best_by_page_query = Vec::new();
         let mut estimations = Vec::with_capacity(query_count);
+        let mut hit_updates = 0u64;
+        let mut page_token_updates = 0u64;
         for (query_id, (accu_set, rough_set, estimation_by_threshold)) in token_searches.enumerate()
         {
-            updates.reserve(accu_set.len() + rough_set.len());
+            debug_assert!(query_id < query_count);
+            let hit_collect_timer = profile::ProfileTimer::start();
+            hit_updates += (accu_set.len() + rough_set.len()) as u64;
             let is_empty = accu_set.is_empty() && rough_set.is_empty();
             let mut estimation_by_scope = Distance::NEG_INFINITY;
             for (distance, payload) in accu_set {
                 estimation_by_scope = std::cmp::max(estimation_by_scope, distance);
                 let (key, _) = pointer_to_kv(payload);
-                updates.push((key, query_id, distance));
+                page_token_updates += u64::from(record_page_token_distance(
+                    &mut page_lookup,
+                    &mut page_keys,
+                    &mut best_by_page_query,
+                    query_count,
+                    query_id,
+                    key,
+                    distance,
+                ));
             }
             for (distance, payload) in rough_set {
                 let (key, _) = pointer_to_kv(payload);
-                updates.push((key, query_id, distance));
+                page_token_updates += u64::from(record_page_token_distance(
+                    &mut page_lookup,
+                    &mut page_keys,
+                    &mut best_by_page_query,
+                    query_count,
+                    query_id,
+                    key,
+                    distance,
+                ));
             }
             estimations.push(if !is_empty {
                 std::cmp::max(estimation_by_scope, estimation_by_threshold)
             } else {
                 Distance::ZERO
             });
+            let hit_collect_elapsed = hit_collect_timer.elapsed();
+            profile::update(|profile| {
+                profile.hit_collect_us += profile::duration_us(hit_collect_elapsed);
+            });
         }
         debug_assert_eq!(estimations.len(), query_count);
-        updates.sort_unstable_by_key(|&(key, ..)| key);
-        let inner = updates
-            .chunk_by(|(kl, ..), (kr, ..)| kl == kr)
-            .map(|chunk| {
-                let key = chunk[0].0;
-                let mut value = vec![None; query_count];
-                for &(_, query_id, distance) in chunk {
-                    let this = value[query_id].get_or_insert(Distance::INFINITY);
-                    *this = std::cmp::min(*this, distance);
-                }
+        profile::update(|profile| {
+            profile.hit_updates += hit_updates;
+            profile.page_token_updates += page_token_updates;
+        });
+        let page_aggregate_timer = profile::ProfileTimer::start();
+        let mut page_order = (0..page_keys.len()).collect::<Vec<_>>();
+        page_order.sort_unstable_by_key(|&page_index| page_keys[page_index]);
+        let inner = page_order
+            .into_iter()
+            .map(|page_index| {
+                let key = page_keys[page_index];
+                let start = page_index * query_count;
+                let values = &best_by_page_query[start..start + query_count];
                 let mut maxsim = 0.0f32;
-                for (query_id, distance) in value.into_iter().enumerate() {
+                for (query_id, distance) in values.iter().copied().enumerate() {
                     let distance = distance.unwrap_or(estimations[query_id]);
                     maxsim += distance.to_f32();
                 }
                 (Reverse(Distance::from_f32(maxsim)), AlwaysEqual(key))
             })
             .collect::<BinaryHeap<_>>();
-        LegacyPageCandidates {
+        let page_aggregate_elapsed = page_aggregate_timer.elapsed();
+        profile::update(|profile| {
+            profile.page_aggregate_us += profile::duration_us(page_aggregate_elapsed);
+            profile.aggregated_pages += page_keys.len() as u64;
+        });
+        PageCandidates {
             inner,
             remaining: candidate_limit,
         }
     }
 }
 
-pub(super) struct LegacyPageCandidates {
+fn record_page_token_distance(
+    page_lookup: &mut HashMap<HeapKey, usize>,
+    page_keys: &mut Vec<HeapKey>,
+    best_by_page_query: &mut Vec<Option<Distance>>,
+    query_count: usize,
+    query_id: usize,
+    key: HeapKey,
+    distance: Distance,
+) -> bool {
+    let page_index = match page_lookup.entry(key) {
+        Entry::Occupied(entry) => *entry.get(),
+        Entry::Vacant(entry) => {
+            let page_index = page_keys.len();
+            entry.insert(page_index);
+            page_keys.push(key);
+            best_by_page_query.resize(best_by_page_query.len() + query_count, None);
+            page_index
+        }
+    };
+    let slot = &mut best_by_page_query[page_index * query_count + query_id];
+    let first_for_page_token = slot.is_none();
+    let best = slot.get_or_insert(Distance::INFINITY);
+    *best = std::cmp::min(*best, distance);
+    first_for_page_token
+}
+
+pub(super) struct PageCandidates {
     inner: BinaryHeap<(Reverse<Distance>, AlwaysEqual<HeapKey>)>,
     remaining: usize,
 }
 
-impl Iterator for LegacyPageCandidates {
+impl Iterator for PageCandidates {
     type Item = PageCandidate;
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -126,8 +188,8 @@ impl Iterator for LegacyPageCandidates {
     }
 }
 
-impl ExactSizeIterator for LegacyPageCandidates {}
-impl std::iter::FusedIterator for LegacyPageCandidates {}
+impl ExactSizeIterator for PageCandidates {}
+impl std::iter::FusedIterator for PageCandidates {}
 
 #[cfg(test)]
 mod tests {
@@ -158,7 +220,7 @@ mod tests {
             ),
         ]
         .into_iter();
-        let candidates = LegacyPageCandidateGenerator
+        let candidates = DensePageCandidateGenerator
             .generate(2, &mut token_searches, usize::MAX)
             .collect::<Vec<_>>();
 
@@ -182,7 +244,7 @@ mod tests {
             Distance::ZERO,
         )]
         .into_iter();
-        let candidates = LegacyPageCandidateGenerator
+        let candidates = DensePageCandidateGenerator
             .generate(1, &mut token_searches, 1)
             .collect::<Vec<_>>();
 

@@ -40,6 +40,8 @@ from typing import Callable, Iterable
 MAGIC = b"VCTM"
 VERSION = 1
 EXTERNAL_VERSION = 2
+SCHEDULED_EXTERNAL_VERSION = 3
+SUPPORTED_VERSIONS = (VERSION, EXTERNAL_VERSION, SCHEDULED_EXTERNAL_VERSION)
 REQUEST_KIND = 1
 RESPONSE_KIND = 2
 SCORING_SUM_QUERY_MAX_DOCUMENT_DOT = 1
@@ -50,6 +52,7 @@ HEADER = struct.Struct("<4sHHQQ")
 REQUEST_FIXED = struct.Struct("<IIIBBH")
 CANDIDATE_FIXED = struct.Struct("<II")
 EXTERNAL_REQUEST_FIXED = struct.Struct("<IIIBBHI")
+SCHEDULED_EXTERNAL_REQUEST_FIXED = struct.Struct("<IIIBBHIiII")
 EXTERNAL_CANDIDATE_FIXED = struct.Struct("<IIII")
 RESPONSE_FIXED = struct.Struct("<II")
 RESULT = struct.Struct("<If")
@@ -117,6 +120,9 @@ class ParsedExternalTensorRequest:
     model_contract_id: str
     query_payload: bytes
     candidates: tuple[ExternalTensorCandidate, ...]
+    scheduler_tenant: str = "__default__"
+    scheduler_priority: int = 0
+    timeout_ms: int = 0
 
 
 ParsedRequest = InlineTensorRequest | ParsedExternalTensorRequest
@@ -365,20 +371,27 @@ def process_external_request(
     reader: Reader,
     limits: Limits,
     resolver: ExternalTensorResolver | None,
+    version: int = EXTERNAL_VERSION,
 ) -> list[tuple[int, float]]:
-    (
-        dimension,
-        query_rows,
-        candidate_count,
-        dtype,
-        scoring,
-        reserved,
-        contract_length,
-    ) = reader.unpack(EXTERNAL_REQUEST_FIXED)
+    if version == SCHEDULED_EXTERNAL_VERSION:
+        (
+            dimension, query_rows, candidate_count, dtype, scoring, reserved,
+            contract_length, priority, timeout_ms, tenant_length,
+        ) = reader.unpack(SCHEDULED_EXTERNAL_REQUEST_FIXED)
+        if not -100 <= priority <= 100 or not 1 <= timeout_ms <= 600_000:
+            raise SidecarError(STATUS_INVALID_REQUEST, "invalid scheduler metadata")
+    else:
+        (
+            dimension, query_rows, candidate_count, dtype, scoring, reserved,
+            contract_length,
+        ) = reader.unpack(EXTERNAL_REQUEST_FIXED)
+        tenant_length = 0
     validate_request_fixed(
         dimension, query_rows, candidate_count, dtype, scoring, reserved, limits
     )
     model_contract_id = read_text(reader, contract_length, 512, "model contract")
+    if tenant_length:
+        read_text(reader, tenant_length, 256, "scheduler tenant")
     query = read_tensor(reader, query_rows, dimension, dtype)
     total_tokens = query_rows
     total_tensor_bytes = checked_tensor_bytes(query_rows, dimension, dtype)
@@ -462,7 +475,7 @@ def parse_request_frame(
     magic, version, kind, request_id, body_len = HEADER.unpack_from(frame)
     if magic != MAGIC:
         raise SidecarError(STATUS_INVALID_REQUEST, "invalid frame magic")
-    if version not in (VERSION, EXTERNAL_VERSION):
+    if version not in SUPPORTED_VERSIONS:
         raise SidecarError(STATUS_INVALID_REQUEST, "unsupported protocol version")
     if kind != REQUEST_KIND:
         raise SidecarError(STATUS_INVALID_REQUEST, "unexpected message kind")
@@ -525,15 +538,21 @@ def parse_request_frame(
             tuple(candidates),
         )
 
-    (
-        dimension,
-        query_rows,
-        candidate_count,
-        dtype,
-        scoring,
-        reserved,
-        contract_length,
-    ) = reader.unpack(EXTERNAL_REQUEST_FIXED)
+    if version == SCHEDULED_EXTERNAL_VERSION:
+        (
+            dimension, query_rows, candidate_count, dtype, scoring, reserved,
+            contract_length, scheduler_priority, timeout_ms, tenant_length,
+        ) = reader.unpack(SCHEDULED_EXTERNAL_REQUEST_FIXED)
+        if not -100 <= scheduler_priority <= 100 or not 1 <= timeout_ms <= 600_000:
+            raise SidecarError(STATUS_INVALID_REQUEST, "invalid scheduler metadata")
+    else:
+        (
+            dimension, query_rows, candidate_count, dtype, scoring, reserved,
+            contract_length,
+        ) = reader.unpack(EXTERNAL_REQUEST_FIXED)
+        scheduler_priority = 0
+        timeout_ms = 0
+        tenant_length = 0
     validate_request_fixed(
         dimension,
         query_rows,
@@ -544,6 +563,11 @@ def parse_request_frame(
         limits,
     )
     model_contract_id = read_text(reader, contract_length, 512, "model contract")
+    scheduler_tenant = (
+        read_text(reader, tenant_length, 256, "scheduler tenant")
+        if tenant_length
+        else "__default__"
+    )
     query_payload = reader.take(checked_tensor_bytes(query_rows, dimension, dtype))
     if validate_finite:
         validate_finite_tensor_payload(query_payload, query_rows, dimension, dtype)
@@ -600,6 +624,9 @@ def parse_request_frame(
         model_contract_id,
         query_payload,
         tuple(candidates),
+        scheduler_tenant,
+        scheduler_priority,
+        timeout_ms,
     )
 
 
@@ -614,11 +641,11 @@ def process_frame(
         if len(frame) < HEADER.size:
             raise SidecarError(STATUS_INVALID_REQUEST, "truncated frame header")
         magic, version, kind, request_id, body_len = HEADER.unpack_from(frame)
-        if version in (VERSION, EXTERNAL_VERSION):
+        if version in SUPPORTED_VERSIONS:
             response_version = version
         if magic != MAGIC:
             raise SidecarError(STATUS_INVALID_REQUEST, "invalid frame magic")
-        if version not in (VERSION, EXTERNAL_VERSION):
+        if version not in SUPPORTED_VERSIONS:
             raise SidecarError(STATUS_INVALID_REQUEST, "unsupported protocol version")
         if kind != REQUEST_KIND:
             raise SidecarError(STATUS_INVALID_REQUEST, "unexpected message kind")
@@ -631,7 +658,7 @@ def process_frame(
         if version == VERSION:
             results = process_inline_request(reader, limits)
         else:
-            results = process_external_request(reader, limits, resolver)
+            results = process_external_request(reader, limits, resolver, version)
         return success_response(request_id, results, response_version)
     except SidecarError as error:
         return error_response(request_id, error.status, str(error), response_version)
@@ -663,7 +690,7 @@ def handle_connection(
     try:
         header = receive_exact(connection, HEADER.size)
         _, version, _, request_id, body_len = HEADER.unpack(header)
-        if version in (VERSION, EXTERNAL_VERSION):
+        if version in SUPPORTED_VERSIONS:
             response_version = version
         if body_len > limits.max_request_bytes - HEADER.size:
             response = error_response(

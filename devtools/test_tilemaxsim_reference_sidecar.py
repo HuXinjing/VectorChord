@@ -114,10 +114,46 @@ def external_request_frame(
     )
 
 
+def scheduled_external_request_frame(
+    request_id: int,
+    dtype: int,
+    query: list[list[float]],
+    model_contract_id: str,
+    candidates: list[tuple[int, str, list[list[float]]]],
+    tenant: str,
+    priority: int,
+    timeout_ms: int,
+) -> tuple[bytes, dict[str, bytes]]:
+    legacy, objects = external_request_frame(
+        request_id, dtype, query, model_contract_id, candidates
+    )
+    body = legacy[sidecar.HEADER.size :]
+    fixed = sidecar.EXTERNAL_REQUEST_FIXED.unpack_from(body)
+    tenant_bytes = tenant.encode()
+    scheduled = bytearray(
+        sidecar.SCHEDULED_EXTERNAL_REQUEST_FIXED.pack(
+            *fixed, priority, timeout_ms, len(tenant_bytes)
+        )
+    )
+    contract_length = fixed[-1]
+    scheduled.extend(body[sidecar.EXTERNAL_REQUEST_FIXED.size :][:contract_length])
+    scheduled.extend(tenant_bytes)
+    scheduled.extend(body[sidecar.EXTERNAL_REQUEST_FIXED.size + contract_length :])
+    return (
+        sidecar.HEADER.pack(
+            sidecar.MAGIC,
+            sidecar.SCHEDULED_EXTERNAL_VERSION,
+            sidecar.REQUEST_KIND,
+            request_id,
+            len(scheduled),
+        )
+        + scheduled,
+        objects,
+    )
 def decode_response(frame: bytes) -> tuple[int, int, list[tuple[int, float]] | str]:
     magic, version, kind, request_id, body_len = sidecar.HEADER.unpack_from(frame)
     assert magic == sidecar.MAGIC
-    assert version in (sidecar.VERSION, sidecar.EXTERNAL_VERSION)
+    assert version in sidecar.SUPPORTED_VERSIONS
     assert kind == sidecar.RESPONSE_KIND
     assert len(frame) == sidecar.HEADER.size + body_len
     status, count_or_length = sidecar.RESPONSE_FIXED.unpack_from(
@@ -216,7 +252,7 @@ class ReferenceSidecarTest(unittest.TestCase):
     def test_header_reserved_trailing_and_token_limit_fail_closed(self) -> None:
         valid = request_frame(47, sidecar.DTYPE_F32, [[1.0]], [(9, [[1.0]])])
         invalid_frames = []
-        for offset, value in ((0, 0), (4, 3), (6, 2)):
+        for offset, value in ((0, 0), (4, 4), (6, 2)):
             invalid = bytearray(valid)
             invalid[offset] = value
             invalid_frames.append(bytes(invalid))
@@ -277,6 +313,32 @@ class ReferenceSidecarTest(unittest.TestCase):
         self.assertEqual(
             [candidate.candidate_id for candidate in parsed.candidates], [77, 4]
         )
+
+    def test_external_v3_preserves_scheduler_metadata_and_v2_scoring(self) -> None:
+        frame, objects = scheduled_external_request_frame(
+            49,
+            sidecar.DTYPE_F16,
+            [[1.0, 0.0]],
+            "model@1",
+            [(7, "sha256://opaque", [[1.0, 0.0]])],
+            "tenant-a",
+            17,
+            4_000,
+        )
+        parsed = sidecar.parse_request_frame(frame)
+        self.assertIsInstance(parsed, sidecar.ParsedExternalTensorRequest)
+        assert isinstance(parsed, sidecar.ParsedExternalTensorRequest)
+        self.assertEqual(parsed.scheduler_tenant, "tenant-a")
+        self.assertEqual(parsed.scheduler_priority, 17)
+        self.assertEqual(parsed.timeout_ms, 4_000)
+        request_id, status, results = decode_response(
+            sidecar.process_frame(
+                frame, resolver=lambda request: objects[request.tensor_ref]
+            )
+        )
+        self.assertEqual((request_id, status), (49, 0))
+        assert isinstance(results, list)
+        self.assertAlmostEqual(results[0][1], 1.0)
 
     def test_external_v2_fails_closed_without_resolver_or_on_checksum_mismatch(
         self,

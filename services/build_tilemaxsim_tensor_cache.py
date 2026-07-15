@@ -22,12 +22,15 @@ import json
 import os
 import sys
 import tempfile
+from collections import deque
 from concurrent.futures import ThreadPoolExecutor
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 
 import numpy as np
 
 from services.tilemaxsim_cuda_sidecar import positive_int
+from services.tilemaxsim_shard import DEFAULT_SHARD_BYTES, ImmutableShardWriter
 
 
 def canonical_tensor(path: Path, expected_rows: int, expected_dim: int) -> np.ndarray:
@@ -96,13 +99,10 @@ def write_payload(path: Path, payload: memoryview, digest: str, fsync: bool) -> 
             pass
 
 
-def process_record(
+def prepare_record(
     record: dict[str, object],
     source_root: Path,
-    cache_root: Path,
-    fsync: bool,
-    dry_run: bool,
-) -> dict[str, object]:
+) -> tuple[dict[str, object], memoryview]:
     page_key = record.get("page_key")
     relative = record.get("embedding_file")
     rows = record.get("n_tokens")
@@ -125,9 +125,6 @@ def process_record(
     tensor = canonical_tensor(source, rows, dimension)
     payload = memoryview(tensor).cast("B")
     digest = hashlib.sha256(payload).hexdigest()
-    destination = cache_root / digest[:2] / f"{digest}.bin"
-    if not dry_run:
-        write_payload(destination, payload, digest, fsync)
     dtype_name = "float16" if tensor.dtype == np.dtype("float16") else "float32"
     return {
         "page_key": page_key,
@@ -137,7 +134,57 @@ def process_record(
         "tensor_dtype": dtype_name,
         "tensor_checksum": f"sha256:{digest}",
         "canonical_bytes": len(payload),
-    }
+    }, payload
+
+
+def process_record(
+    record: dict[str, object],
+    source_root: Path,
+    cache_root: Path,
+    fsync: bool,
+    dry_run: bool,
+) -> dict[str, object]:
+    """Publish one legacy per-tensor file.
+
+    Kept for backwards compatibility and migration tests.  New cache builds use
+    immutable shards by default.
+    """
+
+    descriptor, payload = prepare_record(record, source_root)
+    digest = str(descriptor["tensor_checksum"]).removeprefix("sha256:")
+    destination = cache_root / digest[:2] / f"{digest}.bin"
+    if not dry_run:
+        write_payload(destination, payload, digest, fsync)
+    return descriptor
+
+
+def shard_size_gb(value: str) -> int:
+    try:
+        parsed = int(Decimal(value) * 1024**3)
+    except (InvalidOperation, ValueError) as error:
+        raise argparse.ArgumentTypeError("shard size must be a positive number of GB") from error
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError("shard size must be a positive number of GB")
+    return parsed
+
+
+def bounded_parallel_map(executor, function, items, maximum_pending: int):
+    """Preserve input order without retaining a corpus-sized future backlog."""
+
+    iterator = iter(items)
+    pending = deque()
+    for _ in range(maximum_pending):
+        try:
+            pending.append(executor.submit(function, next(iterator)))
+        except StopIteration:
+            break
+    while pending:
+        future = pending.popleft()
+        yield future.result()
+        try:
+            pending.append(executor.submit(function, next(iterator)))
+        except StopIteration:
+            pass
 
 
 def main() -> None:
@@ -146,6 +193,18 @@ def main() -> None:
     parser.add_argument("--cache-root", required=True, type=Path)
     parser.add_argument("--descriptor-manifest", required=True, type=Path)
     parser.add_argument("--workers", type=positive_int, default=4)
+    parser.add_argument(
+        "--storage-format",
+        choices=("shards", "files"),
+        default="shards",
+        help="publish immutable shards (default) or legacy per-tensor files",
+    )
+    parser.add_argument(
+        "--shard-size-gb",
+        type=shard_size_gb,
+        default=DEFAULT_SHARD_BYTES,
+        help="target immutable shard size in GB",
+    )
     parser.add_argument("--no-fsync", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
@@ -171,28 +230,63 @@ def main() -> None:
 
     cache_root.mkdir(parents=True, exist_ok=True)
     descriptors = []
-    with ThreadPoolExecutor(max_workers=args.workers) as workers:
-        results = workers.map(
-            lambda record: process_record(
-                record,
-                source_root,
-                cache_root,
-                not args.no_fsync,
-                args.dry_run,
-            ),
-            records,
+    shard_writer = None
+    if args.storage_format == "shards" and not args.dry_run:
+        shard_writer = ImmutableShardWriter(
+            cache_root,
+            target_bytes=args.shard_size_gb,
+            fsync=not args.no_fsync,
         )
-        for completed, item in enumerate(results, 1):
-            descriptors.append(item)
-            if completed % 1000 == 0 or completed == len(records):
-                print(
-                    json.dumps(
-                        {"event": "tensor_cache_progress", "completed": completed},
-                        separators=(",", ":"),
-                    ),
-                    file=sys.stderr,
-                    flush=True,
+    try:
+        with ThreadPoolExecutor(max_workers=args.workers) as workers:
+            if args.storage_format == "files":
+                results = (
+                    (item, None)
+                    for item in bounded_parallel_map(
+                        workers,
+                        lambda record: process_record(
+                            record,
+                            source_root,
+                            cache_root,
+                            not args.no_fsync,
+                            args.dry_run,
+                        ),
+                        records,
+                        args.workers * 2,
+                    )
                 )
+            else:
+                results = bounded_parallel_map(
+                    workers,
+                    lambda record: prepare_record(record, source_root),
+                    records,
+                    args.workers * 2,
+                )
+            for completed, (item, payload) in enumerate(results, 1):
+                descriptors.append(item)
+                if shard_writer is not None:
+                    assert payload is not None
+                    digest = str(item["tensor_checksum"]).removeprefix("sha256:")
+                    shard_writer.add(
+                        digest,
+                        payload,
+                        int(item["tensor_rows"]),
+                        int(item["tensor_dim"]),
+                        str(item["tensor_dtype"]),
+                    )
+                if completed % 1000 == 0 or completed == len(records):
+                    print(
+                        json.dumps(
+                            {"event": "tensor_cache_progress", "completed": completed},
+                            separators=(",", ":"),
+                        ),
+                        file=sys.stderr,
+                        flush=True,
+                    )
+        shard_index = shard_writer.finish() if shard_writer is not None else None
+    finally:
+        if shard_writer is not None:
+            shard_writer.close()
 
     output_parent = args.descriptor_manifest.parent
     output_parent.mkdir(parents=True, exist_ok=True)
@@ -224,6 +318,8 @@ def main() -> None:
                 "canonical_bytes": total_bytes,
                 "cache_root": os.fspath(cache_root),
                 "descriptor_manifest": os.fspath(args.descriptor_manifest),
+                "storage_format": args.storage_format,
+                "shard_index": os.fspath(shard_index) if shard_index else None,
                 "dry_run": args.dry_run,
             },
             sort_keys=True,

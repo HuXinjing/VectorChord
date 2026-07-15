@@ -116,6 +116,20 @@ pub(super) struct ExternalTensorSourceBinding {
     pub column_names: ExternalTensorColumnNames,
 }
 
+/// External tensor metadata bound directly to an application source relation.
+///
+/// Unlike [`ExternalTensorSourceBinding`], this binding has no ANN index: the
+/// caller supplies an already-authorized candidate ID set and VectorChord only
+/// performs exact TileMaxSim over those candidates.
+#[derive(Clone, Debug)]
+pub(super) struct TileMaxsimSourceBinding {
+    pub source_oid: pgrx::pg_sys::Oid,
+    pub descriptor_oid: Option<pgrx::pg_sys::Oid>,
+    pub storage: ExternalTensorStorage,
+    pub model_contract_id: String,
+    pub column_names: ExternalTensorColumnNames,
+}
+
 #[derive(Clone, Debug)]
 pub(super) struct ExternalTensorColumnNames {
     pub model_contract: String,
@@ -259,6 +273,114 @@ pub(super) fn resolve_external_tensor_source(
             storage,
             model_contract_id,
             columns,
+            column_names,
+        })
+    })
+}
+
+/// Resolve a source-relation binding for exact candidate-only TileMaxSim.
+///
+/// The SECURITY DEFINER SQL resolver revalidates relation ownership, caller
+/// SELECT privileges, column types, uniqueness, and descriptor metadata. This
+/// Rust layer deliberately sees only the validated projection.
+pub(super) fn resolve_tilemaxsim_source(
+    source_oid: pgrx::pg_sys::Oid,
+) -> Result<TileMaxsimSourceBinding, RerankError> {
+    pgrx::spi::Spi::connect(|client| {
+        let schema_rows = client
+            .select(
+                "SELECT n.nspname::text AS schema_name
+                   FROM pg_catalog.pg_extension AS e
+                   JOIN pg_catalog.pg_namespace AS n ON n.oid = e.extnamespace
+                  WHERE e.extname = 'vchord'",
+                Some(1),
+                &[],
+            )
+            .map_err(registry_error)?;
+        if schema_rows.is_empty() {
+            return Err(RerankError::Registry(
+                "vchord extension schema is unavailable".into(),
+            ));
+        }
+        let schema_name = schema_rows
+            .first()
+            .get_by_name::<String, _>("schema_name")
+            .map_err(registry_error)?
+            .ok_or_else(|| RerankError::Registry("vchord extension schema is NULL".into()))?;
+        let resolver = pgrx::spi::quote_qualified_identifier(
+            schema_name,
+            "vchordrq_tilemaxsim_source_info".to_string(),
+        );
+        let query = format!(
+            "SELECT registered_source::oid AS source_oid,
+                    descriptor_relation::oid AS descriptor_oid,
+                    model_contract_id,
+                    source_storage,
+                    model_contract_column::text AS model_contract_column,
+                    public_id_column::text AS public_id_column,
+                    descriptor_public_id_column::text AS descriptor_public_id_column,
+                    tensor_ref_column::text AS tensor_ref_column,
+                    tensor_rows_column::text AS tensor_rows_column,
+                    tensor_dim_column::text AS tensor_dim_column,
+                    tensor_dtype_column::text AS tensor_dtype_column,
+                    tensor_checksum_column::text AS tensor_checksum_column
+               FROM {resolver}($1::regclass)"
+        );
+        let prepared = client
+            .prepare(query.as_str(), &pgrx::oids_of![pgrx::pg_sys::Oid])
+            .map_err(registry_error)?;
+        let rows = client
+            .select(&prepared, Some(1), &[source_oid.into()])
+            .map_err(registry_error)?;
+        if rows.is_empty() {
+            return Err(RerankError::Registry(
+                "registered TileMaxSim tensor source resolution returned no row".into(),
+            ));
+        }
+        let row = rows.first();
+        let resolved_source_oid = required_column::<pgrx::pg_sys::Oid>(&row, "source_oid")?;
+        let descriptor_oid = optional_column::<pgrx::pg_sys::Oid>(&row, "descriptor_oid")?;
+        let model_contract_id = required_column::<String>(&row, "model_contract_id")?;
+        let storage = required_column::<String>(&row, "source_storage")?;
+        if resolved_source_oid != source_oid {
+            return Err(RerankError::Registry(
+                "registered TileMaxSim tensor source resolved a different relation".into(),
+            ));
+        }
+        let storage = match storage.as_str() {
+            "external_ref" if descriptor_oid.is_none() => ExternalTensorStorage::SameHeap,
+            "external_relation" if descriptor_oid.is_some() => {
+                ExternalTensorStorage::DescriptorRelation
+            }
+            _ => {
+                return Err(RerankError::Registry(
+                    "registered TileMaxSim tensor source is inconsistent".into(),
+                ));
+            }
+        };
+        let column_names = ExternalTensorColumnNames {
+            model_contract: required_column::<String>(&row, "model_contract_column")?,
+            public_id: required_column::<String>(&row, "public_id_column")?,
+            descriptor_public_id: optional_column::<String>(&row, "descriptor_public_id_column")?,
+            tensor_ref: required_column::<String>(&row, "tensor_ref_column")?,
+            tensor_rows: required_column::<String>(&row, "tensor_rows_column")?,
+            tensor_dimension: required_column::<String>(&row, "tensor_dim_column")?,
+            tensor_dtype: required_column::<String>(&row, "tensor_dtype_column")?,
+            tensor_checksum: required_column::<String>(&row, "tensor_checksum_column")?,
+        };
+        if matches!(storage, ExternalTensorStorage::DescriptorRelation)
+            && column_names.descriptor_public_id.is_none()
+        {
+            return Err(RerankError::Registry(
+                "registered descriptor relation has no public ID column".into(),
+            ));
+        }
+        validate_model_contract(&model_contract_id)?;
+        Ok(TileMaxsimSourceBinding {
+            source_oid,
+            descriptor_oid,
+            storage,
+            model_contract_id,
             column_names,
         })
     })

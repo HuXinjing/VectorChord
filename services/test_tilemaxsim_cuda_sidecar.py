@@ -15,10 +15,13 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import socket
 import stat
 import struct
+import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -57,6 +60,26 @@ def write_content_addressed(root: Path, payload: bytes) -> tuple[str, str]:
 
 
 class CudaSidecarTest(unittest.TestCase):
+    def test_cli_without_explicit_gpu_memory_keeps_tilemaxsim_disabled(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            socket_path = Path(directory) / "disabled.sock"
+            completed = subprocess.run(
+                [
+                    sys.executable,
+                    "-m",
+                    "services.tilemaxsim_cuda_sidecar",
+                    "--socket",
+                    os.fspath(socket_path),
+                ],
+                cwd=Path(__file__).resolve().parents[1],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(completed.returncode, 2)
+            self.assertIn("TileMaxSim is disabled", completed.stderr)
+            self.assertFalse(socket_path.exists())
+
     def test_cache_builder_publishes_resolver_compatible_payload(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -139,6 +162,14 @@ class CudaSidecarTest(unittest.TestCase):
                     resolver.resolve(bad)
             finally:
                 resolver.close()
+
+    def test_host_payload_cache_evicts_to_its_byte_budget(self) -> None:
+        cache = cuda_sidecar.PayloadCache(6)
+        cache.put(("first",), b"1234")
+        cache.put(("second",), b"5678")
+        self.assertIsNone(cache.get(("first",)))
+        self.assertEqual(cache.get(("second",)), b"5678")
+        self.assertEqual(cache.current_bytes, 4)
 
     def test_content_addressed_resolver_rejects_symlink(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -245,6 +276,252 @@ class CudaSidecarTest(unittest.TestCase):
         self.assertEqual([item[0] for item in results], [item[0] for item in oracle])
         for (_, actual), (_, expected) in zip(results, oracle, strict=True):
             self.assertAlmostEqual(actual, expected, places=5)
+
+    @unittest.skipUnless(torch.cuda.is_available(), "CUDA is unavailable")
+    def test_cli_gb_allocation_serves_tilemaxsim(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            directory_path = Path(directory)
+            root = directory_path / "tensors"
+            root.mkdir()
+            payload = struct.pack("<4e", 1.0, 0.0, 0.0, 1.0)
+            tensor_ref, _ = write_content_addressed(root, payload)
+            frame, _ = external_request_frame(
+                70,
+                protocol.DTYPE_F16,
+                [[1.0, 0.0], [0.0, 1.0]],
+                "model@1",
+                [(9, tensor_ref, [[1.0, 0.0], [0.0, 1.0]])],
+            )
+            device = max(
+                range(torch.cuda.device_count()),
+                key=lambda candidate: torch.cuda.mem_get_info(candidate)[0],
+            )
+            socket_path = directory_path / "resident.sock"
+            process = subprocess.Popen(
+                [
+                    sys.executable,
+                    "-m",
+                    "services.tilemaxsim_cuda_sidecar",
+                    "--socket",
+                    os.fspath(socket_path),
+                    "--gpu-memory-gb",
+                    f"{device}=0.05",
+                    "--gpu-workspace-gb",
+                    "0.02",
+                    "--host-cache-gb",
+                    "0.01",
+                    "--contract-root",
+                    f"model@1={root}",
+                    "--once",
+                ],
+                cwd=Path(__file__).resolve().parents[1],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+            )
+            try:
+                for _ in range(1000):
+                    if socket_path.exists() or process.poll() is not None:
+                        break
+                    time.sleep(0.01)
+                self.assertIsNone(process.poll())
+                self.assertTrue(socket_path.exists())
+                with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
+                    connection.connect(os.fspath(socket_path))
+                    connection.sendall(frame)
+                    header = protocol.receive_exact(connection, protocol.HEADER.size)
+                    body_len = protocol.HEADER.unpack(header)[4]
+                    response = header + protocol.receive_exact(connection, body_len)
+                output, _ = process.communicate(timeout=10)
+                self.assertEqual(process.returncode, 0, output)
+                self.assertEqual(decode_response(response)[1:], (0, [(9, 2.0)]))
+                self.assertIn('"event":"tilemaxsim_ready"', output)
+            finally:
+                if process.poll() is None:
+                    process.terminate()
+                    process.wait(timeout=5)
+
+    @unittest.skipUnless(torch.cuda.is_available(), "CUDA is unavailable")
+    def test_v2_gpu_resident_hit_does_not_resolve_payload_again(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            payload = struct.pack("<4e", 1.0, 0.0, 0.0, 1.0)
+            tensor_ref, checksum = write_content_addressed(root, payload)
+            digest = checksum.removeprefix("sha256:")
+            frame, _ = external_request_frame(
+                71,
+                protocol.DTYPE_F16,
+                [[1.0, 0.0], [0.0, 1.0]],
+                "model@1",
+                [(9, tensor_ref, [[1.0, 0.0], [0.0, 1.0]])],
+            )
+            device = max(
+                range(torch.cuda.device_count()),
+                key=lambda candidate: torch.cuda.mem_get_info(candidate)[0],
+            )
+            pool = cuda_sidecar.GpuResourcePool(
+                [cuda_sidecar.GpuArenaSpec(f"cuda:{device}", 32 * 1024 * 1024)],
+                16 * 1024 * 1024,
+            )
+            resolver = cuda_sidecar.ContentAddressedResolver({"model@1": root}, 0)
+            try:
+                cache = cuda_sidecar.GpuTensorCache(pool, allow_eviction=False)
+                metrics = CapturingMetrics()
+                stream_engine = cuda_sidecar.TorchTileMaxsimEngine(
+                    f"cuda:{device}", 16 * 1024 * 1024, False, 1
+                )
+                resident_engine = cuda_sidecar.ResidentTorchTileMaxsimEngine(
+                    pool, 16 * 1024 * 1024, False, 1
+                )
+                service = cuda_sidecar.TileMaxsimService(
+                    protocol.Limits(),
+                    resolver,
+                    stream_engine,
+                    2000,
+                    metrics,
+                    cache,
+                    resident_engine,
+                    pin_gpu_entries=True,
+                )
+                client, server = socket.socketpair()
+                try:
+                    first = service.process_frame(
+                        frame, server, time.monotonic() + 2, None
+                    )
+                    (root / digest[:2] / f"{digest}.bin").unlink()
+                    second = service.process_frame(
+                        frame, server, time.monotonic() + 2, None
+                    )
+                finally:
+                    client.close()
+                    server.close()
+                self.assertEqual(decode_response(first)[1:], (0, [(9, 2.0)]))
+                self.assertEqual(decode_response(second)[1:], (0, [(9, 2.0)]))
+                requests = [
+                    event
+                    for event in metrics.events
+                    if event.get("event") == "tilemaxsim_request"
+                ]
+                self.assertEqual(requests[0]["gpu_cache_misses"], 1)
+                self.assertEqual(requests[1]["gpu_cache_hits"], 1)
+            finally:
+                resolver.close()
+                pool.close()
+
+    @unittest.skipUnless(torch.cuda.is_available(), "CUDA is unavailable")
+    def test_lru_gpu_cache_streams_request_larger_than_its_arena(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            rows, dimension = 480, 320
+            first_tensor = np.zeros((rows, dimension), dtype="<f2")
+            second_tensor = np.zeros((rows, dimension), dtype="<f2")
+            first_tensor[:, 0] = 1.0
+            second_tensor[:, 1] = 1.0
+            first_ref, _ = write_content_addressed(root, first_tensor.tobytes())
+            second_ref, _ = write_content_addressed(root, second_tensor.tobytes())
+            query = np.zeros((2, dimension), dtype="<f2")
+            query[0, 0] = 1.0
+            query[1, 1] = 1.0
+            frame, _ = external_request_frame(
+                72,
+                protocol.DTYPE_F16,
+                query.tolist(),
+                "model@1",
+                [
+                    (1, first_ref, first_tensor.tolist()),
+                    (2, second_ref, second_tensor.tolist()),
+                ],
+            )
+            device = max(
+                range(torch.cuda.device_count()),
+                key=lambda candidate: torch.cuda.mem_get_info(candidate)[0],
+            )
+            pool = cuda_sidecar.GpuResourcePool(
+                [cuda_sidecar.GpuArenaSpec(f"cuda:{device}", 1024 * 1024)],
+                512 * 1024,
+            )
+            resolver = cuda_sidecar.ContentAddressedResolver({"model@1": root}, 0)
+            try:
+                cache = cuda_sidecar.GpuTensorCache(pool, allow_eviction=True)
+                metrics = CapturingMetrics()
+                service = cuda_sidecar.TileMaxsimService(
+                    protocol.Limits(),
+                    resolver,
+                    cuda_sidecar.TorchTileMaxsimEngine(
+                        f"cuda:{device}", 512 * 1024, False, 1
+                    ),
+                    10_000,
+                    metrics,
+                    cache,
+                    cuda_sidecar.ResidentTorchTileMaxsimEngine(
+                        pool, 512 * 1024, False, 1
+                    ),
+                )
+                client, server = socket.socketpair()
+                try:
+                    response = service.process_frame(
+                        frame, server, time.monotonic() + 10, None
+                    )
+                finally:
+                    client.close()
+                    server.close()
+                _, status, results = decode_response(response)
+                self.assertEqual(status, 0)
+                self.assertEqual(results, [(1, 1.0), (2, 1.0)])
+                event = metrics.events[-1]
+                self.assertEqual(event["gpu_chunks"], 2)
+                self.assertEqual(event["gpu_cache_misses"], 2)
+                self.assertEqual(cache.status()["evictions"], 1)
+            finally:
+                resolver.close()
+                pool.close()
+
+    @unittest.skipUnless(torch.cuda.is_available(), "CUDA is unavailable")
+    def test_resident_manifest_is_fully_pinned_before_serving(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            payload = struct.pack("<4e", 1.0, 0.0, 0.0, 1.0)
+            tensor_ref, checksum = write_content_addressed(root, payload)
+            manifest = root / "descriptors.jsonl"
+            manifest.write_text(
+                json.dumps(
+                    {
+                        "page_key": "page-1",
+                        "tensor_ref": tensor_ref,
+                        "tensor_rows": 2,
+                        "tensor_dim": 2,
+                        "tensor_dtype": "float16",
+                        "tensor_checksum": checksum,
+                        "canonical_bytes": len(payload),
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            device = max(
+                range(torch.cuda.device_count()),
+                key=lambda candidate: torch.cuda.mem_get_info(candidate)[0],
+            )
+            pool = cuda_sidecar.GpuResourcePool(
+                [cuda_sidecar.GpuArenaSpec(f"cuda:{device}", 32 * 1024 * 1024)],
+                16 * 1024 * 1024,
+            )
+            resolver = cuda_sidecar.ContentAddressedResolver({"model@1": root}, 0)
+            try:
+                cache = cuda_sidecar.GpuTensorCache(pool, allow_eviction=False)
+                metrics = CapturingMetrics()
+                cuda_sidecar.prewarm_resident_cache(
+                    [("model@1", manifest)], resolver, cache, metrics
+                )
+                status = cache.status()
+                self.assertEqual(status["entries"], 1)
+                self.assertEqual(status["pinned_entries"], 1)
+                self.assertEqual(
+                    metrics.events[-1]["event"], "tilemaxsim_prewarm_complete"
+                )
+            finally:
+                resolver.close()
+                pool.close()
 
     def test_v2_unix_socket_end_to_end(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

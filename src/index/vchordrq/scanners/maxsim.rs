@@ -13,12 +13,14 @@
 // Copyright (c) 2025-2026 TensorChord Inc.
 
 mod candidate;
+mod exact;
 mod external;
 mod gpu;
+mod profile;
 mod rerank;
 mod search;
 
-use self::candidate::{LegacyPageCandidateGenerator, PageCandidateGenerator};
+use self::candidate::{DensePageCandidateGenerator, PageCandidateGenerator};
 use self::gpu::{GpuTileMaxsimBackend, UnixSocketTransport, report_gpu_fallback};
 use self::rerank::{CpuExactMaxsimBackend, ExactMaxsimBackend, HeapArrayTensorSource};
 use crate::index::fetcher::*;
@@ -176,6 +178,7 @@ impl SearchBuilder for MaxsimBuilder {
                         .map(|vector| RandomProject::project(vector.as_borrowed()))
                         .collect::<Vec<_>>();
                     Box::new((0..n).map(move |i| {
+                        let token_search_timer = profile::ProfileTimer::start();
                         let (results, estimation_by_threshold) = match options.io_search {
                             Io::Plain => maxsim_search::<_, Op>(
                                 index,
@@ -208,6 +211,15 @@ impl SearchBuilder for MaxsimBuilder {
                                 make_h0_stream_prefetcher.clone(),
                             ),
                         };
+                        let refine_active = maxsim_refine != 0 && !results.is_empty();
+                        let search_results = results.len() as u64;
+                        let token_search_elapsed = token_search_timer.elapsed();
+                        profile::update(|profile| {
+                            profile.token_search_calls += 1;
+                            profile.token_search_us += profile::duration_us(token_search_elapsed);
+                            profile.token_search_results += search_results;
+                        });
+                        let token_refine_timer = profile::ProfileTimer::start();
                         let (mut accu_set, mut rough_set) = (Vec::new(), Vec::new());
                         if maxsim_refine != 0 && !results.is_empty() {
                             let sequence = Heap::from(results);
@@ -312,6 +324,13 @@ impl SearchBuilder for MaxsimBuilder {
                             let rough_iter = results.into_iter();
                             rough_set.extend(rough_iter.map(rough_map));
                         }
+                        let token_refine_elapsed = token_refine_timer.elapsed();
+                        profile::update(|profile| {
+                            profile.token_refine_calls += u64::from(refine_active);
+                            profile.token_refine_us += profile::duration_us(token_refine_elapsed);
+                            profile.accurate_token_hits += accu_set.len() as u64;
+                            profile.rough_token_hits += rough_set.len() as u64;
+                        });
                         (accu_set, rough_set, estimation_by_threshold)
                     }))
                 }
@@ -332,6 +351,7 @@ impl SearchBuilder for MaxsimBuilder {
                         .map(|vector| RandomProject::project(vector.as_borrowed()))
                         .collect::<Vec<_>>();
                     Box::new((0..n).map(move |i| {
+                        let token_search_timer = profile::ProfileTimer::start();
                         let (results, estimation_by_threshold) = match options.io_search {
                             Io::Plain => maxsim_search::<_, Op>(
                                 index,
@@ -364,6 +384,15 @@ impl SearchBuilder for MaxsimBuilder {
                                 make_h0_stream_prefetcher.clone(),
                             ),
                         };
+                        let refine_active = maxsim_refine != 0 && !results.is_empty();
+                        let search_results = results.len() as u64;
+                        let token_search_elapsed = token_search_timer.elapsed();
+                        profile::update(|profile| {
+                            profile.token_search_calls += 1;
+                            profile.token_search_us += profile::duration_us(token_search_elapsed);
+                            profile.token_search_results += search_results;
+                        });
+                        let token_refine_timer = profile::ProfileTimer::start();
                         let (mut accu_set, mut rough_set) = (Vec::new(), Vec::new());
                         if maxsim_refine != 0 && !results.is_empty() {
                             let sequence = Heap::from(results);
@@ -468,6 +497,13 @@ impl SearchBuilder for MaxsimBuilder {
                             let rough_iter = results.into_iter();
                             rough_set.extend(rough_iter.map(rough_map));
                         }
+                        let token_refine_elapsed = token_refine_timer.elapsed();
+                        profile::update(|profile| {
+                            profile.token_refine_calls += u64::from(refine_active);
+                            profile.token_refine_us += profile::duration_us(token_refine_elapsed);
+                            profile.accurate_token_hits += accu_set.len() as u64;
+                            profile.rough_token_hits += rough_set.len() as u64;
+                        });
                         (accu_set, rough_set, estimation_by_threshold)
                     }))
                 }
@@ -484,6 +520,7 @@ impl SearchBuilder for MaxsimBuilder {
                         })
                         .collect::<Vec<_>>();
                     Box::new((0..n).map(move |i| {
+                        let token_search_timer = profile::ProfileTimer::start();
                         let (results, estimation_by_threshold) = match options.io_search {
                             Io::Plain => maxsim_search::<_, Op>(
                                 index,
@@ -516,6 +553,15 @@ impl SearchBuilder for MaxsimBuilder {
                                 make_h0_stream_prefetcher.clone(),
                             ),
                         };
+                        let refine_active = maxsim_refine != 0 && !results.is_empty();
+                        let search_results = results.len() as u64;
+                        let token_search_elapsed = token_search_timer.elapsed();
+                        profile::update(|profile| {
+                            profile.token_search_calls += 1;
+                            profile.token_search_us += profile::duration_us(token_search_elapsed);
+                            profile.token_search_results += search_results;
+                        });
+                        let token_refine_timer = profile::ProfileTimer::start();
                         let (mut accu_set, mut rough_set) = (Vec::new(), Vec::new());
                         if maxsim_refine != 0 && !results.is_empty() {
                             let sequence = Heap::from(results);
@@ -620,6 +666,13 @@ impl SearchBuilder for MaxsimBuilder {
                             let rough_iter = results.into_iter();
                             rough_set.extend(rough_iter.map(rough_map));
                         }
+                        let token_refine_elapsed = token_refine_timer.elapsed();
+                        profile::update(|profile| {
+                            profile.token_refine_calls += u64::from(refine_active);
+                            profile.token_refine_us += profile::duration_us(token_refine_elapsed);
+                            profile.accurate_token_hits += accu_set.len() as u64;
+                            profile.rough_token_hits += rough_set.len() as u64;
+                        });
                         (accu_set, rough_set, estimation_by_threshold)
                     }))
                 }
@@ -636,6 +689,7 @@ impl SearchBuilder for MaxsimBuilder {
                         })
                         .collect::<Vec<_>>();
                     Box::new((0..n).map(move |i| {
+                        let token_search_timer = profile::ProfileTimer::start();
                         let (results, estimation_by_threshold) = match options.io_search {
                             Io::Plain => maxsim_search::<_, Op>(
                                 index,
@@ -668,6 +722,15 @@ impl SearchBuilder for MaxsimBuilder {
                                 make_h0_stream_prefetcher.clone(),
                             ),
                         };
+                        let refine_active = maxsim_refine != 0 && !results.is_empty();
+                        let search_results = results.len() as u64;
+                        let token_search_elapsed = token_search_timer.elapsed();
+                        profile::update(|profile| {
+                            profile.token_search_calls += 1;
+                            profile.token_search_us += profile::duration_us(token_search_elapsed);
+                            profile.token_search_results += search_results;
+                        });
+                        let token_refine_timer = profile::ProfileTimer::start();
                         let (mut accu_set, mut rough_set) = (Vec::new(), Vec::new());
                         if maxsim_refine != 0 && !results.is_empty() {
                             let sequence = Heap::from(results);
@@ -772,6 +835,13 @@ impl SearchBuilder for MaxsimBuilder {
                             let rough_iter = results.into_iter();
                             rough_set.extend(rough_iter.map(rough_map));
                         }
+                        let token_refine_elapsed = token_refine_timer.elapsed();
+                        profile::update(|profile| {
+                            profile.token_refine_calls += u64::from(refine_active);
+                            profile.token_refine_us += profile::duration_us(token_refine_elapsed);
+                            profile.accurate_token_hits += accu_set.len() as u64;
+                            profile.rough_token_hits += rough_set.len() as u64;
+                        });
                         (accu_set, rough_set, estimation_by_threshold)
                     }))
                 }
@@ -779,7 +849,7 @@ impl SearchBuilder for MaxsimBuilder {
             iter
         };
         let mut candidates =
-            LegacyPageCandidateGenerator.generate(n, &mut token_searches, maxsim_candidate_limit);
+            DensePageCandidateGenerator.generate(n, &mut token_searches, maxsim_candidate_limit);
         drop(token_searches);
         let iter: Box<dyn Iterator<Item = _>> = match maxsim_backend {
             PostgresMaxsimBackend::CoarseOnly => Box::new(candidates.map(|candidate| {

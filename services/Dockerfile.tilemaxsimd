@@ -1,0 +1,22 @@
+ARG CUDA_DEVEL_IMAGE=nvidia/cuda:12.6.3-devel-ubuntu24.04
+ARG CUDA_RUNTIME_IMAGE=nvidia/cuda:12.6.3-runtime-ubuntu24.04
+
+FROM ${CUDA_DEVEL_IMAGE} AS build
+
+RUN apt-get update \
+    && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+        build-essential ca-certificates curl \
+    && rm -rf /var/lib/apt/lists/*
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+    | sh -s -- -y --profile minimal --default-toolchain 1.96.0
+
+ENV PATH=/root/.cargo/bin:${PATH}
+WORKDIR /build/tilemaxsimd
+COPY services/tilemaxsimd/ .
+RUN cargo build --release --locked
+
+FROM ${CUDA_RUNTIME_IMAGE}
+
+COPY --from=build /build/tilemaxsimd/target/release/tilemaxsimd /usr/local/bin/tilemaxsimd
+
+ENTRYPOINT ["/usr/local/bin/tilemaxsimd"]
