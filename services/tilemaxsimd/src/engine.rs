@@ -1,7 +1,7 @@
 use crate::cache::{Admission, GpuCache};
 use crate::gpu::Gpu;
 use crate::protocol::{Descriptor, Request};
-use crate::shard::{ShardStore, cache_key};
+use crate::shard::{HostCacheStatus, ShardStore, cache_key};
 use anyhow::{Result, anyhow, bail};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -34,6 +34,37 @@ pub struct Engine {
     devices: Vec<DeviceState>,
     store: ShardStore,
     next_device: usize,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct DeviceStatus {
+    pub slot: usize,
+    pub device: i32,
+    pub capacity_bytes: usize,
+    pub block_bytes: usize,
+    pub free_bytes: usize,
+    pub largest_free_extent_bytes: usize,
+    pub allocated_bytes: usize,
+    pub payload_bytes: usize,
+    pub internal_waste_bytes: usize,
+    pub entries: usize,
+    pub pinned_entries: usize,
+    pub pinned_bytes: usize,
+    pub tenants: usize,
+    pub hits: u64,
+    pub misses: u64,
+    pub evictions: u64,
+    pub admission_rejections: u64,
+    pub h2d_batches: u64,
+    pub h2d_bytes: u64,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct EngineStatus {
+    pub devices: Vec<DeviceStatus>,
+    pub host: HostCacheStatus,
+    pub batch_read_calls: u64,
+    pub batch_read_bytes: u64,
 }
 
 impl Engine {
@@ -526,32 +557,69 @@ impl Engine {
         Ok(())
     }
 
-    pub fn status_json(&self) -> serde_json::Value {
-        let (host_hits, host_misses, host_evictions, host_rejections) = self.store.host_status();
+    pub fn status_snapshot(&self) -> EngineStatus {
         let devices = self
             .devices
             .iter()
             .enumerate()
-            .map(|(index, device)| {
+            .map(|(slot, device)| DeviceStatus {
+                slot,
+                device: device.gpu.device(),
+                capacity_bytes: device.cache.capacity(),
+                block_bytes: device.cache.block_bytes(),
+                free_bytes: device.cache.free_bytes(),
+                largest_free_extent_bytes: device.cache.largest_free_extent(),
+                allocated_bytes: device.cache.allocated_bytes(),
+                payload_bytes: device.cache.payload_bytes(),
+                internal_waste_bytes: device
+                    .cache
+                    .allocated_bytes()
+                    .saturating_sub(device.cache.payload_bytes()),
+                entries: device.cache.entry_count(),
+                pinned_entries: device.cache.pinned_entries(),
+                pinned_bytes: device.cache.pinned_bytes(),
+                tenants: device.cache.tenant_count(),
+                hits: device.cache.hits,
+                misses: device.cache.misses,
+                evictions: device.cache.evictions,
+                admission_rejections: device.cache.admission_rejections,
+                h2d_batches: device.h2d_batches,
+                h2d_bytes: device.h2d_bytes,
+            })
+            .collect();
+        EngineStatus {
+            devices,
+            host: self.store.host_status(),
+            batch_read_calls: self.store.batch_read_calls,
+            batch_read_bytes: self.store.batch_read_bytes,
+        }
+    }
+
+    pub fn status_json(&self) -> serde_json::Value {
+        let status = self.status_snapshot();
+        let devices = status
+            .devices
+            .iter()
+            .map(|device| {
                 serde_json::json!({
-                    "index": index,
+                    "index": device.slot,
+                    "device": device.device,
                     "gpu_allocator": "segregated-page-runs",
-                    "gpu_tensor_bytes": device.cache.capacity(),
-                    "gpu_block_bytes": device.cache.block_bytes(),
-                    "gpu_free_bytes": device.cache.free_bytes(),
-                    "gpu_largest_free_extent_bytes": device.cache.largest_free_extent(),
-                    "gpu_allocated_bytes": device.cache.allocated_bytes(),
-                    "gpu_payload_bytes": device.cache.payload_bytes(),
-                    "gpu_internal_waste_bytes": device.cache.allocated_bytes()
-                        - device.cache.payload_bytes(),
-                    "gpu_entries": device.cache.entry_count(),
-                    "gpu_pinned_entries": device.cache.pinned_entries(),
-                    "gpu_pinned_bytes": device.cache.pinned_bytes(),
-                    "gpu_tenant_count": device.cache.tenant_count(),
-                    "gpu_hits": device.cache.hits,
-                    "gpu_misses": device.cache.misses,
-                    "gpu_evictions": device.cache.evictions,
-                    "gpu_admission_rejections": device.cache.admission_rejections,
+                    "gpu_tensor_bytes": device.capacity_bytes,
+                    "gpu_block_bytes": device.block_bytes,
+                    "gpu_free_bytes": device.free_bytes,
+                    "gpu_largest_free_extent_bytes": device.largest_free_extent_bytes,
+                    "gpu_allocated_bytes": device.allocated_bytes,
+                    "gpu_payload_bytes": device.payload_bytes,
+                    "gpu_internal_waste_bytes": device.internal_waste_bytes,
+                    "gpu_entries": device.entries,
+                    "gpu_pinned_entries": device.pinned_entries,
+                    "gpu_pinned_bytes": device.pinned_bytes,
+                    "gpu_tenant_count": device.tenants,
+                    "gpu_hits": device.hits,
+                    "gpu_misses": device.misses,
+                    "gpu_evictions": device.evictions,
+                    "gpu_admission_rejections": device.admission_rejections,
                     "h2d_batches": device.h2d_batches,
                     "h2d_bytes": device.h2d_bytes,
                 })
@@ -559,12 +627,16 @@ impl Engine {
             .collect::<Vec<_>>();
         serde_json::json!({
             "devices": devices,
-            "host_hits": host_hits,
-            "host_misses": host_misses,
-            "host_evictions": host_evictions,
-            "host_admission_rejections": host_rejections,
-            "batch_read_calls": self.store.batch_read_calls,
-            "batch_read_bytes": self.store.batch_read_bytes,
+            "host_capacity_bytes": status.host.capacity_bytes,
+            "host_used_bytes": status.host.used_bytes,
+            "host_entries": status.host.entries,
+            "host_tenant_count": status.host.tenants,
+            "host_hits": status.host.hits,
+            "host_misses": status.host.misses,
+            "host_evictions": status.host.evictions,
+            "host_admission_rejections": status.host.admission_rejections,
+            "batch_read_calls": status.batch_read_calls,
+            "batch_read_bytes": status.batch_read_bytes,
         })
     }
 }

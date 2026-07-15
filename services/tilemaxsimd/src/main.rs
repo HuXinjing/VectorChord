@@ -7,7 +7,7 @@ mod shard;
 
 use anyhow::{Context, Result, anyhow, bail};
 use clap::Parser;
-use engine::Engine;
+use engine::{Engine, EngineStatus};
 use gpu::Gpu;
 use protocol::{HEADER_BYTES, VERSION_EXTERNAL, VERSION_SCHEDULED_EXTERNAL};
 use scheduler::{RequestQueue, Scheduled, SchedulerPolicy};
@@ -15,6 +15,7 @@ use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use shard::ShardStore;
 use std::collections::HashMap;
+use std::fmt::Write as FmtWrite;
 use std::fs::{self, OpenOptions};
 use std::io::{BufRead, Read, Write};
 use std::os::fd::AsRawFd;
@@ -298,15 +299,25 @@ fn main() -> Result<()> {
         bail!("status socket must differ from the TileMaxSim protocol socket");
     }
     let reload = Arc::new(AtomicBool::new(false));
-    let metrics = Arc::new(RuntimeMetrics::default());
+    let metrics = Arc::new(RuntimeMetrics::new(
+        args.max_connections,
+        args.max_queued_requests,
+        args.max_tenant_queued_requests,
+        args.max_inflight_request_gb,
+    ));
+    metrics.update_engine(engine.status_snapshot());
     install_signal_handlers()?;
     let ready_cache = engine.status_json();
 
     let (sender, receiver) = mpsc::sync_channel::<Work>(args.max_queued_requests);
-    let frame_admission = Arc::new(ByteAdmission::new(args.max_inflight_request_gb));
+    let frame_admission = Arc::new(ByteAdmission::new(
+        args.max_inflight_request_gb,
+        Arc::clone(&metrics),
+    ));
     let pending_admission = Arc::new(PendingAdmission::new(
         args.max_queued_requests,
         args.max_tenant_queued_requests,
+        Arc::clone(&metrics),
     ));
     let tenant_weights = args.tenant_weights.iter().cloned().collect();
     let scheduler_config = SchedulerConfig {
@@ -368,7 +379,6 @@ fn main() -> Result<()> {
         })
     );
 
-    let live_readers = Arc::new(AtomicUsize::new(0));
     let mut readers = Vec::new();
     let mut accepted = 0_usize;
     let mut status_failed = false;
@@ -396,18 +406,18 @@ fn main() -> Result<()> {
         reap_readers(&mut readers);
         match listener.accept() {
             Ok((connection, _)) => {
-                if !try_acquire_reader(&live_readers, args.max_connections) {
+                if !try_acquire_reader(&metrics.active_connections, args.max_connections) {
                     // Closing immediately is deliberate: we have not read enough
                     // bytes to know whether the peer expects a v2 or v3 response.
-                    metrics.rejected_global.fetch_add(1, Ordering::Relaxed);
+                    metrics.rejected_connections.fetch_add(1, Ordering::Relaxed);
                     drop(connection);
                     continue;
                 }
                 accepted += 1;
                 let reader_sender = sender.clone();
-                let reader_count = Arc::clone(&live_readers);
-                let reader_admission = Arc::clone(&pending_admission);
                 let reader_metrics = Arc::clone(&metrics);
+                let reader_admission = Arc::clone(&pending_admission);
+                let request_metrics = Arc::clone(&metrics);
                 let reader_frame_admission = Arc::clone(&frame_admission);
                 let reader_config = ReaderConfig {
                     maximum: args.max_request_bytes,
@@ -417,19 +427,19 @@ fn main() -> Result<()> {
                 match thread::Builder::new()
                     .name("tilemaxsim-reader".to_owned())
                     .spawn(move || {
-                        let _permit = ReaderPermit(reader_count);
+                        let _permit = ReaderPermit(reader_metrics);
                         read_and_enqueue(
                             connection,
                             &reader_sender,
                             reader_config,
                             reader_admission,
-                            reader_metrics,
+                            request_metrics,
                             reader_frame_admission,
                         );
                     }) {
                     Ok(reader) => readers.push(reader),
                     Err(error) => {
-                        live_readers.fetch_sub(1, Ordering::Release);
+                        metrics.active_connections.fetch_sub(1, Ordering::Release);
                         metrics.ready.store(false, Ordering::Release);
                         SHUTDOWN_REQUESTED.store(true, Ordering::Release);
                         fatal_error = Some(error.into());
@@ -513,21 +523,101 @@ struct SchedulerConfig {
 #[derive(Default)]
 struct RuntimeMetrics {
     ready: AtomicBool,
+    max_connections: usize,
+    max_pending_requests: usize,
+    max_tenant_pending_requests: usize,
+    max_inflight_request_bytes: usize,
+    active_connections: AtomicUsize,
+    inflight_request_bytes: AtomicUsize,
+    pending_requests: AtomicUsize,
+    pending_tenants: AtomicUsize,
     scheduler_depth: AtomicUsize,
+    scheduler_depth_high_water: AtomicUsize,
     gpu_active: AtomicUsize,
     completed: AtomicU64,
     failed: AtomicU64,
     timed_out: AtomicU64,
     disconnected: AtomicU64,
-    rejected_global: AtomicU64,
+    rejected_connections: AtomicU64,
+    rejected_frame_bytes: AtomicU64,
+    rejected_queue_global: AtomicU64,
     rejected_tenant: AtomicU64,
+    frame_read_failures: AtomicU64,
+    invalid_requests: AtomicU64,
+    gpu_failures: AtomicU64,
+    scheduler_failures: AtomicU64,
+    reload_succeeded: AtomicU64,
+    reload_failed: AtomicU64,
+    timeout_before_enqueue: AtomicU64,
+    timeout_in_queue: AtomicU64,
+    timeout_before_execution: AtomicU64,
+    timeout_during_execution: AtomicU64,
+    gpu_quantums: AtomicU64,
+    scheduler_requeues: AtomicU64,
+    admitted_priority_negative: AtomicU64,
+    admitted_priority_zero: AtomicU64,
+    admitted_priority_positive: AtomicU64,
+    candidates_scored: AtomicU64,
+    document_rows_scored: AtomicU64,
+    latency_observations: AtomicU64,
+    total_latency_us: AtomicU64,
+    gpu_latency_us: AtomicU64,
+    engine: Mutex<EngineStatus>,
 }
 
-struct ReaderPermit(Arc<AtomicUsize>);
+impl RuntimeMetrics {
+    fn new(
+        max_connections: usize,
+        max_pending_requests: usize,
+        max_tenant_pending_requests: usize,
+        max_inflight_request_bytes: usize,
+    ) -> Self {
+        Self {
+            max_connections,
+            max_pending_requests,
+            max_tenant_pending_requests,
+            max_inflight_request_bytes,
+            ..Self::default()
+        }
+    }
+
+    fn update_engine(&self, status: EngineStatus) {
+        *self
+            .engine
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = status;
+    }
+
+    fn update_scheduler_depth(&self, depth: usize) {
+        self.scheduler_depth.store(depth, Ordering::Relaxed);
+        self.scheduler_depth_high_water
+            .fetch_max(depth, Ordering::Relaxed);
+    }
+
+    fn observe_latency(&self, total: Duration, gpu: Duration) {
+        self.latency_observations.fetch_add(1, Ordering::Relaxed);
+        saturating_atomic_add(&self.total_latency_us, duration_micros(total));
+        saturating_atomic_add(&self.gpu_latency_us, duration_micros(gpu));
+    }
+}
+
+fn duration_micros(duration: Duration) -> u64 {
+    u64::try_from(duration.as_micros()).unwrap_or(u64::MAX)
+}
+
+fn saturating_atomic_add(counter: &AtomicU64, value: u64) {
+    counter
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+            Some(current.saturating_add(value))
+        })
+        .ok();
+}
+
+struct ReaderPermit(Arc<RuntimeMetrics>);
 
 impl Drop for ReaderPermit {
     fn drop(&mut self) {
-        self.0.fetch_sub(1, Ordering::Release);
+        self.0.active_connections.fetch_sub(1, Ordering::Release);
     }
 }
 
@@ -540,11 +630,13 @@ struct PendingAdmission {
     state: Mutex<PendingState>,
     max_total: usize,
     max_tenant: usize,
+    metrics: Arc<RuntimeMetrics>,
 }
 
 struct ByteAdmission {
     used: AtomicUsize,
     maximum: usize,
+    metrics: Arc<RuntimeMetrics>,
 }
 
 struct BytePermit {
@@ -553,21 +645,32 @@ struct BytePermit {
 }
 
 impl ByteAdmission {
-    fn new(maximum: usize) -> Self {
+    fn new(maximum: usize, metrics: Arc<RuntimeMetrics>) -> Self {
         Self {
             used: AtomicUsize::new(0),
             maximum,
+            metrics,
         }
     }
 
     fn try_acquire(self: &Arc<Self>, bytes: usize) -> Option<BytePermit> {
-        self.used
+        let result = self
+            .used
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
                 current
                     .checked_add(bytes)
                     .filter(|next| *next <= self.maximum)
             })
-            .ok()?;
+            .ok();
+        if result.is_none() {
+            self.metrics
+                .rejected_frame_bytes
+                .fetch_add(1, Ordering::Relaxed);
+            return None;
+        }
+        self.metrics
+            .inflight_request_bytes
+            .fetch_add(bytes, Ordering::Relaxed);
         Some(BytePermit {
             admission: Arc::clone(self),
             bytes,
@@ -578,6 +681,10 @@ impl ByteAdmission {
 impl Drop for BytePermit {
     fn drop(&mut self) {
         self.admission.used.fetch_sub(self.bytes, Ordering::Release);
+        self.admission
+            .metrics
+            .inflight_request_bytes
+            .fetch_sub(self.bytes, Ordering::Release);
     }
 }
 
@@ -593,7 +700,7 @@ struct PendingPermit {
 }
 
 impl PendingAdmission {
-    fn new(max_total: usize, max_tenant: usize) -> Self {
+    fn new(max_total: usize, max_tenant: usize, metrics: Arc<RuntimeMetrics>) -> Self {
         Self {
             state: Mutex::new(PendingState {
                 total: 0,
@@ -601,6 +708,7 @@ impl PendingAdmission {
             }),
             max_total,
             max_tenant,
+            metrics,
         }
     }
 
@@ -614,6 +722,12 @@ impl PendingAdmission {
         }
         state.total += 1;
         *state.tenants.entry(tenant.to_owned()).or_default() += 1;
+        self.metrics
+            .pending_requests
+            .store(state.total, Ordering::Relaxed);
+        self.metrics
+            .pending_tenants
+            .store(state.tenants.len(), Ordering::Relaxed);
         Ok(PendingPermit {
             admission: Arc::clone(self),
             tenant: tenant.to_owned(),
@@ -635,6 +749,14 @@ impl Drop for PendingPermit {
                 state.tenants.remove(&self.tenant);
             }
         }
+        self.admission
+            .metrics
+            .pending_requests
+            .store(state.total, Ordering::Relaxed);
+        self.admission
+            .metrics
+            .pending_tenants
+            .store(state.tenants.len(), Ordering::Relaxed);
     }
 }
 
@@ -686,15 +808,16 @@ fn read_and_enqueue(
     }
     let (frame, frame_permit) =
         match read_request(&mut connection, config.maximum, &frame_admission) {
-        Ok(frame) => frame,
-        Err(error) => {
-            metrics.failed.fetch_add(1, Ordering::Relaxed);
-            write_response_nonfatal(
-                &mut connection,
-                &protocol::failure(VERSION_EXTERNAL, 0, 1, &format!("{error:#}")),
-            );
-            return;
-        }
+            Ok(frame) => frame,
+            Err(error) => {
+                metrics.failed.fetch_add(1, Ordering::Relaxed);
+                metrics.frame_read_failures.fetch_add(1, Ordering::Relaxed);
+                write_response_nonfatal(
+                    &mut connection,
+                    &protocol::failure(VERSION_EXTERNAL, 0, 1, &format!("{error:#}")),
+                );
+                return;
+            }
         };
     let version = header_version(&frame);
     let request_id = header_request_id(&frame);
@@ -702,6 +825,7 @@ fn read_and_enqueue(
         Ok(request) => request,
         Err(error) => {
             metrics.failed.fetch_add(1, Ordering::Relaxed);
+            metrics.invalid_requests.fetch_add(1, Ordering::Relaxed);
             write_response_nonfatal(
                 &mut connection,
                 &protocol::failure(version, request_id, 1, &format!("{error:#}")),
@@ -719,6 +843,9 @@ fn read_and_enqueue(
         .unwrap_or(accepted_at);
     if deadline <= Instant::now() {
         metrics.timed_out.fetch_add(1, Ordering::Relaxed);
+        metrics
+            .timeout_before_enqueue
+            .fetch_add(1, Ordering::Relaxed);
         write_response_nonfatal(
             &mut connection,
             &protocol::failure(
@@ -733,7 +860,9 @@ fn read_and_enqueue(
     let pending_permit = match pending_admission.try_acquire(&request.tenant) {
         Ok(permit) => permit,
         Err(AdmissionRejection::Global) => {
-            metrics.rejected_global.fetch_add(1, Ordering::Relaxed);
+            metrics
+                .rejected_queue_global
+                .fetch_add(1, Ordering::Relaxed);
             write_response_nonfatal(
                 &mut connection,
                 &protocol::failure(version, request_id, 2, "TileMaxSim scheduler queue is full"),
@@ -767,7 +896,9 @@ fn read_and_enqueue(
     }) {
         Ok(()) => {}
         Err(mpsc::TrySendError::Full(mut work)) => {
-            metrics.rejected_global.fetch_add(1, Ordering::Relaxed);
+            metrics
+                .rejected_queue_global
+                .fetch_add(1, Ordering::Relaxed);
             write_response_nonfatal(
                 &mut work.connection,
                 &protocol::failure(
@@ -780,6 +911,7 @@ fn read_and_enqueue(
         }
         Err(mpsc::TrySendError::Disconnected(mut work)) => {
             metrics.failed.fetch_add(1, Ordering::Relaxed);
+            metrics.scheduler_failures.fetch_add(1, Ordering::Relaxed);
             write_response_nonfatal(
                 &mut work.connection,
                 &protocol::failure(
@@ -810,11 +942,18 @@ fn run_scheduler(
     while channel_open || queue.len() > 0 {
         if reload.swap(false, Ordering::AcqRel) {
             match engine.reload_shards() {
-                Ok(()) => println!(
-                    "{}",
-                    serde_json::json!({"event": "tilemaxsim_rust_shards_reloaded"})
-                ),
-                Err(error) => eprintln!("TileMaxSim shard reload rejected: {error:#}"),
+                Ok(()) => {
+                    metrics.reload_succeeded.fetch_add(1, Ordering::Relaxed);
+                    metrics.update_engine(engine.status_snapshot());
+                    println!(
+                        "{}",
+                        serde_json::json!({"event": "tilemaxsim_rust_shards_reloaded"})
+                    );
+                }
+                Err(error) => {
+                    metrics.reload_failed.fetch_add(1, Ordering::Relaxed);
+                    eprintln!("TileMaxSim shard reload rejected: {error:#}");
+                }
             }
         }
 
@@ -846,6 +985,8 @@ fn run_scheduler(
         let now = Instant::now();
         for mut expired in queue.drain_expired(now) {
             metrics.timed_out.fetch_add(1, Ordering::Relaxed);
+            metrics.timeout_in_queue.fetch_add(1, Ordering::Relaxed);
+            metrics.observe_latency(expired.payload.accepted_at.elapsed(), Duration::ZERO);
             write_response_nonfatal(
                 &mut expired.payload.connection,
                 &protocol::failure(
@@ -856,17 +997,14 @@ fn run_scheduler(
                 ),
             );
         }
-        metrics
-            .scheduler_depth
-            .store(queue.len(), Ordering::Relaxed);
+        metrics.update_scheduler_depth(queue.len());
         let Some(scheduled) = queue.pop(Instant::now()) else {
             continue;
         };
-        metrics
-            .scheduler_depth
-            .store(queue.len(), Ordering::Relaxed);
+        metrics.update_scheduler_depth(queue.len());
         if peer_disconnected(&scheduled.payload.connection) {
             metrics.disconnected.fetch_add(1, Ordering::Relaxed);
+            metrics.observe_latency(scheduled.payload.accepted_at.elapsed(), Duration::ZERO);
             continue;
         }
         let started = Instant::now();
@@ -877,6 +1015,9 @@ fn run_scheduler(
         let priority = work.request.priority;
         let response = if work.deadline <= started {
             metrics.timed_out.fetch_add(1, Ordering::Relaxed);
+            metrics
+                .timeout_before_execution
+                .fetch_add(1, Ordering::Relaxed);
             Some(protocol::failure(
                 version,
                 request_id,
@@ -898,15 +1039,33 @@ fn run_scheduler(
                 candidates: work.request.candidates[work.next_candidate..end].to_vec(),
             };
             let quantum_started = Instant::now();
+            metrics.gpu_quantums.fetch_add(1, Ordering::Relaxed);
+            saturating_atomic_add(
+                &metrics.candidates_scored,
+                u64::try_from(end - work.next_candidate).unwrap_or(u64::MAX),
+            );
+            saturating_atomic_add(
+                &metrics.document_rows_scored,
+                quantum
+                    .candidates
+                    .iter()
+                    .map(|candidate| u64::from(candidate.rows))
+                    .sum(),
+            );
             metrics.gpu_active.store(1, Ordering::Relaxed);
-            match engine.score(&quantum) {
+            let score_result = engine.score(&quantum);
+            metrics.gpu_active.store(0, Ordering::Relaxed);
+            metrics.update_engine(engine.status_snapshot());
+            match score_result {
                 Ok(results) => {
-                    metrics.gpu_active.store(0, Ordering::Relaxed);
                     work.gpu_elapsed += quantum_started.elapsed();
                     work.results.extend(results);
                     work.next_candidate = end;
                     if work.deadline <= Instant::now() {
                         metrics.timed_out.fetch_add(1, Ordering::Relaxed);
+                        metrics
+                            .timeout_during_execution
+                            .fetch_add(1, Ordering::Relaxed);
                         Some(protocol::failure(
                             version,
                             request_id,
@@ -914,6 +1073,7 @@ fn run_scheduler(
                             "request deadline expired during GPU execution",
                         ))
                     } else if end < work.request.candidates.len() {
+                        metrics.scheduler_requeues.fetch_add(1, Ordering::Relaxed);
                         let cost = estimated_next_work(&work, &config);
                         queue.push(Scheduled::new(
                             tenant.clone(),
@@ -923,9 +1083,7 @@ fn run_scheduler(
                             work.deadline,
                             work,
                         ));
-                        metrics
-                            .scheduler_depth
-                            .store(queue.len(), Ordering::Relaxed);
+                        metrics.update_scheduler_depth(queue.len());
                         continue;
                     } else {
                         metrics.completed.fetch_add(1, Ordering::Relaxed);
@@ -933,8 +1091,8 @@ fn run_scheduler(
                     }
                 }
                 Err(error) => {
-                    metrics.gpu_active.store(0, Ordering::Relaxed);
                     metrics.failed.fetch_add(1, Ordering::Relaxed);
+                    metrics.gpu_failures.fetch_add(1, Ordering::Relaxed);
                     work.gpu_elapsed += quantum_started.elapsed();
                     Some(protocol::failure(
                         version,
@@ -952,6 +1110,7 @@ fn run_scheduler(
             .set_write_timeout(Some(config.socket_io_timeout))
             .ok();
         write_response_nonfatal(&mut work.connection, &response);
+        metrics.observe_latency(work.accepted_at.elapsed(), work.gpu_elapsed);
         println!(
             "{}",
             serde_json::json!({
@@ -976,6 +1135,17 @@ fn enqueue_work(
     config: &SchedulerConfig,
     metrics: &RuntimeMetrics,
 ) {
+    match work.request.priority.cmp(&0) {
+        std::cmp::Ordering::Less => metrics
+            .admitted_priority_negative
+            .fetch_add(1, Ordering::Relaxed),
+        std::cmp::Ordering::Equal => metrics
+            .admitted_priority_zero
+            .fetch_add(1, Ordering::Relaxed),
+        std::cmp::Ordering::Greater => metrics
+            .admitted_priority_positive
+            .fetch_add(1, Ordering::Relaxed),
+    };
     let cost = estimated_next_work(&work, config);
     queue.push(Scheduled::new(
         work.request.tenant.clone(),
@@ -985,9 +1155,7 @@ fn enqueue_work(
         work.deadline,
         work,
     ));
-    metrics
-        .scheduler_depth
-        .store(queue.len(), Ordering::Relaxed);
+    metrics.update_scheduler_depth(queue.len());
 }
 
 fn tenant_hash(tenant: &str) -> String {
@@ -1136,38 +1304,540 @@ fn handle_status_connection(connection: &mut UnixStream, metrics: &RuntimeMetric
 }
 
 fn render_metrics(metrics: &RuntimeMetrics) -> String {
-    format!(
-        concat!(
-            "# HELP tilemaxsim_ready Whether the daemon is ready to accept work.\n",
-            "# TYPE tilemaxsim_ready gauge\n",
-            "tilemaxsim_ready {}\n",
-            "# HELP tilemaxsim_scheduler_queue_depth Requests waiting for a GPU quantum.\n",
-            "# TYPE tilemaxsim_scheduler_queue_depth gauge\n",
-            "tilemaxsim_scheduler_queue_depth {}\n",
-            "# HELP tilemaxsim_gpu_active Whether a CUDA quantum is executing.\n",
-            "# TYPE tilemaxsim_gpu_active gauge\n",
-            "tilemaxsim_gpu_active {}\n",
-            "# HELP tilemaxsim_requests_total Completed request outcomes.\n",
-            "# TYPE tilemaxsim_requests_total counter\n",
-            "tilemaxsim_requests_total{{outcome=\"completed\"}} {}\n",
-            "tilemaxsim_requests_total{{outcome=\"failed\"}} {}\n",
-            "tilemaxsim_requests_total{{outcome=\"timeout\"}} {}\n",
-            "tilemaxsim_requests_total{{outcome=\"disconnected\"}} {}\n",
-            "# HELP tilemaxsim_admission_rejections_total Admission rejections.\n",
-            "# TYPE tilemaxsim_admission_rejections_total counter\n",
-            "tilemaxsim_admission_rejections_total{{reason=\"global\"}} {}\n",
-            "tilemaxsim_admission_rejections_total{{reason=\"tenant\"}} {}\n",
-        ),
-        usize::from(metrics.ready.load(Ordering::Relaxed)),
-        metrics.scheduler_depth.load(Ordering::Relaxed),
-        metrics.gpu_active.load(Ordering::Relaxed),
-        metrics.completed.load(Ordering::Relaxed),
-        metrics.failed.load(Ordering::Relaxed),
-        metrics.timed_out.load(Ordering::Relaxed),
-        metrics.disconnected.load(Ordering::Relaxed),
-        metrics.rejected_global.load(Ordering::Relaxed),
-        metrics.rejected_tenant.load(Ordering::Relaxed),
+    let mut output = String::with_capacity(8 * 1024);
+    writeln!(
+        output,
+        "# HELP tilemaxsim_ready Whether the daemon is ready to accept work."
     )
+    .unwrap();
+    writeln!(output, "# TYPE tilemaxsim_ready gauge").unwrap();
+    writeln!(
+        output,
+        "tilemaxsim_ready {}",
+        usize::from(metrics.ready.load(Ordering::Relaxed))
+    )
+    .unwrap();
+    writeln!(
+        output,
+        "# HELP tilemaxsim_connections Active reader connections and configured limit."
+    )
+    .unwrap();
+    writeln!(output, "# TYPE tilemaxsim_connections gauge").unwrap();
+    writeln!(
+        output,
+        "tilemaxsim_connections{{kind=\"active\"}} {}",
+        metrics.active_connections.load(Ordering::Relaxed)
+    )
+    .unwrap();
+    writeln!(
+        output,
+        "tilemaxsim_connections{{kind=\"limit\"}} {}",
+        metrics.max_connections
+    )
+    .unwrap();
+    writeln!(
+        output,
+        "# HELP tilemaxsim_pending_requests Requests admitted but not yet completed."
+    )
+    .unwrap();
+    writeln!(output, "# TYPE tilemaxsim_pending_requests gauge").unwrap();
+    writeln!(
+        output,
+        "tilemaxsim_pending_requests{{kind=\"current\"}} {}",
+        metrics.pending_requests.load(Ordering::Relaxed)
+    )
+    .unwrap();
+    writeln!(
+        output,
+        "tilemaxsim_pending_requests{{kind=\"global_limit\"}} {}",
+        metrics.max_pending_requests
+    )
+    .unwrap();
+    writeln!(
+        output,
+        "tilemaxsim_pending_requests{{kind=\"per_tenant_limit\"}} {}",
+        metrics.max_tenant_pending_requests
+    )
+    .unwrap();
+    writeln!(
+        output,
+        "# HELP tilemaxsim_pending_tenants Tenants with admitted requests."
+    )
+    .unwrap();
+    writeln!(output, "# TYPE tilemaxsim_pending_tenants gauge").unwrap();
+    writeln!(
+        output,
+        "tilemaxsim_pending_tenants {}",
+        metrics.pending_tenants.load(Ordering::Relaxed)
+    )
+    .unwrap();
+    writeln!(
+        output,
+        "# HELP tilemaxsim_inflight_request_bytes Encoded request frames retained in memory."
+    )
+    .unwrap();
+    writeln!(output, "# TYPE tilemaxsim_inflight_request_bytes gauge").unwrap();
+    writeln!(
+        output,
+        "tilemaxsim_inflight_request_bytes{{kind=\"current\"}} {}",
+        metrics.inflight_request_bytes.load(Ordering::Relaxed)
+    )
+    .unwrap();
+    writeln!(
+        output,
+        "tilemaxsim_inflight_request_bytes{{kind=\"limit\"}} {}",
+        metrics.max_inflight_request_bytes
+    )
+    .unwrap();
+    writeln!(
+        output,
+        "# HELP tilemaxsim_scheduler_queue_depth Requests waiting for a GPU quantum."
+    )
+    .unwrap();
+    writeln!(output, "# TYPE tilemaxsim_scheduler_queue_depth gauge").unwrap();
+    writeln!(
+        output,
+        "tilemaxsim_scheduler_queue_depth{{kind=\"current\"}} {}",
+        metrics.scheduler_depth.load(Ordering::Relaxed)
+    )
+    .unwrap();
+    writeln!(
+        output,
+        "tilemaxsim_scheduler_queue_depth{{kind=\"high_water\"}} {}",
+        metrics.scheduler_depth_high_water.load(Ordering::Relaxed)
+    )
+    .unwrap();
+    writeln!(
+        output,
+        "# HELP tilemaxsim_gpu_active Whether a CUDA quantum is executing."
+    )
+    .unwrap();
+    writeln!(output, "# TYPE tilemaxsim_gpu_active gauge").unwrap();
+    writeln!(
+        output,
+        "tilemaxsim_gpu_active {}",
+        metrics.gpu_active.load(Ordering::Relaxed)
+    )
+    .unwrap();
+    writeln!(
+        output,
+        "# HELP tilemaxsim_requests_total Terminal request outcomes."
+    )
+    .unwrap();
+    writeln!(output, "# TYPE tilemaxsim_requests_total counter").unwrap();
+    for (outcome, value) in [
+        ("completed", metrics.completed.load(Ordering::Relaxed)),
+        ("failed", metrics.failed.load(Ordering::Relaxed)),
+        ("timeout", metrics.timed_out.load(Ordering::Relaxed)),
+        ("disconnected", metrics.disconnected.load(Ordering::Relaxed)),
+    ] {
+        writeln!(
+            output,
+            "tilemaxsim_requests_total{{outcome=\"{outcome}\"}} {value}"
+        )
+        .unwrap();
+    }
+    writeln!(
+        output,
+        "# HELP tilemaxsim_admission_rejections_total Bounded admission rejection reasons."
+    )
+    .unwrap();
+    writeln!(
+        output,
+        "# TYPE tilemaxsim_admission_rejections_total counter"
+    )
+    .unwrap();
+    for (reason, value) in [
+        (
+            "connections",
+            metrics.rejected_connections.load(Ordering::Relaxed),
+        ),
+        (
+            "frame_bytes",
+            metrics.rejected_frame_bytes.load(Ordering::Relaxed),
+        ),
+        (
+            "queue_global",
+            metrics.rejected_queue_global.load(Ordering::Relaxed),
+        ),
+        (
+            "queue_tenant",
+            metrics.rejected_tenant.load(Ordering::Relaxed),
+        ),
+    ] {
+        writeln!(
+            output,
+            "tilemaxsim_admission_rejections_total{{reason=\"{reason}\"}} {value}"
+        )
+        .unwrap();
+    }
+    writeln!(
+        output,
+        "# HELP tilemaxsim_failures_total Internal failure categories."
+    )
+    .unwrap();
+    writeln!(output, "# TYPE tilemaxsim_failures_total counter").unwrap();
+    for (reason, value) in [
+        (
+            "frame_io_or_validation",
+            metrics.frame_read_failures.load(Ordering::Relaxed),
+        ),
+        ("request", metrics.invalid_requests.load(Ordering::Relaxed)),
+        ("gpu", metrics.gpu_failures.load(Ordering::Relaxed)),
+        (
+            "scheduler",
+            metrics.scheduler_failures.load(Ordering::Relaxed),
+        ),
+    ] {
+        writeln!(
+            output,
+            "tilemaxsim_failures_total{{reason=\"{reason}\"}} {value}"
+        )
+        .unwrap();
+    }
+    writeln!(
+        output,
+        "# HELP tilemaxsim_timeouts_total Request timeout phase."
+    )
+    .unwrap();
+    writeln!(output, "# TYPE tilemaxsim_timeouts_total counter").unwrap();
+    for (phase, value) in [
+        (
+            "before_enqueue",
+            metrics.timeout_before_enqueue.load(Ordering::Relaxed),
+        ),
+        ("queue", metrics.timeout_in_queue.load(Ordering::Relaxed)),
+        (
+            "before_execution",
+            metrics.timeout_before_execution.load(Ordering::Relaxed),
+        ),
+        (
+            "gpu",
+            metrics.timeout_during_execution.load(Ordering::Relaxed),
+        ),
+    ] {
+        writeln!(
+            output,
+            "tilemaxsim_timeouts_total{{phase=\"{phase}\"}} {value}"
+        )
+        .unwrap();
+    }
+    writeln!(
+        output,
+        "# HELP tilemaxsim_requests_admitted_total Requests admitted by bounded priority class."
+    )
+    .unwrap();
+    writeln!(output, "# TYPE tilemaxsim_requests_admitted_total counter").unwrap();
+    for (priority_class, value) in [
+        (
+            "negative",
+            metrics.admitted_priority_negative.load(Ordering::Relaxed),
+        ),
+        (
+            "zero",
+            metrics.admitted_priority_zero.load(Ordering::Relaxed),
+        ),
+        (
+            "positive",
+            metrics.admitted_priority_positive.load(Ordering::Relaxed),
+        ),
+    ] {
+        writeln!(
+            output,
+            "tilemaxsim_requests_admitted_total{{priority_class=\"{priority_class}\"}} {value}"
+        )
+        .unwrap();
+    }
+    writeln!(
+        output,
+        "# HELP tilemaxsim_scheduler_quantums_total CUDA scheduling quanta executed."
+    )
+    .unwrap();
+    writeln!(output, "# TYPE tilemaxsim_scheduler_quantums_total counter").unwrap();
+    writeln!(
+        output,
+        "tilemaxsim_scheduler_quantums_total {}",
+        metrics.gpu_quantums.load(Ordering::Relaxed)
+    )
+    .unwrap();
+    writeln!(
+        output,
+        "# HELP tilemaxsim_scheduler_requeues_total Cooperative quantum yields requeued."
+    )
+    .unwrap();
+    writeln!(output, "# TYPE tilemaxsim_scheduler_requeues_total counter").unwrap();
+    writeln!(
+        output,
+        "tilemaxsim_scheduler_requeues_total {}",
+        metrics.scheduler_requeues.load(Ordering::Relaxed)
+    )
+    .unwrap();
+    writeln!(
+        output,
+        "# HELP tilemaxsim_candidates_scored_total Candidate tensors submitted to CUDA."
+    )
+    .unwrap();
+    writeln!(output, "# TYPE tilemaxsim_candidates_scored_total counter").unwrap();
+    writeln!(
+        output,
+        "tilemaxsim_candidates_scored_total {}",
+        metrics.candidates_scored.load(Ordering::Relaxed)
+    )
+    .unwrap();
+    writeln!(
+        output,
+        "# HELP tilemaxsim_document_rows_scored_total Document token rows submitted to CUDA."
+    )
+    .unwrap();
+    writeln!(
+        output,
+        "# TYPE tilemaxsim_document_rows_scored_total counter"
+    )
+    .unwrap();
+    writeln!(
+        output,
+        "tilemaxsim_document_rows_scored_total {}",
+        metrics.document_rows_scored.load(Ordering::Relaxed)
+    )
+    .unwrap();
+    let observations = metrics.latency_observations.load(Ordering::Relaxed);
+    let total_us = metrics.total_latency_us.load(Ordering::Relaxed);
+    let gpu_us = metrics.gpu_latency_us.load(Ordering::Relaxed);
+    writeln!(
+        output,
+        "# HELP tilemaxsim_request_duration_seconds Request wall-clock duration summary."
+    )
+    .unwrap();
+    writeln!(output, "# TYPE tilemaxsim_request_duration_seconds summary").unwrap();
+    writeln!(
+        output,
+        "tilemaxsim_request_duration_seconds_count {observations}"
+    )
+    .unwrap();
+    writeln!(
+        output,
+        "tilemaxsim_request_duration_seconds_sum {}",
+        total_us as f64 / 1_000_000.0
+    )
+    .unwrap();
+    writeln!(
+        output,
+        "# HELP tilemaxsim_gpu_duration_seconds CUDA execution duration summary."
+    )
+    .unwrap();
+    writeln!(output, "# TYPE tilemaxsim_gpu_duration_seconds summary").unwrap();
+    writeln!(
+        output,
+        "tilemaxsim_gpu_duration_seconds_count {observations}"
+    )
+    .unwrap();
+    writeln!(
+        output,
+        "tilemaxsim_gpu_duration_seconds_sum {}",
+        gpu_us as f64 / 1_000_000.0
+    )
+    .unwrap();
+    writeln!(
+        output,
+        "# HELP tilemaxsim_queue_duration_seconds Non-CUDA request duration summary."
+    )
+    .unwrap();
+    writeln!(output, "# TYPE tilemaxsim_queue_duration_seconds summary").unwrap();
+    writeln!(
+        output,
+        "tilemaxsim_queue_duration_seconds_count {observations}"
+    )
+    .unwrap();
+    writeln!(
+        output,
+        "tilemaxsim_queue_duration_seconds_sum {}",
+        total_us.saturating_sub(gpu_us) as f64 / 1_000_000.0
+    )
+    .unwrap();
+    writeln!(
+        output,
+        "# HELP tilemaxsim_shard_reloads_total Immutable shard metadata reload outcomes."
+    )
+    .unwrap();
+    writeln!(output, "# TYPE tilemaxsim_shard_reloads_total counter").unwrap();
+    writeln!(
+        output,
+        "tilemaxsim_shard_reloads_total{{outcome=\"success\"}} {}",
+        metrics.reload_succeeded.load(Ordering::Relaxed)
+    )
+    .unwrap();
+    writeln!(
+        output,
+        "tilemaxsim_shard_reloads_total{{outcome=\"failed\"}} {}",
+        metrics.reload_failed.load(Ordering::Relaxed)
+    )
+    .unwrap();
+
+    let engine = metrics
+        .engine
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .clone();
+    writeln!(
+        output,
+        "# HELP tilemaxsim_gpu_cache_bytes GPU tensor-cache byte accounting."
+    )
+    .unwrap();
+    writeln!(output, "# TYPE tilemaxsim_gpu_cache_bytes gauge").unwrap();
+    writeln!(
+        output,
+        "# HELP tilemaxsim_gpu_cache_entries GPU tensor-cache entry accounting."
+    )
+    .unwrap();
+    writeln!(output, "# TYPE tilemaxsim_gpu_cache_entries gauge").unwrap();
+    writeln!(
+        output,
+        "# HELP tilemaxsim_gpu_cache_events_total GPU tensor-cache cumulative events."
+    )
+    .unwrap();
+    writeln!(output, "# TYPE tilemaxsim_gpu_cache_events_total counter").unwrap();
+    writeln!(
+        output,
+        "# HELP tilemaxsim_gpu_h2d_batches_total Host-to-device transfer batches."
+    )
+    .unwrap();
+    writeln!(output, "# TYPE tilemaxsim_gpu_h2d_batches_total counter").unwrap();
+    writeln!(
+        output,
+        "# HELP tilemaxsim_gpu_h2d_bytes_total Host-to-device transfer bytes."
+    )
+    .unwrap();
+    writeln!(output, "# TYPE tilemaxsim_gpu_h2d_bytes_total counter").unwrap();
+    for device in &engine.devices {
+        for (kind, value) in [
+            ("capacity", device.capacity_bytes),
+            ("free", device.free_bytes),
+            ("largest_free_extent", device.largest_free_extent_bytes),
+            ("allocated", device.allocated_bytes),
+            ("payload", device.payload_bytes),
+            ("internal_waste", device.internal_waste_bytes),
+            ("pinned", device.pinned_bytes),
+            ("block", device.block_bytes),
+        ] {
+            writeln!(
+                output,
+                "tilemaxsim_gpu_cache_bytes{{slot=\"{}\",device=\"{}\",kind=\"{kind}\"}} {value}",
+                device.slot, device.device
+            )
+            .unwrap();
+        }
+        for (kind, value) in [
+            ("total", device.entries),
+            ("pinned", device.pinned_entries),
+            ("tenants", device.tenants),
+        ] {
+            writeln!(
+                output,
+                "tilemaxsim_gpu_cache_entries{{slot=\"{}\",device=\"{}\",kind=\"{kind}\"}} {value}",
+                device.slot, device.device
+            )
+            .unwrap();
+        }
+        for (event, value) in [
+            ("hit", device.hits),
+            ("miss", device.misses),
+            ("eviction", device.evictions),
+            ("admission_rejection", device.admission_rejections),
+        ] {
+            writeln!(output, "tilemaxsim_gpu_cache_events_total{{slot=\"{}\",device=\"{}\",event=\"{event}\"}} {value}", device.slot, device.device).unwrap();
+        }
+        writeln!(
+            output,
+            "tilemaxsim_gpu_h2d_batches_total{{slot=\"{}\",device=\"{}\"}} {}",
+            device.slot, device.device, device.h2d_batches
+        )
+        .unwrap();
+        writeln!(
+            output,
+            "tilemaxsim_gpu_h2d_bytes_total{{slot=\"{}\",device=\"{}\"}} {}",
+            device.slot, device.device, device.h2d_bytes
+        )
+        .unwrap();
+    }
+    writeln!(
+        output,
+        "# HELP tilemaxsim_host_cache_bytes Host tensor-cache byte accounting."
+    )
+    .unwrap();
+    writeln!(output, "# TYPE tilemaxsim_host_cache_bytes gauge").unwrap();
+    writeln!(
+        output,
+        "tilemaxsim_host_cache_bytes{{kind=\"capacity\"}} {}",
+        engine.host.capacity_bytes
+    )
+    .unwrap();
+    writeln!(
+        output,
+        "tilemaxsim_host_cache_bytes{{kind=\"used\"}} {}",
+        engine.host.used_bytes
+    )
+    .unwrap();
+    writeln!(
+        output,
+        "# HELP tilemaxsim_host_cache_entries Host tensor-cache entries and active tenants."
+    )
+    .unwrap();
+    writeln!(output, "# TYPE tilemaxsim_host_cache_entries gauge").unwrap();
+    writeln!(
+        output,
+        "tilemaxsim_host_cache_entries{{kind=\"entries\"}} {}",
+        engine.host.entries
+    )
+    .unwrap();
+    writeln!(
+        output,
+        "tilemaxsim_host_cache_entries{{kind=\"tenants\"}} {}",
+        engine.host.tenants
+    )
+    .unwrap();
+    writeln!(
+        output,
+        "# HELP tilemaxsim_host_cache_events_total Host tensor-cache cumulative events."
+    )
+    .unwrap();
+    writeln!(output, "# TYPE tilemaxsim_host_cache_events_total counter").unwrap();
+    for (event, value) in [
+        ("hit", engine.host.hits),
+        ("miss", engine.host.misses),
+        ("eviction", engine.host.evictions),
+        ("admission_rejection", engine.host.admission_rejections),
+    ] {
+        writeln!(
+            output,
+            "tilemaxsim_host_cache_events_total{{event=\"{event}\"}} {value}"
+        )
+        .unwrap();
+    }
+    writeln!(
+        output,
+        "# HELP tilemaxsim_storage_read_calls_total Immutable tensor storage read calls."
+    )
+    .unwrap();
+    writeln!(output, "# TYPE tilemaxsim_storage_read_calls_total counter").unwrap();
+    writeln!(
+        output,
+        "tilemaxsim_storage_read_calls_total {}",
+        engine.batch_read_calls
+    )
+    .unwrap();
+    writeln!(
+        output,
+        "# HELP tilemaxsim_storage_read_bytes_total Immutable tensor storage read bytes."
+    )
+    .unwrap();
+    writeln!(output, "# TYPE tilemaxsim_storage_read_bytes_total counter").unwrap();
+    writeln!(
+        output,
+        "tilemaxsim_storage_read_bytes_total {}",
+        engine.batch_read_bytes
+    )
+    .unwrap();
+    output
 }
 
 fn read_request(
@@ -1318,7 +1988,9 @@ mod tests {
         ByteAdmission, PendingAdmission, RuntimeMetrics, kib_to_bytes, quantum_end, render_metrics,
         tenant_hash,
     };
+    use crate::engine::{DeviceStatus, EngineStatus};
     use crate::protocol::Descriptor;
+    use crate::shard::HostCacheStatus;
     use std::sync::Arc;
 
     #[test]
@@ -1345,7 +2017,8 @@ mod tests {
 
     #[test]
     fn pending_admission_is_globally_and_per_tenant_bounded() {
-        let admission = Arc::new(PendingAdmission::new(2, 1));
+        let metrics = Arc::new(RuntimeMetrics::default());
+        let admission = Arc::new(PendingAdmission::new(2, 1, metrics));
         let first = admission.try_acquire("a").unwrap();
         assert!(admission.try_acquire("a").is_err());
         let second = admission.try_acquire("b").unwrap();
@@ -1357,7 +2030,8 @@ mod tests {
 
     #[test]
     fn in_flight_frame_bytes_are_bounded_until_the_permit_drops() {
-        let admission = Arc::new(ByteAdmission::new(100));
+        let metrics = Arc::new(RuntimeMetrics::default());
+        let admission = Arc::new(ByteAdmission::new(100, metrics));
         let first = admission.try_acquire(60).unwrap();
         assert!(admission.try_acquire(41).is_none());
         let second = admission.try_acquire(40).unwrap();
@@ -1383,9 +2057,31 @@ mod tests {
         metrics
             .completed
             .store(7, std::sync::atomic::Ordering::Relaxed);
+        metrics.update_engine(EngineStatus {
+            devices: vec![DeviceStatus {
+                slot: 0,
+                device: 3,
+                capacity_bytes: 1_024,
+                free_bytes: 512,
+                largest_free_extent_bytes: 256,
+                ..DeviceStatus::default()
+            }],
+            host: HostCacheStatus {
+                capacity_bytes: 2_048,
+                used_bytes: 128,
+                ..HostCacheStatus::default()
+            },
+            batch_read_calls: 4,
+            batch_read_bytes: 256,
+        });
         let output = render_metrics(&metrics);
         assert!(output.contains("tilemaxsim_ready 1"));
         assert!(output.contains("outcome=\"completed\"} 7"));
+        assert!(output.contains(
+            "tilemaxsim_gpu_cache_bytes{slot=\"0\",device=\"3\",kind=\"capacity\"} 1024"
+        ));
+        assert!(output.contains("tilemaxsim_host_cache_bytes{kind=\"used\"} 128"));
+        assert!(output.contains("tilemaxsim_storage_read_bytes_total 256"));
         assert!(!output.contains("tenant-a"));
     }
 }

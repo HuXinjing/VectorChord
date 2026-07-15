@@ -187,6 +187,12 @@ class RustDaemonTest(unittest.TestCase):
                         while part := status.recv(4096):
                             response_parts.append(part)
                     self.assertIn(expected, b"".join(response_parts))
+                    if path == "/metrics":
+                        metrics_body = b"".join(response_parts)
+                        self.assertIn(b"tilemaxsim_gpu_cache_bytes", metrics_body)
+                        self.assertIn(b"tilemaxsim_host_cache_bytes", metrics_body)
+                        self.assertIn(b"tilemaxsim_storage_read_bytes_total", metrics_body)
+                        self.assertNotIn(b"tenant-a", metrics_body)
                 probe = subprocess.run(
                     [
                         os.fspath(binary.with_name("tilemaxsimctl")),
