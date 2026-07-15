@@ -4,8 +4,7 @@
     "description": "VectorChord (vchord) is a PostgreSQL extension designed for scalable, high-performance, and disk-efficient vector similarity search, it supports L2 distance, inner product, cosine distance and maxsim",
     "version": "@DISTVERSION@",
     "maintainer": [
-        "TensorChord support@tensorchord.ai",
-        "usamoi usamoi@tensorchord.ai"
+        "Hu Xinjing HuXinjing@users.noreply.github.com"
     ],
     "license": "agpl_3",
     "prereqs": {
@@ -24,17 +23,17 @@
         }
     },
     "resources": {
-        "homepage": "https://github.com/tensorchord/VectorChord",
+        "homepage": "https://github.com/HuXinjing/VectorChord",
         "bugtracker": {
-            "web": "https://github.com/tensorchord/VectorChord/issues"
+            "web": "https://github.com/HuXinjing/VectorChord/issues"
         },
         "repository": {
-            "url": "https://github.com/tensorchord/VectorChord.git",
-            "web": "https://github.com/tensorchord/VectorChord",
+            "url": "https://github.com/HuXinjing/VectorChord.git",
+            "web": "https://github.com/HuXinjing/VectorChord",
             "type": "git"
         }
     },
-    "generated_by": "TensorChord",
+    "generated_by": "HuXinjing/VectorChord",
     "meta-spec": {
         "version": "1.0.0",
         "url": "http://pgxn.org/meta/spec.txt"

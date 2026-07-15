@@ -14,6 +14,10 @@ concurrency:
   group: ${{ github.ref }}-${{ github.workflow }}
   cancel-in-progress: true
 
+permissions:
+  contents: write
+  packages: write
+
 jobs:
   semver:
     runs-on: "ubuntu-latest"
@@ -101,10 +105,11 @@ jobs:
           mkdir -p ~/debian/usr/share/doc/postgresql-${VERSION}-vchord/
           echo "Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/
           Upstream-Name: VectorChord
-          Source: https://github.com/tensorchord/VectorChord
+          Source: https://github.com/HuXinjing/VectorChord
 
           Files: *
           Copyright: Copyright (c) 2025-2026 TensorChord Inc.
+           Copyright (c) 2026 Hu Xinjing
           License: AGPL-3.0-only OR Elastic-2.0
 
           License: AGPL-3.0-only
@@ -123,18 +128,44 @@ jobs:
           Section: database
           Priority: optional
           Architecture: ${PLATFORM}
-          Maintainer: Tensorchord <support@tensorchord.ai>
+          Maintainer: Hu Xinjing <HuXinjing@users.noreply.github.com>
           Description: Scalable, fast, and disk-friendly vector search in Postgres
            VectorChord is a PostgreSQL extension designed for scalable,
            high-performance, and disk-efficient vector similarity search. It
            supports L2 distance, inner product, cosine distance and maxsim.
-          Homepage: https://vectorchord.ai/" \
+          Homepage: https://github.com/HuXinjing/VectorChord" \
           > ~/debian/DEBIAN/control
           (cd ~/debian && find usr -type f -print0 | xargs -0 md5sum) > ~/debian/DEBIAN/md5sums
           dpkg-deb --root-owner-group -Zxz --build ~/debian ~/postgresql-${VERSION}-vchord_${SEMVER}-1_${PLATFORM}.deb
           gh release upload --clobber $SEMVER ~/postgresql-${VERSION}-vchord_${SEMVER}-1_${PLATFORM}.deb
 
+  tilemaxsimd:
+    runs-on: ubuntu-24.04
+    needs: ["semver"]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Free space for the CUDA build image
+        run: |
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup
+          docker builder prune --all --force
+
+      - name: Log in to the fork container registry
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: echo "$GH_TOKEN" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+
+      - name: Build and publish native TileMaxSim image
+        env:
+          SEMVER: ${{ needs.semver.outputs.SEMVER }}
+        run: |
+          IMAGE=$(echo "ghcr.io/${GITHUB_REPOSITORY_OWNER}/vectorchord-tilemaxsimd" | tr '[:upper:]' '[:lower:]')
+          docker build -f services/Dockerfile.tilemaxsimd -t "${IMAGE}:${SEMVER}" .
+          docker push "${IMAGE}:${SEMVER}"
+
   pgxn:
+    if: ${{ vars.PUBLISH_PGXN == 'true' }}
     runs-on: "ubuntu-latest"
     needs: ["semver", "build"]
 
@@ -145,6 +176,7 @@ jobs:
       - name: Upload
         env:
           SEMVER: ${{ needs.semver.outputs.SEMVER }}
+          PGXN_USERNAME: ${{ secrets.PGXN_USERNAME }}
           PGXN_PASSWORD: ${{ secrets.PGXN_PASSWORD }}
         run: |
           mkdir -p ./build
@@ -153,7 +185,7 @@ jobs:
           git archive --format zip --prefix "vchord-${SEMVER}/" --add-file META.json -o "./build/vchord--${SEMVER}.zip" HEAD
 
           curl --fail -sS \
-            --user "tensorchord:${PGXN_PASSWORD}" \
+            --user "${PGXN_USERNAME}:${PGXN_PASSWORD}" \
             -F "submit=Release It!" \
             -F "archive=@./build/vchord--${SEMVER}.zip" \
             -H "X-Requested-With: XMLHttpRequest" \

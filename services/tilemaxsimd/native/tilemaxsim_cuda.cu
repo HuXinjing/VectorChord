@@ -1,3 +1,13 @@
+// This software is licensed under a dual license model:
+//
+// GNU Affero General Public License v3 (AGPLv3): You may use, modify, and
+// distribute this software under the terms of the AGPLv3.
+//
+// Elastic License v2 (ELv2): You may also use, modify, and distribute this
+// software under the Elastic License v2, which has specific restrictions.
+//
+// Copyright (c) 2026 Hu Xinjing
+
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 #include <math_constants.h>
@@ -175,7 +185,7 @@ __global__ void tilemaxsim_kernel(const Scalar *query, uint32_t query_rows,
                                   uint32_t dimension,
                                   const unsigned char *documents,
                                   const uint64_t *document_offsets,
-                                  const uint32_t *document_rows, float *scores) {
+                                  const uint32_t *document_rows, float *maxima) {
   const uint32_t candidate = blockIdx.x;
   const uint32_t query_row = blockIdx.y;
   const uint32_t lane = threadIdx.x & 31;
@@ -206,12 +216,34 @@ __global__ void tilemaxsim_kernel(const Scalar *query, uint32_t query_rows,
     for (uint32_t index = 0; index < warps; ++index) {
       maximum = fmaxf(maximum, warp_best[index]);
     }
-    atomicAdd(scores + candidate, maximum);
+    maxima[static_cast<size_t>(candidate) * query_rows + query_row] = maximum;
   }
+}
+
+__global__ void tilemaxsim_sum_kernel(const float *maxima, uint32_t query_rows,
+                                      size_t count, float *scores) {
+  const size_t candidate =
+      static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (candidate >= count) return;
+  float score = 0.0f;
+  for (uint32_t query_row = 0; query_row < query_rows; ++query_row) {
+    score += maxima[candidate * query_rows + query_row];
+  }
+  scores[candidate] = score;
 }
 
 static size_t aligned(size_t value, size_t alignment) {
   return (value + alignment - 1) / alignment * alignment;
+}
+
+static bool reserve_aligned(size_t *cursor, size_t bytes, size_t *offset) {
+  constexpr size_t alignment = 256;
+  *offset = *cursor;
+  if (bytes > std::numeric_limits<size_t>::max() - *cursor) return false;
+  const size_t end = *cursor + bytes;
+  if (end > std::numeric_limits<size_t>::max() - (alignment - 1)) return false;
+  *cursor = aligned(end, alignment);
+  return true;
 }
 
 extern "C" int vctm_gpu_score(
@@ -229,15 +261,29 @@ extern "C" int vctm_gpu_score(
     return cuda_fail(error, error_capacity, "cudaSetDevice", status);
   }
   unsigned char *workspace = gpu->allocation + gpu->tensor_bytes;
+  if (count > std::numeric_limits<size_t>::max() / query_rows) {
+    return fail(error, error_capacity, "TileMaxSim maxima count overflow");
+  }
+  const size_t maxima_count = count * query_rows;
+  if (count > std::numeric_limits<size_t>::max() / sizeof(uint64_t) ||
+      count > std::numeric_limits<size_t>::max() / sizeof(uint32_t) ||
+      count > std::numeric_limits<size_t>::max() / sizeof(float) ||
+      maxima_count > std::numeric_limits<size_t>::max() / sizeof(float)) {
+    return fail(error, error_capacity, "TileMaxSim workspace size overflow");
+  }
   size_t cursor = 0;
-  const size_t query_offset = cursor;
-  cursor = aligned(cursor + query_bytes, 256);
-  const size_t offsets_offset = cursor;
-  cursor = aligned(cursor + count * sizeof(uint64_t), 256);
-  const size_t rows_offset = cursor;
-  cursor = aligned(cursor + count * sizeof(uint32_t), 256);
-  const size_t scores_offset = cursor;
-  cursor = aligned(cursor + count * sizeof(float), 256);
+  size_t query_offset = 0;
+  size_t offsets_offset = 0;
+  size_t rows_offset = 0;
+  size_t maxima_offset = 0;
+  size_t scores_offset = 0;
+  if (!reserve_aligned(&cursor, query_bytes, &query_offset) ||
+      !reserve_aligned(&cursor, count * sizeof(uint64_t), &offsets_offset) ||
+      !reserve_aligned(&cursor, count * sizeof(uint32_t), &rows_offset) ||
+      !reserve_aligned(&cursor, maxima_count * sizeof(float), &maxima_offset) ||
+      !reserve_aligned(&cursor, count * sizeof(float), &scores_offset)) {
+    return fail(error, error_capacity, "TileMaxSim workspace size overflow");
+  }
   if (cursor > gpu->workspace_bytes) {
     return fail(error, error_capacity,
                 "TileMaxSim request exceeds the configured GPU workspace");
@@ -252,9 +298,6 @@ extern "C" int vctm_gpu_score(
     status = cudaMemcpyAsync(workspace + rows_offset, document_rows,
                              count * sizeof(uint32_t), cudaMemcpyHostToDevice,
                              gpu->compute_stream);
-  if (status == cudaSuccess)
-    status = cudaMemsetAsync(workspace + scores_offset, 0,
-                             count * sizeof(float), gpu->compute_stream);
   if (status != cudaSuccess) {
     return cuda_fail(error, error_capacity, "CUDA workspace initialization",
                      status);
@@ -267,18 +310,26 @@ extern "C" int vctm_gpu_score(
         dimension, gpu->allocation,
         reinterpret_cast<const uint64_t *>(workspace + offsets_offset),
         reinterpret_cast<const uint32_t *>(workspace + rows_offset),
-        reinterpret_cast<float *>(workspace + scores_offset));
+        reinterpret_cast<float *>(workspace + maxima_offset));
   } else if (dtype == 1) {
     tilemaxsim_kernel<float><<<grid, block, 0, gpu->compute_stream>>>(
         reinterpret_cast<const float *>(workspace + query_offset), query_rows,
         dimension, gpu->allocation,
         reinterpret_cast<const uint64_t *>(workspace + offsets_offset),
         reinterpret_cast<const uint32_t *>(workspace + rows_offset),
-        reinterpret_cast<float *>(workspace + scores_offset));
+        reinterpret_cast<float *>(workspace + maxima_offset));
   } else {
     return fail(error, error_capacity, "unsupported tensor dtype");
   }
   status = cudaGetLastError();
+  if (status == cudaSuccess) {
+    constexpr unsigned int threads = 256;
+    const auto blocks = static_cast<unsigned int>((count + threads - 1) / threads);
+    tilemaxsim_sum_kernel<<<blocks, threads, 0, gpu->compute_stream>>>(
+        reinterpret_cast<const float *>(workspace + maxima_offset), query_rows,
+        count, reinterpret_cast<float *>(workspace + scores_offset));
+    status = cudaGetLastError();
+  }
   if (status == cudaSuccess)
     status = cudaMemcpyAsync(output, workspace + scores_offset,
                              count * sizeof(float), cudaMemcpyDeviceToHost,

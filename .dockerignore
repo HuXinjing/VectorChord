@@ -1,0 +1,16 @@
+.git
+.github
+build
+target
+**/target
+TODO*
+docs
+sql
+tests
+*.md
+*.zip
+*.deb
+__pycache__
+**/__pycache__
+.pytest_cache
+**/.pytest_cache

@@ -1,3 +1,13 @@
+// This software is licensed under a dual license model:
+//
+// GNU Affero General Public License v3 (AGPLv3): You may use, modify, and
+// distribute this software under the terms of the AGPLv3.
+//
+// Elastic License v2 (ELv2): You may also use, modify, and distribute this
+// software under the Elastic License v2, which has specific restrictions.
+//
+// Copyright (c) 2026 Hu Xinjing
+
 mod cache;
 mod engine;
 mod gpu;
@@ -1094,12 +1104,19 @@ fn run_scheduler(
                     metrics.failed.fetch_add(1, Ordering::Relaxed);
                     metrics.gpu_failures.fetch_add(1, Ordering::Relaxed);
                     work.gpu_elapsed += quantum_started.elapsed();
-                    Some(protocol::failure(
-                        version,
-                        request_id,
-                        3,
-                        &format!("{error:#}"),
-                    ))
+                    let diagnostic = format!("{error:#}");
+                    let failure = protocol::failure(version, request_id, 3, &diagnostic);
+                    if is_fatal_cuda_diagnostic(&diagnostic) {
+                        // CUDA execution/context failures are not ordinary bad
+                        // requests. Stop advertising readiness and terminate
+                        // the scheduler after best-effort notification so the
+                        // service supervisor can recreate the CUDA context.
+                        metrics.ready.store(false, Ordering::Release);
+                        write_response_nonfatal(&mut work.connection, &failure);
+                        metrics.observe_latency(work.accepted_at.elapsed(), work.gpu_elapsed);
+                        return Err(anyhow!("fatal CUDA failure: {diagnostic}"));
+                    }
+                    Some(failure)
                 }
             }
         };
@@ -1164,6 +1181,20 @@ fn tenant_hash(tenant: &str) -> String {
         .iter()
         .map(|byte| format!("{byte:02x}"))
         .collect()
+}
+
+fn is_fatal_cuda_diagnostic(diagnostic: &str) -> bool {
+    [
+        "cudaSetDevice",
+        "cudaMemcpy",
+        "cudaStream",
+        "CUDA workspace initialization",
+        "TileMaxSim CUDA execution",
+        "GPU upload worker panicked",
+        "GPU worker panicked",
+    ]
+    .iter()
+    .any(|marker| diagnostic.contains(marker))
 }
 
 fn next_quantum_end(work: &Work, config: &SchedulerConfig) -> usize {
@@ -1985,8 +2016,8 @@ fn load_resident_manifests(values: &[(String, PathBuf)]) -> Result<Vec<protocol:
 #[cfg(test)]
 mod tests {
     use super::{
-        ByteAdmission, PendingAdmission, RuntimeMetrics, kib_to_bytes, quantum_end, render_metrics,
-        tenant_hash,
+        ByteAdmission, PendingAdmission, RuntimeMetrics, is_fatal_cuda_diagnostic, kib_to_bytes,
+        quantum_end, render_metrics, tenant_hash,
     };
     use crate::engine::{DeviceStatus, EngineStatus};
     use crate::protocol::Descriptor;
@@ -2046,6 +2077,22 @@ mod tests {
         assert_eq!(tenant_hash("tenant-a"), tenant_hash("tenant-a"));
         assert_ne!(tenant_hash("tenant-a"), tenant_hash("tenant-b"));
         assert!(!tenant_hash("tenant-a").contains("tenant"));
+    }
+
+    #[test]
+    fn only_cuda_runtime_failures_force_supervised_restart() {
+        assert!(is_fatal_cuda_diagnostic(
+            "TileMaxSim CUDA execution: an illegal memory access was encountered"
+        ));
+        assert!(is_fatal_cuda_diagnostic(
+            "cudaMemcpyAsync(H2D): unspecified launch failure"
+        ));
+        assert!(!is_fatal_cuda_diagnostic(
+            "tensor is missing from immutable shards and objects"
+        ));
+        assert!(!is_fatal_cuda_diagnostic(
+            "TileMaxSim request exceeds the configured GPU workspace"
+        ));
     }
 
     #[test]
