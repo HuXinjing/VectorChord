@@ -172,9 +172,15 @@ authorization evidence, and request logs expose only a stable tenant hash.
 
 Memory flags use GiB rather than byte counts. A representative launch is:
 
+The published daemon is built with CUDA 12.6 and requires the NVIDIA container
+runtime plus a host driver compatible with CUDA 12.6. Its final image keeps the
+statically linked CUDA application runtime but intentionally omits the unused
+CUDA toolkit; the container runtime injects the host driver libraries/devices.
+
 ```shell
 tilemaxsimd \
   --socket /run/vectorchord/tilemaxsim.sock \
+  --listen 0.0.0.0:9191 \
   --status-socket /run/vectorchord/tilemaxsim-status.sock \
   --gpu-memory-gb 0=20 \
   --gpu-workspace-gb 2 \
@@ -189,13 +195,23 @@ tilemaxsimd \
   --tenant-cache-reservation foreground=4
 ```
 
-The optional status socket serves HTTP `GET /healthz` and Prometheus
+PostgreSQL may use either a local Unix path or a `tcp://HOST:PORT` value for
+`vchordrq.maxsim_gpu_endpoint`. The TCP listener lets a long-lived GPU service
+remain independent from PostgreSQL pod failover. It intentionally has no
+application authentication layer, so it must be exposed only on a private
+network and restricted to PostgreSQL clients with a firewall or Kubernetes
+NetworkPolicy. Tenant and priority fields remain scheduling hints, not trust
+boundaries.
+
+The optional status socket, and an optional TCP status listener for
+network-isolated orchestrator probes, serve HTTP `GET /healthz` and Prometheus
 `GET /metrics`. Metrics include readiness, scheduler depth, active CUDA work,
 completed/error/timeout/disconnect outcomes, and global/per-tenant admission
 rejections without exporting tenant identifiers.
 
 `GET /livez` reports process liveness separately from readiness. The packaged
-`tilemaxsimctl` probe can wait on the status socket without curl or a TCP port.
+`tilemaxsimctl --probe live|ready` probe can wait on the status socket without
+curl or a TCP port.
 An opt-in hardened systemd unit and environment example are provided under
 `deploy/systemd`; the CUDA container uses the same probe for its health check.
 

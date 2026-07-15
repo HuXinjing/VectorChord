@@ -47,6 +47,7 @@ class RustDaemonTest(unittest.TestCase):
         workspace_gb: str = "0.02",
         resident: bool = False,
         scheduled: bool = False,
+        tcp: bool = False,
     ) -> tuple[str, list[tuple[int, float]]]:
         binary = self._release_binary()
         if not binary.exists():
@@ -108,6 +109,11 @@ class RustDaemonTest(unittest.TestCase):
                 )
             socket_path = root / "tilemaxsimd.sock"
             status_socket_path = root / "tilemaxsimd-status.sock"
+            tcp_port = None
+            if tcp:
+                with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as reservation:
+                    reservation.bind(("127.0.0.1", 0))
+                    tcp_port = reservation.getsockname()[1]
             command = [
                 os.fspath(binary),
                 "--socket",
@@ -115,6 +121,8 @@ class RustDaemonTest(unittest.TestCase):
                 "--status-socket",
                 os.fspath(status_socket_path),
             ]
+            if tcp_port is not None:
+                command.extend(("--listen", f"127.0.0.1:{tcp_port}"))
             for device in devices:
                 command.extend(("--gpu-memory-gb", f"{device}={gpu_memory_gb}"))
             command.extend(
@@ -205,8 +213,12 @@ class RustDaemonTest(unittest.TestCase):
                     check=False,
                 )
                 self.assertEqual(probe.returncode, 0, probe.stderr)
-                with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
-                    connection.connect(os.fspath(socket_path))
+                family = socket.AF_INET if tcp_port is not None else socket.AF_UNIX
+                with socket.socket(family, socket.SOCK_STREAM) as connection:
+                    if tcp_port is None:
+                        connection.connect(os.fspath(socket_path))
+                    else:
+                        connection.connect(("127.0.0.1", tcp_port))
                     connection.sendall(frame)
                     header = protocol.receive_exact(connection, protocol.HEADER.size)
                     body_bytes = protocol.HEADER.unpack(header)[4]
@@ -310,6 +322,16 @@ class RustDaemonTest(unittest.TestCase):
             key=lambda index: torch.cuda.mem_get_info(index)[0],
         )
         self.run_daemon([device])
+
+    @unittest.skipUnless(torch.cuda.is_available(), "CUDA is unavailable")
+    def test_tcp_scoring_round_trip_matches_protocol_oracle(self) -> None:
+        device = max(
+            range(torch.cuda.device_count()),
+            key=lambda index: torch.cuda.mem_get_info(index)[0],
+        )
+        output, results = self.run_daemon([device], tcp=True, scheduled=True)
+        self.assertIn('"listen":"127.0.0.1:', output)
+        self.assertEqual([candidate for candidate, _ in results], [11, 12])
 
     @unittest.skipUnless(torch.cuda.is_available(), "CUDA is unavailable")
     def test_exact_scores_are_repeatable_across_cuda_contexts(self) -> None:

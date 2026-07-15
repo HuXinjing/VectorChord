@@ -5,7 +5,6 @@ target
 **/target
 TODO*
 docs
-sql
 tests
 *.md
 *.zip

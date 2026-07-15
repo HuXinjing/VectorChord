@@ -28,6 +28,7 @@ use std::collections::HashMap;
 use std::fmt::Write as FmtWrite;
 use std::fs::{self, OpenOptions};
 use std::io::{BufRead, Read, Write};
+use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::{FileTypeExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
@@ -65,7 +66,10 @@ fn install_signal_handlers() -> Result<()> {
 struct Args {
     #[arg(long)]
     socket: PathBuf,
-    #[arg(long, required = true, value_parser = parse_gpu_memory)]
+    /// Optional TCP scoring listener for a database running in another pod.
+    #[arg(long)]
+    listen: Option<SocketAddr>,
+    #[arg(long, required = true, value_delimiter = ',', value_parser = parse_gpu_memory)]
     gpu_memory_gb: Vec<GpuMemory>,
     #[arg(long, default_value = "2", value_parser = parse_gb)]
     gpu_workspace_gb: usize,
@@ -85,6 +89,8 @@ struct Args {
     socket_mode: u32,
     #[arg(long)]
     status_socket: Option<PathBuf>,
+    #[arg(long)]
+    status_listen: Option<SocketAddr>,
     #[arg(long, default_value = "600", value_parser = parse_mode)]
     status_socket_mode: u32,
     #[arg(long)]
@@ -308,6 +314,17 @@ fn main() -> Result<()> {
         .with_context(|| format!("cannot bind {}", args.socket.display()))?;
     fs::set_permissions(&args.socket, fs::Permissions::from_mode(args.socket_mode))?;
     listener.set_nonblocking(true)?;
+    if args.listen.is_some() && args.listen == args.status_listen {
+        bail!("scoring and status TCP listeners must use different addresses");
+    }
+    let tcp_listener = if let Some(address) = args.listen {
+        let listener = TcpListener::bind(address)
+            .with_context(|| format!("cannot bind scoring listener {address}"))?;
+        listener.set_nonblocking(true)?;
+        Some(listener)
+    } else {
+        None
+    };
     if args.status_socket.as_ref() == Some(&args.socket) {
         bail!("status socket must differ from the TileMaxSim protocol socket");
     }
@@ -372,12 +389,26 @@ fn main() -> Result<()> {
     } else {
         None
     };
+    let status_tcp_server = if let Some(address) = args.status_listen {
+        let status_listener = TcpListener::bind(address)
+            .with_context(|| format!("cannot bind status listener {address}"))?;
+        status_listener.set_nonblocking(true)?;
+        let status_metrics = Arc::clone(&metrics);
+        Some(
+            thread::Builder::new()
+                .name("tilemaxsim-status-tcp".to_owned())
+                .spawn(move || run_tcp_status_server(status_listener, status_metrics))?,
+        )
+    } else {
+        None
+    };
     metrics.ready.store(true, Ordering::Release);
     println!(
         "{}",
         serde_json::json!({
             "event": "tilemaxsim_rust_ready",
             "socket": args.socket,
+            "listen": args.listen,
             "devices": args.gpu_memory_gb.iter().map(|item| serde_json::json!({
                 "device": item.device,
                 "allocated_bytes": item.bytes,
@@ -390,6 +421,7 @@ fn main() -> Result<()> {
             "max_inflight_request_bytes": args.max_inflight_request_gb,
             "scheduler_quantum_fmas": args.scheduler_quantum_fmas,
             "status_socket": args.status_socket,
+            "status_listen": args.status_listen,
             "cache": ready_cache,
         })
     );
@@ -409,6 +441,9 @@ fn main() -> Result<()> {
         if status_server
             .as_ref()
             .is_some_and(thread::JoinHandle::is_finished)
+            || status_tcp_server
+                .as_ref()
+                .is_some_and(thread::JoinHandle::is_finished)
         {
             status_failed = true;
             metrics.ready.store(false, Ordering::Release);
@@ -419,57 +454,14 @@ fn main() -> Result<()> {
             reload.store(true, Ordering::Release);
         }
         reap_readers(&mut readers);
+        let mut connections = Vec::with_capacity(2);
         match listener.accept() {
-            Ok((connection, _)) => {
-                if !try_acquire_reader(&metrics.active_connections, args.max_connections) {
-                    // Closing immediately is deliberate: we have not read enough
-                    // bytes to know whether the peer expects a v2 or v3 response.
-                    metrics.rejected_connections.fetch_add(1, Ordering::Relaxed);
-                    drop(connection);
-                    continue;
-                }
-                accepted += 1;
-                let reader_sender = sender.clone();
-                let reader_metrics = Arc::clone(&metrics);
-                let reader_admission = Arc::clone(&pending_admission);
-                let request_metrics = Arc::clone(&metrics);
-                let reader_frame_admission = Arc::clone(&frame_admission);
-                let reader_config = ReaderConfig {
-                    maximum: args.max_request_bytes,
-                    io_timeout: Duration::from_millis(args.socket_io_timeout_ms),
-                    server_timeout: Duration::from_millis(args.request_timeout_ms),
-                    maximum_candidate_fmas: args.scheduler_quantum_fmas,
-                };
-                match thread::Builder::new()
-                    .name("tilemaxsim-reader".to_owned())
-                    .spawn(move || {
-                        let _permit = ReaderPermit(reader_metrics);
-                        read_and_enqueue(
-                            connection,
-                            &reader_sender,
-                            reader_config,
-                            reader_admission,
-                            request_metrics,
-                            reader_frame_admission,
-                        );
-                    }) {
-                    Ok(reader) => readers.push(reader),
-                    Err(error) => {
-                        metrics.active_connections.fetch_sub(1, Ordering::Release);
-                        metrics.ready.store(false, Ordering::Release);
-                        SHUTDOWN_REQUESTED.store(true, Ordering::Release);
-                        fatal_error = Some(error.into());
-                        break;
-                    }
-                }
-                if args.once && accepted == 1 {
-                    SHUTDOWN_REQUESTED.store(true, Ordering::Relaxed);
-                }
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                thread::sleep(Duration::from_millis(5));
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            Ok((connection, _)) => connections.push(ClientStream::Unix(connection)),
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted
+                ) => {}
             Err(error) => {
                 metrics.ready.store(false, Ordering::Release);
                 SHUTDOWN_REQUESTED.store(true, Ordering::Release);
@@ -477,9 +469,82 @@ fn main() -> Result<()> {
                 break;
             }
         }
+        if let Some(tcp_listener) = &tcp_listener {
+            match tcp_listener.accept() {
+                Ok((connection, _)) => {
+                    connection.set_nodelay(true).ok();
+                    connections.push(ClientStream::Tcp(connection));
+                }
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted
+                    ) => {}
+                Err(error) => {
+                    metrics.ready.store(false, Ordering::Release);
+                    SHUTDOWN_REQUESTED.store(true, Ordering::Release);
+                    fatal_error = Some(error.into());
+                    break;
+                }
+            }
+        }
+        if connections.is_empty() {
+            thread::sleep(Duration::from_millis(5));
+            continue;
+        }
+        for connection in connections {
+            if SHUTDOWN_REQUESTED.load(Ordering::Relaxed) {
+                break;
+            }
+            if !try_acquire_reader(&metrics.active_connections, args.max_connections) {
+                // Closing immediately is deliberate: we have not read enough
+                // bytes to know whether the peer expects a v2 or v3 response.
+                metrics.rejected_connections.fetch_add(1, Ordering::Relaxed);
+                drop(connection);
+                continue;
+            }
+            accepted += 1;
+            let reader_sender = sender.clone();
+            let reader_metrics = Arc::clone(&metrics);
+            let reader_admission = Arc::clone(&pending_admission);
+            let request_metrics = Arc::clone(&metrics);
+            let reader_frame_admission = Arc::clone(&frame_admission);
+            let reader_config = ReaderConfig {
+                maximum: args.max_request_bytes,
+                io_timeout: Duration::from_millis(args.socket_io_timeout_ms),
+                server_timeout: Duration::from_millis(args.request_timeout_ms),
+                maximum_candidate_fmas: args.scheduler_quantum_fmas,
+            };
+            match thread::Builder::new()
+                .name("tilemaxsim-reader".to_owned())
+                .spawn(move || {
+                    let _permit = ReaderPermit(reader_metrics);
+                    read_and_enqueue(
+                        connection,
+                        &reader_sender,
+                        reader_config,
+                        reader_admission,
+                        request_metrics,
+                        reader_frame_admission,
+                    );
+                }) {
+                Ok(reader) => readers.push(reader),
+                Err(error) => {
+                    metrics.active_connections.fetch_sub(1, Ordering::Release);
+                    metrics.ready.store(false, Ordering::Release);
+                    SHUTDOWN_REQUESTED.store(true, Ordering::Release);
+                    fatal_error = Some(error.into());
+                    break;
+                }
+            }
+            if args.once && accepted == 1 {
+                SHUTDOWN_REQUESTED.store(true, Ordering::Relaxed);
+            }
+        }
     }
     SHUTDOWN_REQUESTED.store(true, Ordering::Release);
     drop(listener);
+    drop(tcp_listener);
     for reader in readers {
         if reader.join().is_err() {
             eprintln!("tilemaxsim reader thread panicked during shutdown");
@@ -493,6 +558,9 @@ fn main() -> Result<()> {
         .and_then(|result| result);
     if status_server.is_some_and(|status_server| status_server.join().is_err()) {
         eprintln!("TileMaxSim status thread panicked during shutdown");
+    }
+    if status_tcp_server.is_some_and(|status_server| status_server.join().is_err()) {
+        eprintln!("TileMaxSim TCP status thread panicked during shutdown");
     }
     match fs::remove_file(&args.socket) {
         Ok(()) => {}
@@ -513,9 +581,64 @@ fn main() -> Result<()> {
     Ok(())
 }
 
+enum ClientStream {
+    Unix(UnixStream),
+    Tcp(TcpStream),
+}
+
+impl ClientStream {
+    fn set_read_timeout(&self, timeout: Option<Duration>) -> std::io::Result<()> {
+        match self {
+            Self::Unix(stream) => stream.set_read_timeout(timeout),
+            Self::Tcp(stream) => stream.set_read_timeout(timeout),
+        }
+    }
+
+    fn set_write_timeout(&self, timeout: Option<Duration>) -> std::io::Result<()> {
+        match self {
+            Self::Unix(stream) => stream.set_write_timeout(timeout),
+            Self::Tcp(stream) => stream.set_write_timeout(timeout),
+        }
+    }
+}
+
+impl Read for ClientStream {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        match self {
+            Self::Unix(stream) => stream.read(buffer),
+            Self::Tcp(stream) => stream.read(buffer),
+        }
+    }
+}
+
+impl Write for ClientStream {
+    fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+        match self {
+            Self::Unix(stream) => stream.write(buffer),
+            Self::Tcp(stream) => stream.write(buffer),
+        }
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        match self {
+            Self::Unix(stream) => stream.flush(),
+            Self::Tcp(stream) => stream.flush(),
+        }
+    }
+}
+
+impl AsRawFd for ClientStream {
+    fn as_raw_fd(&self) -> std::os::fd::RawFd {
+        match self {
+            Self::Unix(stream) => stream.as_raw_fd(),
+            Self::Tcp(stream) => stream.as_raw_fd(),
+        }
+    }
+}
+
 struct Work {
     request: protocol::Request,
-    connection: UnixStream,
+    connection: ClientStream,
     accepted_at: Instant,
     deadline: Instant,
     next_candidate: usize,
@@ -808,7 +931,7 @@ struct ReaderConfig {
 }
 
 fn read_and_enqueue(
-    mut connection: UnixStream,
+    mut connection: ClientStream,
     sender: &mpsc::SyncSender<Work>,
     config: ReaderConfig,
     pending_admission: Arc<PendingAdmission>,
@@ -1283,7 +1406,7 @@ fn estimated_next_work(work: &Work, config: &SchedulerConfig) -> u64 {
         .max(1)
 }
 
-fn peer_disconnected(connection: &UnixStream) -> bool {
+fn peer_disconnected(connection: &ClientStream) -> bool {
     let mut byte = 0_u8;
     let result = unsafe {
         libc::recv(
@@ -1306,7 +1429,7 @@ fn peer_disconnected(connection: &UnixStream) -> bool {
     false
 }
 
-fn write_response_nonfatal(connection: &mut UnixStream, response: &[u8]) {
+fn write_response_nonfatal(connection: &mut ClientStream, response: &[u8]) {
     if let Err(error) = connection.write_all(response) {
         eprintln!("TileMaxSim response write failed without stopping daemon: {error}");
     }
@@ -1315,7 +1438,15 @@ fn write_response_nonfatal(connection: &mut UnixStream, response: &[u8]) {
 fn run_status_server(listener: UnixListener, path: PathBuf, metrics: Arc<RuntimeMetrics>) {
     while !SHUTDOWN_REQUESTED.load(Ordering::Relaxed) {
         match listener.accept() {
-            Ok((mut connection, _)) => handle_status_connection(&mut connection, &metrics),
+            Ok((mut connection, _)) => {
+                connection
+                    .set_read_timeout(Some(Duration::from_millis(250)))
+                    .ok();
+                connection
+                    .set_write_timeout(Some(Duration::from_millis(250)))
+                    .ok();
+                handle_status_connection(&mut connection, &metrics);
+            }
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                 thread::sleep(Duration::from_millis(20));
             }
@@ -1334,13 +1465,35 @@ fn run_status_server(listener: UnixListener, path: PathBuf, metrics: Arc<Runtime
     }
 }
 
-fn handle_status_connection(connection: &mut UnixStream, metrics: &RuntimeMetrics) {
+fn run_tcp_status_server(listener: TcpListener, metrics: Arc<RuntimeMetrics>) {
+    while !SHUTDOWN_REQUESTED.load(Ordering::Relaxed) {
+        match listener.accept() {
+            Ok((mut connection, _)) => {
+                configure_tcp_status_connection(&connection);
+                handle_status_connection(&mut connection, &metrics);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                thread::sleep(Duration::from_millis(20));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(error) => {
+                eprintln!("TileMaxSim TCP status listener failed: {error}");
+                break;
+            }
+        }
+    }
+}
+
+fn configure_tcp_status_connection(connection: &TcpStream) {
     connection
         .set_read_timeout(Some(Duration::from_millis(250)))
         .ok();
     connection
         .set_write_timeout(Some(Duration::from_millis(250)))
         .ok();
+}
+
+fn handle_status_connection(connection: &mut (impl Read + Write), metrics: &RuntimeMetrics) {
     let mut request = [0_u8; 1024];
     let Ok(count) = connection.read(&mut request) else {
         return;
@@ -1919,7 +2072,7 @@ fn render_metrics(metrics: &RuntimeMetrics) -> String {
 }
 
 fn read_request(
-    connection: &mut UnixStream,
+    connection: &mut ClientStream,
     maximum: usize,
     frame_admission: &Arc<ByteAdmission>,
 ) -> Result<(Vec<u8>, BytePermit)> {
