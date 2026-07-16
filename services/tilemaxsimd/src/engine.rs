@@ -13,7 +13,7 @@ use crate::gpu::Gpu;
 use crate::protocol::{Descriptor, Request};
 use crate::shard::{HostCacheStatus, ShardStore, cache_key};
 use anyhow::{Result, anyhow, bail};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 struct MissingTensor {
@@ -123,6 +123,12 @@ impl Engine {
         if batch_size == 0 {
             bail!("resident prewarm batch size must be positive");
         }
+        // A content-addressed manifest may legitimately reference the same tensor
+        // from more than one logical candidate. Upload each cache key once. Without
+        // this normalization, two duplicates in one batch both try to admit the
+        // same not-yet-ready entry and the second insert replaces the first arena
+        // allocation.
+        let descriptors = unique_descriptors(descriptors);
         for batch in descriptors.chunks(batch_size) {
             let payloads = self.store.resolve_many(batch, "__resident__")?;
             let mut uploads = (0..self.devices.len())
@@ -230,8 +236,15 @@ impl Engine {
             .collect::<Vec<_>>();
         let mut missing_descriptors = Vec::new();
         let mut missing_indices = Vec::new();
+        let mut first_candidate_by_key = HashMap::<String, usize>::new();
+        let mut duplicate_candidates = Vec::<(usize, usize)>::new();
         for (index, descriptor) in request.candidates.iter().enumerate() {
             let key = cache_key(descriptor);
+            if let Some(first_index) = first_candidate_by_key.get(&key) {
+                duplicate_candidates.push((index, *first_index));
+                continue;
+            }
+            first_candidate_by_key.insert(key.clone(), index);
             let hit_device = self
                 .devices
                 .iter()
@@ -395,6 +408,13 @@ impl Engine {
             score_result?;
             cleanup_result?;
             pending.drain(..consumed);
+        }
+
+        // Equal content-addressed tensors have equal TileMaxSim scores. Preserve
+        // every logical candidate id while avoiding duplicate cache acquisitions,
+        // uploads, and kernel work inside one request.
+        for (duplicate_index, first_index) in duplicate_candidates {
+            scores[duplicate_index] = scores[first_index];
         }
 
         request
@@ -651,6 +671,15 @@ impl Engine {
     }
 }
 
+fn unique_descriptors(descriptors: &[Descriptor]) -> Vec<Descriptor> {
+    let mut seen = HashSet::with_capacity(descriptors.len());
+    descriptors
+        .iter()
+        .filter(|descriptor| seen.insert(cache_key(descriptor)))
+        .cloned()
+        .collect()
+}
+
 fn validate_entry(descriptor: &Descriptor, entry: &crate::cache::CacheEntry) -> Result<()> {
     let scalar_bytes = if descriptor.dtype == 1 { 4 } else { 2 };
     let expected_bytes = descriptor.rows as usize * descriptor.dimension as usize * scalar_bytes;
@@ -663,4 +692,37 @@ fn validate_entry(descriptor: &Descriptor, entry: &crate::cache::CacheEntry) -> 
         bail!("GPU cache metadata disagrees with the tensor descriptor");
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn descriptor(candidate_id: u32, digest: &str, rows: u32) -> Descriptor {
+        Descriptor {
+            candidate_id,
+            contract: "colqwen35@test".to_owned(),
+            digest: digest.to_owned(),
+            rows,
+            dimension: 320,
+            dtype: 2,
+        }
+    }
+
+    #[test]
+    fn resident_prewarm_deduplicates_content_references() {
+        let descriptors = vec![
+            descriptor(1, "a", 100),
+            descriptor(2, "a", 100),
+            descriptor(3, "b", 120),
+            // Shape is part of the cache identity and must not be collapsed.
+            descriptor(4, "a", 101),
+        ];
+
+        let unique = unique_descriptors(&descriptors);
+        assert_eq!(unique.len(), 3);
+        assert_eq!(unique[0].candidate_id, 1);
+        assert_eq!(unique[1].candidate_id, 3);
+        assert_eq!(unique[2].candidate_id, 4);
+    }
 }
