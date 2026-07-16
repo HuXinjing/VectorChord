@@ -2,252 +2,110 @@
 
 # VectorChord TileMaxSim
 
-**An open-source VectorChord fork focused on exact multi-vector retrieval in PostgreSQL.**
+**PostgreSQL-native vector and tensor retrieval with exact TileMaxSim and a persistent GPU cache.**
 
 English | [简体中文](README.zh-CN.md)
 
 </div>
 
-This fork extends VectorChord's `vchordrq` index with exact late-interaction
-TileMaxSim retrieval. It is intended for applications that store one array of
-token vectors per document and need PostgreSQL-native multi-vector search.
+VectorChord TileMaxSim is an open-source retrieval engine built on PostgreSQL
+and derived from the upstream
+[VectorChord](https://github.com/supervc-stack/VectorChord) codebase. It preserves
+the traditional single-vector path while adding exact late-interaction retrieval
+for documents represented as arrays of token vectors.
 
-## What this fork adds
+This repository is maintained as its own project. Its public README describes
+this project's implementation, measured results, limitations, and roadmap; it
+does not reproduce the upstream project's README or present upstream product
+claims as our own.
 
-- Exact TileMaxSim reranking on CPU, plus an optional CUDA sidecar backend.
-- Full caller-scoped tensor sets without an artificial candidate-count cap;
-  device-memory pressure is handled by the GPU page cache and request batching.
-- External tensor-source registration for deployments that keep full-precision
-  token tensors outside the indexed PostgreSQL value.
-- PostgreSQL-aware permission, MVCC, row-visibility, cancellation, and timeout
-  handling for the external-tensor search path.
-- Planner statistics and cost estimation for multi-vector queries.
-- Deterministic correctness, registry, sidecar-protocol, and planner-cost tests.
+## Project scope
 
-## Performance ablation
+VectorChord TileMaxSim provides infrastructure primitives:
 
-We measured each cache-path optimization independently on the same development
-machine. The corpus contained 34,054 tensor descriptors (34,027 unique tensors,
-16.28 GB of logical FP16 tensor data). The request-level tests sampled 100
-candidates containing 47.81 MB of tensor data. Absolute latency depends on the
-storage and GPU, so the same-run comparisons are more useful than the raw
-numbers.
+- vector, tensor-descriptor, and retrieval-metadata storage in PostgreSQL;
+- traditional single-vector retrieval and exact multi-vector TileMaxSim;
+- PostgreSQL permission, MVCC, row-visibility, cancellation, and timeout
+  semantics around retrieval;
+- a persistent GPU tensor arena, host-memory cache, and immutable disk shards;
+- bounded admission, fair/priority scheduling, cache quotas, health probes, and
+  metrics for the optional GPU service.
 
-| Optimization | Baseline | Optimized | Result |
-| --- | ---: | ---: | ---: |
-| Immutable shards and batched reads | 333.38 ms, sequential files | 56.52 ms | 5.90x faster |
-| Shards versus batched legacy files | 87.56 ms | 56.52 ms | 1.55x faster |
-| Batched host-to-device transfer | 37.06 ms, 100 transfers | 14.19 ms, one transfer | 2.61x faster |
-| TinyLFU/GDSF admission | 69.98% LRU hit rate | 76.18% hit rate | +6.20 percentage points |
-| Rust/CUDA cold request | 855.34 ms, Python/Triton | 93.86 ms | 9.11x faster |
-| Rust/CUDA warm request p50 | 14.26 ms, Python/Triton | 2.09 ms | 6.82x faster |
-| Rust/CUDA warm request p95 | 14.84 ms, Python/Triton | 2.20 ms | 6.75x faster |
+It does not implement application identity, authentication, ACL policy, entity
+registries, facts, events, relationship graphs, communities, or query-intent
+routing. Those belong to an authenticated application or knowledge-governance
+layer. VectorChord accepts only the already-authorized candidate scope and
+opaque scheduling hints supplied by that caller.
 
-A full resident-cache run assigned 20 GiB to one GPU: 18 GiB for tensors and
-2 GiB for the TileMaxSim workspace. All 34,027 unique tensors were pinned before
-the service became ready. Process-to-ready time was 23.07 seconds for the
-Python/Triton sidecar and 14.86 seconds for the Rust/CUDA daemon, a 35.6%
-reduction. This is a one-time prewarm cost; resident warm requests do not read
-the tensors from disk.
+## Core capabilities
 
-The GPU cache now suballocates exact contiguous page runs from one CUDA arena,
-using best-fit size buckets and address-ordered coalescing. On the full corpus,
-the 32 KiB default reduced allocated tensor space from 17.840 GB with the former
-256 KiB power-of-two buddy allocator to 16.725 GB. It recovered 1.115 GB of GPU
-space and reduced internal rounding waste from 8.82% to 2.74%. The default can
-be overridden with `--gpu-block-kib`.
+- Exact TileMaxSim reranking on CPU and through the native Rust/CUDA
+  `tilemaxsimd` backend.
+- No artificial cap on a caller-authorized tensor scope. Oversized working sets
+  are processed in bounded chunks.
+- External tensor-source registration, so full token tensors can remain outside
+  the indexed PostgreSQL value while stable public IDs and descriptors remain
+  queryable.
+- A three-level tensor path:
+  - L0: persistent GPU page cache;
+  - L1: bounded host-memory cache;
+  - L2: immutable tensor shards or content-addressed objects on durable storage.
+- Batched shard reads, batched host-to-device transfers, content-addressed
+  deduplication, TinyLFU/GDSF admission, and a coalescing page-run allocator.
+- Optional resident prewarming that completes before the daemon reports ready.
+- Per-daemon fair, strict-priority, or fair-priority scheduling, request aging,
+  tenant weights, deadlines, disconnect cancellation, and bounded CUDA work
+  quanta.
+- PostgreSQL planner statistics and cost estimation for multi-vector queries.
+- Prometheus metrics and separate liveness/readiness probes.
+- Correctness, registry, protocol, planner, real-GPU, and fault-path tests.
 
-In a deterministic 20,000-event churn trace, the former buddy allocator had 815
-failed cache-allocation attempts, while the segregated page-run allocator had
-637; neither recorded an external-fragmentation failure on this workload. Exact
-byte extents had 585 failures, all caused by external fragmentation. Page-run
-metadata processing added about 1.4 microseconds per event versus the buddy
-baseline. These are cache-admission attempts, not failed search requests: the
-runtime evicts unpinned entries or streams oversized working sets in chunks.
+TileMaxSim is opt-in. Ordinary single-vector operation does not start the CUDA
+daemon and does not require a GPU-memory setting. When enabled, `tilemaxsimd`
+reserves the configured devices and GiB allocations during startup and exits if
+any requested device or allocation cannot be obtained.
 
-Rust/CUDA and Python/Triton produced identical top-10 results. The maximum
-absolute score difference was 5.25e-6 and the mean difference was 3.45e-6.
-The benchmark driver is
-[`services/benchmark_tilemaxsim_ablation.py`](services/benchmark_tilemaxsim_ablation.py);
-run it with `--help` for the corpus, cache-root, device, and output arguments.
+## Architecture
 
-### Full-source retrieval and cache-scheduler stress
+```text
+Authenticated application / retrieval planner
+                  │ authorized IDs + scheduling hints
+                  ▼
+            PostgreSQL + VectorChord
+                  │ tensor descriptors
+                  ▼
+              tilemaxsimd
+        ┌─────────┼──────────┐
+        │         │          │
+      L0 GPU   L1 host    L2 durable
+      cache     cache      shards
+        │
+        └── exact CUDA TileMaxSim
+```
 
-We separately scored all 34,054 descriptors for each query to exercise a
-working set larger than the cache. This is both a storage/cache stress test and
-an upper bound for general semantic retrieval when no safe narrower hard scope
-exists. GBrain still applies source, ACL, type, and other mandatory filters, but
-lexical or graph recall must not hide semantic paraphrases. The traditional
-embedding/HNSW path remains a separate `single_vector` mode and is not a
-dependency of tensor retrieval.
+PostgreSQL remains the source of row visibility and hard filtering. The daemon
+does not infer authorization from tenant or priority fields. It receives an
+explicit tensor set, resolves the corresponding immutable objects through the
+cache hierarchy, and returns exact scores.
 
-With an 18 GiB tensor arena, all 34,027 unique tensors were resident and native
-daemon round trips averaged 1.08 seconds for a deliberately exhaustive scan. A
-3 GiB tensor arena plus 1 GiB host cache produced the same exact top-K, but two
-sequential scans caused 68,106 misses, 61,499 evictions, 32.53 GB of host-to-
-device transfer, and only two cache hits. Native round trips averaged 18.47
-seconds. The slowdown is cyclic cache thrashing and repeated I/O, not TileMaxSim
-compute scaling linearly with GPU-memory capacity. Candidate-scoped queries
-whose hot working set fits the cache do not exhibit this full-scan behavior.
+## GPU cache and scheduling
 
-The diagnostic driver is
-[`services/benchmark_full_corpus_tilemaxsim.py`](services/benchmark_full_corpus_tilemaxsim.py).
-A GBrain-scoped comparison against its original text-embedding/pgvector HNSW
-path is reported separately; tensor-derived pooled vectors are not a valid
-single-vector baseline.
+The default `fair-priority` scheduler combines explicit urgency with weighted
+fairness. Large requests are split by candidate count, document tokens, and
+actual `query rows × document rows × dimension` work. A request re-enters the
+scheduler between CUDA launches, allowing another scheduling domain to run.
+An executing CUDA kernel cannot be interrupted, so the FMA quantum bounds the
+cooperative, non-preemptible interval.
 
-### Rejected lexical hard-gate ablation and the traditional embedding baseline
+GPU and host caches have per-scheduling-domain maximums. An optional
+`--tenant-cache-reservation TENANT=GB` protects already-warmed GPU pages from
+cross-domain eviction below the configured allocation. This is currently an
+aggregate byte reservation, not a permanent partition for one particular
+knowledge base: it does not prewarm data, does not provide an L1 host-cache
+minimum, and does not distinguish multiple sources owned by one tenant. These
+gaps are listed explicitly in the roadmap.
 
-We then used 40 real queries and their original 1,024-dimensional
-`text-embedding-v4` vectors. The single-vector baseline searched 1,200 stored
-chunk embeddings with PostgreSQL pgvector HNSW (`m=16`, `ef_search=40`). Tensor
-mode did not read those vectors: a real lexical result list supplied every
-returned chunk without a second truncation, the chunks were mapped to their
-source-page tensors, and the native CUDA daemon ran exact TileMaxSim only over
-that scope. This ablation tests whether lexical recall is safe as a mandatory
-gate; it is not the accepted general semantic query plan.
-
-| Path | Mean latency | p95 | Quality |
-| --- | ---: | ---: | ---: |
-| Original text embedding + pgvector HNSW | 5.80 ms | 5.86 ms | document hit@1 1.000 |
-| Candidate-scoped TileMaxSim, 18 GiB resident tensor cache, native round trips | 45.56 ms | 134.99 ms | document hit@1 0.475; hit@5 0.650 |
-| Candidate-scoped TileMaxSim, resident Python driver end to end | 112.33 ms | 319.87 ms | same ranking |
-| Candidate-scoped TileMaxSim, 3 GiB LRU tensor cache, native round trips | 573.43 ms | 1,812.70 ms | same ranking |
-| Candidate-scoped TileMaxSim, small-cache Python driver end to end | 657.46 ms | 2,011.99 ms | same ranking |
-
-The lexical scope contained 19.3 chunks and 13.2 documents on average. Because
-the source chunks span multiple PDF pages, that mapped to 1,459 page tensors on
-average (p95 4,000); no whole-corpus tensor scan occurred. Candidate document
-recall was 0.650, and TileMaxSim retained the relevant document in its top five
-for all covered queries, so scope generation—not exact reranking—set the recall
-ceiling in this run. A 35% loss before TileMaxSim is unacceptable, so lexical
-and non-relational graph results neither exclude candidates nor reorder general
-tensor retrieval. Only explicit relationship intent may use and fuse GBrain's
-complete graph scope as a hard range. The HNSW baseline is an intentionally strong upper-bound
-workload whose queries are excerpts from their gold chunks; page-tensor and
-text-chunk granularity differ, so its quality number is not a claim that the two
-rankers are interchangeable.
-
-The 3 GiB run completed every request with identical ranking, but incurred
-24,432 GPU misses and 11.68 GB of host-to-device transfer across the query
-sequence. Its 5.85x driver slowdown relative to resident mode is therefore a
-cache-locality result that happens to resemble the 6x cache-capacity ratio; GPU
-TileMaxSim arithmetic does not become six times slower when memory is smaller.
-
-The reproducible drivers are
-[`services/benchmark_gbrain_scoped_tilemaxsim.py`](services/benchmark_gbrain_scoped_tilemaxsim.py)
-and
-[`services/benchmark_postgres_single_vector.py`](services/benchmark_postgres_single_vector.py).
-
-## Limitations
-
-This fork is suitable for controlled production pilots, but the following
-limits must be addressed or explicitly accepted before a general-availability
-deployment with strict latency, availability, or multi-tenant SLOs.
-
-### Retrieval scalability
-
-- TileMaxSim is an exact scorer, not a tensor-native approximate-nearest-
-  neighbour index. Mandatory source, ACL, document-type, and other caller-
-  authorized filters may safely reduce its input, but lexical or graph matches
-  are not high-recall semantic gates for ordinary queries.
-- Keeping all tensors resident on a GPU removes storage transfer but not the
-  exact scoring arithmetic. On the development corpus, exhaustive scoring of
-  34,054 descriptors with an 18 GiB resident tensor arena averaged 1.08 seconds;
-  a high-recall application scope averaged 45.56 ms. Larger low-latency
-  deployments need a tensor-native ANN or another measured high-recall
-  candidate generator before exact TileMaxSim.
-- A cache smaller than the active working set remains correct, but can thrash.
-  The 3 GiB tensor-arena stress run returned the same exact top-K while averaging
-  18.47 seconds for exhaustive scans. Capacity planning must therefore cover
-  the hot working set, or the application must preserve a high-recall scope.
-
-### Scheduling and multi-user operation
-
-- Fairness, priority, admission limits, and cache quotas are enforced by each
-  daemon independently. Multiple GPU replicas do not yet share a global queue,
-  global entitlement ledger, or work-aware load balancer, so skew between
-  replicas is possible.
-- Preemption is cooperative between CUDA kernel launches. The daemon cannot
-  interrupt a kernel that is already executing; the configured FMA quantum
-  bounds that non-preemptible interval.
-- GPU failover preserves correctness through durable tensor storage, but a new
-  replica starts with a cold cache. Availability and warm latency are separate
-  SLOs and should be tested independently.
-- Tenant identifiers and priorities are scheduling hints only. VectorChord does
-  not implement application tenancy, identity, ACL policy, graph governance, or
-  privileged-user membership. The authenticated caller must enforce those
-  policies and pass only an authorized hard scope.
-
-### Deployment, security, and disaster recovery
-
-- The TileMaxSim TCP protocol currently has no built-in TLS or client
-  authentication. Keep it on a private network and restrict callers with a
-  firewall or Kubernetes NetworkPolicy; use a mutually authenticated proxy if
-  traffic crosses a trust boundary.
-- Container images, health probes, metrics, PostgreSQL integration, and HA-
-  friendly TCP serving are provided, but manifests alone do not prove a
-  production installation. Operators must rehearse PostgreSQL switchover,
-  GPU-pod loss, rolling upgrades, restore, and migration with their actual
-  storage and Kubernetes environment.
-- This repository does not configure continuous PostgreSQL WAL archiving,
-  point-in-time recovery, or cross-site disaster recovery. Those remain
-  database-platform responsibilities and require a verified restore test.
-- Metrics endpoints are available, but ready-made SLO dashboards and alert
-  rules are not included. Production deployments need alerts for queueing,
-  rejection, timeout, cache churn, disk capacity, GPU health, and cold-cache
-  failover latency.
-- Tensor-object garbage collection and very large registries require explicit
-  operational testing and maintenance planning. Filesystem scans and database
-  locking can become visible at sufficiently large object counts.
-
-### Release status
-
-The SQL surface, external-tensor protocol, image tags, and deployment packaging
-remain under active development and may change before a stable release. The
-real-GPU and fault-path tests in this repository validate bounded execution and
-correctness; they are not a substitute for a multi-hour, many-user soak and
-chaos test on the target hardware.
-
-## Bounded multi-tenant GPU scheduling
-
-TileMaxSim remains opt-in. Ordinary single-vector VectorChord use does not
-start the CUDA daemon and does not require a GPU-memory setting. When an
-operator enables TileMaxSim, `tilemaxsimd` reserves exactly the configured
-CUDA devices and GiB allocations at startup and fails closed if any allocation
-cannot be obtained.
-
-The default `fair-priority` scheduler combines explicit request urgency with
-weighted tenant fairness. Higher numeric priority is more urgent; requests in
-the configured priority band are selected by normalized GPU service consumed,
-not merely by request count. The default band spans the complete public priority
-range, so urgency breaks ties and reorders work inside one tenant without letting
-a high-priority noisy tenant starve an under-served tenant. Waiting requests age
-up to the maximum priority. Operators that require global strict priority can
-select `priority`; a narrower band is an explicit stronger-urgency trade-off.
-This is a serving-design adaptation rather than wire compatibility with vLLM:
-VectorChord intentionally uses higher-number-means-more-urgent throughout its
-SQL, MCP, and IPC contracts.
-`fair` and strict `priority` (priority then FCFS) are also available. This takes
-the useful serving ideas from vLLM—bounded work budgets, continuous scheduling,
-and resumable long work—while adding tenant isolation: a large request is split
-at candidate/token quanta and re-enters the scheduler between CUDA launches.
-It is cooperative preemption between kernels, not interruption of an executing
-CUDA kernel.
-
-Admission is bounded both globally and per tenant before work enters the
-scheduler. Client disconnects and end-to-end deadlines are checked between
-quanta. GPU and host cache ownership also have per-tenant caps; optional GPU
-reservations and tenant scheduling weights can be configured for differentiated
-service. Tenant identifiers are accepted only as scheduling domains, never as
-authorization evidence, and request logs expose only a stable tenant hash.
-
-Memory flags use GiB rather than byte counts. A representative launch is:
-
-The published daemon is built with CUDA 12.6 and requires the NVIDIA container
-runtime plus a host driver compatible with CUDA 12.6. Its final image keeps the
-statically linked CUDA application runtime but intentionally omits the unused
-CUDA toolkit; the container runtime injects the host driver libraries/devices.
+Memory flags use GiB rather than raw byte counts. A representative launch is:
 
 ```shell
 tilemaxsimd \
@@ -267,211 +125,243 @@ tilemaxsimd \
   --tenant-cache-reservation foreground=4
 ```
 
-PostgreSQL may use either a local Unix path or a `tcp://HOST:PORT` value for
-`vchordrq.maxsim_gpu_endpoint`. The TCP listener lets a long-lived GPU service
-remain independent from PostgreSQL pod failover. It intentionally has no
-application authentication layer, so it must be exposed only on a private
-network and restricted to PostgreSQL clients with a firewall or Kubernetes
-NetworkPolicy. Tenant and priority fields remain scheduling hints, not trust
-boundaries.
+PostgreSQL can connect through a local Unix socket or a `tcp://HOST:PORT`
+endpoint. `GET /livez`, `GET /healthz`, and `GET /metrics` expose process
+liveness, readiness, and bounded operational metrics. See
+[`docs/TILEMAXSIM_CUDA_SIDECAR.md`](docs/TILEMAXSIM_CUDA_SIDECAR.md) and
+[`docs/TILEMAXSIM_IPC_V2.md`](docs/TILEMAXSIM_IPC_V2.md) for deployment and
+protocol details.
 
-The optional status socket, and an optional TCP status listener for
-network-isolated orchestrator probes, serve HTTP `GET /healthz` and Prometheus
-`GET /metrics`. Metrics include readiness, scheduler depth, active CUDA work,
-completed/error/timeout/disconnect outcomes, and global/per-tenant admission
-rejections without exporting tenant identifiers.
+## Measured performance
 
-`GET /livez` reports process liveness separately from readiness. The packaged
-`tilemaxsimctl --probe live|ready` probe can wait on the status socket without
-curl or a TCP port.
-An opt-in hardened systemd unit and environment example are provided under
-`deploy/systemd`; the CUDA container uses the same probe for its health check.
+The development corpus contains 34,054 descriptors, 34,027 unique tensors, and
+16.28 GB of logical FP16 tensor data. Absolute latency depends on storage, CPU,
+and GPU hardware; same-machine comparisons are more meaningful than isolated
+numbers.
 
-The in-flight request budget is also expressed in GiB. A reader must reserve
-its complete declared frame after the fixed header is validated, and keeps that
-permit through completion, timeout, or disconnect. This bounds aggregate query
-and descriptor memory even when many clients submit maximum-size frames at once.
-The FMA quantum additionally bounds one non-preemptible CUDA launch by actual
-`query rows × document rows × dimension` work. A single candidate above that
-operator-configured limit is rejected instead of monopolizing a shared GPU.
+| Optimization | Baseline | Optimized | Result |
+| --- | ---: | ---: | ---: |
+| Immutable shards and batched reads | 333.38 ms, sequential files | 56.52 ms | 5.90x faster |
+| Shards versus batched legacy files | 87.56 ms | 56.52 ms | 1.55x faster |
+| Batched host-to-device transfer | 37.06 ms, 100 transfers | 14.19 ms, one transfer | 2.61x faster |
+| TinyLFU/GDSF admission | 69.98% LRU hit rate | 76.18% hit rate | +6.20 percentage points |
+| Rust/CUDA cold request | 855.34 ms, Python/Triton | 93.86 ms | 9.11x faster |
+| Rust/CUDA warm request p50 | 14.26 ms, Python/Triton | 2.09 ms | 6.82x faster |
+| Rust/CUDA warm request p95 | 14.84 ms, Python/Triton | 2.20 ms | 6.75x faster |
 
-PostgreSQL sends protocol v3 scheduling metadata only when
-`vchordrq.maxsim_tenant` is set; otherwise it retains protocol v2 compatibility.
-GBrain derives that tenant value from authenticated runtime context and may set
-`vchordrq.maxsim_priority` in the range -100 through 100. Priority changes
-latency ordering only and never bypasses PostgreSQL row visibility, ACL, source,
-or other mandatory filters.
+A 20 GiB run assigned 18 GiB to tensors and 2 GiB to workspace. Prewarming all
+34,027 unique tensors took 14.86 seconds in the Rust/CUDA daemon versus 23.07
+seconds in the Python/Triton implementation. The default 32 KiB page-run
+allocator reduced allocated space from 17.840 GB with the former 256 KiB buddy
+allocator to 16.725 GB, reducing internal rounding waste from 8.82% to 2.74%.
 
-The implementation is currently under active development. Its SQL interfaces
-and deployment packaging may change before a stable release. This repository
-contains only the public implementation and public-facing project information;
-private planning and application documentation are intentionally excluded.
+### Full-range and small-cache stress
 
-This work is based on
-[supervc-stack/VectorChord](https://github.com/supervc-stack/VectorChord). The
-original VectorChord README is retained below for upstream installation,
-licensing, and project information.
+With all tensors resident, an intentionally exhaustive exact scan of all 34,054
+descriptors averaged 1.08 seconds. A 3 GiB tensor arena plus 1 GiB host cache
+returned the same exact top-K, but sequential full scans caused 68,106 misses,
+61,499 evictions, and 32.53 GB of host-to-device transfer; native round trips
+averaged 18.47 seconds.
 
----
+The slowdown is cyclic cache thrashing and repeated I/O, not TileMaxSim
+arithmetic becoming linearly slower as memory shrinks. Candidate-scoped queries
+whose hot working set fits the cache do not exhibit this full-scan behavior.
 
-<div align="center">
+### Candidate-scope ablation
 
-# VectorChord
+Forty real queries compared the original 1,024-dimensional text embedding with
+pgvector HNSW against exact TileMaxSim over a lexical candidate scope:
 
-**Ready for the Billion-Scale Era. Host 100M vectors on a single i4i.xlarge ($247/mo) and [scale seamlessly to 1B+](https://blog.vectorchord.ai/scaling-vector-search-to-1-billion-on-postgresql).**
+| Path | Mean latency | p95 | Quality |
+| --- | ---: | ---: | ---: |
+| Original text embedding + pgvector HNSW | 5.80 ms | 5.86 ms | document hit@1 1.000 |
+| Candidate-scoped TileMaxSim, 18 GiB resident cache | 45.56 ms | 134.99 ms | hit@1 0.475; hit@5 0.650 |
+| Candidate-scoped TileMaxSim, 3 GiB cache | 573.43 ms | 1,812.70 ms | identical TileMaxSim ranking |
 
-[Official Site][official-site-link] · [Blog][blog-link] · [Docs][docs-link] · [Feedback][github-issues-link] · [Contact Us][email-link]
+The lexical scope covered the relevant document for only 65% of queries.
+TileMaxSim kept the relevant document in its top five for every covered query,
+so candidate generation—not exact scoring—set the recall ceiling. Lexical and
+ordinary graph matches must therefore not be the only hard gate for general
+semantic retrieval. Authorization filters remain hard; relational graph scopes
+may be used for explicitly relational intent when the application can construct
+a complete range.
 
-[![][github-release-shield]][github-release-link]
-[![][docker-release-shield]][docker-release-link]
-[![][docker-pulls-shield]][docker-pulls-link]
-[![][ghcr-release-shield]][ghcr-release-link]
-[![][github-downloads-shield]][github-downloads-link]
-[![][discord-shield]][discord-link]
-[![][X-shield]][X-link]
-[![][deepwiki-shield]][deepwiki-link]
-[![][license-1-shield]][license-1-link]
-[![][license-2-shield]][license-2-link]
+Reproducible drivers:
 
-</div>
+- [`services/benchmark_tilemaxsim_ablation.py`](services/benchmark_tilemaxsim_ablation.py)
+- [`services/benchmark_full_corpus_tilemaxsim.py`](services/benchmark_full_corpus_tilemaxsim.py)
+- [`services/benchmark_gbrain_scoped_tilemaxsim.py`](services/benchmark_gbrain_scoped_tilemaxsim.py)
+- [`services/benchmark_postgres_single_vector.py`](services/benchmark_postgres_single_vector.py)
 
-VectorChord (vchord) is a PostgreSQL extension engineered for scalable, high-performance, and cost-effective vector search.
+## Limitations
 
-To efficiently store vectors while preserving search quality, VectorChord applies RaBitQ[^1] compression together with autonomous reranking. With VectorChord, you can store 400,000 vectors for just $1, enabling significant savings: 6x more vectors compared to Pinecone's optimized storage and 26x more than pgvector/pgvecto.rs for the same price.
+This project is suitable for controlled production pilots. Strict low-latency,
+high-availability, or large multi-user deployments must address or explicitly
+accept the following limitations before general availability.
 
-[^1]: Gao, Jianyang, and Cheng Long. "RaBitQ: Quantizing High-Dimensional Vectors with a Theoretical Error Bound for Approximate Nearest Neighbor Search." Proceedings of the ACM on Management of Data 2.3 (2024): 1-27.
+### Retrieval scale
 
-![][image-compare]
+- Exact TileMaxSim is a scorer, not a tensor-native approximate-nearest-
+  neighbour index. Full residency removes transfer time but not exact scoring
+  arithmetic.
+- Large low-latency corpora still need a measured high-recall candidate
+  generator or a future tensor-native ANN before exact TileMaxSim.
+- A cache smaller than the active working set remains correct but can thrash;
+  production capacity must cover the hot set or preserve a safe high-recall
+  range.
 
-## Features
+### Cache and multi-user isolation
 
-VectorChord introduces remarkable enhancements over pgvecto.rs and pgvector:
+- Fairness, priority, admission, and reservations are enforced independently by
+  each daemon. Replicas do not share a global queue, entitlement ledger, or
+  residency-aware router.
+- A GPU reservation protects aggregate bytes for a scheduling tenant, not a
+  named `source_id` or knowledge base. There is no dynamic cache-domain API,
+  source-level prewarm contract, or host-cache minimum.
+- Reservations are configured at daemon startup. On multi-GPU daemons the
+  current value is applied to each device, rather than being expressed as one
+  explicit cluster-wide total.
+- Globally resident manifests are pinned under a service-owned domain. If
+  pinned pages consume the entire arena, unrelated cold tensors cannot evict
+  them and the request fails instead of waiting for pinned data to leave.
+- Preemption occurs only between CUDA launches. A running kernel is not
+  interruptible.
+- Tenant and priority values are scheduling hints, not authorization evidence.
 
-**💰 Affordable Vector Search**: Host 100M × 768-dimensional vectors → AWS i4i.xlarge ($247/month)[^2], host 1B × 96-dimensional vectors → i7ie.6xlarge ($2246/month)[^3], helping you keep infrastructure costs down while maintaining competitive search quality.
+### Operations and security
 
-[^2]: Please check out our [blog post](https://blog.vectorchord.ai/vectorchord-store-400k-vectors-for-1-in-postgresql) for more details.
-[^3]: Please check out our [blog post](https://blog.vectorchord.ai/scaling-vector-search-to-1-billion-on-postgresql) for more details.
+- The TileMaxSim TCP protocol has no built-in TLS or client authentication. It
+  must remain on a private network or behind a mutually authenticated proxy.
+- A replacement GPU replica starts cold. Durable storage preserves correctness,
+  but availability and warm-cache latency are separate SLOs.
+- PostgreSQL WAL archiving, PITR, cross-site disaster recovery, and verified
+  restore procedures remain database-platform responsibilities.
+- Metrics exist, but ready-made SLO dashboards and alert rules are not yet
+  included.
+- Very large tensor registries and garbage collection require scale-specific
+  operational testing.
 
-**⚡ Accelerated Index Build**: Index 100 million vectors in just 20 minutes. Powered by hierarchical K-means and highly optimized disk operations, VectorChord eliminates the bottleneck of vector indexing on a single machine with limited hardware resources.
+### Release status
 
-[^4]: Please check out our [blog post](https://blog.vectorchord.ai/how-we-made-100m-vector-indexing-in-20-minutes-possible-on-postgresql#heading-hierarchical-k-means) for more technique details and [document](https://docs.vectorchord.ai/vectorchord/usage/partitioning-tuning.html#hierarchical-k-means) for usages.
+The SQL surface, external-tensor protocol, image tags, and deployment packaging
+remain under active development. Real-GPU and fault-path tests do not replace
+multi-hour, many-user soak and chaos testing on target hardware.
 
-**📈 Smoothly Scale Up**: Scale with confidence as your data grows. Through dimensionality reduction and sampling[^5], VectorChord effectively controls memory growth, enabling 1B-vector indexes to be built on machines with 128GB of memory in practice.
+## Outlook: an AI infrastructure retrieval plane
 
-[^5]: Please check out our [blog post](https://blog.vectorchord.ai/how-we-made-100m-vector-indexing-in-20-minutes-possible-on-postgresql#heading-dimensionality-reduction) for more technique details and [document](https://docs.vectorchord.ai/vectorchord/usage/partitioning-tuning.html#reduce-sampling-factor) for usages.
+VectorChord TileMaxSim is intended to become the retrieval plane in a broader,
+composable AI infrastructure rather than absorb application or model-serving
+responsibilities:
 
-**🔌 Seamless Integration**: Fully compatible with pgvector data types and syntax while providing optimal defaults out of the box - no complex parameter tuning needed. Just drop in VectorChord for enhanced experience.
+```text
+Agent / application layer
+          │
+          ▼
+AI gateway: identity, quota, priority, deadline, trace
+          │
+          ├── Knowledge layer ── PostgreSQL / VectorChord ── tilemaxsimd
+          │
+          └── Ray Serve ── vLLM and other model engines
 
-**💾 Efficient Storage with Low-Bit Data type**: Drastically reduce storage costs with our [native 4-bit (RaBitQ4) and 8-bit (RaBitQ8) vector types](https://docs.vectorchord.ai/vectorchord/usage/quantization-types.html). Achieve massive space savings without compromising search quality—RaBitQ8 maintains high precision with <1% recall loss.
-
-## Quick Start
-
-For new users, we recommend using the Docker image to get started quickly. If you do not prefer Docker, please read [installation guide](https://docs.vectorchord.ai/vectorchord/getting-started/installation.html) for other installation methods.
-
-```bash
-docker run \
-  --name vectorchord-demo \
-  -e POSTGRES_PASSWORD=mysecretpassword \
-  -p 5432:5432 \
-  -d ghcr.io/tensorchord/vchord-postgres:pg18-v1.1.1
+Kubernetes / KubeRay: placement, GPU nodes, scaling, recovery
+Object storage: model weights, tensor shards, ingestion artifacts
+Prometheus + OpenTelemetry: end-to-end observability
 ```
 
-> [!NOTE]
-> In addition to the base image with the VectorChord extension, we provide an all-in-one image, `tensorchord/vchord-suite:pg17-latest`. This comprehensive image includes all official TensorChord extensions, including `VectorChord`, `VectorChord-bm25` and `pg_tokenizer.rs` . Developers should select an image tag that is compatible with their extension's version, as indicated in [the support matrix](https://github.com/tensorchord/VectorChord-images?tab=readme-ov-file#support-matrix).
+In this design:
 
-Then you can connect to the database using the `psql` command line tool. The default username is `postgres`, and the default password is `mysecretpassword`.
+- [Ray Serve LLM](https://docs.ray.io/en/latest/serve/llm/) coordinates
+  distributed model replicas, autoscaling, and model-aware routing.
+- [vLLM](https://docs.vllm.ai/) owns generation batching, model parallelism,
+  KV-cache management, and prefix-cache reuse.
+- VectorChord owns PostgreSQL retrieval semantics and vector/tensor metadata;
+  `tilemaxsimd` owns exact TileMaxSim, persistent tensor residency, and bounded
+  retrieval scheduling.
+- The authenticated application owns identity, ACL, graph/fact/event
+  governance, query intent, and the final RAG pipeline.
 
-```bash
-psql -h localhost -p 5432 -U postgres
+The components should not silently compete for the same GPU memory. Initial
+deployments should place vLLM and TileMaxSim in separate GPU pools. Kubernetes
+or another resource manager must account for the memory reserved by the
+long-lived TileMaxSim daemon before scheduling model workers; explicit MIG or
+other hardware partitioning can be evaluated later.
+
+The next infrastructure milestones are:
+
+1. Separate `scheduler_tenant` from an opaque `cache_domain`, typically derived
+   by the authorized caller from tenant and source identity.
+2. Add GPU and host `min_resident_gb`, `max_gb`, and prewarm contracts per cache
+   domain, with unambiguous per-device and fleet-wide semantics.
+3. Build a bounded global admission layer and a residency-aware router across
+   TileMaxSim replicas, while leaving exact local quantum scheduling in each
+   daemon.
+4. Propagate one request envelope—request ID, tenant, source, priority,
+   deadline, trace ID, and cache domain—through retrieval and model serving.
+5. Validate cold-start recovery, rolling upgrades, PostgreSQL failover, GPU-pod
+   loss, multi-tenant isolation, and long-running soak/chaos behavior.
+6. Add a tensor-native ANN or another recall-measured first stage for corpora
+   where exact full-range TileMaxSim cannot meet the latency SLO.
+
+Ray is an orchestration layer, not durable storage. PostgreSQL and immutable
+object storage remain authoritative. `tilemaxsimd` should remain a supervised,
+stateful GPU service rather than a short-lived generic Ray task, so its reserved
+arena and cache lifetime remain predictable.
+
+## Security boundary
+
+PostgreSQL sends scheduled protocol metadata only when
+`vchordrq.maxsim_tenant` is set. Priority affects latency ordering only; it
+cannot bypass row visibility, ACL, source, or other mandatory filters. Request
+logs expose a stable hash rather than raw tenant identifiers.
+
+This public repository contains implementation and public-facing project
+information only. Private application and planning documents are intentionally
+excluded.
+
+## Build and test
+
+Useful entry points include:
+
+```shell
+make build
+cargo test --locked --workspace --exclude vchord --no-fail-fast
+cargo test --manifest-path services/tilemaxsimd/Cargo.toml --locked
 ```
 
-Now you can play with VectorChord!
+The CUDA container and its test stage are defined in
+[`services/Dockerfile.tilemaxsimd`](services/Dockerfile.tilemaxsimd). PostgreSQL
+tensor-source integration is documented in
+[`docs/MAXSIM_TENSOR_SOURCES.md`](docs/MAXSIM_TENSOR_SOURCES.md).
 
-VectorChord depends on pgvector, including the vector representation. Since you can use them directly, your application can be easily migrated without pain!
+## Acknowledgements
 
-```sql
-CREATE EXTENSION IF NOT EXISTS vchord CASCADE;
-```
+We thank the maintainers and contributors of the upstream
+[supervc-stack/VectorChord](https://github.com/supervc-stack/VectorChord)
+project. Its PostgreSQL extension, vector types, `vchordrq` index, and existing
+MaxSim support provide the foundation on which this project builds.
 
-Similar to pgvector, you can create a table with vector column and insert some rows to it.
+The project's IO-aware GPU MaxSim direction and the `TileMaxSim` name are
+informed by Ashutosh Sharma's paper,
+[“TileMaxSim: IO-Aware GPU MaxSim Scoring with Dimension Tiling and Fused Product Quantization”](https://arxiv.org/abs/2606.26439),
+arXiv:2606.26439 (2026), and its accompanying open-source
+[ashutoshuiuc/tilemaxsim](https://github.com/ashutoshuiuc/tilemaxsim)
+Triton implementation. We gratefully acknowledge that work and its published
+analysis of fused, tiled MaxSim scoring.
 
-```sql
-CREATE TABLE items (id bigserial PRIMARY KEY, embedding vector(3));
-INSERT INTO items (embedding) SELECT ARRAY[random(), random(), random()]::real[] FROM generate_series(1, 1000);
-```
+This repository is a separate PostgreSQL/Rust/CUDA systems integration. Its
+IPC protocols, persistent three-level tensor cache, allocator, multi-user
+scheduler, database bindings, and operational packaging are maintained here;
+the acknowledgement does not imply endorsement or shared maintenance by the
+upstream projects or paper author.
 
-With VectorChord, you can create `vchordrq` indexes.
+## Project provenance and license
 
-```SQL
-CREATE INDEX ON items USING vchordrq (embedding vector_l2_ops);
-```
+This project is derived from
+[supervc-stack/VectorChord](https://github.com/supervc-stack/VectorChord).
+Original source files retain their upstream copyright and license notices.
+TileMaxSim project additions are Copyright (c) 2026 Hu Xinjing.
 
-And then perform a vector search using `SELECT ... ORDER BY ... LIMIT ...`.
-
-```SQL
-SELECT * FROM items ORDER BY embedding <-> '[3,1,2]' LIMIT 5;
-```
-
-For more usage, please read:
-
-- [Indexing](https://docs.vectorchord.ai/vectorchord/usage/indexing.html)
-- [Multi-Vector Retrieval](https://docs.vectorchord.ai/vectorchord/usage/indexing-with-maxsim-operators.html)
-- [Quantization Types](https://docs.vectorchord.ai/vectorchord/usage/quantization-types.html)
-- [Graph Index](https://docs.vectorchord.ai/vectorchord/usage/graph-index.html)
-- [Quantization Types](https://docs.vectorchord.ai/vectorchord/usage/quantization-types.html)
-- [Similarity Filter](https://docs.vectorchord.ai/vectorchord/usage/range-query.html)
-- [PostgreSQL Tuning](https://docs.vectorchord.ai/vectorchord/usage/performance-tuning.html)
-- [Monitoring](https://docs.vectorchord.ai/vectorchord/usage/monitoring.html)
-- [Fallback Parameters](https://docs.vectorchord.ai/vectorchord/usage/fallback-parameters.html)
-- [Measure Recall](https://docs.vectorchord.ai/vectorchord/usage/measure-recall.html)
-- [Prewarm](https://docs.vectorchord.ai/vectorchord/usage/prewarm.html)
-- [Prefilter](https://docs.vectorchord.ai/vectorchord/usage/prefilter.html)
-- [Prefetch](https://docs.vectorchord.ai/vectorchord/usage/prefetch.html)
-- [Rerank in Table](https://docs.vectorchord.ai/vectorchord/usage/rerank-in-table.html)
-- [Partitioning Tuning](https://docs.vectorchord.ai/vectorchord/usage/partitioning-tuning.html)
-- [External Build](https://docs.vectorchord.ai/vectorchord/usage/external-index-precomputation.html)
-
-## License
-
-This software is licensed under a dual license model:
-
-1. **GNU Affero General Public License v3 (AGPLv3)**: You may use, modify, and distribute this software under the terms of the AGPLv3.
-
-2. **Elastic License v2 (ELv2)**: You may also use, modify, and distribute this software under the Elastic License v2, which has specific restrictions.
-
-You may choose either license based on its terms. The original VectorChord code
-retains its upstream copyright notices. TileMaxSim fork additions are Copyright
-(c) 2026 Hu Xinjing; use this fork's
-[issue tracker](https://github.com/HuXinjing/VectorChord/issues) for support.
-
-[cost-estimation]: https://github.com/user-attachments/assets/168fe550-6465-4eee-a224-8c848c301e3d
-[image-compare]: https://github.com/user-attachments/assets/2d985f1e-7093-4c3a-8bf3-9f0b92c0e7e7
-[license-1-link]: https://github.com/HuXinjing/VectorChord#license
-[license-1-shield]: https://img.shields.io/badge/License-AGPLv3-green?logo=data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCAyNCAyNCIgd2lkdGg9IjI0IiBoZWlnaHQ9IjI0IiBmaWxsPSIjZmZmZmZmIj48cGF0aCBmaWxsLXJ1bGU9ImV2ZW5vZGQiIGQ9Ik0xMi43NSAyLjc1YS43NS43NSAwIDAwLTEuNSAwVjQuNUg5LjI3NmExLjc1IDEuNzUgMCAwMC0uOTg1LjMwM0w2LjU5NiA1Ljk1N0EuMjUuMjUgMCAwMTYuNDU1IDZIMi4zNTNhLjc1Ljc1IDAgMTAwIDEuNUgzLjkzTC41NjMgMTUuMThhLjc2Mi43NjIgMCAwMC4yMS44OGMuMDguMDY0LjE2MS4xMjUuMzA5LjIyMS4xODYuMTIxLjQ1Mi4yNzguNzkyLjQzMy42OC4zMTEgMS42NjIuNjIgMi44NzYuNjJhNi45MTkgNi45MTkgMCAwMDIuODc2LS42MmMuMzQtLjE1NS42MDYtLjMxMi43OTItLjQzMy4xNS0uMDk3LjIzLS4xNTguMzEtLjIyM2EuNzUuNzUgMCAwMC4yMDktLjg3OEw1LjU2OSA3LjVoLjg4NmMuMzUxIDAgLjY5NC0uMTA2Ljk4NC0uMzAzbDEuNjk2LTEuMTU0QS4yNS4yNSAwIDAxOS4yNzUgNmgxLjk3NXYxNC41SDYuNzYzYS43NS43NSAwIDAwMCAxLjVoMTAuNDc0YS43NS43NSAwIDAwMC0xLjVIMTIuNzVWNmgxLjk3NGMuMDUgMCAuMS4wMTUuMTQuMDQzbDEuNjk3IDEuMTU0Yy4yOS4xOTcuNjMzLjMwMy45ODQuMzAzaC44ODZsLTMuMzY4IDcuNjhhLjc1Ljc1IDAgMDAuMjMuODk2Yy4wMTIuMDA5IDAgMCAuMDAyIDBhMy4xNTQgMy4xNTQgMCAwMC4zMS4yMDZjLjE4NS4xMTIuNDUuMjU2Ljc5LjRhNy4zNDMgNy4zNDMgMCAwMDIuODU1LjU2OCA3LjM0MyA3LjM0MyAwIDAwMi44NTYtLjU2OWMuMzM4LS4xNDMuNjA0LS4yODcuNzktLjM5OWEzLjUgMy41IDAgMDAuMzEtLjIwNi43NS43NSAwIDAwLjIzLS44OTZMMjAuMDcgNy41aDEuNTc4YS43NS43NSAwIDAwMC0xLjVoLTQuMTAyYS4yNS4yNSAwIDAxLS4xNC0uMDQzbC0xLjY5Ny0xLjE1NGExLjc1IDEuNzUgMCAwMC0uOTg0LS4zMDNIMTIuNzVWMi43NXpNMi4xOTMgMTUuMTk4YTUuNDE4IDUuNDE4IDAgMDAyLjU1Ny42MzUgNS40MTggNS40MTggMCAwMDIuNTU3LS42MzVMNC43NSA5LjM2OGwtMi41NTcgNS44M3ptMTQuNTEtLjAyNGMuMDgyLjA0LjE3NC4wODMuMjc1LjEyNi41My4yMjMgMS4zMDUuNDUgMi4yNzIuNDVhNS44NDYgNS44NDYgMCAwMDIuNTQ3LS41NzZMMTkuMjUgOS4zNjdsLTIuNTQ3IDUuODA3eiI+PC9wYXRoPjwvc3ZnPgo=
-[license-2-link]: https://github.com/HuXinjing/VectorChord#license
-[license-2-shield]: https://img.shields.io/badge/License-ELv2-green?logo=data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCAyNCAyNCIgd2lkdGg9IjI0IiBoZWlnaHQ9IjI0IiBmaWxsPSIjZmZmZmZmIj48cGF0aCBmaWxsLXJ1bGU9ImV2ZW5vZGQiIGQ9Ik0xMi43NSAyLjc1YS43NS43NSAwIDAwLTEuNSAwVjQuNUg5LjI3NmExLjc1IDEuNzUgMCAwMC0uOTg1LjMwM0w2LjU5NiA1Ljk1N0EuMjUuMjUgMCAwMTYuNDU1IDZIMi4zNTNhLjc1Ljc1IDAgMTAwIDEuNUgzLjkzTC41NjMgMTUuMThhLjc2Mi43NjIgMCAwMC4yMS44OGMuMDguMDY0LjE2MS4xMjUuMzA5LjIyMS4xODYuMTIxLjQ1Mi4yNzguNzkyLjQzMy42OC4zMTEgMS42NjIuNjIgMi44NzYuNjJhNi45MTkgNi45MTkgMCAwMDIuODc2LS42MmMuMzQtLjE1NS42MDYtLjMxMi43OTItLjQzMy4xNS0uMDk3LjIzLS4xNTguMzEtLjIyM2EuNzUuNzUgMCAwMC4yMDktLjg3OEw1LjU2OSA3LjVoLjg4NmMuMzUxIDAgLjY5NC0uMTA2Ljk4NC0uMzAzbDEuNjk2LTEuMTU0QS4yNS4yNSAwIDAxOS4yNzUgNmgxLjk3NXYxNC41SDYuNzYzYS43NS43NSAwIDAwMCAxLjVoMTAuNDc0YS43NS43NSAwIDAwMC0xLjVIMTIuNzVWNmgxLjk3NGMuMDUgMCAuMS4wMTUuMTQuMDQzbDEuNjk3IDEuMTU0Yy4yOS4xOTcuNjMzLjMwMy45ODQuMzAzaC44ODZsLTMuMzY4IDcuNjhhLjc1Ljc1IDAgMDAuMjMuODk2Yy4wMTIuMDA5IDAgMCAuMDAyIDBhMy4xNTQgMy4xNTQgMCAwMC4zMS4yMDZjLjE4NS4xMTIuNDUuMjU2Ljc5LjRhNy4zNDMgNy4zNDMgMCAwMDIuODU1LjU2OCA3LjM0MyA3LjM0MyAwIDAwMi44NTYtLjU2OWMuMzM4LS4xNDMuNjA0LS4yODcuNzktLjM5OWEzLjUgMy41IDAgMDAuMzEtLjIwNi43NS43NSAwIDAwLjIzLS44OTZMMjAuMDcgNy41aDEuNTc4YS43NS43NSAwIDAwMC0xLjVoLTQuMTAyYS4yNS4yNSAwIDAxLS4xNC0uMDQzbC0xLjY5Ny0xLjE1NGExLjc1IDEuNzUgMCAwMC0uOTg0LS4zMDNIMTIuNzVWMi43NXpNMi4xOTMgMTUuMTk4YTUuNDE4IDUuNDE4IDAgMDAyLjU1Ny42MzUgNS40MTggNS40MTggMCAwMDIuNTU3LS42MzVMNC43NSA5LjM2OGwtMi41NTcgNS44M3ptMTQuNTEtLjAyNGMuMDgyLjA0LjE3NC4wODMuMjc1LjEyNi41My4yMjMgMS4zMDUuNDUgMi4yNzIuNDVhNS44NDYgNS44NDYgMCAwMDIuNTQ3LS41NzZMMTkuMjUgOS4zNjdsLTIuNTQ3IDUuODA3eiI+PC9wYXRoPjwvc3ZnPgo=
-
-[docker-release-link]: https://hub.docker.com/r/tensorchord/vchord-postgres
-[docker-release-shield]: https://img.shields.io/docker/v/tensorchord/vchord-postgres?color=369eff&label=docker&labelColor=black&logo=docker&logoColor=white&style=flat
-[github-release-link]: https://github.com/HuXinjing/VectorChord/releases
-[github-release-shield]: https://img.shields.io/github/v/release/HuXinjing/VectorChord?color=369eff&labelColor=black&logo=github&style=flat
-[ghcr-release-link]: https://github.com/users/HuXinjing/packages/container/package/vectorchord-tilemaxsimd
-<!-- GHCR badge is not supported by shields.io yet, use docker badge instead -->
-[ghcr-release-shield]: https://img.shields.io/docker/v/tensorchord/vchord-postgres?color=369eff&label=GHCR&labelColor=black&logo=github&logoColor=white&style=flat
-[docker-pulls-link]: https://hub.docker.com/r/tensorchord/vchord-postgres
-[docker-pulls-shield]: https://img.shields.io/docker/pulls/tensorchord/vchord-postgres?color=45cc11&labelColor=black&style=flat&sort=semver
-[previous-docker-pulls-link]: https://hub.docker.com/r/tensorchord/pgvecto-rs
-[previous-docker-pulls-shield]: https://img.shields.io/docker/pulls/tensorchord/pgvecto-rs?color=45cc11&labelColor=black&style=flat&sort=semver
-[github-downloads-link]: https://github.com/HuXinjing/VectorChord/releases
-[github-downloads-shield]: https://img.shields.io/github/downloads/HuXinjing/VectorChord/total?color=45cc11&labelColor=black&style=flat&sort=semver
-[discord-link]: https://discord.gg/KqswhpVgdU
-[discord-shield]: https://img.shields.io/discord/974584200327991326?&logoColor=white&color=5865F2&style=flat&logo=discord&cacheSeconds=60
-[X-link]: https://x.com/TensorChord
-[X-shield]: https://img.shields.io/badge/follow-%40tensorchord-1DA1F2?logo=x&style=flat&logoColor=white&color=1da1f2
-[deepwiki-link]: https://deepwiki.com/HuXinjing/VectorChord
-[deepwiki-shield]: https://deepwiki.com/badge.svg
-[blog-link]: https://blog.vectorchord.ai/
-[official-site-link]: https://vectorchord.ai/
-[github-issues-link]: https://github.com/HuXinjing/VectorChord/issues
-[email-link]: https://github.com/HuXinjing/VectorChord/issues
-[docs-link]: https://docs.vectorchord.ai/vectorchord/
+The repository is offered under the license terms in [`LICENSE`](LICENSE),
+including AGPLv3 and Elastic License v2 options where applicable. Use this
+project's [issue tracker](https://github.com/HuXinjing/VectorChord/issues) for
+support and project-specific reports.
