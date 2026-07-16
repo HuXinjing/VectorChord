@@ -13,14 +13,73 @@ use crate::gpu::Gpu;
 use crate::protocol::{Descriptor, Request};
 use crate::shard::{HostCacheStatus, ShardStore, cache_key};
 use anyhow::{Result, anyhow, bail};
-use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::sync::{Arc, Mutex, mpsc};
+use std::time::{Duration, Instant};
+
+#[derive(Clone, Copy, Debug)]
+pub struct IoPipelineConfig {
+    pub overlap: bool,
+    pub batch_bytes: usize,
+}
+
+impl IoPipelineConfig {
+    pub fn validate(self) -> Result<Self> {
+        if self.batch_bytes == 0 {
+            bail!("I/O pipeline batch size must be positive");
+        }
+        Ok(self)
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct IoPipelineStatus {
+    pub overlap_enabled: bool,
+    pub batch_bytes: usize,
+    pub resolve_batches: u64,
+    pub resolve_bytes: u64,
+    pub resolve_microseconds: u64,
+    pub upload_microseconds: u64,
+    pub compute_microseconds: u64,
+    pub overlap_cycles: u64,
+    pub overlap_microseconds: u64,
+}
 
 struct MissingTensor {
     candidate_index: usize,
     descriptor: Descriptor,
     key: String,
     payload: Arc<[u8]>,
+}
+
+struct UnresolvedBatch {
+    indices: Vec<usize>,
+    descriptors: Vec<Descriptor>,
+    payload_bytes: usize,
+}
+
+struct ResolvedBatch {
+    tensors: VecDeque<MissingTensor>,
+    payload_bytes: usize,
+    elapsed: Duration,
+}
+
+struct PreparedBatch {
+    chunks: Vec<Vec<ResidentTensor>>,
+    uploads: Vec<Vec<(u64, Arc<[u8]>)>>,
+}
+
+impl PreparedBatch {
+    fn empty(device_count: usize) -> Self {
+        Self {
+            chunks: (0..device_count).map(|_| Vec::new()).collect(),
+            uploads: (0..device_count).map(|_| Vec::new()).collect(),
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.chunks.iter().all(Vec::is_empty)
+    }
 }
 
 struct ResidentTensor {
@@ -34,7 +93,7 @@ struct ResidentTensor {
 }
 
 struct DeviceState {
-    gpu: Gpu,
+    gpu: Arc<Gpu>,
     cache: GpuCache,
     h2d_batches: u64,
     h2d_bytes: u64,
@@ -42,8 +101,10 @@ struct DeviceState {
 
 pub struct Engine {
     devices: Vec<DeviceState>,
-    store: ShardStore,
+    store: Arc<Mutex<ShardStore>>,
     next_device: usize,
+    io_pipeline: IoPipelineConfig,
+    io_status: IoPipelineStatus,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -75,6 +136,7 @@ pub struct EngineStatus {
     pub host: HostCacheStatus,
     pub batch_read_calls: u64,
     pub batch_read_bytes: u64,
+    pub io_pipeline: IoPipelineStatus,
 }
 
 impl Engine {
@@ -85,10 +147,12 @@ impl Engine {
         tenant_cache_max_percent: u8,
         pinned_cache_max_percent: u8,
         tenant_reservations: &HashMap<String, usize>,
+        io_pipeline: IoPipelineConfig,
     ) -> Result<Self> {
         if gpus.is_empty() {
             bail!("at least one GPU is required");
         }
+        let io_pipeline = io_pipeline.validate()?;
         let devices = gpus
             .into_iter()
             .map(|gpu| {
@@ -101,7 +165,7 @@ impl Engine {
                 )
                 .map_err(|message| anyhow!(message))?;
                 Ok(DeviceState {
-                    gpu,
+                    gpu: Arc::new(gpu),
                     cache,
                     h2d_batches: 0,
                     h2d_bytes: 0,
@@ -110,13 +174,40 @@ impl Engine {
             .collect::<Result<Vec<_>>>()?;
         Ok(Self {
             devices,
-            store,
+            store: Arc::new(Mutex::new(store)),
             next_device: 0,
+            io_pipeline,
+            io_status: IoPipelineStatus {
+                overlap_enabled: io_pipeline.overlap,
+                batch_bytes: io_pipeline.batch_bytes,
+                ..IoPipelineStatus::default()
+            },
         })
     }
 
     pub fn reload_shards(&mut self) -> Result<()> {
-        self.store.reload()
+        self.store
+            .lock()
+            .map_err(|_| anyhow!("immutable shard store lock is poisoned"))?
+            .reload()
+    }
+
+    /// Return the H2D payload expected for a descriptor at the instant the
+    /// scheduler builds its next cooperative quantum. Host-cache residency does
+    /// not make this zero: every L0 miss still consumes upload bandwidth.
+    pub fn gpu_miss_bytes(&self, descriptor: &Descriptor) -> u64 {
+        let key = cache_key(descriptor);
+        if self
+            .devices
+            .iter()
+            .any(|device| device.cache.contains(&key))
+        {
+            return 0;
+        }
+        descriptor_payload_bytes(descriptor)
+            .ok()
+            .and_then(|bytes| u64::try_from(bytes).ok())
+            .unwrap_or(u64::MAX)
     }
 
     pub fn prewarm(&mut self, descriptors: &[Descriptor], batch_size: usize) -> Result<()> {
@@ -130,7 +221,11 @@ impl Engine {
         // allocation.
         let descriptors = unique_descriptors(descriptors);
         for batch in descriptors.chunks(batch_size) {
-            let payloads = self.store.resolve_many(batch, "__resident__")?;
+            let payloads = self
+                .store
+                .lock()
+                .map_err(|_| anyhow!("immutable shard store lock is poisoned"))?
+                .resolve_many(batch, "__resident__")?;
             let mut uploads = (0..self.devices.len())
                 .map(|_| Vec::<(u64, &[u8])>::new())
                 .collect::<Vec<_>>();
@@ -275,139 +370,28 @@ impl Engine {
             }
         }
 
-        let hit_result = self.score_devices(request, &hit_chunks, &mut scores);
-        let hit_cleanup = self.release_chunks(&hit_chunks);
-        hit_result?;
-        hit_cleanup?;
-
-        let payloads = self
-            .store
-            .resolve_many(&missing_descriptors, &request.tenant)?;
-        let mut pending = missing_indices
-            .into_iter()
-            .zip(missing_descriptors)
-            .zip(payloads)
-            .map(|((candidate_index, descriptor), payload)| MissingTensor {
-                candidate_index,
-                key: cache_key(&descriptor),
-                descriptor,
-                payload,
-            })
-            .collect::<Vec<_>>();
-
-        while !pending.is_empty() {
-            let mut chunks = (0..self.devices.len())
-                .map(|_| Vec::<ResidentTensor>::new())
-                .collect::<Vec<_>>();
-            let mut uploads = (0..self.devices.len())
-                .map(|_| Vec::<(u64, &[u8])>::new())
-                .collect::<Vec<_>>();
-            let mut consumed = 0;
-            for tensor in &pending {
-                if let Some((device_index, entry)) =
-                    self.devices
-                        .iter_mut()
-                        .enumerate()
-                        .find_map(|(index, device)| {
-                            device
-                                .cache
-                                .acquire_existing(&tensor.key)
-                                .map(|entry| (index, entry))
-                        })
-                {
-                    chunks[device_index].push(ResidentTensor {
-                        candidate_index: tensor.candidate_index,
-                        device: device_index,
-                        key: tensor.key.clone(),
-                        offset: entry.offset,
-                        rows: entry.rows,
-                        transient: false,
-                        newly_admitted: false,
-                    });
-                    consumed += 1;
-                    continue;
-                }
-
-                let mut admitted = None;
-                for step in 0..self.devices.len() {
-                    let device_index = (self.next_device + step) % self.devices.len();
-                    let admission = self.devices[device_index].cache.admit_for_tenant(
-                        &request.tenant,
-                        tensor.key.clone(),
-                        tensor.payload.len(),
-                        tensor.descriptor.rows,
-                        tensor.descriptor.dimension,
-                        tensor.descriptor.dtype,
-                        false,
-                        false,
-                    );
-                    if let Admission::Admitted { offset, .. } = admission {
-                        admitted = Some((device_index, offset, false));
-                        self.next_device = (device_index + 1) % self.devices.len();
-                        break;
-                    }
-                }
-
-                if admitted.is_none() && chunks.iter().all(Vec::is_empty) {
-                    // TinyLFU rejected the cold item on every device, but the
-                    // request must still be computed. Use one transient slab
-                    // and remove it after the chunk completes.
-                    for step in 0..self.devices.len() {
-                        let device_index = (self.next_device + step) % self.devices.len();
-                        if let Admission::Admitted { offset, .. } =
-                            self.devices[device_index].cache.admit_for_tenant(
-                                &request.tenant,
-                                tensor.key.clone(),
-                                tensor.payload.len(),
-                                tensor.descriptor.rows,
-                                tensor.descriptor.dimension,
-                                tensor.descriptor.dtype,
-                                false,
-                                true,
-                            )
-                        {
-                            admitted = Some((device_index, offset, true));
-                            self.next_device = (device_index + 1) % self.devices.len();
-                            break;
-                        }
-                    }
-                }
-
-                let Some((device_index, offset, transient)) = admitted else {
-                    if chunks.iter().any(|chunk| !chunk.is_empty()) {
-                        break;
-                    }
-                    bail!("one tensor cannot be scheduled in any configured Rust GPU block cache");
-                };
-                uploads[device_index].push((offset, tensor.payload.as_ref()));
-                chunks[device_index].push(ResidentTensor {
-                    candidate_index: tensor.candidate_index,
-                    device: device_index,
-                    key: tensor.key.clone(),
-                    offset,
-                    rows: tensor.descriptor.rows,
-                    transient,
-                    newly_admitted: true,
-                });
-                consumed += 1;
-            }
-
-            if consumed == 0 {
-                bail!("Rust multi-GPU scheduler made no progress");
-            }
-            let upload_succeeded = match self.upload_devices(&chunks, &uploads) {
-                Ok(upload_succeeded) => upload_succeeded,
-                Err((error, upload_succeeded)) => {
-                    self.cleanup_after_upload_failure(&chunks, &upload_succeeded)?;
-                    return Err(error);
-                }
-            };
-            debug_assert!(upload_succeeded.iter().all(|succeeded| *succeeded));
-            let score_result = self.score_devices(request, &chunks, &mut scores);
-            let cleanup_result = self.release_chunks(&chunks);
-            score_result?;
-            cleanup_result?;
-            pending.drain(..consumed);
+        let unresolved = split_unresolved_batches(
+            missing_indices,
+            missing_descriptors,
+            self.io_pipeline.batch_bytes,
+        )?;
+        let hits = PreparedBatch {
+            chunks: hit_chunks,
+            uploads: (0..self.devices.len()).map(|_| Vec::new()).collect(),
+        };
+        if self.io_pipeline.overlap {
+            let stage_before = self.pipeline_stage_microseconds();
+            let pipeline_started = Instant::now();
+            self.score_overlapped(request, hits, unresolved, &mut scores)?;
+            let stage_delta = self
+                .pipeline_stage_microseconds()
+                .saturating_sub(stage_before);
+            let hidden =
+                stage_delta.saturating_sub(duration_microseconds(pipeline_started.elapsed()));
+            self.io_status.overlap_microseconds =
+                self.io_status.overlap_microseconds.saturating_add(hidden);
+        } else {
+            self.score_serial(request, hits, unresolved, &mut scores)?;
         }
 
         // Equal content-addressed tensors have equal TileMaxSim scores. Preserve
@@ -429,32 +413,349 @@ impl Engine {
             .collect()
     }
 
-    fn upload_devices(
+    fn score_serial(
         &mut self,
-        chunks: &[Vec<ResidentTensor>],
-        uploads: &[Vec<(u64, &[u8])>],
-    ) -> Result<Vec<bool>, (anyhow::Error, Vec<bool>)> {
+        request: &Request,
+        mut current: PreparedBatch,
+        mut unresolved: VecDeque<UnresolvedBatch>,
+        scores: &mut [Option<f32>],
+    ) -> Result<()> {
+        let mut pending = VecDeque::new();
+        loop {
+            if !current.is_empty() {
+                let result = score_chunks(&self.gpus(), request, &current.chunks);
+                let cleanup = self.release_chunks(&current.chunks);
+                let (computed, elapsed) = result?;
+                self.io_status.compute_microseconds = self
+                    .io_status
+                    .compute_microseconds
+                    .saturating_add(duration_microseconds(elapsed));
+                apply_scores(scores, computed);
+                cleanup?;
+            }
+            if pending.is_empty() && unresolved.is_empty() {
+                return Ok(());
+            }
+            current =
+                self.fill_next_batch(&request.tenant, &mut unresolved, &mut pending, false)?;
+        }
+    }
+
+    fn score_overlapped(
+        &mut self,
+        request: &Request,
+        current: PreparedBatch,
+        unresolved: VecDeque<UnresolvedBatch>,
+        scores: &mut [Option<f32>],
+    ) -> Result<()> {
+        let (sender, receiver) = mpsc::sync_channel::<Result<ResolvedBatch>>(1);
+        let store = Arc::clone(&self.store);
+        let tenant = request.tenant.clone();
+        std::thread::scope(|scope| {
+            let resolver = scope.spawn(move || {
+                for batch in unresolved {
+                    let result = resolve_batch(&store, batch, &tenant);
+                    let failed = result.is_err();
+                    if sender.send(result).is_err() || failed {
+                        break;
+                    }
+                }
+            });
+            let result = self.score_overlapped_inner(request, current, &receiver, scores);
+            // An early CUDA or cache error must unblock a resolver waiting on the
+            // bounded one-batch channel before the scoped worker can join.
+            drop(receiver);
+            let resolver_result = resolver
+                .join()
+                .map_err(|_| anyhow!("tensor resolver coordinator panicked"));
+            result.and(resolver_result)
+        })
+    }
+
+    fn score_overlapped_inner(
+        &mut self,
+        request: &Request,
+        mut current: PreparedBatch,
+        receiver: &mpsc::Receiver<Result<ResolvedBatch>>,
+        scores: &mut [Option<f32>],
+    ) -> Result<()> {
+        let mut pending = VecDeque::new();
+        let mut resolver_done = false;
+        loop {
+            if current.is_empty() {
+                current = self.fill_next_resolved_batch(
+                    &request.tenant,
+                    receiver,
+                    &mut pending,
+                    &mut resolver_done,
+                    false,
+                )?;
+                if current.is_empty() && resolver_done {
+                    return Ok(());
+                }
+                continue;
+            }
+
+            if pending.is_empty() && resolver_done {
+                let result = score_chunks(&self.gpus(), request, &current.chunks);
+                let cleanup = self.release_chunks(&current.chunks);
+                let (computed, elapsed) = result?;
+                self.io_status.compute_microseconds = self
+                    .io_status
+                    .compute_microseconds
+                    .saturating_add(duration_microseconds(elapsed));
+                apply_scores(scores, computed);
+                cleanup?;
+                return Ok(());
+            }
+
+            let gpus = self.gpus();
+            let (score_result, next_result) = std::thread::scope(|scope| {
+                let score_worker = scope.spawn(|| score_chunks(&gpus, request, &current.chunks));
+                let next = self.fill_next_resolved_batch(
+                    &request.tenant,
+                    receiver,
+                    &mut pending,
+                    &mut resolver_done,
+                    true,
+                );
+                let score = score_worker
+                    .join()
+                    .map_err(|_| anyhow!("GPU score coordinator panicked"))
+                    .and_then(|result| result);
+                (score, next)
+            });
+            let cleanup_current = self.release_chunks(&current.chunks);
+
+            let (computed, compute_elapsed) = match score_result {
+                Ok(result) => result,
+                Err(error) => {
+                    if let Ok(next) = next_result {
+                        self.release_chunks(&next.chunks)?;
+                    }
+                    cleanup_current?;
+                    return Err(error);
+                }
+            };
+            self.io_status.compute_microseconds = self
+                .io_status
+                .compute_microseconds
+                .saturating_add(duration_microseconds(compute_elapsed));
+            apply_scores(scores, computed);
+            cleanup_current?;
+
+            let next = next_result?;
+            self.io_status.overlap_cycles = self.io_status.overlap_cycles.saturating_add(1);
+            current = next;
+        }
+    }
+
+    fn fill_next_resolved_batch(
+        &mut self,
+        tenant: &str,
+        receiver: &mpsc::Receiver<Result<ResolvedBatch>>,
+        pending: &mut VecDeque<MissingTensor>,
+        resolver_done: &mut bool,
+        allow_deferred: bool,
+    ) -> Result<PreparedBatch> {
+        if pending.is_empty() && !*resolver_done {
+            match receiver.recv() {
+                Ok(result) => {
+                    let resolved = result?;
+                    self.record_resolution(&resolved);
+                    *pending = resolved.tensors;
+                }
+                Err(_) => *resolver_done = true,
+            }
+        }
+        if pending.is_empty() {
+            return Ok(PreparedBatch::empty(self.devices.len()));
+        }
+        let mut prepared = self.prepare_pending(pending, tenant, allow_deferred)?;
+        if prepared.is_empty() {
+            return Ok(prepared);
+        }
+        let upload_elapsed = self.upload_prepared(&mut prepared)?;
+        self.io_status.upload_microseconds = self
+            .io_status
+            .upload_microseconds
+            .saturating_add(duration_microseconds(upload_elapsed));
+        Ok(prepared)
+    }
+
+    fn fill_next_batch(
+        &mut self,
+        tenant: &str,
+        unresolved: &mut VecDeque<UnresolvedBatch>,
+        pending: &mut VecDeque<MissingTensor>,
+        allow_deferred: bool,
+    ) -> Result<PreparedBatch> {
+        if pending.is_empty()
+            && let Some(batch) = unresolved.pop_front()
+        {
+            let resolved = resolve_batch(&self.store, batch, tenant)?;
+            self.record_resolution(&resolved);
+            *pending = resolved.tensors;
+        }
+        if pending.is_empty() {
+            return Ok(PreparedBatch::empty(self.devices.len()));
+        }
+        let mut prepared = self.prepare_pending(pending, tenant, allow_deferred)?;
+        if prepared.is_empty() {
+            return Ok(prepared);
+        }
+        let upload_elapsed = self.upload_prepared(&mut prepared)?;
+        self.io_status.upload_microseconds = self
+            .io_status
+            .upload_microseconds
+            .saturating_add(duration_microseconds(upload_elapsed));
+        Ok(prepared)
+    }
+
+    fn record_resolution(&mut self, resolved: &ResolvedBatch) {
+        self.io_status.resolve_batches = self.io_status.resolve_batches.saturating_add(1);
+        self.io_status.resolve_bytes = self
+            .io_status
+            .resolve_bytes
+            .saturating_add(u64::try_from(resolved.payload_bytes).unwrap_or(u64::MAX));
+        self.io_status.resolve_microseconds = self
+            .io_status
+            .resolve_microseconds
+            .saturating_add(duration_microseconds(resolved.elapsed));
+    }
+
+    fn pipeline_stage_microseconds(&self) -> u64 {
+        self.io_status
+            .resolve_microseconds
+            .saturating_add(self.io_status.upload_microseconds)
+            .saturating_add(self.io_status.compute_microseconds)
+    }
+
+    fn prepare_pending(
+        &mut self,
+        pending: &mut VecDeque<MissingTensor>,
+        tenant: &str,
+        allow_deferred: bool,
+    ) -> Result<PreparedBatch> {
+        let mut prepared = PreparedBatch::empty(self.devices.len());
+        let mut consumed = 0;
+        for tensor in pending.iter() {
+            if let Some((device_index, entry)) =
+                self.devices
+                    .iter_mut()
+                    .enumerate()
+                    .find_map(|(index, device)| {
+                        device
+                            .cache
+                            .acquire_existing(&tensor.key)
+                            .map(|entry| (index, entry))
+                    })
+            {
+                prepared.chunks[device_index].push(ResidentTensor {
+                    candidate_index: tensor.candidate_index,
+                    device: device_index,
+                    key: tensor.key.clone(),
+                    offset: entry.offset,
+                    rows: entry.rows,
+                    transient: false,
+                    newly_admitted: false,
+                });
+                consumed += 1;
+                continue;
+            }
+
+            let mut admitted = None;
+            for step in 0..self.devices.len() {
+                let device_index = (self.next_device + step) % self.devices.len();
+                let admission = self.devices[device_index].cache.admit_for_tenant(
+                    tenant,
+                    tensor.key.clone(),
+                    tensor.payload.len(),
+                    tensor.descriptor.rows,
+                    tensor.descriptor.dimension,
+                    tensor.descriptor.dtype,
+                    false,
+                    false,
+                );
+                if let Admission::Admitted { offset, .. } = admission {
+                    admitted = Some((device_index, offset, false));
+                    self.next_device = (device_index + 1) % self.devices.len();
+                    break;
+                }
+            }
+
+            if admitted.is_none() && prepared.is_empty() {
+                // TinyLFU may reject a cold item, but every requested tensor must
+                // still be scored. A transient page run is removed after this
+                // chunk completes. During overlap it may be temporarily deferred
+                // because the current compute batch still owns all freeable pages.
+                for step in 0..self.devices.len() {
+                    let device_index = (self.next_device + step) % self.devices.len();
+                    if let Admission::Admitted { offset, .. } =
+                        self.devices[device_index].cache.admit_for_tenant(
+                            tenant,
+                            tensor.key.clone(),
+                            tensor.payload.len(),
+                            tensor.descriptor.rows,
+                            tensor.descriptor.dimension,
+                            tensor.descriptor.dtype,
+                            false,
+                            true,
+                        )
+                    {
+                        admitted = Some((device_index, offset, true));
+                        self.next_device = (device_index + 1) % self.devices.len();
+                        break;
+                    }
+                }
+            }
+
+            let Some((device_index, offset, transient)) = admitted else {
+                if !prepared.is_empty() || allow_deferred {
+                    break;
+                }
+                bail!("one tensor cannot be scheduled in any configured Rust GPU block cache");
+            };
+            prepared.uploads[device_index].push((offset, Arc::clone(&tensor.payload)));
+            prepared.chunks[device_index].push(ResidentTensor {
+                candidate_index: tensor.candidate_index,
+                device: device_index,
+                key: tensor.key.clone(),
+                offset,
+                rows: tensor.descriptor.rows,
+                transient,
+                newly_admitted: true,
+            });
+            consumed += 1;
+        }
+
+        if consumed == 0 {
+            if allow_deferred {
+                return Ok(prepared);
+            }
+            bail!("Rust multi-GPU scheduler made no progress");
+        }
+        pending.drain(..consumed);
+        Ok(prepared)
+    }
+
+    fn upload_prepared(&mut self, prepared: &mut PreparedBatch) -> Result<Duration> {
+        let started = Instant::now();
+        let gpus = self.gpus();
         let results = std::thread::scope(|scope| {
             let mut workers = Vec::new();
-            for (device_index, ((device, chunk), upload)) in
-                self.devices.iter_mut().zip(chunks).zip(uploads).enumerate()
-            {
+            for (device_index, (gpu, upload)) in gpus.iter().zip(&prepared.uploads).enumerate() {
                 if upload.is_empty() {
                     continue;
                 }
                 workers.push((
                     device_index,
                     scope.spawn(move || -> Result<()> {
-                        device.gpu.upload_batch(upload)?;
-                        device.h2d_batches += 1;
-                        device.h2d_bytes += upload
+                        let items = upload
                             .iter()
-                            .map(|(_, payload)| payload.len() as u64)
-                            .sum::<u64>();
-                        // Keep the chunk borrow in this worker so upload metadata and
-                        // payload lifetimes remain tied to the scoped thread.
-                        let _ = chunk;
-                        Ok(())
+                            .map(|(offset, payload)| (*offset, payload.as_ref()))
+                            .collect::<Vec<_>>();
+                        gpu.upload_batch(&items)
                     }),
                 ));
             }
@@ -476,9 +777,17 @@ impl Engine {
             if let Err(error) = result {
                 succeeded[device] = false;
                 first_error.get_or_insert(error);
+                continue;
             }
+            self.devices[device].h2d_batches = self.devices[device].h2d_batches.saturating_add(1);
+            self.devices[device].h2d_bytes = self.devices[device].h2d_bytes.saturating_add(
+                prepared.uploads[device]
+                    .iter()
+                    .map(|(_, payload)| payload.len() as u64)
+                    .sum(),
+            );
         }
-        for (device, chunk) in chunks.iter().enumerate() {
+        for (device, chunk) in prepared.chunks.iter().enumerate() {
             if !succeeded[device] {
                 continue;
             }
@@ -490,59 +799,20 @@ impl Engine {
                 }
             }
         }
+        prepared.uploads.iter_mut().for_each(Vec::clear);
         if let Some(error) = first_error {
-            Err((error, succeeded))
+            self.cleanup_after_upload_failure(&prepared.chunks, &succeeded)?;
+            Err(error)
         } else {
-            Ok(succeeded)
+            Ok(started.elapsed())
         }
     }
 
-    fn score_devices(
-        &mut self,
-        request: &Request,
-        chunks: &[Vec<ResidentTensor>],
-        scores: &mut [Option<f32>],
-    ) -> Result<()> {
-        let completed = std::thread::scope(|scope| -> Result<Vec<Vec<(usize, f32)>>> {
-            let mut workers = Vec::new();
-            for (device, chunk) in self.devices.iter_mut().zip(chunks) {
-                if chunk.is_empty() {
-                    continue;
-                }
-                workers.push(scope.spawn(move || -> Result<Vec<(usize, f32)>> {
-                    let offsets = chunk.iter().map(|item| item.offset).collect::<Vec<_>>();
-                    let rows = chunk.iter().map(|item| item.rows).collect::<Vec<_>>();
-                    let computed = device.gpu.score(
-                        &request.query,
-                        request.query_rows,
-                        request.dimension,
-                        request.dtype,
-                        &offsets,
-                        &rows,
-                    )?;
-                    Ok(chunk
-                        .iter()
-                        .zip(computed)
-                        .map(|(tensor, score)| (tensor.candidate_index, score))
-                        .collect())
-                }));
-            }
-            let mut completed = Vec::new();
-            for worker in workers {
-                completed.push(
-                    worker
-                        .join()
-                        .map_err(|_| anyhow!("GPU worker panicked"))??,
-                );
-            }
-            Ok(completed)
-        })?;
-        for device_scores in completed {
-            for (candidate_index, score) in device_scores {
-                scores[candidate_index] = Some(score);
-            }
-        }
-        Ok(())
+    fn gpus(&self) -> Vec<Arc<Gpu>> {
+        self.devices
+            .iter()
+            .map(|device| Arc::clone(&device.gpu))
+            .collect()
     }
 
     fn release_chunks(&mut self, chunks: &[Vec<ResidentTensor>]) -> Result<()> {
@@ -617,11 +887,13 @@ impl Engine {
                 h2d_bytes: device.h2d_bytes,
             })
             .collect();
+        let store = self.store.lock().unwrap_or_else(|error| error.into_inner());
         EngineStatus {
             devices,
-            host: self.store.host_status(),
-            batch_read_calls: self.store.batch_read_calls,
-            batch_read_bytes: self.store.batch_read_bytes,
+            host: store.host_status(),
+            batch_read_calls: store.batch_read_calls,
+            batch_read_bytes: store.batch_read_bytes,
+            io_pipeline: self.io_status.clone(),
         }
     }
 
@@ -667,8 +939,154 @@ impl Engine {
             "host_admission_rejections": status.host.admission_rejections,
             "batch_read_calls": status.batch_read_calls,
             "batch_read_bytes": status.batch_read_bytes,
+            "io_pipeline": {
+                "mode": if status.io_pipeline.overlap_enabled { "overlap" } else { "serial" },
+                "batch_bytes": status.io_pipeline.batch_bytes,
+                "resolve_batches": status.io_pipeline.resolve_batches,
+                "resolve_bytes": status.io_pipeline.resolve_bytes,
+                "resolve_microseconds": status.io_pipeline.resolve_microseconds,
+                "upload_microseconds": status.io_pipeline.upload_microseconds,
+                "compute_microseconds": status.io_pipeline.compute_microseconds,
+                "overlap_cycles": status.io_pipeline.overlap_cycles,
+                "overlap_microseconds": status.io_pipeline.overlap_microseconds,
+            },
         })
     }
+}
+
+fn resolve_batch(
+    store: &Arc<Mutex<ShardStore>>,
+    batch: UnresolvedBatch,
+    tenant: &str,
+) -> Result<ResolvedBatch> {
+    let started = Instant::now();
+    let payloads = store
+        .lock()
+        .map_err(|_| anyhow!("immutable shard store lock is poisoned"))?
+        .resolve_many(&batch.descriptors, tenant)?;
+    let elapsed = started.elapsed();
+    let tensors = batch
+        .indices
+        .into_iter()
+        .zip(batch.descriptors)
+        .zip(payloads)
+        .map(|((candidate_index, descriptor), payload)| MissingTensor {
+            candidate_index,
+            key: cache_key(&descriptor),
+            descriptor,
+            payload,
+        })
+        .collect();
+    Ok(ResolvedBatch {
+        tensors,
+        payload_bytes: batch.payload_bytes,
+        elapsed,
+    })
+}
+
+fn split_unresolved_batches(
+    indices: Vec<usize>,
+    descriptors: Vec<Descriptor>,
+    maximum_bytes: usize,
+) -> Result<VecDeque<UnresolvedBatch>> {
+    if indices.len() != descriptors.len() {
+        bail!("internal missing tensor metadata disagrees");
+    }
+    let mut output = VecDeque::new();
+    let mut batch_indices = Vec::new();
+    let mut batch_descriptors = Vec::new();
+    let mut batch_bytes = 0_usize;
+    for (index, descriptor) in indices.into_iter().zip(descriptors) {
+        let payload_bytes = descriptor_payload_bytes(&descriptor)?;
+        if !batch_descriptors.is_empty()
+            && batch_bytes.saturating_add(payload_bytes) > maximum_bytes
+        {
+            output.push_back(UnresolvedBatch {
+                indices: std::mem::take(&mut batch_indices),
+                descriptors: std::mem::take(&mut batch_descriptors),
+                payload_bytes: batch_bytes,
+            });
+            batch_bytes = 0;
+        }
+        batch_indices.push(index);
+        batch_descriptors.push(descriptor);
+        batch_bytes = batch_bytes
+            .checked_add(payload_bytes)
+            .ok_or_else(|| anyhow!("I/O pipeline batch byte count overflow"))?;
+    }
+    if !batch_descriptors.is_empty() {
+        output.push_back(UnresolvedBatch {
+            indices: batch_indices,
+            descriptors: batch_descriptors,
+            payload_bytes: batch_bytes,
+        });
+    }
+    Ok(output)
+}
+
+fn descriptor_payload_bytes(descriptor: &Descriptor) -> Result<usize> {
+    let scalar_bytes = match descriptor.dtype {
+        1 => 4_usize,
+        2 => 2_usize,
+        _ => bail!("unsupported tensor dtype"),
+    };
+    (descriptor.rows as usize)
+        .checked_mul(descriptor.dimension as usize)
+        .and_then(|value| value.checked_mul(scalar_bytes))
+        .ok_or_else(|| anyhow!("tensor payload byte count overflow"))
+}
+
+fn score_chunks(
+    gpus: &[Arc<Gpu>],
+    request: &Request,
+    chunks: &[Vec<ResidentTensor>],
+) -> Result<(Vec<(usize, f32)>, Duration)> {
+    let started = Instant::now();
+    let completed = std::thread::scope(|scope| -> Result<Vec<Vec<(usize, f32)>>> {
+        let mut workers = Vec::new();
+        for (gpu, chunk) in gpus.iter().zip(chunks) {
+            if chunk.is_empty() {
+                continue;
+            }
+            workers.push(scope.spawn(move || -> Result<Vec<(usize, f32)>> {
+                let offsets = chunk.iter().map(|item| item.offset).collect::<Vec<_>>();
+                let rows = chunk.iter().map(|item| item.rows).collect::<Vec<_>>();
+                let computed = gpu.score(
+                    &request.query,
+                    request.query_rows,
+                    request.dimension,
+                    request.dtype,
+                    &offsets,
+                    &rows,
+                )?;
+                Ok(chunk
+                    .iter()
+                    .zip(computed)
+                    .map(|(tensor, score)| (tensor.candidate_index, score))
+                    .collect())
+            }));
+        }
+        let mut completed = Vec::new();
+        for worker in workers {
+            completed.push(
+                worker
+                    .join()
+                    .map_err(|_| anyhow!("GPU worker panicked"))??,
+            );
+        }
+        Ok(completed)
+    })?;
+    Ok((completed.into_iter().flatten().collect(), started.elapsed()))
+}
+
+fn apply_scores(scores: &mut [Option<f32>], computed: Vec<(usize, f32)>) {
+    for (candidate_index, score) in computed {
+        scores[candidate_index] = Some(score);
+    }
+}
+
+fn duration_microseconds(duration: Duration) -> u64 {
+    u64::try_from(duration.as_micros()).unwrap_or(u64::MAX)
 }
 
 fn unique_descriptors(descriptors: &[Descriptor]) -> Vec<Descriptor> {
@@ -724,5 +1142,22 @@ mod tests {
         assert_eq!(unique[0].candidate_id, 1);
         assert_eq!(unique[1].candidate_id, 3);
         assert_eq!(unique[2].candidate_id, 4);
+    }
+
+    #[test]
+    fn io_batches_are_payload_bounded_and_keep_one_oversized_tensor() {
+        let descriptors = vec![
+            descriptor(1, "a", 1),
+            descriptor(2, "b", 1),
+            descriptor(3, "c", 3),
+        ];
+        // One row is 640 bytes. The first two fit exactly; the final tensor is
+        // larger than the target but must remain a schedulable one-item batch.
+        let batches = split_unresolved_batches(vec![0, 1, 2], descriptors, 1_280).unwrap();
+        assert_eq!(batches.len(), 2);
+        assert_eq!(batches[0].indices, vec![0, 1]);
+        assert_eq!(batches[0].payload_bytes, 1_280);
+        assert_eq!(batches[1].indices, vec![2]);
+        assert_eq!(batches[1].payload_bytes, 1_920);
     }
 }

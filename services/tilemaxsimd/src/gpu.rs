@@ -57,9 +57,13 @@ pub struct Gpu {
     tensor_bytes: usize,
 }
 
-// SAFETY: `Gpu` uniquely owns the native handle. It may move to a scoped
-// worker, but no method exposes the pointer and all calls require `&mut self`.
+// SAFETY: `Gpu` uniquely owns the native handle. The engine permits at most one
+// upload and one score call at a time. The native implementation assigns those
+// operations distinct CUDA streams and disjoint host/device workspaces; tensor
+// cache references prevent an upload from overwriting pages used by scoring.
+// Destruction happens only after every scoped worker has joined.
 unsafe impl Send for Gpu {}
+unsafe impl Sync for Gpu {}
 
 impl Gpu {
     pub fn create(device: i32, total_bytes: usize, workspace_bytes: usize) -> Result<Self> {
@@ -97,7 +101,7 @@ impl Gpu {
         self.tensor_bytes
     }
 
-    pub fn upload_batch(&mut self, items: &[(u64, &[u8])]) -> Result<()> {
+    pub fn upload_batch(&self, items: &[(u64, &[u8])]) -> Result<()> {
         if items.is_empty() {
             return Ok(());
         }
@@ -124,7 +128,7 @@ impl Gpu {
     }
 
     pub fn score(
-        &mut self,
+        &self,
         query: &[u8],
         query_rows: u32,
         dimension: u32,

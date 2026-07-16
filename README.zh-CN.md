@@ -98,12 +98,15 @@ tilemaxsimd \
   --gpu-memory-gb 0=20 \
   --gpu-workspace-gb 2 \
   --host-cache-gb 8 \
+  --io-pipeline overlap \
+  --io-batch-gb 0.05 \
   --max-inflight-request-gb 1 \
   --contract-root MODEL_CONTRACT_ID=/srv/vectorchord/tensors \
   --scheduler-policy fair-priority \
   --max-queued-requests 128 \
   --max-tenant-queued-requests 16 \
   --scheduler-quantum-fmas 4000000000 \
+  --scheduler-quantum-io-gb 1 \
   --tenant-weight foreground=2 \
   --tenant-cache-reservation foreground=4
 ```
@@ -128,6 +131,13 @@ PostgreSQL 可以通过本地 Unix socket 或 `tcp://HOST:PORT` 连接 daemon。
 | Rust/CUDA 冷请求 | Python/Triton 855.34 ms | 93.86 ms | 快 9.11 倍 |
 | Rust/CUDA 热请求 p50 | Python/Triton 14.26 ms | 2.09 ms | 快 6.82 倍 |
 | Rust/CUDA 热请求 p95 | Python/Triton 14.84 ms | 2.20 ms | 快 6.75 倍 |
+| 小显存冷 I/O 流水线 | 串行 757.96 ms | 重叠 685.85 ms | 快 1.11 倍；分数一致 |
+
+I/O 流水线一行使用 1,000 个真实张量（逻辑 478,016,000 字节）做了 5 次冷请求，
+daemon 只分配 0.5 GiB：0.4 GiB 张量页面加 0.1 GiB CUDA 工作区。0.05 GiB
+有界解析批次让 N+1 批 SSD/L1 解析、N 批 H2D 上传与 N-1 批精确 TileMaxSim
+重叠执行。串行与重叠路径的最大分数差为 0。实际收益对硬件和批次大小敏感，生产
+环境应以流水线指标实测，不能直接套用该倍数。
 
 20 GiB 实验将 18 GiB 分给张量、2 GiB 分给工作区。Rust/CUDA daemon 预热全部
 34,027 个唯一张量耗时 14.86 秒，Python/Triton 实现为 23.07 秒。默认 32 KiB
@@ -166,6 +176,7 @@ round trip 平均达到 18.47 秒。
 - [`services/benchmark_full_corpus_tilemaxsim.py`](services/benchmark_full_corpus_tilemaxsim.py)
 - [`services/benchmark_gbrain_scoped_tilemaxsim.py`](services/benchmark_gbrain_scoped_tilemaxsim.py)
 - [`services/benchmark_postgres_single_vector.py`](services/benchmark_postgres_single_vector.py)
+- [`services/benchmark_tilemaxsim_io_pipeline.py`](services/benchmark_tilemaxsim_io_pipeline.py)
 
 ## 已知局限
 
@@ -180,6 +191,10 @@ round trip 平均达到 18.47 秒。
   再执行精确 TileMaxSim。
 - 缓存小于活跃工作集时结果仍然正确，但可能发生抖动；生产容量必须覆盖热工作集，
   或保留经过验证的高召回范围。
+- 当前受 Tutti 启发的流水线仍通过 CPU 读取分片并经 pinned host memory 上传，
+  还不是 GPU io_uring 或 GPUDirect Storage 后端。SSD、PCIe 与 H2D 竞争使
+  `--io-batch-gb` 对硬件敏感；应使用 `--io-pipeline serial` 做消融/回退，并在
+  SLO 上线前检查 `tilemaxsim_io_pipeline_*` 指标。
 
 ### 缓存与多用户隔离
 
@@ -296,6 +311,11 @@ MaxSim 能力构成了本项目继续开发的基础。
 （arXiv:2606.26439，2026）及其配套开源
 [ashutoshuiuc/tilemaxsim](https://github.com/ashutoshuiuc/tilemaxsim) Triton 实现
 的启发。感谢该工作公开的融合、分块 MaxSim 设计与性能分析。
+
+有界异步张量流水线也受到
+[《Tutti: Making SSD-Backed KV Cache Practical for Long-Context LLM Serving》](https://arxiv.org/abs/2605.03375)
+中 GPU 原生对象、异步 I/O 与 slack-aware 调度原则的启发。当前实现只引入其调度
+与流水思想，不包含 Tutti 的 GPU io_uring 存储栈。
 
 本仓库是独立的 PostgreSQL/Rust/CUDA 系统集成，IPC 协议、GPU/内存/磁盘三级
 张量缓存、分配器、多用户调度、数据库绑定和部署运维由本项目维护。上述致谢不表示

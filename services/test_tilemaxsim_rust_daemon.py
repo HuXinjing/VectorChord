@@ -48,6 +48,8 @@ class RustDaemonTest(unittest.TestCase):
         resident: bool = False,
         scheduled: bool = False,
         tcp: bool = False,
+        io_pipeline: str = "overlap",
+        io_batch_gb: str = "0.25",
     ) -> tuple[str, list[tuple[int, float]]]:
         binary = self._release_binary()
         if not binary.exists():
@@ -131,6 +133,10 @@ class RustDaemonTest(unittest.TestCase):
                     workspace_gb,
                     "--host-cache-gb",
                     "0.01",
+                    "--io-pipeline",
+                    io_pipeline,
+                    "--io-batch-gb",
+                    io_batch_gb,
                     "--contract-root",
                     f"model@1={shard_root}",
                     "--once",
@@ -200,6 +206,7 @@ class RustDaemonTest(unittest.TestCase):
                         self.assertIn(b"tilemaxsim_gpu_cache_bytes", metrics_body)
                         self.assertIn(b"tilemaxsim_host_cache_bytes", metrics_body)
                         self.assertIn(b"tilemaxsim_storage_read_bytes_total", metrics_body)
+                        self.assertIn(b"tilemaxsim_io_pipeline_enabled", metrics_body)
                         self.assertNotIn(b"tenant-a", metrics_body)
                 probe = subprocess.run(
                     [
@@ -322,6 +329,42 @@ class RustDaemonTest(unittest.TestCase):
             key=lambda index: torch.cuda.mem_get_info(index)[0],
         )
         self.run_daemon([device])
+
+    @unittest.skipUnless(torch.cuda.is_available(), "CUDA is unavailable")
+    def test_io_overlap_matches_serial_scores_and_reports_pipeline_cycles(self) -> None:
+        device = max(
+            range(torch.cuda.device_count()),
+            key=lambda index: torch.cuda.mem_get_info(index)[0],
+        )
+        serial_output, serial_results = self.run_daemon(
+            [device], io_pipeline="serial", io_batch_gb="0.000000004"
+        )
+        overlap_output, overlap_results = self.run_daemon(
+            [device], io_pipeline="overlap", io_batch_gb="0.000000004"
+        )
+        self.assertEqual(overlap_results, serial_results)
+        serial_events = [
+            json.loads(line) for line in serial_output.splitlines() if line.startswith("{")
+        ]
+        overlap_events = [
+            json.loads(line)
+            for line in overlap_output.splitlines()
+            if line.startswith("{")
+        ]
+        serial_cache = next(
+            event["cache"]
+            for event in serial_events
+            if event.get("event") == "tilemaxsim_rust_request"
+        )
+        overlap_cache = next(
+            event["cache"]
+            for event in overlap_events
+            if event.get("event") == "tilemaxsim_rust_request"
+        )
+        self.assertEqual(serial_cache["io_pipeline"]["mode"], "serial")
+        self.assertEqual(overlap_cache["io_pipeline"]["mode"], "overlap")
+        self.assertEqual(serial_cache["io_pipeline"]["overlap_cycles"], 0)
+        self.assertGreaterEqual(overlap_cache["io_pipeline"]["overlap_cycles"], 1)
 
     @unittest.skipUnless(torch.cuda.is_available(), "CUDA is unavailable")
     def test_tcp_scoring_round_trip_matches_protocol_oracle(self) -> None:

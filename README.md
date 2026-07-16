@@ -115,12 +115,15 @@ tilemaxsimd \
   --gpu-memory-gb 0=20 \
   --gpu-workspace-gb 2 \
   --host-cache-gb 8 \
+  --io-pipeline overlap \
+  --io-batch-gb 0.05 \
   --max-inflight-request-gb 1 \
   --contract-root MODEL_CONTRACT_ID=/srv/vectorchord/tensors \
   --scheduler-policy fair-priority \
   --max-queued-requests 128 \
   --max-tenant-queued-requests 16 \
   --scheduler-quantum-fmas 4000000000 \
+  --scheduler-quantum-io-gb 1 \
   --tenant-weight foreground=2 \
   --tenant-cache-reservation foreground=4
 ```
@@ -148,6 +151,15 @@ numbers.
 | Rust/CUDA cold request | 855.34 ms, Python/Triton | 93.86 ms | 9.11x faster |
 | Rust/CUDA warm request p50 | 14.26 ms, Python/Triton | 2.09 ms | 6.82x faster |
 | Rust/CUDA warm request p95 | 14.84 ms, Python/Triton | 2.20 ms | 6.75x faster |
+| Small-VRAM cold I/O pipeline | 757.96 ms, serial | 685.85 ms, overlap | 1.11x faster; identical scores |
+
+The I/O-pipeline row used five cold trials over 1,000 real tensors
+(478,016,000 logical bytes) with only 0.5 GiB assigned to the daemon: 0.4 GiB
+for tensor pages and 0.1 GiB for CUDA workspace. The 0.05 GiB bounded resolver
+stage overlaps SSD/L1 resolution of batch N+1, H2D upload of batch N, and exact
+TileMaxSim for batch N-1. The maximum score delta between serial and overlap
+was zero. Results are hardware- and batch-size-sensitive, so production must
+measure the exposed pipeline metrics rather than assume this exact ratio.
 
 A 20 GiB run assigned 18 GiB to tensors and 2 GiB to workspace. Prewarming all
 34,027 unique tensors took 14.86 seconds in the Rust/CUDA daemon versus 23.07
@@ -192,6 +204,7 @@ Reproducible drivers:
 - [`services/benchmark_full_corpus_tilemaxsim.py`](services/benchmark_full_corpus_tilemaxsim.py)
 - [`services/benchmark_gbrain_scoped_tilemaxsim.py`](services/benchmark_gbrain_scoped_tilemaxsim.py)
 - [`services/benchmark_postgres_single_vector.py`](services/benchmark_postgres_single_vector.py)
+- [`services/benchmark_tilemaxsim_io_pipeline.py`](services/benchmark_tilemaxsim_io_pipeline.py)
 
 ## Limitations
 
@@ -209,6 +222,11 @@ accept the following limitations before general availability.
 - A cache smaller than the active working set remains correct but can thrash;
   production capacity must cover the hot set or preserve a safe high-recall
   range.
+- The current Tutti-inspired pipeline still uses CPU shard reads and pinned
+  host-to-device copies; it is not GPU io_uring or a GPUDirect Storage backend.
+  SSD, PCIe, and H2D contention make `--io-batch-gb` hardware-sensitive. Use
+  `--io-pipeline serial` as the ablation/fallback mode and inspect
+  `tilemaxsim_io_pipeline_*` before enabling overlap for an SLO.
 
 ### Cache and multi-user isolation
 
@@ -347,6 +365,13 @@ arXiv:2606.26439 (2026), and its accompanying open-source
 [ashutoshuiuc/tilemaxsim](https://github.com/ashutoshuiuc/tilemaxsim)
 Triton implementation. We gratefully acknowledge that work and its published
 analysis of fused, tiled MaxSim scoring.
+
+The bounded asynchronous tensor pipeline is informed by
+[“Tutti: Making SSD-Backed KV Cache Practical for Long-Context LLM Serving”](https://arxiv.org/abs/2605.03375),
+particularly its GPU-native object, asynchronous I/O, and slack-aware
+scheduling principles. This implementation currently adopts the scheduling
+and pipelining ideas only; it does not include Tutti's GPU io_uring storage
+stack.
 
 This repository is a separate PostgreSQL/Rust/CUDA systems integration. Its
 IPC protocols, persistent three-level tensor cache, allocator, multi-user

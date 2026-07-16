@@ -57,9 +57,12 @@ tilemaxsimd \
   --gpu-memory-gb 0=20 \
   --gpu-workspace-gb 2 \
   --host-cache-gb 8 \
+  --io-pipeline overlap \
+  --io-batch-gb 0.05 \
   --max-inflight-request-gb 1 \
   --contract-root 'MODEL_CONTRACT_ID=/var/lib/vectorchord/tensors' \
   --scheduler-policy fair-priority \
+  --scheduler-quantum-io-gb 1 \
   --max-connections 256 \
   --max-queued-requests 128 \
   --max-tenant-queued-requests 16
@@ -67,6 +70,39 @@ tilemaxsimd \
 
 Multiple GPU assignments may be supplied. Device selection and the requested
 allocation are never inferred from all currently free VRAM.
+
+## Tutti-inspired tensor I/O pipeline
+
+`--io-pipeline overlap` is the default for the opt-in CUDA daemon. It uses a
+bounded one-batch resolver channel and separate CUDA upload/compute streams to
+pipeline three stages:
+
+```text
+immutable shard or L1 resolve N+1
+              │
+              ├── H2D upload N
+              │
+              └── exact TileMaxSim N-1
+```
+
+`--io-batch-gb` bounds the logical payload held by each resolver stage; the
+default is 0.05 GiB. The channel has capacity one, so speculative prefetch
+cannot grow without bound. GPU cache references keep the current compute pages
+non-evictable, and a next batch that cannot acquire pages while computation is
+active is deferred and retried after the current batch releases them. The
+request therefore remains correct even when its working set exceeds L0.
+
+The cooperative scheduler also caps the L0-miss payload in one quantum with
+`--scheduler-quantum-io-gb` in addition to candidate, token, and FMA limits.
+This shortens the period for which a cold request can occupy the I/O/GPU path
+before a higher-priority or under-served scheduling domain can run.
+
+Use `--io-pipeline serial` for a controlled fallback or an A/B comparison.
+The current implementation retains ordinary CPU shard reads and pinned H2D
+copies. It adopts Tutti's bounded asynchronous pipeline and I/O-aware
+scheduling ideas, but it is not yet a GPU io_uring or GPUDirect Storage data
+path. SSD and GPU traffic may share a PCIe root complex, so tune the batch on
+target hardware and reject configurations that regress the application SLO.
 
 The example systemd unit and environment file are in `deploy/systemd`. The unit
 is deliberately opt-in: enabling it is the operator's explicit TileMaxSim/GPU
@@ -105,6 +141,10 @@ The most useful production signals are:
   overload or an undersized deadline;
 - `tilemaxsim_gpu_cache_events_total`, `tilemaxsim_gpu_h2d_bytes_total`, and
   `tilemaxsim_storage_read_bytes_total` for cache churn and cold-load traffic;
+- `tilemaxsim_io_pipeline_batches_total`,
+  `tilemaxsim_io_pipeline_resolve_bytes_total`, and
+  `tilemaxsim_io_pipeline_seconds_total` for resolve/upload/compute time and
+  time hidden by overlap;
 - `tilemaxsim_gpu_cache_bytes` for free space, largest free extent, payload,
   allocator waste, and pinned capacity;
 - `tilemaxsim_host_cache_bytes` and `tilemaxsim_host_cache_events_total` for

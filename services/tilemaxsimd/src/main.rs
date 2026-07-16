@@ -17,7 +17,7 @@ mod shard;
 
 use anyhow::{Context, Result, anyhow, bail};
 use clap::Parser;
-use engine::{Engine, EngineStatus};
+use engine::{Engine, EngineStatus, IoPipelineConfig};
 use gpu::Gpu;
 use protocol::{HEADER_BYTES, VERSION_EXTERNAL, VERSION_SCHEDULED_EXTERNAL};
 use scheduler::{RequestQueue, Scheduled, SchedulerPolicy};
@@ -75,6 +75,12 @@ struct Args {
     gpu_workspace_gb: usize,
     #[arg(long, default_value = "8", value_parser = parse_gb)]
     host_cache_gb: usize,
+    /// Overlap tensor resolution and H2D upload with the current CUDA batch.
+    #[arg(long, default_value = "overlap", value_parser = ["serial", "overlap"])]
+    io_pipeline: String,
+    /// Maximum logical tensor payload resolved by one pipeline stage, in GB.
+    #[arg(long, default_value = "0.05", value_parser = parse_gb)]
+    io_batch_gb: usize,
     #[arg(long, default_value_t = 80, value_parser = clap::value_parser!(u8).range(1..=100))]
     host_tenant_cache_max_percent: u8,
     #[arg(long = "contract-root", required = true, value_parser = parse_contract_root)]
@@ -133,6 +139,9 @@ struct Args {
     scheduler_quantum_tokens: u64,
     #[arg(long, default_value_t = 4_000_000_000)]
     scheduler_quantum_fmas: u64,
+    /// Maximum L0-miss payload admitted to one cooperative quantum, in GB.
+    #[arg(long, default_value = "1", value_parser = parse_gb)]
+    scheduler_quantum_io_gb: usize,
     #[arg(long = "tenant-weight", value_parser = parse_tenant_weight)]
     tenant_weights: Vec<(String, f64)>,
 }
@@ -287,6 +296,10 @@ fn main() -> Result<()> {
         args.tenant_cache_max_percent,
         args.pinned_cache_max_percent,
         &tenant_cache_reservations,
+        IoPipelineConfig {
+            overlap: args.io_pipeline == "overlap",
+            batch_bytes: args.io_batch_gb,
+        },
     )?;
     if args.gpu_cache_mode == "resident" && args.resident_manifests.is_empty() {
         bail!("resident GPU cache mode requires at least one resident manifest");
@@ -358,6 +371,7 @@ fn main() -> Result<()> {
         quantum_candidates: args.scheduler_quantum_candidates,
         quantum_tokens: args.scheduler_quantum_tokens,
         quantum_fmas: args.scheduler_quantum_fmas,
+        quantum_io_bytes: args.scheduler_quantum_io_gb,
         socket_io_timeout: Duration::from_millis(args.socket_io_timeout_ms),
         tenant_weights,
     };
@@ -420,6 +434,9 @@ fn main() -> Result<()> {
             "max_tenant_queued_requests": args.max_tenant_queued_requests,
             "max_inflight_request_bytes": args.max_inflight_request_gb,
             "scheduler_quantum_fmas": args.scheduler_quantum_fmas,
+            "scheduler_quantum_io_bytes": args.scheduler_quantum_io_gb,
+            "io_pipeline": args.io_pipeline,
+            "io_batch_bytes": args.io_batch_gb,
             "status_socket": args.status_socket,
             "status_listen": args.status_listen,
             "cache": ready_cache,
@@ -656,6 +673,7 @@ struct SchedulerConfig {
     quantum_candidates: usize,
     quantum_tokens: u64,
     quantum_fmas: u64,
+    quantum_io_bytes: usize,
     socket_io_timeout: Duration,
     tenant_weights: std::collections::HashMap<String, f64>,
 }
@@ -1117,7 +1135,7 @@ fn run_scheduler(
 
         if queue.len() == 0 && channel_open {
             match receiver.recv_timeout(Duration::from_millis(50)) {
-                Ok(work) => enqueue_work(&mut queue, work, &config, &metrics),
+                Ok(work) => enqueue_work(&mut queue, work, &config, &engine, &metrics),
                 Err(mpsc::RecvTimeoutError::Timeout) => continue,
                 Err(mpsc::RecvTimeoutError::Disconnected) => channel_open = false,
             }
@@ -1130,7 +1148,7 @@ fn run_scheduler(
                     break;
                 }
                 match receiver.recv_timeout(remaining) {
-                    Ok(work) => enqueue_work(&mut queue, work, &config, &metrics),
+                    Ok(work) => enqueue_work(&mut queue, work, &config, &engine, &metrics),
                     Err(mpsc::RecvTimeoutError::Timeout) => break,
                     Err(mpsc::RecvTimeoutError::Disconnected) => {
                         channel_open = false;
@@ -1183,7 +1201,7 @@ fn run_scheduler(
                 "request deadline expired before execution",
             ))
         } else {
-            let end = next_quantum_end(&work, &config);
+            let end = next_quantum_end(&work, &config, &engine);
             let quantum = protocol::Request {
                 protocol_version: work.request.protocol_version,
                 request_id: work.request.request_id,
@@ -1232,7 +1250,7 @@ fn run_scheduler(
                         ))
                     } else if end < work.request.candidates.len() {
                         metrics.scheduler_requeues.fetch_add(1, Ordering::Relaxed);
-                        let cost = estimated_next_work(&work, &config);
+                        let cost = estimated_next_work(&work, &config, &engine);
                         queue.push(Scheduled::new(
                             tenant.clone(),
                             priority,
@@ -1298,6 +1316,7 @@ fn enqueue_work(
     queue: &mut RequestQueue<Work>,
     work: Work,
     config: &SchedulerConfig,
+    engine: &Engine,
     metrics: &RuntimeMetrics,
 ) {
     match work.request.priority.cmp(&0) {
@@ -1311,7 +1330,7 @@ fn enqueue_work(
             .admitted_priority_positive
             .fetch_add(1, Ordering::Relaxed),
     };
-    let cost = estimated_next_work(&work, config);
+    let cost = estimated_next_work(&work, config, engine);
     queue.push(Scheduled::new(
         work.request.tenant.clone(),
         work.request.priority,
@@ -1345,8 +1364,8 @@ fn is_fatal_cuda_diagnostic(diagnostic: &str) -> bool {
     .any(|marker| diagnostic.contains(marker))
 }
 
-fn next_quantum_end(work: &Work, config: &SchedulerConfig) -> usize {
-    quantum_end(
+fn next_quantum_end(work: &Work, config: &SchedulerConfig, engine: &Engine) -> usize {
+    let compute_end = quantum_end(
         &work.request.candidates,
         work.next_candidate,
         config.quantum_candidates,
@@ -1354,7 +1373,35 @@ fn next_quantum_end(work: &Work, config: &SchedulerConfig) -> usize {
         config.quantum_fmas,
         work.request.query_rows,
         work.request.dimension,
+    );
+    io_quantum_end(
+        &work.request.candidates,
+        work.next_candidate,
+        compute_end,
+        config.quantum_io_bytes,
+        |candidate| engine.gpu_miss_bytes(candidate),
     )
+}
+
+fn io_quantum_end(
+    candidates: &[protocol::Descriptor],
+    start: usize,
+    compute_end: usize,
+    maximum_io_bytes: usize,
+    mut miss_bytes: impl FnMut(&protocol::Descriptor) -> u64,
+) -> usize {
+    let maximum_io_bytes = u64::try_from(maximum_io_bytes).unwrap_or(u64::MAX);
+    let mut end = start;
+    let mut bytes = 0_u64;
+    while end < compute_end {
+        let candidate_bytes = miss_bytes(&candidates[end]);
+        if end > start && bytes.saturating_add(candidate_bytes) > maximum_io_bytes {
+            break;
+        }
+        bytes = bytes.saturating_add(candidate_bytes);
+        end += 1;
+    }
+    end.max((start + 1).min(compute_end))
 }
 
 fn quantum_end(
@@ -1391,8 +1438,8 @@ fn candidate_fmas(query_rows: u32, dimension: u32, document_rows: u32) -> u64 {
         .saturating_mul(u64::from(dimension))
 }
 
-fn estimated_next_work(work: &Work, config: &SchedulerConfig) -> u64 {
-    let end = next_quantum_end(work, config);
+fn estimated_next_work(work: &Work, config: &SchedulerConfig, engine: &Engine) -> u64 {
+    let end = next_quantum_end(work, config, engine);
     work.request.candidates[work.next_candidate..end]
         .iter()
         .map(|candidate| {
@@ -2068,6 +2115,89 @@ fn render_metrics(metrics: &RuntimeMetrics) -> String {
         engine.batch_read_bytes
     )
     .unwrap();
+    writeln!(
+        output,
+        "# HELP tilemaxsim_io_pipeline_enabled Whether tensor I/O overlaps CUDA scoring."
+    )
+    .unwrap();
+    writeln!(output, "# TYPE tilemaxsim_io_pipeline_enabled gauge").unwrap();
+    writeln!(
+        output,
+        "tilemaxsim_io_pipeline_enabled {}",
+        usize::from(engine.io_pipeline.overlap_enabled)
+    )
+    .unwrap();
+    writeln!(
+        output,
+        "# HELP tilemaxsim_io_pipeline_batch_bytes Configured logical tensor bytes per I/O stage."
+    )
+    .unwrap();
+    writeln!(output, "# TYPE tilemaxsim_io_pipeline_batch_bytes gauge").unwrap();
+    writeln!(
+        output,
+        "tilemaxsim_io_pipeline_batch_bytes {}",
+        engine.io_pipeline.batch_bytes
+    )
+    .unwrap();
+    writeln!(
+        output,
+        "# HELP tilemaxsim_io_pipeline_batches_total Tensor pipeline stage executions."
+    )
+    .unwrap();
+    writeln!(
+        output,
+        "# TYPE tilemaxsim_io_pipeline_batches_total counter"
+    )
+    .unwrap();
+    for (stage, value) in [
+        ("resolve", engine.io_pipeline.resolve_batches),
+        ("overlap", engine.io_pipeline.overlap_cycles),
+    ] {
+        writeln!(
+            output,
+            "tilemaxsim_io_pipeline_batches_total{{stage=\"{stage}\"}} {value}"
+        )
+        .unwrap();
+    }
+    writeln!(
+        output,
+        "# HELP tilemaxsim_io_pipeline_resolve_bytes_total Logical tensor payload passed through resolve stages."
+    )
+    .unwrap();
+    writeln!(
+        output,
+        "# TYPE tilemaxsim_io_pipeline_resolve_bytes_total counter"
+    )
+    .unwrap();
+    writeln!(
+        output,
+        "tilemaxsim_io_pipeline_resolve_bytes_total {}",
+        engine.io_pipeline.resolve_bytes
+    )
+    .unwrap();
+    writeln!(
+        output,
+        "# HELP tilemaxsim_io_pipeline_seconds_total Cumulative tensor pipeline stage and hidden time."
+    )
+    .unwrap();
+    writeln!(
+        output,
+        "# TYPE tilemaxsim_io_pipeline_seconds_total counter"
+    )
+    .unwrap();
+    for (stage, microseconds) in [
+        ("resolve", engine.io_pipeline.resolve_microseconds),
+        ("upload", engine.io_pipeline.upload_microseconds),
+        ("compute", engine.io_pipeline.compute_microseconds),
+        ("overlap", engine.io_pipeline.overlap_microseconds),
+    ] {
+        writeln!(
+            output,
+            "tilemaxsim_io_pipeline_seconds_total{{stage=\"{stage}\"}} {}",
+            microseconds as f64 / 1_000_000.0
+        )
+        .unwrap();
+    }
     output
 }
 
@@ -2216,10 +2346,10 @@ fn load_resident_manifests(values: &[(String, PathBuf)]) -> Result<Vec<protocol:
 #[cfg(test)]
 mod tests {
     use super::{
-        ByteAdmission, PendingAdmission, RuntimeMetrics, candidate_fmas, is_fatal_cuda_diagnostic,
-        kib_to_bytes, quantum_end, render_metrics, tenant_hash,
+        ByteAdmission, PendingAdmission, RuntimeMetrics, candidate_fmas, io_quantum_end,
+        is_fatal_cuda_diagnostic, kib_to_bytes, quantum_end, render_metrics, tenant_hash,
     };
-    use crate::engine::{DeviceStatus, EngineStatus};
+    use crate::engine::{DeviceStatus, EngineStatus, IoPipelineStatus};
     use crate::protocol::Descriptor;
     use crate::shard::HostCacheStatus;
     use std::sync::Arc;
@@ -2246,6 +2376,26 @@ mod tests {
         assert_eq!(quantum_end(&candidates, 2, 8, 10, 1_000, 5, 2), 3);
         assert_eq!(candidate_fmas(5, 2, 60), 600);
         assert_eq!(candidate_fmas(u32::MAX, u32::MAX, u32::MAX), u64::MAX);
+    }
+
+    #[test]
+    fn scheduler_quantum_caps_l0_miss_bytes_but_keeps_hot_candidates_free() {
+        let descriptor = |candidate_id| Descriptor {
+            candidate_id,
+            contract: "model".to_owned(),
+            digest: format!("{candidate_id:064x}"),
+            rows: 1,
+            dimension: 2,
+            dtype: 2,
+        };
+        let candidates = vec![descriptor(1), descriptor(2), descriptor(3)];
+        let cold_end = io_quantum_end(&candidates, 0, 3, 8, |_| 5);
+        assert_eq!(cold_end, 1);
+        let mixed_end = io_quantum_end(&candidates, 0, 3, 8, |candidate| {
+            if candidate.candidate_id == 2 { 0 } else { 5 }
+        });
+        assert_eq!(mixed_end, 2);
+        assert_eq!(io_quantum_end(&candidates, 2, 3, 1, |_| 5), 3);
     }
 
     #[test]
@@ -2322,6 +2472,13 @@ mod tests {
             },
             batch_read_calls: 4,
             batch_read_bytes: 256,
+            io_pipeline: IoPipelineStatus {
+                overlap_enabled: true,
+                batch_bytes: 512,
+                resolve_batches: 2,
+                overlap_cycles: 1,
+                ..IoPipelineStatus::default()
+            },
         });
         let output = render_metrics(&metrics);
         assert!(output.contains("tilemaxsim_ready 1"));
@@ -2331,6 +2488,8 @@ mod tests {
         ));
         assert!(output.contains("tilemaxsim_host_cache_bytes{kind=\"used\"} 128"));
         assert!(output.contains("tilemaxsim_storage_read_bytes_total 256"));
+        assert!(output.contains("tilemaxsim_io_pipeline_enabled 1"));
+        assert!(output.contains("tilemaxsim_io_pipeline_batch_bytes 512"));
         assert!(!output.contains("tenant-a"));
     }
 }
