@@ -197,6 +197,47 @@ class QuantizationBenchmarkIntegrationTest(unittest.TestCase):
                 dataset.close()
             np.testing.assert_array_equal(actual, expected.numpy())
 
+    def test_residual_pq_cache_persists_every_stage(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            manifest_path = self.make_dataset(root)
+            tensor_path = root / "one-row.f16"
+            np.asarray([[1.0, 0.0, 0.0, 0.0]], dtype="<f2").tofile(tensor_path)
+            manifest = json.loads(manifest_path.read_text())
+            page = {
+                "page_key": "shared",
+                "page_no": 1,
+                "tensor_rows": 1,
+                "tensor_dim": 4,
+                "tensor_dtype": "float16",
+                "source": {"kind": "file", "path": str(tensor_path)},
+            }
+            manifest["documents"] = {
+                doc_id: [page] for doc_id in manifest["documents"]
+            }
+            manifest_path.write_text(json.dumps(manifest))
+            dataset = Dataset(manifest_path)
+            try:
+                cache = build_variant(
+                    dataset,
+                    Variant(
+                        "rpq-cache",
+                        encoding="pq",
+                        subspaces=2,
+                        centroids=1,
+                        residual_stages=2,
+                    ),
+                    root / "cache",
+                    training_rows=8,
+                    iterations=1,
+                    seed=37,
+                    device=torch.device("cuda:0"),
+                )
+                codes = np.load(cache / "codes.npy")
+            finally:
+                dataset.close()
+            self.assertEqual(codes.shape, (1124, 2, 2))
+
     def make_dataset(self, root: Path) -> Path:
         corpus = root / "corpus.jsonl"
         documents = [f"doc-{index:04d}" for index in range(1124)]

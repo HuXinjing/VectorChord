@@ -512,13 +512,13 @@ def build_variant(
             )
             chunk_position = position
             for document_chunk in document.split(encoding_rows):
-                encoded = quantizer.encode(document_chunk.to(device)).cpu()
+                encoded = quantizer.encode(document_chunk.to(device))
                 stages = (
                     (encoded,) if isinstance(encoded, torch.Tensor) else encoded
                 )
                 chunk_end = chunk_position + document_chunk.shape[0]
                 values[chunk_position:chunk_end] = torch.stack(
-                    stages, dim=1
+                    tuple(stage.cpu() for stage in stages), dim=1
                 ).numpy()
                 chunk_position = chunk_end
             if chunk_position != end:
