@@ -51,6 +51,11 @@ class TileMaxSimQuantizationTest(unittest.TestCase):
         expected = torch.stack((tokens[0], tokens[1:4].mean(0), tokens[4]))
         torch.testing.assert_close(pooled, expected)
         torch.testing.assert_close(pool_tokens(tokens, 1), tokens)
+        normalized = pool_tokens(tokens + 1, 2, normalize=True)
+        torch.testing.assert_close(
+            torch.linalg.vector_norm(normalized.float(), dim=1),
+            torch.ones(normalized.shape[0]),
+        )
 
     def test_reservoir_sampling_is_bounded_and_deterministic(self) -> None:
         documents = [self.training[:40], self.training[40:]]

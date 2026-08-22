@@ -57,12 +57,16 @@ class Variant:
     opq_iterations: int = 0
     fused: bool = True
     storage_name: str = ""
+    normalize_pooling: bool = False
 
 
 VARIANTS = (
     Variant("exact-fp16"),
+    Variant("document-mean-fp16", pooling=0, normalize_pooling=True),
     Variant("pool2-fp16", pooling=2),
+    Variant("pool2-normalized-fp16", pooling=2, normalize_pooling=True),
     Variant("pool4-fp16", pooling=4),
+    Variant("pool4-normalized-fp16", pooling=4, normalize_pooling=True),
     Variant("int8", encoding="int8"),
     Variant("fp8-e4m3", encoding="fp8"),
     Variant("int8-unfused", encoding="int8", fused=False, storage_name="int8"),
@@ -127,6 +131,16 @@ VARIANTS = (
         centroids=256,
         residual_stages=2,
         opq_iterations=4,
+    ),
+    Variant(
+        "pool2-normalized-opq-rpq2-m16-b8",
+        pooling=2,
+        encoding="pq",
+        subspaces=16,
+        centroids=256,
+        residual_stages=2,
+        opq_iterations=4,
+        normalize_pooling=True,
     ),
 )
 
@@ -216,17 +230,32 @@ class Dataset:
         # Shard buffers and memmaps are read-only; copy before exposing to torch.
         return torch.from_numpy(np.array(array, copy=True))
 
-    def iter_documents(self, pooling: int) -> Iterator[torch.Tensor]:
+    def iter_documents(
+        self, pooling: int, normalize_pooling: bool = False
+    ) -> Iterator[torch.Tensor]:
         for index in range(len(self.pages)):
-            yield self.load_document(index, pooling)
+            yield self.load_document(index, pooling, normalize_pooling)
 
-    def load_document(self, index: int, pooling: int) -> torch.Tensor:
+    def load_document(
+        self, index: int, pooling: int, normalize_pooling: bool = False
+    ) -> torch.Tensor:
+        if pooling == 0:
+            tokens = torch.cat(
+                [self.load_page(page) for page in self.pages[index]], dim=0
+            )
+            pooled = tokens.mean(dim=0, keepdim=True)
+            return torch.nn.functional.normalize(pooled.float(), dim=1).to(tokens.dtype)
         return torch.cat(
-            [pool_tokens(self.load_page(page), pooling) for page in self.pages[index]],
+            [
+                pool_tokens(self.load_page(page), pooling, normalize=normalize_pooling)
+                for page in self.pages[index]
+            ],
             dim=0,
         )
 
     def row_counts(self, pooling: int) -> np.ndarray:
+        if pooling == 0:
+            return np.ones(len(self.pages), dtype=np.int32)
         return np.asarray(
             [
                 sum(math.ceil(int(page["tensor_rows"]) / pooling) for page in pages)
@@ -251,6 +280,7 @@ def storage_config(variant: Variant) -> dict[str, Any]:
         "centroids": variant.centroids,
         "residual_stages": variant.residual_stages,
         "opq_iterations": variant.opq_iterations,
+        "normalize_pooling": variant.normalize_pooling,
     }
 
 
@@ -358,7 +388,14 @@ def build_variant(
         json.dumps(stored_doc_ids, ensure_ascii=False) + "\n", encoding="utf-8"
     )
 
-    base_name = {1: "exact-fp16", 2: "pool2-fp16", 4: "pool4-fp16"}.get(variant.pooling)
+    base_name = {
+        (0, True): "document-mean-fp16",
+        (1, False): "exact-fp16",
+        (2, False): "pool2-fp16",
+        (2, True): "pool2-normalized-fp16",
+        (4, False): "pool4-fp16",
+        (4, True): "pool4-normalized-fp16",
+    }.get((variant.pooling, variant.normalize_pooling))
     base_root = output_root / base_name if base_name else None
     use_base = (
         variant.encoding != "fp16"
@@ -397,7 +434,11 @@ def build_variant(
                 yield torch.from_numpy(np.array(base_values[start:end], copy=True))
             return
         for original_index in order:
-            yield dataset.load_document(int(original_index), variant.pooling)
+            yield dataset.load_document(
+                int(original_index),
+                variant.pooling,
+                variant.normalize_pooling,
+            )
 
     quantizer = None
     training_ms = 0.0

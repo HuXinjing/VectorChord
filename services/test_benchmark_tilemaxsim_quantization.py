@@ -90,11 +90,25 @@ class QuantizationBenchmarkIntegrationTest(unittest.TestCase):
                     seed=3,
                     device=torch.device("cuda:0"),
                 )
+                document_mean = build_variant(
+                    dataset,
+                    Variant(
+                        "document-mean-fp16",
+                        pooling=0,
+                        normalize_pooling=True,
+                    ),
+                    cache_root,
+                    training_rows=8,
+                    iterations=1,
+                    seed=3,
+                    device=torch.device("cuda:0"),
+                )
             finally:
                 dataset.close()
             metadata = json.loads((compressed / "metadata.json").read_text())
             self.assertEqual(metadata["source_fp16_cache"], str(exact.resolve()))
             self.assertEqual(np.load(compressed / "values.npy").shape, (1124, 4))
+            self.assertTrue(np.all(np.load(document_mean / "rows.npy") == 1))
 
     def make_dataset(self, root: Path) -> Path:
         corpus = root / "corpus.jsonl"

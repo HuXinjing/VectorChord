@@ -25,15 +25,16 @@ stored per page and are not assumed to be a fixed value.
 
 The default matrix includes:
 
-- Exact FP16 and consecutive mean pooling factors 2 and 4.
+- Exact FP16, consecutive mean pooling factors 2 and 4 with and without
+  post-pooling L2 normalization, and normalized whole-document mean pooling.
 - Per-token symmetric INT8 and scaled FP8 E4M3.
 - PQ with 8, 16, and 32 subspaces and 4- or 8-bit codes.
 - Two- and three-stage residual PQ.
 - OPQ followed by PQ.
 - Pooling combined independently with scalar quantization, PQ, residual PQ,
   and OPQ.
-- The compatible full stack: pooling + OPQ first stage + residual PQ + fused
-  ADC.
+- The compatible full stacks: raw or normalized pooling + OPQ first stage +
+  residual PQ + fused ADC.
 - Fused/unfused execution pairs for INT8, FP8, PQ, and residual PQ. Unfused
   variants materialize a full FP16 document arena before exact TileMaxSim;
   fused variants dequantize in registers or score ADC lookup tables directly.
