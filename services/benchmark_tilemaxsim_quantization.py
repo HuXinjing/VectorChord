@@ -502,9 +502,27 @@ def build_variant(
             scales[position:end] = encoded.scales.numpy()
         else:
             assert quantizer is not None
-            encoded = quantizer.encode(document.to(device)).cpu()
-            stages = (encoded,) if isinstance(encoded, torch.Tensor) else encoded
-            values[position:end] = torch.stack(stages, dim=1).numpy()
+            # PQ's temporary distance arena is [rows, subspaces, centroids].
+            # Stream large documents so cache construction remains bounded on
+            # a GPU shared with serving workloads. Keep at most ~16 MiB of
+            # distance workspace per encode call (before allocator overhead).
+            distance_bytes_per_row = variant.subspaces * variant.centroids * 4
+            encoding_rows = max(
+                1, min(8192, (16 * 1024**2) // distance_bytes_per_row)
+            )
+            chunk_position = position
+            for document_chunk in document.split(encoding_rows):
+                encoded = quantizer.encode(document_chunk.to(device)).cpu()
+                stages = (
+                    (encoded,) if isinstance(encoded, torch.Tensor) else encoded
+                )
+                chunk_end = chunk_position + document_chunk.shape[0]
+                values[chunk_position:chunk_end] = torch.stack(
+                    stages, dim=1
+                ).numpy()
+                chunk_position = chunk_end
+            if chunk_position != end:
+                raise RuntimeError("chunked PQ encoding lost document rows")
         position = end
     values.flush()
     if variant.encoding in ("int8", "fp8"):

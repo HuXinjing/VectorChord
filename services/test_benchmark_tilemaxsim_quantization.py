@@ -140,6 +140,63 @@ class QuantizationBenchmarkIntegrationTest(unittest.TestCase):
             self.assertEqual(np.load(compressed / "values.npy").shape, (1124, 4))
             self.assertTrue(np.all(np.load(document_mean / "rows.npy") == 1))
 
+    def test_pq_build_streams_documents_without_changing_codes(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            manifest_path = self.make_dataset(root)
+            tensor_path = root / "many-rows.f16"
+            source = np.random.default_rng(29).normal(size=(9000, 4)).astype("<f2")
+            source.tofile(tensor_path)
+            one_row_path = root / "one-row.f16"
+            source[:1].tofile(one_row_path)
+            manifest = json.loads(manifest_path.read_text())
+            page = {
+                "page_key": "shared",
+                "page_no": 1,
+                "tensor_rows": len(source),
+                "tensor_dim": 4,
+                "tensor_dtype": "float16",
+                "source": {"kind": "file", "path": str(tensor_path)},
+            }
+            small_page = {
+                **page,
+                "page_key": "small",
+                "tensor_rows": 1,
+                "source": {"kind": "file", "path": str(one_row_path)},
+            }
+            document_ids = list(manifest["documents"])
+            manifest["documents"] = {
+                doc_id: [page if index == 0 else small_page]
+                for index, doc_id in enumerate(document_ids)
+            }
+            manifest_path.write_text(json.dumps(manifest))
+            dataset = Dataset(manifest_path)
+            variant = Variant(
+                "pq-streamed", encoding="pq", subspaces=2, centroids=4
+            )
+            try:
+                cache = build_variant(
+                    dataset,
+                    variant,
+                    root / "cache",
+                    training_rows=16,
+                    iterations=1,
+                    seed=31,
+                    device=torch.device("cuda:0"),
+                )
+                quantizer = load_quantizer(cache / "quantizer.npz")
+                expected = quantizer.encode(torch.from_numpy(source).cuda()).cpu()
+                rows = np.load(cache / "rows.npy")
+                offsets = np.load(cache / "offsets.npy")
+                large_index = int(rows.argmax())
+                start = int(offsets[large_index])
+                actual = np.load(cache / "codes.npy")[
+                    start : start + len(source), 0
+                ]
+            finally:
+                dataset.close()
+            np.testing.assert_array_equal(actual, expected.numpy())
+
     def make_dataset(self, root: Path) -> Path:
         corpus = root / "corpus.jsonl"
         documents = [f"doc-{index:04d}" for index in range(1124)]
