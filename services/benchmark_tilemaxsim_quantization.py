@@ -712,6 +712,15 @@ def score_variant(
         # arenas so the planner does not rely on allocator luck.
         bytes_per_row += dimension * (10 if variant.encoding == "pq" else 2)
     batch_ranges = list(batches(rows, bytes_per_row, batch_bytes))
+    planned_batch_bytes = [
+        int(rows[start:end].sum()) * bytes_per_row for start, end in batch_ranges
+    ]
+    oversized_singletons = sum(
+        end == start + 1 and planned > batch_bytes
+        for (start, end), planned in zip(
+            batch_ranges, planned_batch_bytes, strict=True
+        )
+    )
     relevant = {item["id"]: set(item["relevant"]) for item in dataset.qrels}
     latencies = []
     transfer_latencies = []
@@ -941,6 +950,11 @@ def score_variant(
         },
         "gpu_batch_bytes": batch_bytes,
         "gpu_batches": len(batch_ranges),
+        "maximum_planned_batch_bytes": max(planned_batch_bytes),
+        "oversized_singleton_documents": oversized_singletons,
+        "oversized_unfused_documents_streamed": (
+            oversized_singletons if not variant.fused else 0
+        ),
         "padding_row_ratio": sum(
             int(rows[start:end].max()) * (end - start) for start, end in batch_ranges
         )

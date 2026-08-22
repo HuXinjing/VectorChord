@@ -372,6 +372,10 @@ class QuantizationBenchmarkIntegrationTest(unittest.TestCase):
             self.assertEqual(report["quality"]["recall_at_1"], 1.0)
             self.assertEqual(report["quality"]["mrr"], 1.0)
             self.assertEqual(report["dataset"]["documents"], 1124)
+            self.assertEqual(report["oversized_singleton_documents"], 0)
+            self.assertLessEqual(
+                report["maximum_planned_batch_bytes"], report["gpu_batch_bytes"]
+            )
 
     def test_fused_and_unfused_int8_have_identical_rankings(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
