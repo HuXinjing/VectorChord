@@ -33,8 +33,17 @@ def main() -> None:
     parser.add_argument("--output-json", required=True, type=Path)
     parser.add_argument("--output-markdown", required=True, type=Path)
     args = parser.parse_args()
-    paths = sorted(args.report_root.glob("*.json"))
-    reports = {path.stem: load(path) for path in paths}
+    output_json = args.output_json.resolve()
+    paths = sorted(
+        path
+        for path in args.report_root.glob("*.json")
+        if path.resolve() != output_json
+    )
+    reports = {}
+    for path in paths:
+        payload = load(path)
+        if "variant" in payload and "cases" in payload:
+            reports[path.stem] = payload
     if args.baseline not in reports:
         raise ValueError(f"missing baseline report {args.baseline!r}")
     baseline = reports[args.baseline]
