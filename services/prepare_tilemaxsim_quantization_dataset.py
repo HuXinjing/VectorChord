@@ -389,6 +389,11 @@ def main() -> None:
     parser.add_argument("--supplement", action="append", default=[], type=Path)
     parser.add_argument("--pooling-url", default="http://127.0.0.1:18019/pooling")
     parser.add_argument("--concurrency", type=int, default=4)
+    parser.add_argument(
+        "--regenerate-all",
+        action="store_true",
+        help="ignore historical tensors and encode every corpus page with the current model",
+    )
     args = parser.parse_args()
     if args.concurrency <= 0:
         parser.error("--concurrency must be positive")
@@ -408,12 +413,12 @@ def main() -> None:
 
     old_pages = read_jsonl(args.page_text)
     old_descriptors = {item["page_key"]: item for item in read_jsonl(args.descriptors)}
-    old_by_doc = corpus_bindings(corpus, old_pages)
+    old_by_doc = {} if args.regenerate_all else corpus_bindings(corpus, old_pages)
     for pages in old_by_doc.values():
         for page in pages:
             if page["page_key"] not in old_descriptors:
                 raise ValueError(f"page has no tensor descriptor: {page['page_key']}")
-    supplements = load_supplements(args.supplement)
+    supplements = {} if args.regenerate_all else load_supplements(args.supplement)
     covered = set(old_by_doc) | set(supplements)
     generated = encode_missing_documents(
         corpus,
@@ -459,6 +464,9 @@ def main() -> None:
         "version": 1,
         "model": MODEL,
         "model_contract": MODEL_CONTRACT,
+        "encoding_mode": "regenerated-all"
+        if args.regenerate_all
+        else "reuse-compatible",
         "dimension": DIMENSION,
         "preprocess": {
             "renderer": "PyMuPDF",
