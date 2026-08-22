@@ -71,6 +71,19 @@ class TileMaxSimQuantizationTest(unittest.TestCase):
         actual = adc_tilemaxsim(self.query, codes, quantizer)
         torch.testing.assert_close(actual, expected, atol=2e-5, rtol=2e-5)
 
+    def test_pq_encoding_is_identical_across_workspace_batches(self) -> None:
+        quantizer = train_opq(
+            self.training,
+            4,
+            8,
+            outer_iterations=1,
+            kmeans_iterations=2,
+            seed=10,
+        )
+        expected = quantizer.encode(self.document, batch_rows=len(self.document))
+        actual = quantizer.encode(self.document, batch_rows=2)
+        torch.testing.assert_close(actual, expected)
+
     def test_residual_pq_adc_equals_explicit_reconstruction_score(self) -> None:
         quantizer = train_residual_product_quantizer(
             self.training, 4, 8, 2, iterations=4, seed=13
