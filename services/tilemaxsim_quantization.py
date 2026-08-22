@@ -216,10 +216,17 @@ class ProductQuantizer:
         if codes.ndim != 2 or codes.shape[1] != self.subspaces:
             raise ValueError("invalid PQ code shape")
         books = self.codebooks.to(codes.device)
-        pieces = [
-            books[index][codes[:, index].long()] for index in range(self.subspaces)
-        ]
-        decoded = torch.cat(pieces, dim=1)
+        subdimension = books.shape[2]
+        decoded = torch.empty(
+            (codes.shape[0], self.dimension),
+            dtype=books.dtype,
+            device=codes.device,
+        )
+        for index in range(self.subspaces):
+            start = index * subdimension
+            decoded[:, start : start + subdimension] = books[index][
+                codes[:, index].long()
+            ]
         if undo_rotation and self.rotation is not None:
             decoded = decoded @ self.rotation.to(decoded.device).T
         return decoded
