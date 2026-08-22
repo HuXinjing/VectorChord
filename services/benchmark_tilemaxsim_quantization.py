@@ -706,9 +706,11 @@ def score_variant(
         bytes_per_row = variant.subspaces * variant.residual_stages
         quantizer = load_quantizer(cache / "quantizer.npz")
     if not variant.fused and variant.encoding != "fp16":
-        # The unfused oracle holds both compressed input and a materialized
-        # FP16 document arena at peak; budget for both to avoid an unfair OOM.
-        bytes_per_row += dimension * 2
+        # The unfused oracle holds compressed input plus reconstruction. INT8
+        # and FP8 reconstruct directly to FP16. PQ decode uses FP32 codebooks;
+        # conservatively include decode, OPQ/RPQ intermediate, and final FP16
+        # arenas so the planner does not rely on allocator luck.
+        bytes_per_row += dimension * (10 if variant.encoding == "pq" else 2)
     batch_ranges = list(batches(rows, bytes_per_row, batch_bytes))
     relevant = {item["id"]: set(item["relevant"]) for item in dataset.qrels}
     latencies = []
