@@ -192,16 +192,19 @@ class ProductQuantizer:
             return values
         return values @ self.rotation.to(values.device)
 
-    def encode(self, values: torch.Tensor, *, batch_rows: int = 8192) -> torch.Tensor:
+    def encode(self, values: torch.Tensor, *, batch_rows: int = 1024) -> torch.Tensor:
         if batch_rows <= 0:
             raise ValueError("PQ encoding batch_rows must be positive")
-        rotated = self.rotate(values)
-        books = self.codebooks.to(rotated.device)
+        values = _matrix(values, "values")
+        if values.shape[1] != self.dimension:
+            raise ValueError("values and quantizer dimensions disagree")
+        books = self.codebooks.to(values.device)
         dtype = torch.uint8 if self.centroids <= 256 else torch.int16
         book_norms = torch.sum(books * books, dim=2)
         encoded = []
-        for batch in rotated.split(batch_rows):
-            chunks = batch.reshape(-1, self.subspaces, self.codebooks.shape[2])
+        for batch in values.split(batch_rows):
+            rotated = self.rotate(batch)
+            chunks = rotated.reshape(-1, self.subspaces, self.codebooks.shape[2])
             distances = (
                 torch.sum(chunks * chunks, dim=2)[:, :, None]
                 + book_norms[None, :, :]
