@@ -169,6 +169,9 @@ class QuantizationBenchmarkIntegrationTest(unittest.TestCase):
         np.save(cache / "rows.npy", rows)
         np.save(cache / "offsets.npy", offsets)
         np.save(cache / "values.npy", values)
+        (cache / "doc-ids.json").write_text(
+            json.dumps([f"doc-{index:04d}" for index in range(1124)])
+        )
         (cache / "metadata.json").write_text(
             json.dumps(
                 {
@@ -198,6 +201,9 @@ class QuantizationBenchmarkIntegrationTest(unittest.TestCase):
         np.save(cache / "offsets.npy", np.arange(1124, dtype=np.int64))
         np.save(cache / "values.npy", values)
         np.save(cache / "scales.npy", np.full(1124, 1 / 127, dtype="<f2"))
+        (cache / "doc-ids.json").write_text(
+            json.dumps([f"doc-{index:04d}" for index in range(1124)])
+        )
         (cache / "metadata.json").write_text(
             json.dumps({"complete": True, "artifact_bytes": values.nbytes})
         )
