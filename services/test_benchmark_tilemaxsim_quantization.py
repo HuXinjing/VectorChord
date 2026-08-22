@@ -21,9 +21,11 @@ import torch
 from services.benchmark_tilemaxsim_quantization import (
     Dataset,
     Variant,
+    batches,
     build_variant,
     load_quantizer,
     save_quantizer,
+    score_unfused_document_chunks,
     score_variant,
 )
 from services.tilemaxsim_quantization import train_residual_product_quantizer
@@ -31,6 +33,34 @@ from services.tilemaxsim_quantization import train_residual_product_quantizer
 
 @unittest.skipUnless(torch.cuda.is_available(), "CUDA is unavailable")
 class QuantizationBenchmarkIntegrationTest(unittest.TestCase):
+    def test_batch_planner_streams_an_oversized_document_as_singleton(self) -> None:
+        rows = np.asarray([2, 20, 3], dtype=np.int32)
+        self.assertEqual(list(batches(rows, 4, 32)), [(0, 1), (1, 2), (2, 3)])
+
+    def test_chunked_unfused_int8_matches_whole_document_maxsim(self) -> None:
+        rng = np.random.default_rng(17)
+        values = rng.integers(-127, 128, size=(23, 8), dtype=np.int8)
+        scales = rng.uniform(0.001, 0.02, size=23).astype("<f2")
+        query = torch.from_numpy(rng.normal(size=(5, 8)).astype("<f2")).cuda()
+        actual, _, _ = score_unfused_document_chunks(
+            query,
+            values,
+            scales,
+            None,
+            Variant("int8-unfused", encoding="int8", fused=False),
+            0,
+            len(values),
+            8 * (8 * 3 + 2),
+            torch.device("cuda:0"),
+        )
+        reconstructed = torch.from_numpy(values).cuda().to(torch.float16) * (
+            torch.from_numpy(scales).cuda().to(torch.float16)[:, None]
+        )
+        expected = (
+            query.float().matmul(reconstructed.float().T).amax(dim=1).sum()
+        )
+        torch.testing.assert_close(actual, expected)
+
     def test_quantizer_cache_round_trip_has_no_pickle(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "quantizer.npz"
