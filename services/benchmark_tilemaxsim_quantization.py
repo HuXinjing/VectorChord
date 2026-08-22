@@ -542,13 +542,91 @@ def batches(
         if index > start and used + size > maximum_bytes:
             yield start, index
             start, used = index, 0
+        # An individual document may be larger than the transfer budget. Keep
+        # it as a singleton range; score_variant streams that document in token
+        # chunks and merges the per-query-token maxima exactly.
         if size > maximum_bytes:
-            raise ValueError(
-                f"one document requires {size} bytes, above GPU batch budget"
-            )
+            yield index, index + 1
+            start, used = index + 1, 0
+            continue
         used += size
     if start < len(rows):
         yield start, len(rows)
+
+
+def score_unfused_document_chunks(
+    query: torch.Tensor,
+    values: np.ndarray,
+    scales: np.ndarray | None,
+    quantizer: ProductQuantizer | ResidualProductQuantizer | None,
+    variant: Variant,
+    row_start: int,
+    row_end: int,
+    batch_bytes: int,
+    device: torch.device,
+) -> tuple[torch.Tensor, float, float]:
+    """Score one oversized document without changing exact MaxSim semantics."""
+    dimension = query.shape[1]
+    if variant.encoding in ("int8", "fp8"):
+        encoded_bytes_per_row = dimension + 2
+    else:
+        encoded_bytes_per_row = variant.subspaces * variant.residual_stages
+    # Peak includes compressed input, FP16 reconstruction, the FP32 operand
+    # used to preserve dot accumulation semantics, and the query-by-chunk
+    # similarity matrix. The factor of two leaves allocator/workspace headroom
+    # on a GPU shared with other services.
+    peak_bytes_per_row = (
+        encoded_bytes_per_row
+        + dimension * 2
+        + dimension * 4
+        + query.shape[0] * 4
+    )
+    chunk_rows = max(1, batch_bytes // (2 * peak_bytes_per_row))
+    maxima = torch.full(
+        (query.shape[0],), -torch.inf, dtype=torch.float32, device=device
+    )
+    transfer_ms = 0.0
+    kernel_ms = 0.0
+    for chunk_start in range(row_start, row_end, chunk_rows):
+        chunk_end = min(row_end, chunk_start + chunk_rows)
+        transfer_started = time.perf_counter()
+        encoded = torch.from_numpy(
+            np.array(values[chunk_start:chunk_end], copy=True)
+        )
+        if variant.encoding == "fp8":
+            encoded = encoded.view(torch.float8_e4m3fn)
+        encoded = encoded.to(device)
+        chunk_scales = None
+        if scales is not None:
+            chunk_scales = torch.from_numpy(
+                np.array(scales[chunk_start:chunk_end], copy=True)
+            ).to(device)
+        torch.cuda.synchronize(device)
+        transfer_ms += (time.perf_counter() - transfer_started) * 1000
+
+        kernel_started = time.perf_counter()
+        if variant.encoding in ("int8", "fp8"):
+            assert chunk_scales is not None
+            reconstructed = encoded.to(torch.float16) * chunk_scales.to(
+                torch.float16
+            )[:, None]
+        else:
+            assert quantizer is not None
+            stage_codes = tuple(
+                encoded[:, index, :] for index in range(variant.residual_stages)
+            )
+            reconstructed = (
+                quantizer.decode(stage_codes[0])
+                if isinstance(quantizer, ProductQuantizer)
+                else quantizer.decode(stage_codes)
+            ).to(torch.float16)
+        chunk_maxima = torch.matmul(
+            query.to(torch.float32), reconstructed.to(torch.float32).T
+        ).amax(dim=1)
+        maxima = torch.maximum(maxima, chunk_maxima)
+        torch.cuda.synchronize(device)
+        kernel_ms += (time.perf_counter() - kernel_started) * 1000
+    return maxima.sum(), transfer_ms, kernel_ms
 
 
 def ragged_batch_metadata(
@@ -646,6 +724,29 @@ def score_variant(
             for start, end in batch_ranges:
                 row_start = int(offsets[start])
                 row_end = int(offsets[end - 1] + rows[end - 1])
+                oversized_unfused = (
+                    not variant.fused
+                    and end == start + 1
+                    and int(rows[start]) * bytes_per_row > batch_bytes
+                )
+                if oversized_unfused:
+                    score, chunk_transfer_ms, chunk_kernel_ms = (
+                        score_unfused_document_chunks(
+                            query,
+                            values,
+                            scales if variant.encoding in ("int8", "fp8") else None,
+                            quantizer,
+                            variant,
+                            row_start,
+                            row_end,
+                            batch_bytes,
+                            device,
+                        )
+                    )
+                    scores[start] = score.cpu()
+                    transfer_ms += chunk_transfer_ms
+                    kernel_ms += chunk_kernel_ms
+                    continue
                 transfer_started = time.perf_counter()
                 batch_encoded = torch.from_numpy(
                     np.array(values[row_start:row_end], copy=True)
@@ -706,9 +807,9 @@ def score_variant(
                 else:
                     if variant.encoding in ("int8", "fp8"):
                         assert batch_scales is not None
-                        reconstructed = (
-                            batch_encoded.float() * batch_scales.float()[:, None]
-                        )
+                        reconstructed = batch_encoded.to(
+                            torch.float16
+                        ) * batch_scales.to(torch.float16)[:, None]
                     else:
                         assert quantizer is not None
                         stage_codes = tuple(
