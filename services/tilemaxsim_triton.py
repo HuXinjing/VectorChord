@@ -41,7 +41,10 @@ def _ragged_tilemaxsim_fp16_kernel(
     valid_document_rows = tl.load(document_rows + document_index)
     running_max = tl.full([block_query], value=float("-inf"), dtype=tl.float32)
 
-    for document_start in range(0, max_document_rows, block_document):
+    # Keep this as a device loop.  A logical document may concatenate hundreds
+    # of pages; compile-time unrolling would make kernel size scale with the
+    # longest document in the corpus.
+    for document_start in tl.range(0, max_document_rows, block_document):
         document_indices = (document_start + tl.arange(0, block_document)).to(tl.int64)
         document_mask = document_indices < valid_document_rows
         similarities = tl.zeros([block_query, block_document], dtype=tl.float32)
