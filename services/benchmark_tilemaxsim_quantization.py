@@ -13,6 +13,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import math
 import os
@@ -130,6 +131,14 @@ VARIANTS = (
 )
 
 
+def file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        while block := stream.read(1024 * 1024):
+            digest.update(block)
+    return "sha256:" + digest.hexdigest()
+
+
 class ShardReader:
     def __init__(self, root: Path) -> None:
         index = json.loads((root / "tilemaxsim-shards-v1.json").read_text())
@@ -208,10 +217,14 @@ class Dataset:
         return torch.from_numpy(np.array(array, copy=True))
 
     def iter_documents(self, pooling: int) -> Iterator[torch.Tensor]:
-        for pages in self.pages:
-            yield torch.cat(
-                [pool_tokens(self.load_page(page), pooling) for page in pages], dim=0
-            )
+        for index in range(len(self.pages)):
+            yield self.load_document(index, pooling)
+
+    def load_document(self, index: int, pooling: int) -> torch.Tensor:
+        return torch.cat(
+            [pool_tokens(self.load_page(page), pooling) for page in self.pages[index]],
+            dim=0,
+        )
 
     def row_counts(self, pooling: int) -> np.ndarray:
         return np.asarray(
@@ -322,13 +335,19 @@ def build_variant(
     output = output_root / (variant.storage_name or variant.name)
     output.mkdir(parents=True, exist_ok=True)
     metadata_path = output / "metadata.json"
+    source_manifest_checksum = file_sha256(dataset.manifest_path)
     if metadata_path.exists():
         metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
-        if metadata.get("complete") and metadata.get("storage") == storage_config(
-            variant
+        if (
+            metadata.get("complete")
+            and metadata.get("storage") == storage_config(variant)
+            and metadata.get("source_manifest_checksum") == source_manifest_checksum
         ):
             return output
-    rows = dataset.row_counts(variant.pooling)
+    original_rows = dataset.row_counts(variant.pooling)
+    order = np.argsort(original_rows, kind="stable")
+    rows = original_rows[order]
+    stored_doc_ids = [dataset.doc_ids[int(index)] for index in order]
     offsets = np.zeros(len(rows), dtype=np.int64)
     offsets[1:] = np.cumsum(rows[:-1], dtype=np.int64)
     total_rows = int(rows.sum())
@@ -336,7 +355,7 @@ def build_variant(
     np.save(output / "rows.npy", rows, allow_pickle=False)
     np.save(output / "offsets.npy", offsets, allow_pickle=False)
     (output / "doc-ids.json").write_text(
-        json.dumps(dataset.doc_ids, ensure_ascii=False) + "\n", encoding="utf-8"
+        json.dumps(stored_doc_ids, ensure_ascii=False) + "\n", encoding="utf-8"
     )
 
     base_name = {1: "exact-fp16", 2: "pool2-fp16", 4: "pool4-fp16"}.get(variant.pooling)
@@ -349,24 +368,36 @@ def build_variant(
     )
 
     def source_documents() -> Iterator[torch.Tensor]:
-        if not use_base:
-            yield from dataset.iter_documents(variant.pooling)
+        if use_base:
+            assert base_root is not None
+            base_metadata = json.loads(
+                (base_root / "metadata.json").read_text(encoding="utf-8")
+            )
+            if (
+                not base_metadata.get("complete")
+                or base_metadata.get("source_manifest_checksum")
+                != source_manifest_checksum
+            ):
+                raise ValueError(f"incomplete or stale FP16 base cache: {base_root}")
+            base_rows = np.load(base_root / "rows.npy", mmap_mode="r")
+            base_offsets = np.load(base_root / "offsets.npy", mmap_mode="r")
+            if not np.array_equal(base_rows, rows):
+                raise ValueError(
+                    "FP16 base row layout disagrees with compression variant"
+                )
+            base_doc_ids = json.loads((base_root / "doc-ids.json").read_text())
+            if base_doc_ids != stored_doc_ids:
+                raise ValueError(
+                    "FP16 base document order disagrees with compression variant"
+                )
+            base_values = np.load(base_root / "values.npy", mmap_mode="r")
+            for index, count in enumerate(base_rows):
+                start = int(base_offsets[index])
+                end = start + int(count)
+                yield torch.from_numpy(np.array(base_values[start:end], copy=True))
             return
-        assert base_root is not None
-        base_metadata = json.loads(
-            (base_root / "metadata.json").read_text(encoding="utf-8")
-        )
-        if not base_metadata.get("complete"):
-            raise ValueError(f"incomplete FP16 base cache: {base_root}")
-        base_rows = np.load(base_root / "rows.npy", mmap_mode="r")
-        base_offsets = np.load(base_root / "offsets.npy", mmap_mode="r")
-        if not np.array_equal(base_rows, rows):
-            raise ValueError("FP16 base row layout disagrees with compression variant")
-        base_values = np.load(base_root / "values.npy", mmap_mode="r")
-        for index, count in enumerate(base_rows):
-            start = int(base_offsets[index])
-            end = start + int(count)
-            yield torch.from_numpy(np.array(base_values[start:end], copy=True))
+        for original_index in order:
+            yield dataset.load_document(int(original_index), variant.pooling)
 
     quantizer = None
     training_ms = 0.0
@@ -451,6 +482,7 @@ def build_variant(
         "encoding_ms": encoding_ms,
         "artifact_bytes": sum(path.stat().st_size for path in files),
         "source_manifest": str(dataset.manifest_path.resolve()),
+        "source_manifest_checksum": source_manifest_checksum,
         "source_fp16_cache": str(base_root.resolve()) if use_base else None,
     }
     temporary = metadata_path.with_suffix(".tmp")
@@ -516,6 +548,9 @@ def score_variant(
 ) -> dict[str, Any]:
     rows = np.load(cache / "rows.npy", mmap_mode="r")
     offsets = np.load(cache / "offsets.npy", mmap_mode="r")
+    stored_doc_ids = json.loads((cache / "doc-ids.json").read_text(encoding="utf-8"))
+    if len(stored_doc_ids) != len(rows) or set(stored_doc_ids) != set(dataset.doc_ids):
+        raise ValueError("cache document IDs disagree with the frozen corpus")
     dimension = int(dataset.manifest["dimension"])
     quantizer = None
     if variant.encoding == "fp16":
@@ -655,10 +690,13 @@ def score_variant(
                 kernel_ms += (time.perf_counter() - kernel_started) * 1000
                 scores[start:end] = batch_scores.cpu()
             latency_ms = (time.perf_counter() - started_query) * 1000
-            ranking_indices = torch.argsort(
-                scores, descending=True, stable=True
+            # Physical length bucketing must never become a ranking signal.
+            # Resolve exact score ties by canonical document ID, independent of
+            # cache layout and pooling variant.
+            ranking_indices = np.lexsort(
+                (np.asarray(stored_doc_ids), -scores.numpy())
             ).tolist()
-            ranking = [dataset.doc_ids[index] for index in ranking_indices]
+            ranking = [stored_doc_ids[index] for index in ranking_indices]
             gold = relevant[item["id"]]
             ranking_positions = {
                 doc_id: index + 1 for index, doc_id in enumerate(ranking)
@@ -741,6 +779,10 @@ def score_variant(
         },
         "gpu_batch_bytes": batch_bytes,
         "gpu_batches": len(batch_ranges),
+        "padding_row_ratio": sum(
+            int(rows[start:end].max()) * (end - start) for start, end in batch_ranges
+        )
+        / int(rows.sum()),
         "latency_ms": metric_summary(latencies),
         "transfer_ms": metric_summary(transfer_latencies),
         "kernel_ms": metric_summary(kernel_latencies),

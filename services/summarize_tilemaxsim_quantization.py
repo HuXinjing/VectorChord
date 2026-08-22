@@ -83,6 +83,7 @@ def main() -> None:
                 "mean_transfer_ms": float(report["transfer_ms"]["mean"]),
                 "mean_kernel_ms": float(report["kernel_ms"]["mean"]),
                 "mean_query_prep_ms": float(report["query_prep_ms"]["mean"]),
+                "padding_row_ratio": float(report["padding_row_ratio"]),
             }
         )
     rows.sort(key=lambda item: item["variant"])

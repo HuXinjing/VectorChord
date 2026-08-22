@@ -186,9 +186,11 @@ class QuantizedTritonTest(unittest.TestCase):
     def test_gpu_pq_training_and_chunked_encoding(self) -> None:
         training = torch.cat(self.documents).cuda()
         quantizer = train_product_quantizer(training, 2, 8, iterations=2, seed=23)
+        repeated = train_product_quantizer(training, 2, 8, iterations=2, seed=23)
         codes = quantizer.encode(training, batch_rows=3)
         self.assertEqual(codes.shape, (16, 2))
         self.assertEqual(codes.device.type, "cuda")
+        self.assertTrue(torch.equal(quantizer.codebooks, repeated.codebooks))
 
 
 if __name__ == "__main__":

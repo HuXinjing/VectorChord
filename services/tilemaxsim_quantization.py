@@ -143,8 +143,14 @@ def _kmeans(
     for _ in range(iterations):
         assignments = torch.cdist(values, centroids).argmin(dim=1)
         counts = torch.bincount(assignments, minlength=clusters)
-        sums = torch.zeros_like(centroids)
-        sums.index_add_(0, assignments, values)
+        # CUDA index_add uses atomic floating-point accumulation and changes a
+        # few low bits across runs.  The one-hot GEMM has a fixed reduction
+        # schedule for a fixed environment, making seeded benchmark codebooks
+        # reproducible without moving training back to the CPU.
+        membership = torch.nn.functional.one_hot(assignments, num_classes=clusters).to(
+            values.dtype
+        )
+        sums = membership.T @ values
         nonempty = counts > 0
         centroids[nonempty] = sums[nonempty] / counts[nonempty, None]
         if not nonempty.all():
