@@ -88,3 +88,45 @@ python -m services.summarize_tilemaxsim_quantization \
   --output-json "$REPORT_ROOT/summary.json" \
   --output-markdown "$REPORT_ROOT/summary.md"
 ```
+
+For independent repeated runs, write each run to `run-001`, `run-002`, and so
+on, then generate deterministic bootstrap confidence intervals:
+
+```bash
+python -m services.summarize_tilemaxsim_repetitions \
+  --run-root "$REPEATED_REPORT_ROOT" \
+  --output-json "$REPEATED_REPORT_ROOT/stability.json" \
+  --output-markdown "$REPEATED_REPORT_ROOT/stability.md" \
+  --bootstrap-samples 10000 \
+  --confidence 0.95
+```
+
+Warmup queries are explicitly marked and excluded. Confidence intervals use a
+hierarchical bootstrap that resamples runs and then queries within each run,
+rather than treating repeated observations as independent. The aggregate fails
+closed if deterministic repetitions disagree on their variant definition or
+quality metrics.
+
+## Quantization contract lifecycle
+
+`services.tilemaxsim_quantization_contract` provides content-addressed,
+immutable encoding contracts and an atomic activation registry. A controller
+stages only complete artifacts whose source checksum matches, activates them
+after independently hashing their payload tree, uses compare-and-swap
+protection, retains the previous version, and can roll back without rewriting
+tensor data. Registry state is fsynced and atomically replaced; a failed or
+stale controller leaves the current active contract unchanged.
+
+## Concurrent scheduler benchmark
+
+`services.benchmark_tilemaxsim_concurrency` creates a domain-neutral synthetic
+tensor corpus and submits protocol-v3 requests from crossed scheduling domains
+and priorities. It reports throughput, p50/p95/p99, per-priority and per-domain
+latency, and the maximum consecutive completion run. The cross-product avoids
+confounding priority with domain identity. Scheduling domains remain opaque
+hints and do not grant access to any tensor.
+
+`services.benchmark_tilemaxsim_cache_tiers` additionally verifies each cache
+tier from daemon counters rather than inferring it from latency: L2 requires a
+GPU miss, host miss, and storage reads; L1 requires a GPU miss, host hit, and no
+storage read; L0 requires a GPU hit and no transfer.
