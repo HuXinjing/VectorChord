@@ -116,6 +116,10 @@ PostgreSQL 可以通过本地 Unix socket 或 `tcp://HOST:PORT` 连接 daemon。
 
 ## 性能实测
 
+27 组真实 GPU 量化、池化、PQ/RPQ/OPQ、融合算子和小显存消融的完整结果见
+[《TileMaxSim 量化、池化与融合算子消融实验报告》](docs/tilemaxsim-quantization-results.zh-CN.md)。
+报告只公开聚合指标和可复现程序，不公开私有评测语料、生成张量、模型权重或内部路径。
+
 开发机语料包含 34,054 个张量描述符、34,027 个唯一张量，逻辑 FP16 数据量为
 16.28 GB。绝对延迟会随存储、CPU 和 GPU 改变，因此同机对照比孤立数字更有意义。
 
