@@ -12,6 +12,7 @@ mod cache;
 mod engine;
 mod gpu;
 mod protocol;
+mod quant;
 mod scheduler;
 mod shard;
 
