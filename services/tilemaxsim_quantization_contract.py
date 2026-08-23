@@ -218,6 +218,7 @@ class QuantizationContractRegistry:
             previous = state.get("previous")
             if not isinstance(previous, str):
                 raise ValueError("no previous contract is available")
+            self._verify_staged(previous)
             state["active"], state["previous"] = previous, state["active"]
             state["generation"] = int(state["generation"]) + 1
             self._write_state(state)

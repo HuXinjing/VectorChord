@@ -120,6 +120,26 @@ class QuantizationContractRegistryTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "changed before activation"):
             self.registry.activate(identifier, expected_active=None)
 
+    def test_rollback_revalidates_previous_artifact(self):
+        first = self.registry.stage(
+            contract(self.source, artifact_tree_sha256(self.artifact)), self.artifact
+        )
+        self.registry.activate(first, expected_active=None)
+        second_artifact = self.root / "artifact-2"
+        second_artifact.mkdir()
+        (second_artifact / "metadata.json").write_text(
+            json.dumps({"complete": True, "source_manifest_checksum": self.source})
+        )
+        (second_artifact / "codes.bin").write_bytes(b"second")
+        second = self.registry.stage(
+            contract(self.source, artifact_tree_sha256(second_artifact)), second_artifact
+        )
+        self.registry.activate(second, expected_active=first)
+        (self.artifact / "codes.bin").write_bytes(b"broken-previous")
+        with self.assertRaisesRegex(ValueError, "changed before activation"):
+            self.registry.rollback(expected_active=second)
+        self.assertEqual(self.registry.resolve_active()["contract_id"], second)
+
 
 if __name__ == "__main__":
     unittest.main()
