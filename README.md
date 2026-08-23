@@ -215,6 +215,17 @@ curl or a TCP port.
 An opt-in hardened systemd unit and environment example are provided under
 `deploy/systemd`; the CUDA container uses the same probe for its health check.
 
+The complete 27-variant GPU quantization, pooling, PQ/RPQ/OPQ, fused-kernel,
+and low-memory ablation is available in the
+[full Chinese research report](docs/tilemaxsim-quantization-results.zh-CN.md).
+The report publishes aggregate measurements and reproducible tooling, not the
+private evaluation corpus, generated tensors, model weights, or internal paths.
+
+The development corpus contains 34,054 descriptors, 34,027 unique tensors, and
+16.28 GB of logical FP16 tensor data. Absolute latency depends on storage, CPU,
+and GPU hardware; same-machine comparisons are more meaningful than isolated
+numbers.
+
 The in-flight request budget is also expressed in GiB. A reader must reserve
 its complete declared frame after the fixed header is validated, and keeps that
 permit through completion, timeout, or disconnect. This bounds aggregate query
