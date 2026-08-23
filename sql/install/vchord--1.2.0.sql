@@ -2909,4 +2909,3 @@ CREATE EVENT TRIGGER _vchordrq_tilemaxsim_source_sql_drop
 ON sql_drop
 EXECUTE FUNCTION _vchordrq_tilemaxsim_source_sql_drop();
 /* </end connected objects> */
-
