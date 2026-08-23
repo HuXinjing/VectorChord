@@ -307,32 +307,22 @@ pub unsafe extern "C-unwind" fn amcostestimate(
                 std::ptr::null_mut(),
             )
         };
+        // PostgreSQL's relation estimate is the planner's current heap-row
+        // cardinality after base restrictions. Keep the raw clause
+        // selectivity separately because the MaxSim cost model needs both.
+        let total_rows = (*(*index_opt_info).rel).rows.max(1.0);
+        let filter_selectivity = selectivity.clamp(0.0, 1.0);
         // index exists
         if !(*index_opt_info).hypothetical {
             let relation = Index::open((*index_opt_info).indexoid, pgrx::pg_sys::NoLock as _);
             let opfamily = opfamily(relation.raw());
-            if !matches!(
+            let is_maxsim = matches!(
                 opfamily,
-                Opfamily::HalfvecCosine
-                    | Opfamily::HalfvecIp
-                    | Opfamily::HalfvecL2
-                    | Opfamily::VectorCosine
-                    | Opfamily::VectorIp
-                    | Opfamily::VectorL2
-                    | Opfamily::Rabitq8Cosine
-                    | Opfamily::Rabitq8Ip
-                    | Opfamily::Rabitq8L2
-                    | Opfamily::Rabitq4Cosine
-                    | Opfamily::Rabitq4Ip
-                    | Opfamily::Rabitq4L2
-            ) {
-                *index_startup_cost = 0.0;
-                *index_total_cost = 0.0;
-                *index_selectivity = 1.0;
-                *index_correlation = 0.0;
-                *index_pages = 1.0;
-                return;
-            }
+                Opfamily::VectorMaxsim
+                    | Opfamily::HalfvecMaxsim
+                    | Opfamily::Rabitq8Maxsim
+                    | Opfamily::Rabitq4Maxsim
+            );
             let index = PostgresRelation::<vchordrq::Opaque>::new(relation.raw());
             let probes = gucs::vchordrq_probes(relation.raw());
             let cost = vchordrq::cost(&index);
@@ -343,15 +333,25 @@ pub unsafe extern "C-unwind" fn amcostestimate(
                     probes.len()
                 );
             }
+            let estimated_index_vectors = if is_maxsim {
+                cost.indexed_vectors.map_or_else(
+                    || {
+                        (*index_opt_info).tuples.max(total_rows).max(1.0)
+                            * f64::from(gucs::vchordrq_maxsim_planner_document_tokens())
+                    },
+                    |indexed_vectors| indexed_vectors as f64,
+                )
+            } else {
+                (*index_opt_info).tuples.max(0.0)
+            };
             let node_count = {
-                let tuples = (*index_opt_info).tuples as u32;
                 let mut count = 0.0;
-                let r = cost.cells.iter().copied().rev();
-                let numerator = std::iter::once(1).chain(probes.clone());
+                let r = cost.cells.iter().copied().rev().map(f64::from);
+                let numerator = std::iter::once(1.0).chain(probes.iter().copied().map(f64::from));
                 let denumerator = r.clone();
-                let scale = r.skip(1).chain(std::iter::once(tuples));
+                let scale = r.skip(1).chain(std::iter::once(estimated_index_vectors));
                 for (scale, (numerator, denumerator)) in scale.zip(numerator.zip(denumerator)) {
-                    count += (scale as f64) * 1.0f64.min((numerator as f64) / (denumerator as f64));
+                    count += scale * 1.0f64.min(numerator / denumerator);
                 }
                 count
             };
@@ -367,6 +367,27 @@ pub unsafe extern "C-unwind" fn amcostestimate(
                 pages += cost.cells[0] as f64;
                 pages
             };
+            if is_maxsim {
+                let estimate = vchordrq::estimate_maxsim_cost(vchordrq::MaxsimCostInput {
+                    heap_rows: total_rows,
+                    index_tokens: estimated_index_vectors,
+                    token_nodes_per_query: node_count,
+                    base_index_pages: page_count,
+                    query_tokens: gucs::vchordrq_maxsim_planner_query_tokens(),
+                    limit_tuples: ((*root).limit_tuples > 0.0).then_some((*root).limit_tuples),
+                    filter_selectivity,
+                });
+                *index_startup_cost = estimate.startup_cost;
+                *index_total_cost = estimate.total_cost;
+                *index_selectivity = estimate.selectivity;
+                *index_correlation = 0.0;
+                *index_pages = estimate.index_pages;
+                return;
+            }
+            // Preserve upstream's cost/selectivity behavior for every
+            // non-MaxSim opfamily. TileMaxSim-specific estimates above are
+            // intentionally isolated so enabling the optional backend cannot
+            // perturb the normal vector scan planner path.
             let next_count =
                 f64::max(1.0, (*root).limit_tuples) * f64::min(1000.0, 1.0 / selectivity);
             *index_startup_cost = 0.001 * node_count;
@@ -458,7 +479,9 @@ pub unsafe extern "C-unwind" fn ambulkdelete(
             pg_guard_ffi_boundary(|| callback(&mut ctid, callback_state))
         }
     };
-    crate::index::vchordrq::dispatch::bulkdelete(opfamily, &index, check, callback);
+    let indexed_vectors =
+        crate::index::vchordrq::dispatch::bulkdelete(opfamily, &index, check, callback);
+    vchordrq::set_indexed_vectors(&index, indexed_vectors);
     stats
 }
 

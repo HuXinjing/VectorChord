@@ -78,6 +78,10 @@ static VCHORDRQ_MAXSIM_THRESHOLD: GucSetting<i32> = GucSetting::<i32>::new(0);
 static mut VCHORDRQ_MAXSIM_THRESHOLD_CONFIG: *mut pgrx::pg_sys::config_generic =
     core::ptr::null_mut();
 
+static VCHORDRQ_MAXSIM_PLANNER_QUERY_TOKENS: GucSetting<i32> = GucSetting::<i32>::new(32);
+
+static VCHORDRQ_MAXSIM_PLANNER_DOCUMENT_TOKENS: GucSetting<i32> = GucSetting::<i32>::new(256);
+
 static VCHORDRQ_PREFILTER: GucSetting<bool> = GucSetting::<bool>::new(false);
 
 static VCHORDRQ_IO_SEARCH: GucSetting<PostgresIo> = GucSetting::<PostgresIo>::new(
@@ -148,6 +152,26 @@ pub fn init() {
         &VCHORDRQ_MAXSIM_THRESHOLD,
         0,
         i32::MAX,
+        GucContext::Userset,
+        GucFlags::default(),
+    );
+    GucRegistry::define_int_guc(
+        c"vchordrq.maxsim_planner_query_tokens",
+        c"Expected MaxSim query-token count used by the planner.",
+        c"Set this to the measured deployment average until expression statistics are available.",
+        &VCHORDRQ_MAXSIM_PLANNER_QUERY_TOKENS,
+        1,
+        65_536,
+        GucContext::Userset,
+        GucFlags::default(),
+    );
+    GucRegistry::define_int_guc(
+        c"vchordrq.maxsim_planner_document_tokens",
+        c"Fallback MaxSim document-token count used by the planner.",
+        c"Used for indexes that predate the indexed-vector statistic.",
+        &VCHORDRQ_MAXSIM_PLANNER_DOCUMENT_TOKENS,
+        1,
+        65_536,
         GucContext::Userset,
         GucFlags::default(),
     );
@@ -470,6 +494,14 @@ pub fn vchordrq_maxsim_threshold(index: pgrx::pg_sys::Relation) -> u32 {
         let value = unsafe { Reloption::maxsim_threshold((*index).rd_options as _, DEFAULT) };
         parse(value)
     }
+}
+
+pub fn vchordrq_maxsim_planner_query_tokens() -> u32 {
+    VCHORDRQ_MAXSIM_PLANNER_QUERY_TOKENS.get() as u32
+}
+
+pub fn vchordrq_maxsim_planner_document_tokens() -> u32 {
+    VCHORDRQ_MAXSIM_PLANNER_DOCUMENT_TOKENS.get() as u32
 }
 
 pub fn vchordrq_prefilter() -> bool {
