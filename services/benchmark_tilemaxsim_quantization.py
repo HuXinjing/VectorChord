@@ -142,6 +142,16 @@ VARIANTS = (
         opq_iterations=4,
         normalize_pooling=True,
     ),
+    Variant(
+        "pool4-normalized-opq-rpq3-m16-b8",
+        pooling=4,
+        encoding="pq",
+        subspaces=16,
+        centroids=256,
+        residual_stages=3,
+        opq_iterations=4,
+        normalize_pooling=True,
+    ),
 )
 
 
@@ -989,9 +999,9 @@ def score_variant(
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--manifest", required=True, type=Path)
-    parser.add_argument("--cache-root", required=True, type=Path)
-    parser.add_argument("--report-root", required=True, type=Path)
+    parser.add_argument("--manifest", type=Path)
+    parser.add_argument("--cache-root", type=Path)
+    parser.add_argument("--report-root", type=Path)
     parser.add_argument("--variant", action="append", default=[])
     parser.add_argument("--list-variants", action="store_true")
     parser.add_argument("--build-only", action="store_true")
@@ -1005,6 +1015,16 @@ def main() -> None:
     if args.list_variants:
         print("\n".join(item.name for item in VARIANTS))
         return
+    missing_paths = [
+        name
+        for name in ("manifest", "cache_root", "report_root")
+        if getattr(args, name) is None
+    ]
+    if missing_paths:
+        parser.error(
+            "the following arguments are required: "
+            + ", ".join("--" + name.replace("_", "-") for name in missing_paths)
+        )
     names = args.variant or [item.name for item in VARIANTS]
     variants = [variant_by_name(name) for name in names]
     if args.training_rows <= 0 or args.kmeans_iterations <= 0:

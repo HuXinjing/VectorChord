@@ -35,6 +35,9 @@ The default matrix includes:
   and OPQ.
 - The compatible full stacks: raw or normalized pooling + OPQ first stage +
   residual PQ + fused ADC.
+- An aggressive full stack combines factor-4 normalized pooling, OPQ, and
+  three residual PQ stages to measure the far end of the compression/recall
+  tradeoff.
 - Fused/unfused execution pairs for INT8, FP8, PQ, and residual PQ. Unfused
   variants materialize a full FP16 document arena before exact TileMaxSim;
   fused variants dequantize in registers or score ADC lookup tables directly.
