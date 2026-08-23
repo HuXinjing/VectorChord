@@ -10,10 +10,11 @@
 
 use crate::cache::{Admission, GpuCache};
 use crate::gpu::Gpu;
-use crate::protocol::{Descriptor, Request};
+use crate::protocol::{Descriptor, Request, ScoringProfile};
 use crate::shard::{HostCacheStatus, ShardStore, cache_key};
 use anyhow::{Result, anyhow, bail};
 use std::collections::{HashMap, HashSet};
+use std::mem::size_of;
 use std::sync::Arc;
 
 struct MissingTensor {
@@ -136,7 +137,7 @@ impl Engine {
                 .collect::<Vec<_>>();
             let mut acquired = Vec::<(usize, String, bool)>::new();
             for (descriptor, payload) in batch.iter().zip(&payloads) {
-                let key = cache_key(descriptor);
+                let key = gpu_cache_key(descriptor, ScoringProfile::ExactFp16);
                 if let Some((device, _)) =
                     self.devices
                         .iter_mut()
@@ -227,7 +228,10 @@ impl Engine {
     }
 
     pub fn score(&mut self, request: &Request) -> Result<Vec<(u32, f32)>> {
-        if request.scoring_profile != crate::protocol::ScoringProfile::ExactFp16 {
+        if !matches!(
+            request.scoring_profile,
+            ScoringProfile::ExactFp16 | ScoringProfile::Int8
+        ) {
             anyhow::bail!(
                 "requested TileMaxSim scoring profile {:?} is not enabled by the native daemon",
                 request.scoring_profile
@@ -245,7 +249,7 @@ impl Engine {
         let mut first_candidate_by_key = HashMap::<String, usize>::new();
         let mut duplicate_candidates = Vec::<(usize, usize)>::new();
         for (index, descriptor) in request.candidates.iter().enumerate() {
-            let key = cache_key(descriptor);
+            let key = gpu_cache_key(descriptor, request.scoring_profile);
             if let Some(first_index) = first_candidate_by_key.get(&key) {
                 duplicate_candidates.push((index, *first_index));
                 continue;
@@ -260,7 +264,7 @@ impl Engine {
                     .cache
                     .get(&key)
                     .expect("cache hit disappeared");
-                validate_entry(descriptor, &entry)?;
+                validate_entry(descriptor, &entry, request.scoring_profile)?;
                 hit_chunks[device_index].push(ResidentTensor {
                     candidate_index: index,
                     device: device_index,
@@ -293,13 +297,16 @@ impl Engine {
             .into_iter()
             .zip(missing_descriptors)
             .zip(payloads)
-            .map(|((candidate_index, descriptor), payload)| MissingTensor {
-                candidate_index,
-                key: cache_key(&descriptor),
-                descriptor,
-                payload,
+            .map(|((candidate_index, descriptor), payload)| {
+                let payload = encode_for_profile(&descriptor, payload, request.scoring_profile)?;
+                Ok(MissingTensor {
+                    candidate_index,
+                    key: gpu_cache_key(&descriptor, request.scoring_profile),
+                    descriptor,
+                    payload,
+                })
             })
-            .collect::<Vec<_>>();
+            .collect::<Result<Vec<_>>>()?;
 
         while !pending.is_empty() {
             let mut chunks = (0..self.devices.len())
@@ -523,6 +530,7 @@ impl Engine {
                         request.query_rows,
                         request.dimension,
                         request.dtype,
+                        request.scoring_profile.native_code(),
                         &offsets,
                         &rows,
                     )?;
@@ -686,9 +694,22 @@ fn unique_descriptors(descriptors: &[Descriptor]) -> Vec<Descriptor> {
         .collect()
 }
 
-fn validate_entry(descriptor: &Descriptor, entry: &crate::cache::CacheEntry) -> Result<()> {
+fn gpu_cache_key(descriptor: &Descriptor, profile: ScoringProfile) -> String {
+    format!("{}:{}", profile.cache_tag(), cache_key(descriptor))
+}
+
+fn validate_entry(
+    descriptor: &Descriptor,
+    entry: &crate::cache::CacheEntry,
+    profile: ScoringProfile,
+) -> Result<()> {
     let scalar_bytes = if descriptor.dtype == 1 { 4 } else { 2 };
-    let expected_bytes = descriptor.rows as usize * descriptor.dimension as usize * scalar_bytes;
+    let exact_bytes = descriptor.rows as usize * descriptor.dimension as usize * scalar_bytes;
+    let expected_bytes = match profile {
+        ScoringProfile::ExactFp16 => exact_bytes,
+        ScoringProfile::Int8 => int8_payload_bytes(descriptor.rows, descriptor.dimension)?,
+        _ => bail!("unsupported GPU cache scoring profile"),
+    };
     if entry.rows != descriptor.rows
         || entry.dimension != descriptor.dimension
         || entry.dtype != descriptor.dtype
@@ -698,6 +719,98 @@ fn validate_entry(descriptor: &Descriptor, entry: &crate::cache::CacheEntry) -> 
         bail!("GPU cache metadata disagrees with the tensor descriptor");
     }
     Ok(())
+}
+
+fn encode_for_profile(
+    descriptor: &Descriptor,
+    payload: Arc<[u8]>,
+    profile: ScoringProfile,
+) -> Result<Arc<[u8]>> {
+    if profile == ScoringProfile::ExactFp16 {
+        return Ok(payload);
+    }
+    if profile != ScoringProfile::Int8 {
+        bail!("unsupported TileMaxSim encoding profile");
+    }
+    let rows = descriptor.rows as usize;
+    let dimension = descriptor.dimension as usize;
+    let scalar_bytes = if descriptor.dtype == 1 { 4 } else { 2 };
+    let expected = rows
+        .checked_mul(dimension)
+        .and_then(|count| count.checked_mul(scalar_bytes))
+        .ok_or_else(|| anyhow!("tensor encoding size overflow"))?;
+    if payload.len() != expected {
+        bail!("tensor payload length disagrees with its descriptor");
+    }
+    let code_bytes = rows
+        .checked_mul(dimension)
+        .ok_or_else(|| anyhow!("INT8 tensor size overflow"))?;
+    let scale_offset = align_up(code_bytes, size_of::<f32>())?;
+    let mut encoded = vec![0_u8; int8_payload_bytes(descriptor.rows, descriptor.dimension)?];
+    for row in 0..rows {
+        let mut maximum = 0.0_f32;
+        for column in 0..dimension {
+            maximum = maximum.max(read_scalar(&payload, row * dimension + column, descriptor.dtype)?.abs());
+        }
+        let scale = if maximum == 0.0 { 1.0 } else { maximum / 127.0 };
+        for column in 0..dimension {
+            let value = read_scalar(&payload, row * dimension + column, descriptor.dtype)?;
+            encoded[row * dimension + column] =
+                (value / scale).round().clamp(-127.0, 127.0) as i8 as u8;
+        }
+        let offset = scale_offset + row * size_of::<f32>();
+        encoded[offset..offset + 4].copy_from_slice(&scale.to_le_bytes());
+    }
+    Ok(Arc::from(encoded))
+}
+
+fn int8_payload_bytes(rows: u32, dimension: u32) -> Result<usize> {
+    let codes = (rows as usize)
+        .checked_mul(dimension as usize)
+        .ok_or_else(|| anyhow!("INT8 tensor size overflow"))?;
+    align_up(codes, size_of::<f32>())?
+        .checked_add(rows as usize * size_of::<f32>())
+        .ok_or_else(|| anyhow!("INT8 tensor size overflow"))
+}
+
+fn align_up(value: usize, alignment: usize) -> Result<usize> {
+    value
+        .checked_add(alignment - 1)
+        .map(|value| value / alignment * alignment)
+        .ok_or_else(|| anyhow!("tensor alignment overflow"))
+}
+
+fn read_scalar(payload: &[u8], index: usize, dtype: u8) -> Result<f32> {
+    match dtype {
+        1 => {
+            let offset = index * 4;
+            Ok(f32::from_le_bytes(payload[offset..offset + 4].try_into().unwrap()))
+        }
+        2 => {
+            let offset = index * 2;
+            Ok(half_to_f32(u16::from_le_bytes(
+                payload[offset..offset + 2].try_into().unwrap(),
+            )))
+        }
+        _ => bail!("unsupported source tensor dtype"),
+    }
+}
+
+fn half_to_f32(bits: u16) -> f32 {
+    let sign = ((bits & 0x8000) as u32) << 16;
+    let exponent = (bits >> 10) & 0x1f;
+    let fraction = (bits & 0x03ff) as u32;
+    let value = match exponent {
+        0 if fraction == 0 => sign,
+        0 => {
+            let shift = fraction.leading_zeros() - 21;
+            let normalized = fraction << shift;
+            sign | ((113 - shift) << 23) | ((normalized & 0x03ff) << 13)
+        }
+        31 => sign | 0x7f80_0000 | (fraction << 13),
+        _ => sign | (((exponent as u32) + 112) << 23) | (fraction << 13),
+    };
+    f32::from_bits(value)
 }
 
 #[cfg(test)]
@@ -730,5 +843,38 @@ mod tests {
         assert_eq!(unique[0].candidate_id, 1);
         assert_eq!(unique[1].candidate_id, 3);
         assert_eq!(unique[2].candidate_id, 4);
+    }
+
+    #[test]
+    fn fp16_decoder_covers_normal_and_subnormal_values() {
+        assert_eq!(half_to_f32(0x3c00), 1.0);
+        assert_eq!(half_to_f32(0xc000), -2.0);
+        assert_eq!(half_to_f32(0x0001), 2.0_f32.powi(-24));
+    }
+
+    #[test]
+    fn int8_encoding_is_row_scaled_and_profile_namespaced() {
+        let descriptor = descriptor(1, "a", 1);
+        let mut payload = Vec::with_capacity(640);
+        for column in 0..320 {
+            let bits = if column == 0 { 0x3c00_u16 } else { 0_u16 };
+            payload.extend_from_slice(&bits.to_le_bytes());
+        }
+        let encoded = encode_for_profile(
+            &descriptor,
+            Arc::from(payload),
+            ScoringProfile::Int8,
+        )
+        .unwrap();
+        assert_eq!(encoded.len(), 320 + 4);
+        assert_eq!(encoded[0] as i8, 127);
+        assert_eq!(
+            f32::from_le_bytes(encoded[320..324].try_into().unwrap()),
+            1.0 / 127.0
+        );
+        assert_ne!(
+            gpu_cache_key(&descriptor, ScoringProfile::ExactFp16),
+            gpu_cache_key(&descriptor, ScoringProfile::Int8)
+        );
     }
 }

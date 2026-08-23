@@ -71,8 +71,9 @@ COMMIT;
 
 `maxsim_backend` 决定运行位置，`maxsim_scoring_profile` 独立决定张量表示和打分
 kernel。可选 profile 为 `exact_fp16`、`int8`、`fp8_e4m3`、`pq` 和
-`opq_rpq`。当前原生 daemon 只启用 `exact_fp16`；其他 profile 已进入协议和
-实验 contract，但在对应持久格式、迁移和原生 kernel 接通前会明确报错。系统绝不
+`opq_rpq`。当前原生 daemon 已启用 `exact_fp16` 和按行缩放的融合 `int8`；其他
+profile 已进入协议和实验 contract，但在对应持久格式、迁移和原生 kernel 接通前
+会明确报错。系统绝不
 静默改用另一精度。默认 backend 仍为 `coarse_only`，所以未显式启用 TileMaxSim
 的应用不需要 GPU。
 

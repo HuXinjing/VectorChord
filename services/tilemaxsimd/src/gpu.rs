@@ -42,6 +42,7 @@ unsafe extern "C" {
         query_rows: u32,
         dimension: u32,
         dtype: u8,
+        scoring_profile: u8,
         document_offsets: *const u64,
         document_rows: *const u32,
         count: usize,
@@ -129,6 +130,7 @@ impl Gpu {
         query_rows: u32,
         dimension: u32,
         dtype: u8,
+        scoring_profile: u8,
         document_offsets: &[u64],
         document_rows: &[u32],
     ) -> Result<Vec<f32>> {
@@ -146,6 +148,7 @@ impl Gpu {
                 query_rows,
                 dimension,
                 dtype,
+                scoring_profile,
                 document_offsets.as_ptr(),
                 document_rows.as_ptr(),
                 document_offsets.len(),
@@ -176,4 +179,32 @@ fn native_error(buffer: &[c_char]) -> String {
     unsafe { CStr::from_ptr(buffer.as_ptr()) }
         .to_string_lossy()
         .into_owned()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    #[ignore = "requires an explicitly assigned CUDA device"]
+    fn native_int8_profile_scores_all_candidates() {
+        let device = std::env::var("VCTM_TEST_GPU")
+            .unwrap_or_else(|_| "0".to_owned())
+            .parse::<i32>()
+            .unwrap();
+        let mut gpu = Gpu::create(device, 64 * 1024 * 1024, 32 * 1024 * 1024).unwrap();
+        // Two 2-D rows followed by aligned per-row FP32 scales.
+        let mut document = vec![127_u8, 0, 0, 127];
+        document.extend_from_slice(&(1.0_f32 / 127.0).to_le_bytes());
+        document.extend_from_slice(&(1.0_f32 / 127.0).to_le_bytes());
+        gpu.upload_batch(&[(0, &document)]).unwrap();
+        let query = [1.0_f32, 0.0, 0.0, 1.0]
+            .into_iter()
+            .flat_map(f32::to_le_bytes)
+            .collect::<Vec<_>>();
+        let scores = gpu
+            .score(&query, 2, 2, 1, 2, &[0], &[2])
+            .unwrap();
+        assert!((scores[0] - 2.0).abs() < 1e-5, "scores={scores:?}");
+    }
 }

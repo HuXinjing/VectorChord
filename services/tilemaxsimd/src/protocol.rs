@@ -68,6 +68,26 @@ impl ScoringProfile {
             _ => bail!("unsupported TileMaxSim scoring profile"),
         })
     }
+
+    pub fn cache_tag(self) -> &'static str {
+        match self {
+            Self::ExactFp16 => "exact-fp16-v1",
+            Self::Int8 => "int8-row-scale-v1",
+            Self::Fp8E4m3 => "fp8-e4m3-row-scale-v1",
+            Self::Pq => "pq-adc-v1",
+            Self::OpqRpq => "opq-rpq-adc-v1",
+        }
+    }
+
+    pub fn native_code(self) -> u8 {
+        match self {
+            Self::ExactFp16 => 1,
+            Self::Int8 => 2,
+            Self::Fp8E4m3 => 3,
+            Self::Pq => 4,
+            Self::OpqRpq => 5,
+        }
+    }
 }
 
 struct Reader<'a> {
