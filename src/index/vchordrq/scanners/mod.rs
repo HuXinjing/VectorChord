@@ -15,6 +15,7 @@
 mod default;
 mod maxsim;
 
+use crate::index::gucs::PostgresMaxsimBackend;
 use crate::index::scanners::Io;
 
 pub use default::DefaultBuilder;
@@ -27,6 +28,8 @@ pub struct SearchOptions {
     pub max_scan_tuples: Option<u32>,
     pub maxsim_refine: u32,
     pub maxsim_threshold: u32,
+    pub maxsim_candidate_limit: Option<u32>,
+    pub maxsim_backend: PostgresMaxsimBackend,
     pub io_search: Io,
     pub io_rerank: Io,
     pub prefilter: bool,

@@ -27,6 +27,14 @@ pub enum PostgresIo {
     ReadStream,
 }
 
+#[derive(Debug, Clone, Copy, PostgresGucEnum)]
+pub enum PostgresMaxsimBackend {
+    #[name = c"coarse_only"]
+    CoarseOnly,
+    #[name = c"cpu_exact"]
+    CpuExact,
+}
+
 static VCHORDRQ_QUERY_SAMPLING_ENABLE: GucSetting<bool> = GucSetting::<bool>::new(false);
 
 static VCHORDRQ_QUERY_SAMPLING_MAX_RECORDS: GucSetting<i32> = GucSetting::<i32>::new(0);
@@ -74,6 +82,13 @@ static VCHORDRQ_MAXSIM_REFINE: GucSetting<i32> = GucSetting::<i32>::new(0);
 static mut VCHORDRQ_MAXSIM_REFINE_CONFIG: *mut pgrx::pg_sys::config_generic = core::ptr::null_mut();
 
 static VCHORDRQ_MAXSIM_THRESHOLD: GucSetting<i32> = GucSetting::<i32>::new(0);
+
+static VCHORDRQ_MAXSIM_CANDIDATE_LIMIT: GucSetting<i32> = GucSetting::<i32>::new(-1);
+
+const VCHORDRQ_MAXSIM_CANDIDATE_LIMIT_MAX: i32 = 65_536;
+
+static VCHORDRQ_MAXSIM_BACKEND: GucSetting<PostgresMaxsimBackend> =
+    GucSetting::<PostgresMaxsimBackend>::new(PostgresMaxsimBackend::CoarseOnly);
 
 static mut VCHORDRQ_MAXSIM_THRESHOLD_CONFIG: *mut pgrx::pg_sys::config_generic =
     core::ptr::null_mut();
@@ -148,6 +163,24 @@ pub fn init() {
         &VCHORDRQ_MAXSIM_THRESHOLD,
         0,
         i32::MAX,
+        GucContext::Userset,
+        GucFlags::default(),
+    );
+    GucRegistry::define_int_guc(
+        c"vchordrq.maxsim_candidate_limit",
+        c"Maximum number of index candidates passed to exact MaxSim reranking.",
+        c"A positive value is required when maxsim_backend is cpu_exact.",
+        &VCHORDRQ_MAXSIM_CANDIDATE_LIMIT,
+        -1,
+        VCHORDRQ_MAXSIM_CANDIDATE_LIMIT_MAX,
+        GucContext::Userset,
+        GucFlags::default(),
+    );
+    GucRegistry::define_enum_guc(
+        c"vchordrq.maxsim_backend",
+        c"Backend used after MaxSim candidate generation.",
+        c"coarse_only preserves existing behavior; cpu_exact reads full tensors from the heap.",
+        &VCHORDRQ_MAXSIM_BACKEND,
         GucContext::Userset,
         GucFlags::default(),
     );
@@ -470,6 +503,15 @@ pub fn vchordrq_maxsim_threshold(index: pgrx::pg_sys::Relation) -> u32 {
         let value = unsafe { Reloption::maxsim_threshold((*index).rd_options as _, DEFAULT) };
         parse(value)
     }
+}
+
+pub fn vchordrq_maxsim_candidate_limit() -> Option<u32> {
+    let value = VCHORDRQ_MAXSIM_CANDIDATE_LIMIT.get();
+    if value < 0 { None } else { Some(value as u32) }
+}
+
+pub fn vchordrq_maxsim_backend() -> PostgresMaxsimBackend {
+    VCHORDRQ_MAXSIM_BACKEND.get()
 }
 
 pub fn vchordrq_prefilter() -> bool {

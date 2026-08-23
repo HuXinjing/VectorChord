@@ -12,7 +12,11 @@
 //
 // Copyright (c) 2025-2026 TensorChord Inc.
 
+mod rerank;
+
+use self::rerank::{Candidate, CpuExactMaxsimBackend, ExactMaxsimBackend, HeapTensorSource};
 use crate::index::fetcher::*;
+use crate::index::gucs::PostgresMaxsimBackend;
 use crate::index::scanners::{Io, SearchBuilder};
 use crate::index::vchordrq::dispatch::*;
 use crate::index::vchordrq::filter::filter;
@@ -99,10 +103,18 @@ impl SearchBuilder for MaxsimBuilder {
         }
         let maxsim_refine = options.maxsim_refine;
         let maxsim_threshold = options.maxsim_threshold;
+        let maxsim_backend = options.maxsim_backend;
+        let maxsim_candidate_limit = options.maxsim_candidate_limit;
+        if matches!(maxsim_backend, PostgresMaxsimBackend::CpuExact)
+            && !matches!(maxsim_candidate_limit, Some(1..))
+        {
+            pgrx::error!("cpu_exact MaxSim requires a positive vchordrq.maxsim_candidate_limit");
+        }
         let opfamily = self.opfamily;
         let Some(vectors) = vectors else {
             return Box::new(std::iter::empty()) as Box<dyn Iterator<Item = (f32, [u16; 3], bool)>>;
         };
+        let exact_query = vectors.clone();
         let method = how(index);
         if !matches!(method, RerankMethod::Index) {
             pgrx::error!("maxsim search with rerank_in_table is not supported");
@@ -124,8 +136,9 @@ impl SearchBuilder for MaxsimBuilder {
                 _,
                 AlwaysEqual<PackedRefMut8<(NonZero<u64>, _, _)>>,
             )| (rough, payload);
-        let iter: Box<dyn Iterator<Item = _>> = match opfamily.vector_kind() {
+        let coarse = match opfamily.vector_kind() {
             VectorKind::Vecf32 => {
+                let fetcher = &mut fetcher;
                 type Op = vchordrq::operator::Op<VectOwned<f32>, Dot>;
                 let unprojected = vectors
                     .into_iter()
@@ -141,7 +154,7 @@ impl SearchBuilder for MaxsimBuilder {
                     .iter()
                     .map(|vector| RandomProject::project(vector.as_borrowed()))
                     .collect::<Vec<_>>();
-                Box::new((0..n).map(move |i| {
+                let token_searches = (0..n).map(move |i| {
                     let (results, estimation_by_threshold) = match options.io_search {
                         Io::Plain => maxsim_search::<_, Op>(
                             index,
@@ -267,9 +280,11 @@ impl SearchBuilder for MaxsimBuilder {
                         rough_set.extend(rough_iter.map(rough_map));
                     }
                     (accu_set, rough_set, estimation_by_threshold)
-                }))
+                });
+                aggregate_token_searches(token_searches, n)
             }
             VectorKind::Vecf16 => {
+                let fetcher = &mut fetcher;
                 type Op = vchordrq::operator::Op<VectOwned<f16>, Dot>;
                 let unprojected = vectors
                     .into_iter()
@@ -285,7 +300,7 @@ impl SearchBuilder for MaxsimBuilder {
                     .iter()
                     .map(|vector| RandomProject::project(vector.as_borrowed()))
                     .collect::<Vec<_>>();
-                Box::new((0..n).map(move |i| {
+                let token_searches = (0..n).map(move |i| {
                     let (results, estimation_by_threshold) = match options.io_search {
                         Io::Plain => maxsim_search::<_, Op>(
                             index,
@@ -411,9 +426,11 @@ impl SearchBuilder for MaxsimBuilder {
                         rough_set.extend(rough_iter.map(rough_map));
                     }
                     (accu_set, rough_set, estimation_by_threshold)
-                }))
+                });
+                aggregate_token_searches(token_searches, n)
             }
             VectorKind::Rabitq8 => {
+                let fetcher = &mut fetcher;
                 type Op = vchordrq::operator::Op<Rabitq8Owned, Dot>;
                 let unprojected = vectors
                     .into_iter()
@@ -425,7 +442,7 @@ impl SearchBuilder for MaxsimBuilder {
                         }
                     })
                     .collect::<Vec<_>>();
-                Box::new((0..n).map(move |i| {
+                let token_searches = (0..n).map(move |i| {
                     let (results, estimation_by_threshold) = match options.io_search {
                         Io::Plain => maxsim_search::<_, Op>(
                             index,
@@ -551,9 +568,11 @@ impl SearchBuilder for MaxsimBuilder {
                         rough_set.extend(rough_iter.map(rough_map));
                     }
                     (accu_set, rough_set, estimation_by_threshold)
-                }))
+                });
+                aggregate_token_searches(token_searches, n)
             }
             VectorKind::Rabitq4 => {
+                let fetcher = &mut fetcher;
                 type Op = vchordrq::operator::Op<Rabitq4Owned, Dot>;
                 let unprojected = vectors
                     .into_iter()
@@ -565,7 +584,7 @@ impl SearchBuilder for MaxsimBuilder {
                         }
                     })
                     .collect::<Vec<_>>();
-                Box::new((0..n).map(move |i| {
+                let token_searches = (0..n).map(move |i| {
                     let (results, estimation_by_threshold) = match options.io_search {
                         Io::Plain => maxsim_search::<_, Op>(
                             index,
@@ -691,55 +710,35 @@ impl SearchBuilder for MaxsimBuilder {
                         rough_set.extend(rough_iter.map(rough_map));
                     }
                     (accu_set, rough_set, estimation_by_threshold)
-                }))
+                });
+                aggregate_token_searches(token_searches, n)
             }
         };
-        let mut updates = Vec::new();
-        let mut estimations = Vec::new();
-        for (query_id, (accu_set, rough_set, estimation_by_threshold)) in iter.enumerate() {
-            updates.reserve(accu_set.len() + rough_set.len());
-            let is_empty = accu_set.is_empty() && rough_set.is_empty();
-            let mut estimation_by_scope = Distance::NEG_INFINITY;
-            for (distance, payload) in accu_set {
-                estimation_by_scope = std::cmp::max(estimation_by_scope, distance);
-                let (key, _) = pointer_to_kv(payload);
-                updates.push((key, query_id, distance));
+        let iter: Box<dyn Iterator<Item = _>> = match maxsim_backend {
+            PostgresMaxsimBackend::CoarseOnly => Box::new(
+                coarse
+                    .into_iter_sorted_polyfill()
+                    .map(|(Reverse(distance), AlwaysEqual(key))| (distance.to_f32(), key, false)),
+            ),
+            PostgresMaxsimBackend::CpuExact => {
+                let mut candidates = coarse
+                    .into_iter_sorted_polyfill()
+                    .take(maxsim_candidate_limit.unwrap() as usize)
+                    .map(|(Reverse(distance), AlwaysEqual(heap_key))| Candidate {
+                        distance,
+                        heap_key,
+                    });
+                let mut source = HeapTensorSource::new(&mut fetcher, opfamily);
+                let results = CpuExactMaxsimBackend
+                    .rerank(&exact_query, &mut candidates, &mut source)
+                    .unwrap_or_else(|error| pgrx::error!("{error}"));
+                Box::new(
+                    results
+                        .into_iter()
+                        .map(|candidate| (candidate.distance.to_f32(), candidate.heap_key, false)),
+                )
             }
-            for (distance, payload) in rough_set {
-                let (key, _) = pointer_to_kv(payload);
-                updates.push((key, query_id, distance));
-            }
-            estimations.push(if !is_empty {
-                std::cmp::max(estimation_by_scope, estimation_by_threshold)
-            } else {
-                Distance::ZERO
-            });
-        }
-        updates.sort_unstable_by_key(|&(key, ..)| key);
-        let iter = updates
-            .chunk_by(|(kl, ..), (kr, ..)| kl == kr)
-            .map(|chunk| {
-                let key = chunk[0].0;
-                let mut value = vec![None; n];
-                for &(_, query_id, distance) in chunk {
-                    let this = value[query_id].get_or_insert(Distance::INFINITY);
-                    *this = std::cmp::min(*this, distance);
-                }
-                let mut maxsim = 0.0f32;
-                for (query_id, distance) in value.into_iter().enumerate() {
-                    let d = distance.unwrap_or(estimations[query_id]);
-                    maxsim += Distance::to_f32(d);
-                }
-                (Reverse(Distance::from_f32(maxsim)), AlwaysEqual(key))
-            })
-            .collect::<BinaryHeap<_>>()
-            .into_iter_sorted_polyfill()
-            .map(|(Reverse(distance), AlwaysEqual(key))| {
-                let distance = distance.to_f32();
-                let recheck = false;
-                (distance, key, recheck)
-            });
-        let iter: Box<dyn Iterator<Item = _>> = Box::new(iter);
+        };
         let iter = if let Some(max_scan_tuples) = options.max_scan_tuples {
             Box::new(iter.take(max_scan_tuples as _))
         } else {
@@ -748,6 +747,57 @@ impl SearchBuilder for MaxsimBuilder {
         #[allow(clippy::let_and_return)]
         iter
     }
+}
+
+type TokenSearchResult = (
+    Vec<(Distance, NonZero<u64>)>,
+    Vec<(Distance, NonZero<u64>)>,
+    Distance,
+);
+
+fn aggregate_token_searches(
+    iter: impl Iterator<Item = TokenSearchResult>,
+    query_count: usize,
+) -> BinaryHeap<(Reverse<Distance>, AlwaysEqual<[u16; 3]>)> {
+    let mut updates = Vec::new();
+    let mut estimations = Vec::new();
+    for (query_id, (accu_set, rough_set, estimation_by_threshold)) in iter.enumerate() {
+        updates.reserve(accu_set.len() + rough_set.len());
+        let is_empty = accu_set.is_empty() && rough_set.is_empty();
+        let mut estimation_by_scope = Distance::NEG_INFINITY;
+        for (distance, payload) in accu_set {
+            estimation_by_scope = std::cmp::max(estimation_by_scope, distance);
+            let (key, _) = pointer_to_kv(payload);
+            updates.push((key, query_id, distance));
+        }
+        for (distance, payload) in rough_set {
+            let (key, _) = pointer_to_kv(payload);
+            updates.push((key, query_id, distance));
+        }
+        estimations.push(if !is_empty {
+            std::cmp::max(estimation_by_scope, estimation_by_threshold)
+        } else {
+            Distance::ZERO
+        });
+    }
+    updates.sort_unstable_by_key(|&(key, ..)| key);
+    updates
+        .chunk_by(|(left, ..), (right, ..)| left == right)
+        .map(|chunk| {
+            let key = chunk[0].0;
+            let mut value = vec![None; query_count];
+            for &(_, query_id, distance) in chunk {
+                let this = value[query_id].get_or_insert(Distance::INFINITY);
+                *this = std::cmp::min(*this, distance);
+            }
+            let maxsim = value
+                .into_iter()
+                .enumerate()
+                .map(|(query_id, distance)| distance.unwrap_or(estimations[query_id]).to_f32())
+                .sum();
+            (Reverse(Distance::from_f32(maxsim)), AlwaysEqual(key))
+        })
+        .collect()
 }
 
 // Emulate unstable library feature `binary_heap_into_iter_sorted`.

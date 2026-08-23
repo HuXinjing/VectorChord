@@ -514,6 +514,8 @@ pub unsafe extern "C-unwind" fn amrescan(
             max_scan_tuples: gucs::vchordrq_max_scan_tuples(),
             maxsim_refine: gucs::vchordrq_maxsim_refine((*scan).indexRelation),
             maxsim_threshold: gucs::vchordrq_maxsim_threshold((*scan).indexRelation),
+            maxsim_candidate_limit: gucs::vchordrq_maxsim_candidate_limit(),
+            maxsim_backend: gucs::vchordrq_maxsim_backend(),
             io_search: gucs::vchordrq_io_search(),
             io_rerank: gucs::vchordrq_io_rerank(),
             prefilter: gucs::vchordrq_prefilter(),

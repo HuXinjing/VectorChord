@@ -1,0 +1,48 @@
+statement ok
+CREATE TABLE t (id integer, val vector(2)[]);
+
+statement ok
+INSERT INTO t VALUES
+    (1, ARRAY['[1,0]'::vector, '[0,1]'::vector]),
+    (2, ARRAY['[0.5,0.5]'::vector]),
+    (3, ARRAY['[-1,0]'::vector, '[0,-1]'::vector]);
+
+statement ok
+CREATE INDEX t_val_idx ON t USING vchordrq (val vector_maxsim_ops)
+WITH (options = $$
+build.internal.lists = []
+$$);
+
+statement ok
+SET enable_seqscan = off;
+
+statement ok
+SET vchordrq.probes = '';
+
+statement ok
+SET vchordrq.maxsim_refine = 16;
+
+statement ok
+SET vchordrq.maxsim_candidate_limit = 3;
+
+statement ok
+SET vchordrq.maxsim_backend = 'cpu_exact';
+
+query I
+SELECT id
+FROM t
+ORDER BY val @# ARRAY['[1,0]'::vector, '[0,1]'::vector]
+LIMIT 3;
+----
+1
+2
+3
+
+statement ok
+RESET vchordrq.maxsim_backend;
+
+statement ok
+RESET vchordrq.maxsim_candidate_limit;
+
+statement ok
+DROP TABLE t;
