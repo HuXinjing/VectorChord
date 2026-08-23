@@ -307,6 +307,11 @@ pub unsafe extern "C-unwind" fn amcostestimate(
                 std::ptr::null_mut(),
             )
         };
+        // PostgreSQL's relation estimate is the planner's current heap-row
+        // cardinality after base restrictions. Keep the raw clause
+        // selectivity separately because the MaxSim cost model needs both.
+        let total_rows = (*(*index_opt_info).rel).rows.max(1.0);
+        let filter_selectivity = selectivity.clamp(0.0, 1.0);
         // index exists
         if !(*index_opt_info).hypothetical {
             let relation = Index::open((*index_opt_info).indexoid, pgrx::pg_sys::NoLock as _);
