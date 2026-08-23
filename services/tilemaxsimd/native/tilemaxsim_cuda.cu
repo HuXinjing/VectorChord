@@ -46,6 +46,12 @@ static int fail(char *error, size_t capacity, const char *message);
 static int cuda_fail(char *error, size_t capacity, const char *operation,
                      cudaError_t status);
 
+static bool checked_mul(size_t left, size_t right, size_t *output) {
+  if (right != 0 && left > std::numeric_limits<size_t>::max() / right) return false;
+  *output = left * right;
+  return true;
+}
+
 extern "C" int vctm_quantizer_create(
     int device, const unsigned char *payload, size_t payload_bytes,
     uint32_t dimension, uint16_t stages, uint16_t subspaces,
@@ -53,9 +59,22 @@ extern "C" int vctm_quantizer_create(
     char *error, size_t error_capacity) {
   if (output == nullptr || payload == nullptr || payload_bytes == 0 ||
       payload_bytes % sizeof(float) != 0 || dimension == 0 || stages == 0 ||
-      subspaces == 0 || centroids < 2 || dimension % subspaces != 0) {
+      stages > 16 || subspaces == 0 || centroids < 2 || centroids > 256 ||
+      dimension % subspaces != 0 || (rotation_mask >> stages) != 0) {
     return fail(error, error_capacity, "invalid PQ quantizer");
   }
+  size_t rotations = 0, books = 0, expected_values = 0;
+  if (!checked_mul(static_cast<size_t>(__builtin_popcount(rotation_mask)), dimension, &rotations) ||
+      !checked_mul(rotations, dimension, &rotations) ||
+      !checked_mul(stages, subspaces, &books) ||
+      !checked_mul(books, centroids, &books) ||
+      !checked_mul(books, dimension / subspaces, &books) ||
+      rotations > std::numeric_limits<size_t>::max() - books) {
+    return fail(error, error_capacity, "PQ quantizer shape overflows address space");
+  }
+  expected_values = rotations + books;
+  if (payload_bytes / sizeof(float) != expected_values)
+    return fail(error, error_capacity, "PQ quantizer payload length disagrees with its shape");
   cudaError_t status = cudaSetDevice(device);
   if (status != cudaSuccess) return cuda_fail(error, error_capacity, "cudaSetDevice", status);
   auto *quantizer = new VctmQuantizer{device, nullptr, payload_bytes / sizeof(float),
@@ -612,11 +631,30 @@ extern "C" int vctm_gpu_score_pq(
   if (gpu == nullptr || quantizer == nullptr || query == nullptr || query_rows == 0 ||
       count == 0 || document_offsets == nullptr || document_rows == nullptr || output == nullptr ||
       quantizer->device != gpu->device) return fail(error, error_capacity, "invalid PQ score request");
+  const size_t scalar_bytes = dtype == 1 ? sizeof(float) : dtype == 2 ? sizeof(half) : 0;
+  size_t expected_query_values = 0, expected_query_bytes = 0;
+  if (scalar_bytes == 0 || !checked_mul(query_rows, quantizer->dimension, &expected_query_values) ||
+      !checked_mul(expected_query_values, scalar_bytes, &expected_query_bytes) ||
+      query_bytes != expected_query_bytes)
+    return fail(error, error_capacity, "PQ query byte length disagrees with its shape");
+  size_t codes_per_row = 0;
+  if (!checked_mul(quantizer->stages, quantizer->subspaces, &codes_per_row))
+    return fail(error, error_capacity, "PQ document shape overflows address space");
+  for (size_t index = 0; index < count; ++index) {
+    size_t code_bytes = 0;
+    if (document_rows[index] == 0 || !checked_mul(document_rows[index], codes_per_row, &code_bytes) ||
+        document_offsets[index] > gpu->tensor_bytes ||
+        code_bytes > gpu->tensor_bytes - static_cast<size_t>(document_offsets[index]))
+      return fail(error, error_capacity, "PQ document range exceeds the GPU tensor arena");
+  }
   cudaError_t status = cudaSetDevice(gpu->device);
   if (status != cudaSuccess) return cuda_fail(error, error_capacity, "cudaSetDevice", status);
-  const size_t maxima_count = count * query_rows;
-  const size_t lut_count = static_cast<size_t>(query_rows) * quantizer->stages *
-      quantizer->subspaces * quantizer->centroids;
+  size_t maxima_count = 0, lut_count = 0;
+  if (!checked_mul(count, query_rows, &maxima_count) ||
+      !checked_mul(query_rows, quantizer->stages, &lut_count) ||
+      !checked_mul(lut_count, quantizer->subspaces, &lut_count) ||
+      !checked_mul(lut_count, quantizer->centroids, &lut_count))
+    return fail(error, error_capacity, "PQ request shape overflows address space");
   unsigned char *workspace = gpu->allocation + gpu->tensor_bytes;
   size_t cursor = 0, query_offset = 0, offsets_offset = 0, rows_offset = 0,
          lut_offset = 0, maxima_offset = 0, scores_offset = 0;

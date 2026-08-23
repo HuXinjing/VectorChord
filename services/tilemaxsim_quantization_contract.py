@@ -35,6 +35,9 @@ class QuantizationContract:
     centroids: int
     residual_stages: int
     opq_iterations: int
+    # Digest of the trained encoder/codebook material before VCTQ framing.
+    # This participates in v2 identity, unlike the post-framing artifact tree.
+    quantizer_checksum: str
     artifact_checksum: str
     schema_version: int = 1
 
@@ -47,6 +50,7 @@ class QuantizationContract:
             raise ValueError("invalid model contract ID")
         for name, value in (
             ("source manifest", self.source_manifest_checksum),
+            ("quantizer", self.quantizer_checksum),
             ("artifact", self.artifact_checksum),
         ):
             if len(value) != 64 or any(character not in string.hexdigits for character in value):

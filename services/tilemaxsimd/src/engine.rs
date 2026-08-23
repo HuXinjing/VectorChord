@@ -232,16 +232,50 @@ impl Engine {
     }
 
     pub fn score(&mut self, request: &Request) -> Result<Vec<(u32, f32)>> {
-        let active_quantizer = if matches!(request.scoring_profile, ScoringProfile::Pq | ScoringProfile::OpqRpq) {
-            let contract_id = request.quantization_contract.as_deref().ok_or_else(|| anyhow!("PQ-family request has no quantization contract"))?;
-            let model_contract = request.candidates.first().ok_or_else(|| anyhow!("PQ-family request has no candidates"))?.contract.as_str();
-            Some(self.quantization_registry.as_ref().ok_or_else(|| anyhow!("PQ-family scoring requires --quantization-registry-root"))?
-                .resolve_active(contract_id, model_contract, request.scoring_profile)?)
-        } else { None };
+        let active_quantizer = if matches!(
+            request.scoring_profile,
+            ScoringProfile::Pq | ScoringProfile::OpqRpq
+        ) {
+            let contract_id = request
+                .quantization_contract
+                .as_deref()
+                .ok_or_else(|| anyhow!("PQ-family request has no quantization contract"))?;
+            let model_contract = request
+                .candidates
+                .first()
+                .ok_or_else(|| anyhow!("PQ-family request has no candidates"))?
+                .contract
+                .as_str();
+            Some(
+                self.quantization_registry
+                    .as_ref()
+                    .ok_or_else(|| {
+                        anyhow!("PQ-family scoring requires --quantization-registry-root")
+                    })?
+                    .resolve_active(contract_id, model_contract, request.scoring_profile)?,
+            )
+        } else {
+            None
+        };
+        if let Some(registry) = self.quantization_registry.as_ref() {
+            // PQ requests retain exactly the contracts from the registry
+            // snapshot that authorized them. Non-PQ requests may use a fresh
+            // snapshot because no contract is bound to the request.
+            let active_ids = match active_quantizer.as_ref() {
+                Some(active) => active.active_contract_ids.clone(),
+                None => registry.active_contract_ids()?,
+            };
+            for device in &mut self.devices {
+                device.gpu.retain_quantizers(&active_ids);
+            }
+        }
         if !matches!(
             request.scoring_profile,
-            ScoringProfile::ExactFp16 | ScoringProfile::Int8 | ScoringProfile::Fp8E4m3
-                | ScoringProfile::Pq | ScoringProfile::OpqRpq
+            ScoringProfile::ExactFp16
+                | ScoringProfile::Int8
+                | ScoringProfile::Fp8E4m3
+                | ScoringProfile::Pq
+                | ScoringProfile::OpqRpq
         ) {
             anyhow::bail!(
                 "requested TileMaxSim scoring profile {:?} is not enabled by the native daemon",
@@ -279,7 +313,12 @@ impl Engine {
                     .cache
                     .get(&key)
                     .expect("cache hit disappeared");
-                validate_entry(descriptor, &entry, request.scoring_profile, active_quantizer.as_ref())?;
+                validate_entry(
+                    descriptor,
+                    &entry,
+                    request.scoring_profile,
+                    active_quantizer.as_ref(),
+                )?;
                 hit_chunks[device_index].push(ResidentTensor {
                     candidate_index: index,
                     device: device_index,
@@ -300,27 +339,36 @@ impl Engine {
             }
         }
 
-        let hit_result = self.score_devices(request, active_quantizer.as_ref(), &hit_chunks, &mut scores);
+        let hit_result =
+            self.score_devices(request, active_quantizer.as_ref(), &hit_chunks, &mut scores);
         let hit_cleanup = self.release_chunks(&hit_chunks);
         hit_result?;
         hit_cleanup?;
 
         let payloads = if let Some(active) = active_quantizer.as_ref() {
             let registry = self.quantization_registry.as_ref().unwrap();
-            missing_descriptors.iter().map(|descriptor| {
-                let codes = registry.load_codes(active, &descriptor.digest)?;
-                if codes.rows != descriptor.rows { bail!("PQ code rows disagree with tensor descriptor"); }
-                Ok(Arc::<[u8]>::from(codes.codes))
-            }).collect::<Result<Vec<_>>>()?
+            missing_descriptors
+                .iter()
+                .map(|descriptor| {
+                    let codes = registry.load_codes(active, &descriptor.digest)?;
+                    if codes.rows != descriptor.rows {
+                        bail!("PQ code rows disagree with tensor descriptor");
+                    }
+                    Ok(Arc::<[u8]>::from(codes.codes))
+                })
+                .collect::<Result<Vec<_>>>()?
         } else {
-            self.store.resolve_many(&missing_descriptors, &request.tenant)?
+            self.store
+                .resolve_many(&missing_descriptors, &request.tenant)?
         };
         let mut pending = missing_indices
             .into_iter()
             .zip(missing_descriptors)
             .zip(payloads)
             .map(|((candidate_index, descriptor), payload)| {
-                let payload = if active_quantizer.is_some() { payload } else {
+                let payload = if active_quantizer.is_some() {
+                    payload
+                } else {
                     encode_for_profile(&descriptor, payload, request.scoring_profile)?
                 };
                 Ok(MissingTensor {
@@ -444,7 +492,8 @@ impl Engine {
                 }
             };
             debug_assert!(upload_succeeded.iter().all(|succeeded| *succeeded));
-            let score_result = self.score_devices(request, active_quantizer.as_ref(), &chunks, &mut scores);
+            let score_result =
+                self.score_devices(request, active_quantizer.as_ref(), &chunks, &mut scores);
             let cleanup_result = self.release_chunks(&chunks);
             score_result?;
             cleanup_result?;
@@ -552,24 +601,37 @@ impl Engine {
                     continue;
                 }
                 if let Some(active) = active_quantizer {
-                    device.gpu.ensure_quantizer(&active.contract_id, &active.quantizer.payload,
-                        active.quantizer.dimension, active.quantizer.stages,
-                        active.quantizer.subspaces, active.quantizer.centroids,
-                        active.quantizer.rotation_mask)?;
+                    device.gpu.ensure_quantizer(
+                        &active.contract_id,
+                        &active.quantizer.payload,
+                        active.quantizer.dimension,
+                        active.quantizer.stages,
+                        active.quantizer.subspaces,
+                        active.quantizer.centroids,
+                        active.quantizer.rotation_mask,
+                    )?;
                 }
                 workers.push(scope.spawn(move || -> Result<Vec<(usize, f32)>> {
                     let offsets = chunk.iter().map(|item| item.offset).collect::<Vec<_>>();
                     let rows = chunk.iter().map(|item| item.rows).collect::<Vec<_>>();
                     let computed = if let Some(active) = active_quantizer {
                         device.gpu.score_pq(
-                            &active.contract_id, &request.query, request.query_rows,
-                            request.dtype, &offsets, &rows,
+                            &active.contract_id,
+                            &request.query,
+                            request.query_rows,
+                            request.dtype,
+                            &offsets,
+                            &rows,
                         )?
                     } else {
                         device.gpu.score(
-                            &request.query, request.query_rows, request.dimension,
-                            request.dtype, request.scoring_profile.native_code(),
-                            &offsets, &rows,
+                            &request.query,
+                            request.query_rows,
+                            request.dimension,
+                            request.dtype,
+                            request.scoring_profile.native_code(),
+                            &offsets,
+                            &rows,
                         )?
                     };
                     Ok(chunk
@@ -759,8 +821,10 @@ fn validate_entry(
             scaled_payload_bytes(descriptor.rows, descriptor.dimension)?
         }
         ScoringProfile::Pq | ScoringProfile::OpqRpq => {
-            let quantizer = active_quantizer.ok_or_else(|| anyhow!("PQ cache entry has no active quantizer"))?;
-            descriptor.rows as usize * quantizer.quantizer.stages as usize
+            let quantizer = active_quantizer
+                .ok_or_else(|| anyhow!("PQ cache entry has no active quantizer"))?;
+            descriptor.rows as usize
+                * quantizer.quantizer.stages as usize
                 * quantizer.quantizer.subspaces as usize
         }
     };
@@ -804,9 +868,14 @@ fn encode_for_profile(
     for row in 0..rows {
         let mut maximum = 0.0_f32;
         for column in 0..dimension {
-            maximum = maximum.max(read_scalar(&payload, row * dimension + column, descriptor.dtype)?.abs());
+            maximum = maximum
+                .max(read_scalar(&payload, row * dimension + column, descriptor.dtype)?.abs());
         }
-        let bound = if profile == ScoringProfile::Int8 { 127.0 } else { 448.0 };
+        let bound = if profile == ScoringProfile::Int8 {
+            127.0
+        } else {
+            448.0
+        };
         let scale = if maximum == 0.0 { 1.0 } else { maximum / bound };
         for column in 0..dimension {
             let value = read_scalar(&payload, row * dimension + column, descriptor.dtype)?;
@@ -862,7 +931,11 @@ fn f32_to_e4m3fn(value: f32) -> u8 {
         value => {
             let lower = table[value - 1];
             let upper = table[value];
-            if magnitude - lower.0 <= upper.0 - magnitude { lower } else { upper }
+            if magnitude - lower.0 <= upper.0 - magnitude {
+                lower
+            } else {
+                upper
+            }
         }
     };
     selected.1 | if negative { 0x80 } else { 0 }
@@ -879,7 +952,9 @@ fn read_scalar(payload: &[u8], index: usize, dtype: u8) -> Result<f32> {
     match dtype {
         1 => {
             let offset = index * 4;
-            Ok(f32::from_le_bytes(payload[offset..offset + 4].try_into().unwrap()))
+            Ok(f32::from_le_bytes(
+                payload[offset..offset + 4].try_into().unwrap(),
+            ))
         }
         2 => {
             let offset = index * 2;
@@ -955,12 +1030,8 @@ mod tests {
             let bits = if column == 0 { 0x3c00_u16 } else { 0_u16 };
             payload.extend_from_slice(&bits.to_le_bytes());
         }
-        let encoded = encode_for_profile(
-            &descriptor,
-            Arc::from(payload),
-            ScoringProfile::Int8,
-        )
-        .unwrap();
+        let encoded =
+            encode_for_profile(&descriptor, Arc::from(payload), ScoringProfile::Int8).unwrap();
         assert_eq!(encoded.len(), 320 + 4);
         assert_eq!(encoded[0] as i8, 127);
         assert_eq!(

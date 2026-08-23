@@ -9,8 +9,8 @@
 // Copyright (c) 2026 Hu Xinjing
 
 use anyhow::{Result, anyhow, bail};
-use std::ffi::{CStr, c_char, c_int, c_uchar, c_void};
 use std::collections::HashMap;
+use std::ffi::{CStr, c_char, c_int, c_uchar, c_void};
 use std::ptr::NonNull;
 
 #[repr(C)]
@@ -172,6 +172,17 @@ impl Gpu {
         Ok(())
     }
 
+    pub fn retain_quantizers(&mut self, active: &std::collections::HashSet<String>) {
+        self.quantizers.retain(|contract, quantizer| {
+            if active.contains(contract) {
+                true
+            } else {
+                unsafe { vctm_quantizer_destroy(quantizer.as_ptr()) };
+                false
+            }
+        });
+    }
+
     pub fn upload_batch(&mut self, items: &[(u64, &[u8])]) -> Result<()> {
         if items.is_empty() {
             return Ok(());
@@ -249,19 +260,37 @@ impl Gpu {
         document_offsets: &[u64],
         document_rows: &[u32],
     ) -> Result<Vec<f32>> {
-        let quantizer = self.quantizers.get(contract_id)
+        let quantizer = self
+            .quantizers
+            .get(contract_id)
             .ok_or_else(|| anyhow!("PQ quantizer is not resident on this GPU"))?;
         if document_offsets.len() != document_rows.len() || document_offsets.is_empty() {
             bail!("invalid PQ document metadata");
         }
         let mut output = vec![0.0_f32; document_offsets.len()];
         let mut error = [0_i8; 512];
-        let status = unsafe { vctm_gpu_score_pq(
-            self.native.as_ptr(), quantizer.as_ptr(), query.as_ptr(), query.len(),
-            query_rows, dtype, document_offsets.as_ptr(), document_rows.as_ptr(),
-            document_offsets.len(), output.as_mut_ptr(), error.as_mut_ptr(), error.len()) };
-        if status != 0 { bail!(native_error(&error)); }
-        if output.iter().any(|score| !score.is_finite()) { bail!("native PQ TileMaxSim returned a non-finite score"); }
+        let status = unsafe {
+            vctm_gpu_score_pq(
+                self.native.as_ptr(),
+                quantizer.as_ptr(),
+                query.as_ptr(),
+                query.len(),
+                query_rows,
+                dtype,
+                document_offsets.as_ptr(),
+                document_rows.as_ptr(),
+                document_offsets.len(),
+                output.as_mut_ptr(),
+                error.as_mut_ptr(),
+                error.len(),
+            )
+        };
+        if status != 0 {
+            bail!(native_error(&error));
+        }
+        if output.iter().any(|score| !score.is_finite()) {
+            bail!("native PQ TileMaxSim returned a non-finite score");
+        }
         Ok(output)
     }
 }
@@ -304,9 +333,7 @@ mod tests {
             .into_iter()
             .flat_map(f32::to_le_bytes)
             .collect::<Vec<_>>();
-        let scores = gpu
-            .score(&query, 2, 2, 1, 2, &[0], &[2])
-            .unwrap();
+        let scores = gpu.score(&query, 2, 2, 1, 2, &[0], &[2]).unwrap();
         assert!((scores[0] - 2.0).abs() < 1e-5, "scores={scores:?}");
     }
 
@@ -327,15 +354,15 @@ mod tests {
             .into_iter()
             .flat_map(f32::to_le_bytes)
             .collect::<Vec<_>>();
-        let scores = gpu
-            .score(&query, 2, 2, 1, 3, &[0], &[2])
-            .unwrap();
+        let scores = gpu.score(&query, 2, 2, 1, 3, &[0], &[2]).unwrap();
         assert!((scores[0] - 2.0).abs() < 1e-5, "scores={scores:?}");
     }
 
-
     fn pq_gpu() -> Gpu {
-        let device = std::env::var("VCTM_TEST_GPU").unwrap_or_else(|_| "0".to_owned()).parse().unwrap();
+        let device = std::env::var("VCTM_TEST_GPU")
+            .unwrap_or_else(|_| "0".to_owned())
+            .parse()
+            .unwrap();
         Gpu::create(device, 64 * 1024 * 1024, 32 * 1024 * 1024).unwrap()
     }
 
@@ -347,7 +374,8 @@ mod tests {
     #[ignore = "requires an explicitly assigned CUDA device"]
     fn native_pq_adc_maxsim_matches_identity_oracle() {
         let mut gpu = pq_gpu();
-        gpu.ensure_quantizer("pq", &f32_payload(&[1.0, 0.0, 0.0, 1.0]), 2, 1, 1, 2, 0).unwrap();
+        gpu.ensure_quantizer("pq", &f32_payload(&[1.0, 0.0, 0.0, 1.0]), 2, 1, 1, 2, 0)
+            .unwrap();
         gpu.upload_batch(&[(0, &[0_u8, 1])]).unwrap();
         let query = f32_payload(&[1.0, 0.0, 0.0, 1.0]);
         let scores = gpu.score_pq("pq", &query, 2, 1, &[0], &[2]).unwrap();
@@ -360,7 +388,8 @@ mod tests {
         let mut gpu = pq_gpu();
         // Swap-coordinate rotation, followed by identity centroids.
         let payload = f32_payload(&[0.0, 1.0, 1.0, 0.0, 1.0, 0.0, 0.0, 1.0]);
-        gpu.ensure_quantizer("opq", &payload, 2, 1, 1, 2, 1).unwrap();
+        gpu.ensure_quantizer("opq", &payload, 2, 1, 1, 2, 1)
+            .unwrap();
         gpu.upload_batch(&[(0, &[1_u8, 0])]).unwrap();
         let query = f32_payload(&[1.0, 0.0, 0.0, 1.0]);
         let scores = gpu.score_pq("opq", &query, 2, 1, &[0], &[2]).unwrap();
@@ -373,11 +402,26 @@ mod tests {
         let mut gpu = pq_gpu();
         // Stage 0 contributes identity; stage 1 contributes 0.5 * identity.
         let payload = f32_payload(&[1.0, 0.0, 0.0, 1.0, 0.5, 0.0, 0.0, 0.5]);
-        gpu.ensure_quantizer("rpq", &payload, 2, 2, 1, 2, 0).unwrap();
+        gpu.ensure_quantizer("rpq", &payload, 2, 2, 1, 2, 0)
+            .unwrap();
         // row-major [row][stage][subspace]
         gpu.upload_batch(&[(0, &[0_u8, 0, 1, 1])]).unwrap();
         let query = f32_payload(&[1.0, 0.0, 0.0, 1.0]);
         let scores = gpu.score_pq("rpq", &query, 2, 1, &[0], &[2]).unwrap();
         assert!((scores[0] - 3.0).abs() < 1e-5, "scores={scores:?}");
+    }
+
+    #[test]
+    #[ignore = "requires an explicitly assigned CUDA device"]
+    fn inactive_quantizer_allocations_are_reclaimed_at_a_safe_point() {
+        let mut gpu = pq_gpu();
+        let payload = f32_payload(&[1.0, 0.0, 0.0, 1.0]);
+        gpu.ensure_quantizer("active", &payload, 2, 1, 1, 2, 0)
+            .unwrap();
+        gpu.ensure_quantizer("retired", &payload, 2, 1, 1, 2, 0)
+            .unwrap();
+        gpu.retain_quantizers(&std::collections::HashSet::from(["active".to_owned()]));
+        assert!(gpu.quantizers.contains_key("active"));
+        assert!(!gpu.quantizers.contains_key("retired"));
     }
 }

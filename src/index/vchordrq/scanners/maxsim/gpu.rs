@@ -238,6 +238,8 @@ impl<T: TileMaxsimTransport> GpuExternalTileMaxsimBackend<T> {
                 self.max_batch_tokens,
                 self.max_batch_bytes,
                 self.scheduling.as_ref(),
+                self.scoring_profile,
+                self.quantization_contract.as_deref(),
                 &mut pending,
             )?;
             if descriptors.is_empty() {
@@ -508,6 +510,8 @@ fn collect_external_batch<S: CandidateTensorDescriptorSource>(
     max_batch_tokens: usize,
     max_batch_bytes: usize,
     scheduling: Option<&TileMaxsimScheduling>,
+    scoring_profile: PostgresMaxsimScoringProfile,
+    quantization_contract: Option<&str>,
     pending: &mut Option<ExternalTensorDescriptor>,
 ) -> Result<Vec<ExternalTensorDescriptor>, RerankError> {
     validate_external_request_identity(model_contract_id, scheduling)?;
@@ -520,7 +524,13 @@ fn collect_external_batch<S: CandidateTensorDescriptorSource>(
     let query_bytes = tensor_bytes(query_rows, dimension, dtype)?;
     let mut total_tokens = query.len();
     let mut declared_tensor_bytes = query_bytes;
-    let mut frame_bytes = external_request_base_bytes(model_contract_id, scheduling, query_bytes)?;
+    let mut frame_bytes = external_request_base_bytes(
+        model_contract_id,
+        scheduling,
+        scoring_profile,
+        quantization_contract,
+        query_bytes,
+    )?;
     if total_tokens > max_batch_tokens
         || declared_tensor_bytes > max_batch_bytes
         || frame_bytes > max_batch_bytes
@@ -614,15 +624,28 @@ fn validate_external_request_identity(
 fn external_request_base_bytes(
     model_contract_id: &str,
     scheduling: Option<&TileMaxsimScheduling>,
+    scoring_profile: PostgresMaxsimScoringProfile,
+    quantization_contract: Option<&str>,
     query_bytes: usize,
 ) -> Result<usize, RerankError> {
-    let fixed = if scheduling.is_some() {
+    let quantized = matches!(
+        scoring_profile,
+        PostgresMaxsimScoringProfile::Pq | PostgresMaxsimScoringProfile::OpqRpq
+    );
+    let fixed = if scheduling.is_some() || quantized {
         56usize
     } else {
         44usize
     };
     fixed
         .checked_add(model_contract_id.len())
+        .and_then(|size| {
+            size.checked_add(if quantized {
+                4 + quantization_contract.map_or(0, str::len)
+            } else {
+                0
+            })
+        })
         .and_then(|size| {
             size.checked_add(scheduling.map_or(0, |scheduling| scheduling.tenant.len()))
         })
@@ -1800,6 +1823,64 @@ mod tests {
             tensor_ref.as_bytes()
         );
         assert_eq!(encoded.heap_keys, vec![page]);
+    }
+
+    #[test]
+    fn pq_request_binds_canonical_contract_in_v5_frame() {
+        let page = [0, 0, 8];
+        let candidate = PageCandidate {
+            approximate_distance: Distance::ZERO,
+            heap_key: page,
+        };
+        let descriptor = external_descriptor(
+            candidate,
+            8,
+            "object://immutable/tensor-8",
+            2,
+            2,
+            ExternalTensorDtype::F16,
+        );
+        let contract = format!("qtc1-{}", "a".repeat(64));
+        let encoded = encode_external_descriptors(
+            20,
+            "model@1",
+            &[half_vector(&[1.0, 0.0])],
+            &[descriptor],
+            100,
+            4096,
+            None,
+            PostgresMaxsimScoringProfile::Pq,
+            Some(&contract),
+            Duration::from_secs(2),
+        )
+        .unwrap();
+        assert_eq!(encoded.version, QUANTIZED_EXTERNAL_VERSION);
+        assert_eq!(
+            encoded.frame[38],
+            scoring_profile_code(PostgresMaxsimScoringProfile::Pq)
+        );
+        assert!(
+            encoded
+                .frame
+                .windows(contract.len())
+                .any(|value| value == contract.as_bytes())
+        );
+
+        assert!(matches!(
+            encode_external_descriptors(
+                21,
+                "model@1",
+                &[half_vector(&[1.0, 0.0])],
+                &[],
+                100,
+                4096,
+                None,
+                PostgresMaxsimScoringProfile::Pq,
+                None,
+                Duration::from_secs(2),
+            ),
+            Err(RerankError::Configuration(_))
+        ));
     }
 
     #[test]

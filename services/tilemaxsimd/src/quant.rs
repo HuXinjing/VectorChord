@@ -5,8 +5,8 @@
 //! Immutable production formats for PQ-family TileMaxSim artifacts.
 
 use anyhow::{Result, anyhow, bail};
-use sha2::{Digest, Sha256};
 use serde::Deserialize;
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
@@ -43,6 +43,10 @@ pub struct CodesArtifact {
 #[derive(Clone, Debug)]
 pub struct ActiveQuantizer {
     pub generation: u64,
+    /// All contracts active in the same immutable registry snapshot that
+    /// authorized this request.  Keeping these together prevents a rollback
+    /// between two state reads from reclaiming the request's quantizer.
+    pub active_contract_ids: std::collections::HashSet<String>,
     pub contract_id: String,
     pub artifact_root: PathBuf,
     pub quantizer: QuantizerArtifact,
@@ -77,6 +81,7 @@ struct ContractBody {
     centroids: u16,
     residual_stages: u16,
     opq_iterations: u16,
+    quantizer_checksum: String,
 }
 
 #[derive(Clone, Debug)]
@@ -103,39 +108,60 @@ impl QuantizationRegistry {
             crate::protocol::ScoringProfile::OpqRpq => "pq",
             _ => bail!("quantization registry is only valid for PQ-family profiles"),
         };
-        let state: RegistryState = serde_json::from_slice(&fs::read(self.root.join("state.json"))?)?;
+        let state: RegistryState =
+            serde_json::from_slice(&fs::read(self.root.join("state.json"))?)?;
         if state.version != 2 {
             bail!("quantization registry must be migrated to state schema v2");
         }
         let scope = format!("{model_contract}\u{1f}{encoding}");
-        let active = state.scopes.get(&scope).and_then(|scope| scope.active.as_deref());
+        let active = state
+            .scopes
+            .get(&scope)
+            .and_then(|scope| scope.active.as_deref());
         if active != Some(contract_id) {
             bail!("requested quantization contract is not active for this model and encoding");
         }
-        let record_path = self.root.join("contracts").join(format!("{contract_id}.json"));
+        let record_path = self
+            .root
+            .join("contracts")
+            .join(format!("{contract_id}.json"));
         if fs::symlink_metadata(&record_path)?.file_type().is_symlink() {
             bail!("quantization contract record must not be a symlink");
         }
         let record: ContractRecord = serde_json::from_slice(&fs::read(record_path)?)?;
-        if record.version != 1 || record.contract_id != contract_id
-            || record.contract.model_contract != model_contract || record.contract.encoding != encoding
+        if record.version != 1
+            || record.contract_id != contract_id
+            || record.contract.model_contract != model_contract
+            || record.contract.encoding != encoding
         {
             bail!("quantization contract record disagrees with the active request");
         }
-        let expects_opq_rpq = record.contract.opq_iterations > 0 || record.contract.residual_stages > 1;
+        let expects_opq_rpq =
+            record.contract.opq_iterations > 0 || record.contract.residual_stages > 1;
         if (profile == crate::protocol::ScoringProfile::OpqRpq) != expects_opq_rpq {
             bail!("PQ scoring profile disagrees with contract rotation/residual stages");
         }
         let artifact_root = record.artifact_root;
-        if !artifact_root.is_absolute() || fs::symlink_metadata(&artifact_root)?.file_type().is_symlink() {
+        if !artifact_root.is_absolute()
+            || fs::symlink_metadata(&artifact_root)?
+                .file_type()
+                .is_symlink()
+        {
             bail!("quantization artifact root must be absolute and must not be a symlink");
         }
         let quantizer_path = artifact_root.join("quantizer.vctq");
-        if fs::symlink_metadata(&quantizer_path)?.file_type().is_symlink() {
+        if fs::symlink_metadata(&quantizer_path)?
+            .file_type()
+            .is_symlink()
+        {
             bail!("quantizer artifact must not be a symlink");
         }
         let quantizer = parse_quantizer(&fs::read(quantizer_path)?)?;
-        let digest = hex::decode(contract_id.strip_prefix("qtc1-").ok_or_else(|| anyhow!("invalid contract ID"))?)?;
+        let digest = hex::decode(
+            contract_id
+                .strip_prefix("qtc1-")
+                .ok_or_else(|| anyhow!("invalid contract ID"))?,
+        )?;
         if digest.as_slice() != quantizer.contract_digest
             || quantizer.dimension != record.contract.dimension
             || quantizer.subspaces != record.contract.subspaces
@@ -144,22 +170,67 @@ impl QuantizationRegistry {
         {
             bail!("quantizer artifact shape or identity disagrees with its contract");
         }
-        Ok(ActiveQuantizer { generation: state.generation, contract_id: contract_id.to_owned(), artifact_root, quantizer })
+        if record.contract.quantizer_checksum.len() != 64
+            || hex::encode(Sha256::digest(&quantizer.payload)) != record.contract.quantizer_checksum
+        {
+            bail!("quantizer payload checksum disagrees with its contract identity");
+        }
+        let active_contract_ids = state
+            .scopes
+            .values()
+            .filter_map(|scope| scope.active.clone())
+            .collect();
+        Ok(ActiveQuantizer {
+            generation: state.generation,
+            active_contract_ids,
+            contract_id: contract_id.to_owned(),
+            artifact_root,
+            quantizer,
+        })
     }
 
-    pub fn load_codes(&self, active: &ActiveQuantizer, source_digest: &str) -> Result<CodesArtifact> {
-        if source_digest.len() != 64 || !source_digest.bytes().all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase()) {
+    pub fn active_contract_ids(&self) -> Result<std::collections::HashSet<String>> {
+        let state: RegistryState =
+            serde_json::from_slice(&fs::read(self.root.join("state.json"))?)?;
+        if state.version != 2 {
+            bail!("quantization registry must use state schema v2");
+        }
+        Ok(state
+            .scopes
+            .into_values()
+            .filter_map(|scope| scope.active)
+            .collect())
+    }
+
+    pub fn load_codes(
+        &self,
+        active: &ActiveQuantizer,
+        source_digest: &str,
+    ) -> Result<CodesArtifact> {
+        if source_digest.len() != 64
+            || !source_digest
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+        {
             bail!("invalid source tensor digest");
         }
-        let path = active.artifact_root.join("codes").join(&source_digest[..2]).join(format!("{source_digest}.vctc"));
-        if fs::symlink_metadata(&path)?.file_type().is_symlink() { bail!("PQ code artifact must not be a symlink"); }
+        let path = active
+            .artifact_root
+            .join("codes")
+            .join(&source_digest[..2])
+            .join(format!("{source_digest}.vctc"));
+        if fs::symlink_metadata(&path)?.file_type().is_symlink() {
+            bail!("PQ code artifact must not be a symlink");
+        }
         let codes = parse_codes(&fs::read(path)?)?;
         if codes.contract_digest != active.quantizer.contract_digest
             || hex::encode(codes.source_digest) != source_digest
             || codes.dimension != active.quantizer.dimension
             || codes.stages != active.quantizer.stages
             || codes.subspaces != active.quantizer.subspaces
-        { bail!("PQ code artifact disagrees with the active quantizer or source tensor"); }
+        {
+            bail!("PQ code artifact disagrees with the active quantizer or source tensor");
+        }
         Ok(codes)
     }
 }
@@ -189,11 +260,18 @@ fn checked_payload<'a>(
         bail!("unsupported quantization artifact flags or reserved bytes");
     }
     let length = usize::try_from(u64_at(bytes, 16)).map_err(|_| anyhow!("payload too large"))?;
-    if bytes.len() != HEADER_BYTES.checked_add(length).ok_or_else(|| anyhow!("length overflow"))? {
+    if bytes.len()
+        != HEADER_BYTES
+            .checked_add(length)
+            .ok_or_else(|| anyhow!("length overflow"))?
+    {
         bail!("quantization artifact length mismatch");
     }
     let payload = &bytes[HEADER_BYTES..];
-    let actual: [u8; 32] = Sha256::digest(payload).into();
+    let mut hasher = Sha256::new();
+    hasher.update(&bytes[..checksum_offset]);
+    hasher.update(payload);
+    let actual: [u8; 32] = hasher.finalize().into();
     if actual != bytes[checksum_offset..checksum_offset + 32] {
         bail!("quantization artifact checksum mismatch");
     }
@@ -207,26 +285,41 @@ pub fn parse_quantizer(bytes: &[u8]) -> Result<QuantizerArtifact> {
     let subspaces = u16_at(bytes, 14);
     let centroids = u16_at(bytes, 24);
     let rotation_mask = u16_at(bytes, 26);
-    if dimension == 0 || stages == 0 || subspaces == 0 || centroids < 2
-        || dimension % u32::from(subspaces) != 0 || stages > 16
+    if dimension == 0
+        || stages == 0
+        || subspaces == 0
+        || !(2..=256).contains(&centroids)
+        || dimension % u32::from(subspaces) != 0
+        || stages > 16
         || rotation_mask >> stages != 0
     {
         bail!("invalid quantizer shape");
     }
-    let rotation_values = rotation_mask.count_ones() as usize
-        * dimension as usize * dimension as usize;
-    let codebook_values = stages as usize * subspaces as usize * centroids as usize
+    let rotation_values =
+        rotation_mask.count_ones() as usize * dimension as usize * dimension as usize;
+    let codebook_values = stages as usize
+        * subspaces as usize
+        * centroids as usize
         * (dimension as usize / subspaces as usize);
-    let expected = rotation_values.checked_add(codebook_values)
-        .and_then(|value| value.checked_mul(4)).ok_or_else(|| anyhow!("quantizer size overflow"))?;
-    if payload.len() != expected || payload.chunks_exact(4).any(|value| {
-        !f32::from_le_bytes(value.try_into().unwrap()).is_finite()
-    }) {
+    let expected = rotation_values
+        .checked_add(codebook_values)
+        .and_then(|value| value.checked_mul(4))
+        .ok_or_else(|| anyhow!("quantizer size overflow"))?;
+    if payload.len() != expected
+        || payload
+            .chunks_exact(4)
+            .any(|value| !f32::from_le_bytes(value.try_into().unwrap()).is_finite())
+    {
         bail!("quantizer payload disagrees with its shape or contains non-finite values");
     }
     Ok(QuantizerArtifact {
-        contract_digest: bytes[28..60].try_into().unwrap(), dimension, stages,
-        subspaces, centroids, rotation_mask, payload: payload.to_vec(),
+        contract_digest: bytes[28..60].try_into().unwrap(),
+        dimension,
+        stages,
+        subspaces,
+        centroids,
+        rotation_mask,
+        payload: payload.to_vec(),
     })
 }
 
@@ -242,8 +335,12 @@ pub fn parse_codes(bytes: &[u8]) -> Result<CodesArtifact> {
     }
     Ok(CodesArtifact {
         contract_digest: bytes[28..60].try_into().unwrap(),
-        source_digest: bytes[60..92].try_into().unwrap(), rows, dimension,
-        stages, subspaces, codes: codes.to_vec(),
+        source_digest: bytes[60..92].try_into().unwrap(),
+        rows,
+        dimension,
+        stages,
+        subspaces,
+        codes: codes.to_vec(),
     })
 }
 
@@ -257,9 +354,19 @@ mod tests {
         result[..4].copy_from_slice(magic);
         result[4..6].copy_from_slice(&VERSION.to_le_bytes());
         result[16..24].copy_from_slice(&(payload.len() as u64).to_le_bytes());
-        result[checksum_offset..checksum_offset + 32].copy_from_slice(&Sha256::digest(payload));
         result.extend_from_slice(payload);
+        let mut hasher = Sha256::new();
+        hasher.update(&result[..checksum_offset]);
+        hasher.update(payload);
+        result[checksum_offset..checksum_offset + 32].copy_from_slice(&hasher.finalize());
         result
+    }
+
+    fn reseal(value: &mut [u8], checksum_offset: usize) {
+        let mut hasher = Sha256::new();
+        hasher.update(&value[..checksum_offset]);
+        hasher.update(&value[HEADER_BYTES..]);
+        value[checksum_offset..checksum_offset + 32].copy_from_slice(&hasher.finalize());
     }
 
     #[test]
@@ -269,6 +376,7 @@ mod tests {
         value[12..16].copy_from_slice(&8_u32.to_le_bytes());
         value[24..26].copy_from_slice(&1_u16.to_le_bytes());
         value[26..28].copy_from_slice(&2_u16.to_le_bytes());
+        reseal(&mut value, 92);
         assert_eq!(parse_codes(&value).unwrap().codes, [1, 2, 3, 4]);
         *value.last_mut().unwrap() ^= 1;
         assert!(parse_codes(&value).is_err());
@@ -286,8 +394,12 @@ mod tests {
         value[12..14].copy_from_slice(&1_u16.to_le_bytes());
         value[14..16].copy_from_slice(&1_u16.to_le_bytes());
         value[24..26].copy_from_slice(&2_u16.to_le_bytes());
+        reseal(&mut value, 60);
         let parsed = parse_quantizer(&value).unwrap();
-        assert_eq!((parsed.stages, parsed.subspaces, parsed.centroids), (1, 1, 2));
+        assert_eq!(
+            (parsed.stages, parsed.subspaces, parsed.centroids),
+            (1, 1, 2)
+        );
     }
 
     #[test]
@@ -299,28 +411,64 @@ mod tests {
         fs::create_dir_all(&artifact).unwrap();
         let digest = "a".repeat(64);
         let contract_id = format!("qtc1-{digest}");
-        let payload = [0.0_f32, 0.0, 1.0, 1.0].into_iter().flat_map(f32::to_le_bytes).collect::<Vec<_>>();
+        let payload = [0.0_f32, 0.0, 1.0, 1.0]
+            .into_iter()
+            .flat_map(f32::to_le_bytes)
+            .collect::<Vec<_>>();
         let mut quantizer = frame(QUANTIZER_MAGIC, &payload, 60);
         quantizer[8..12].copy_from_slice(&2_u32.to_le_bytes());
         quantizer[12..14].copy_from_slice(&1_u16.to_le_bytes());
         quantizer[14..16].copy_from_slice(&1_u16.to_le_bytes());
         quantizer[24..26].copy_from_slice(&2_u16.to_le_bytes());
         quantizer[28..60].copy_from_slice(&hex::decode(&digest).unwrap());
+        reseal(&mut quantizer, 60);
         fs::write(artifact.join("quantizer.vctq"), quantizer).unwrap();
-        fs::write(root.join("contracts").join(format!("{contract_id}.json")), serde_json::to_vec(&json!({
-            "version": 1, "contract_id": contract_id, "artifact_root": artifact,
-            "contract": {"model_contract":"model@1","encoding":"pq","dimension":2,
-                "subspaces":1,"centroids":2,"residual_stages":1,"opq_iterations":0}
-        })).unwrap()).unwrap();
+        fs::write(
+            root.join("contracts").join(format!("{contract_id}.json")),
+            serde_json::to_vec(&json!({
+                "version": 1, "contract_id": contract_id, "artifact_root": artifact,
+                "contract": {"model_contract":"model@1","encoding":"pq","dimension":2,
+                    "subspaces":1,"centroids":2,"residual_stages":1,"opq_iterations":0,
+                    "quantizer_checksum": hex::encode(Sha256::digest(&payload))}
+            }))
+            .unwrap(),
+        )
+        .unwrap();
         fs::write(root.join("state.json"), serde_json::to_vec(&json!({
             "version":2,"generation":1,"scopes":{"model@1\u{1f}pq":{"active":contract_id,"previous":null}}
         })).unwrap()).unwrap();
         let registry = QuantizationRegistry::open(root.clone()).unwrap();
-        assert_eq!(registry.resolve_active(&contract_id, "model@1", crate::protocol::ScoringProfile::Pq).unwrap().generation, 1);
+        let active = registry
+            .resolve_active(&contract_id, "model@1", crate::protocol::ScoringProfile::Pq)
+            .unwrap();
+        assert_eq!(active.generation, 1);
+        let source = "b".repeat(64);
+        let mut codes = frame(CODES_MAGIC, &[0, 1], 92);
+        codes[8..12].copy_from_slice(&2_u32.to_le_bytes());
+        codes[12..16].copy_from_slice(&2_u32.to_le_bytes());
+        codes[24..26].copy_from_slice(&1_u16.to_le_bytes());
+        codes[26..28].copy_from_slice(&1_u16.to_le_bytes());
+        codes[28..60].copy_from_slice(&hex::decode(&digest).unwrap());
+        codes[60..92].copy_from_slice(&hex::decode(&source).unwrap());
+        reseal(&mut codes, 92);
+        fs::create_dir_all(artifact.join("codes").join("bb")).unwrap();
+        fs::write(
+            artifact
+                .join("codes")
+                .join("bb")
+                .join(format!("{source}.vctc")),
+            codes,
+        )
+        .unwrap();
+        assert_eq!(registry.load_codes(&active, &source).unwrap().codes, [0, 1]);
         fs::write(root.join("state.json"), serde_json::to_vec(&json!({
             "version":2,"generation":2,"scopes":{"model@1\u{1f}pq":{"active":null,"previous":contract_id}}
         })).unwrap()).unwrap();
-        assert!(registry.resolve_active(&contract_id, "model@1", crate::protocol::ScoringProfile::Pq).is_err());
+        assert!(
+            registry
+                .resolve_active(&contract_id, "model@1", crate::protocol::ScoringProfile::Pq)
+                .is_err()
+        );
         fs::remove_dir_all(root).unwrap();
     }
 }

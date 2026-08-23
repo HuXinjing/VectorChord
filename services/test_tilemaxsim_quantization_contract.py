@@ -22,7 +22,8 @@ from services.tilemaxsim_quantization_contract import (
 
 
 def contract(
-    source: str, artifact: str, *, encoding: str = "pq", schema_version: int = 1
+    source: str, artifact: str, *, encoding: str = "pq", schema_version: int = 1,
+    quantizer: str = "c" * 64,
 ) -> QuantizationContract:
     return QuantizationContract(
         model_contract="model@1",
@@ -35,6 +36,7 @@ def contract(
         centroids=256 if encoding == "pq" else 0,
         residual_stages=2 if encoding == "pq" else 0,
         opq_iterations=4,
+        quantizer_checksum=quantizer,
         artifact_checksum=artifact,
         schema_version=schema_version,
     )
@@ -110,6 +112,10 @@ class QuantizationContractRegistryTest(unittest.TestCase):
         second = contract(self.source, "b" * 64, schema_version=2)
         self.assertEqual(first.contract_id, second.contract_id)
         self.assertNotEqual(first.artifact_checksum, second.artifact_checksum)
+        self.assertNotEqual(
+            first.contract_id,
+            contract(self.source, "b" * 64, schema_version=2, quantizer="d" * 64).contract_id,
+        )
 
     def test_invalid_contract_and_symlink_fail_closed(self):
         with self.assertRaisesRegex(ValueError, "artifact checksum"):
