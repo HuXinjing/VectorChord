@@ -692,6 +692,7 @@ def score_variant(
     device: torch.device,
     batch_bytes: int,
     warmups: int,
+    query_limit: int = 0,
 ) -> dict[str, Any]:
     rows = np.load(cache / "rows.npy", mmap_mode="r")
     offsets = np.load(cache / "offsets.npy", mmap_mode="r")
@@ -738,8 +739,11 @@ def score_variant(
     query_prep_latencies = []
     results = []
 
+    selected_qrels = dataset.qrels[: query_limit or None]
+    if warmups >= len(selected_qrels):
+        raise ValueError("warmup queries must be fewer than evaluated queries")
     with np.load(dataset.query_path, allow_pickle=False) as queries:
-        for query_index, item in enumerate(dataset.qrels):
+        for query_index, item in enumerate(selected_qrels):
             started_query = time.perf_counter()
             query = torch.from_numpy(queries[item["id"]].astype("<f2", copy=False)).to(
                 device
@@ -892,6 +896,7 @@ def score_variant(
             results.append(
                 {
                     "query_id": item["id"],
+                    "measured": query_index >= warmups,
                     "query": item["query"],
                     "relevant": sorted(gold),
                     "rank": rank,
@@ -959,6 +964,8 @@ def score_variant(
             "git_dirty": dirty,
         },
         "gpu_batch_bytes": batch_bytes,
+        "warmup_queries": warmups,
+        "evaluated_queries": len(selected_qrels),
         "gpu_batches": len(batch_ranges),
         "maximum_planned_batch_bytes": max(planned_batch_bytes),
         "oversized_singleton_documents": oversized_singletons,
@@ -1011,6 +1018,7 @@ def main() -> None:
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--gpu-batch-gb", type=float, default=0.5)
     parser.add_argument("--warmups", type=int, default=1)
+    parser.add_argument("--query-limit", type=int, default=0)
     args = parser.parse_args()
     if args.list_variants:
         print("\n".join(item.name for item in VARIANTS))
@@ -1029,8 +1037,8 @@ def main() -> None:
     variants = [variant_by_name(name) for name in names]
     if args.training_rows <= 0 or args.kmeans_iterations <= 0:
         parser.error("training rows and k-means iterations must be positive")
-    if args.gpu_batch_gb <= 0 or args.warmups < 0:
-        parser.error("GPU batch GB must be positive and warmups nonnegative")
+    if args.gpu_batch_gb <= 0 or args.warmups < 0 or args.query_limit < 0:
+        parser.error("GPU batch GB must be positive; warmups and query limit nonnegative")
     dataset = Dataset(args.manifest)
     try:
         args.cache_root.mkdir(parents=True, exist_ok=True)
@@ -1064,6 +1072,7 @@ def main() -> None:
                 torch.device(args.device),
                 int(args.gpu_batch_gb * 1024**3),
                 args.warmups,
+                args.query_limit,
             )
             destination = args.report_root / f"{variant.name}.json"
             destination.write_text(
