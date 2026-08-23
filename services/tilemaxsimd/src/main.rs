@@ -19,7 +19,9 @@ use anyhow::{Context, Result, anyhow, bail};
 use clap::Parser;
 use engine::{Engine, EngineStatus};
 use gpu::Gpu;
-use protocol::{HEADER_BYTES, VERSION_EXTERNAL, VERSION_SCHEDULED_EXTERNAL};
+use protocol::{
+    HEADER_BYTES, VERSION_EXTERNAL, VERSION_PROFILED_EXTERNAL, VERSION_SCHEDULED_EXTERNAL,
+};
 use scheduler::{RequestQueue, Scheduled, SchedulerPolicy};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
@@ -2111,6 +2113,7 @@ fn header_version(frame: &[u8]) -> u16 {
     } else {
         match u16::from_le_bytes(frame[4..6].try_into().unwrap()) {
             VERSION_SCHEDULED_EXTERNAL => VERSION_SCHEDULED_EXTERNAL,
+            VERSION_PROFILED_EXTERNAL => VERSION_PROFILED_EXTERNAL,
             _ => VERSION_EXTERNAL,
         }
     }
