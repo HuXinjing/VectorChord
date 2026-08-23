@@ -163,7 +163,7 @@ COMMIT;
 `maxsim_backend` selects where scoring runs; `maxsim_scoring_profile`
 independently selects the tensor representation and kernel. The public profile
 names are `exact_fp16`, `int8`, `fp8_e4m3`, `pq`, and `opq_rpq`. The native
-daemon currently enables `exact_fp16` and fused row-scaled `int8`. The remaining
+daemon currently enables `exact_fp16` plus fused row-scaled `int8` and `fp8_e4m3`. The remaining
 profiles are present in the request and experiment contracts, but fail explicitly until their
 persistent formats, migrations, and native kernels are connected. No request
 is silently substituted with another precision. The default backend remains

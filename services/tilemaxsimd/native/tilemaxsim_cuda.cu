@@ -276,6 +276,57 @@ __global__ void tilemaxsim_int8_kernel(
   }
 }
 
+__device__ float e4m3fn_to_float(uint8_t bits) {
+  const float sign = (bits & 0x80) == 0 ? 1.0f : -1.0f;
+  const uint8_t exponent = (bits >> 3) & 0x0f;
+  const uint8_t fraction = bits & 0x07;
+  if (exponent == 0) return sign * static_cast<float>(fraction) * 0.001953125f;
+  return sign * (1.0f + static_cast<float>(fraction) * 0.125f) *
+         exp2f(static_cast<float>(exponent) - 7.0f);
+}
+
+template <typename QueryScalar>
+__global__ void tilemaxsim_fp8_kernel(
+    const QueryScalar *query, uint32_t query_rows, uint32_t dimension,
+    const unsigned char *documents, const uint64_t *document_offsets,
+    const uint32_t *document_rows, size_t task_count, float *maxima) {
+  const uint32_t lane = threadIdx.x & 31;
+  const uint32_t warp = threadIdx.x >> 5;
+  const uint32_t warps = blockDim.x >> 5;
+  __shared__ float warp_best[8];
+  for (size_t task = blockIdx.x; task < task_count; task += gridDim.x) {
+    const size_t candidate = task / query_rows;
+    const uint32_t query_row = static_cast<uint32_t>(task % query_rows);
+    const uint8_t *document = documents + document_offsets[candidate];
+    const size_t code_bytes = static_cast<size_t>(document_rows[candidate]) * dimension;
+    const size_t scale_offset = (code_bytes + 3) & ~static_cast<size_t>(3);
+    const float *scales = reinterpret_cast<const float *>(document + scale_offset);
+    const QueryScalar *query_vector = query + static_cast<size_t>(query_row) * dimension;
+    float best = -CUDART_INF_F;
+    for (uint32_t row = warp; row < document_rows[candidate]; row += warps) {
+      const uint8_t *document_vector = document + static_cast<size_t>(row) * dimension;
+      float dot = 0.0f;
+      for (uint32_t index = lane; index < dimension; index += 32) {
+        dot = fmaf(scalar_to_float(query_vector[index]),
+                   e4m3fn_to_float(document_vector[index]), dot);
+      }
+      dot *= scales[row];
+      for (int delta = 16; delta != 0; delta >>= 1) {
+        dot += __shfl_down_sync(0xffffffff, dot, delta);
+      }
+      if (lane == 0) best = fmaxf(best, dot);
+    }
+    if (lane == 0) warp_best[warp] = best;
+    __syncthreads();
+    if (threadIdx.x == 0) {
+      float maximum = -CUDART_INF_F;
+      for (uint32_t index = 0; index < warps; ++index) maximum = fmaxf(maximum, warp_best[index]);
+      maxima[task] = maximum;
+    }
+    __syncthreads();
+  }
+}
+
 __global__ void tilemaxsim_sum_kernel(const float *maxima, uint32_t query_rows,
                                       size_t count, float *scores) {
   const size_t candidate =
@@ -390,6 +441,20 @@ extern "C" int vctm_gpu_score(
         maxima_count, reinterpret_cast<float *>(workspace + maxima_offset));
   } else if (scoring_profile == 2 && dtype == 1) {
     tilemaxsim_int8_kernel<float><<<grid, block, 0, gpu->compute_stream>>>(
+        reinterpret_cast<const float *>(workspace + query_offset), query_rows,
+        dimension, gpu->allocation,
+        reinterpret_cast<const uint64_t *>(workspace + offsets_offset),
+        reinterpret_cast<const uint32_t *>(workspace + rows_offset),
+        maxima_count, reinterpret_cast<float *>(workspace + maxima_offset));
+  } else if (scoring_profile == 3 && dtype == 2) {
+    tilemaxsim_fp8_kernel<half><<<grid, block, 0, gpu->compute_stream>>>(
+        reinterpret_cast<const half *>(workspace + query_offset), query_rows,
+        dimension, gpu->allocation,
+        reinterpret_cast<const uint64_t *>(workspace + offsets_offset),
+        reinterpret_cast<const uint32_t *>(workspace + rows_offset),
+        maxima_count, reinterpret_cast<float *>(workspace + maxima_offset));
+  } else if (scoring_profile == 3 && dtype == 1) {
+    tilemaxsim_fp8_kernel<float><<<grid, block, 0, gpu->compute_stream>>>(
         reinterpret_cast<const float *>(workspace + query_offset), query_rows,
         dimension, gpu->allocation,
         reinterpret_cast<const uint64_t *>(workspace + offsets_offset),

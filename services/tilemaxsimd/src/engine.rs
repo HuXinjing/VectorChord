@@ -15,7 +15,7 @@ use crate::shard::{HostCacheStatus, ShardStore, cache_key};
 use anyhow::{Result, anyhow, bail};
 use std::collections::{HashMap, HashSet};
 use std::mem::size_of;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 struct MissingTensor {
     candidate_index: usize,
@@ -230,7 +230,7 @@ impl Engine {
     pub fn score(&mut self, request: &Request) -> Result<Vec<(u32, f32)>> {
         if !matches!(
             request.scoring_profile,
-            ScoringProfile::ExactFp16 | ScoringProfile::Int8
+            ScoringProfile::ExactFp16 | ScoringProfile::Int8 | ScoringProfile::Fp8E4m3
         ) {
             anyhow::bail!(
                 "requested TileMaxSim scoring profile {:?} is not enabled by the native daemon",
@@ -707,7 +707,9 @@ fn validate_entry(
     let exact_bytes = descriptor.rows as usize * descriptor.dimension as usize * scalar_bytes;
     let expected_bytes = match profile {
         ScoringProfile::ExactFp16 => exact_bytes,
-        ScoringProfile::Int8 => int8_payload_bytes(descriptor.rows, descriptor.dimension)?,
+        ScoringProfile::Int8 | ScoringProfile::Fp8E4m3 => {
+            scaled_payload_bytes(descriptor.rows, descriptor.dimension)?
+        }
         _ => bail!("unsupported GPU cache scoring profile"),
     };
     if entry.rows != descriptor.rows
@@ -729,7 +731,7 @@ fn encode_for_profile(
     if profile == ScoringProfile::ExactFp16 {
         return Ok(payload);
     }
-    if profile != ScoringProfile::Int8 {
+    if !matches!(profile, ScoringProfile::Int8 | ScoringProfile::Fp8E4m3) {
         bail!("unsupported TileMaxSim encoding profile");
     }
     let rows = descriptor.rows as usize;
@@ -746,17 +748,21 @@ fn encode_for_profile(
         .checked_mul(dimension)
         .ok_or_else(|| anyhow!("INT8 tensor size overflow"))?;
     let scale_offset = align_up(code_bytes, size_of::<f32>())?;
-    let mut encoded = vec![0_u8; int8_payload_bytes(descriptor.rows, descriptor.dimension)?];
+    let mut encoded = vec![0_u8; scaled_payload_bytes(descriptor.rows, descriptor.dimension)?];
     for row in 0..rows {
         let mut maximum = 0.0_f32;
         for column in 0..dimension {
             maximum = maximum.max(read_scalar(&payload, row * dimension + column, descriptor.dtype)?.abs());
         }
-        let scale = if maximum == 0.0 { 1.0 } else { maximum / 127.0 };
+        let bound = if profile == ScoringProfile::Int8 { 127.0 } else { 448.0 };
+        let scale = if maximum == 0.0 { 1.0 } else { maximum / bound };
         for column in 0..dimension {
             let value = read_scalar(&payload, row * dimension + column, descriptor.dtype)?;
-            encoded[row * dimension + column] =
-                (value / scale).round().clamp(-127.0, 127.0) as i8 as u8;
+            encoded[row * dimension + column] = if profile == ScoringProfile::Int8 {
+                (value / scale).round().clamp(-127.0, 127.0) as i8 as u8
+            } else {
+                f32_to_e4m3fn(value / scale)
+            };
         }
         let offset = scale_offset + row * size_of::<f32>();
         encoded[offset..offset + 4].copy_from_slice(&scale.to_le_bytes());
@@ -764,13 +770,50 @@ fn encode_for_profile(
     Ok(Arc::from(encoded))
 }
 
-fn int8_payload_bytes(rows: u32, dimension: u32) -> Result<usize> {
+fn scaled_payload_bytes(rows: u32, dimension: u32) -> Result<usize> {
     let codes = (rows as usize)
         .checked_mul(dimension as usize)
         .ok_or_else(|| anyhow!("INT8 tensor size overflow"))?;
     align_up(codes, size_of::<f32>())?
         .checked_add(rows as usize * size_of::<f32>())
         .ok_or_else(|| anyhow!("INT8 tensor size overflow"))
+}
+
+fn e4m3fn_to_f32(bits: u8) -> f32 {
+    let sign = if bits & 0x80 == 0 { 1.0 } else { -1.0 };
+    let exponent = (bits >> 3) & 0x0f;
+    let fraction = bits & 0x07;
+    if exponent == 0 {
+        sign * fraction as f32 * 2.0_f32.powi(-9)
+    } else if exponent == 0x0f && fraction == 0x07 {
+        f32::NAN
+    } else {
+        sign * (1.0 + fraction as f32 / 8.0) * 2.0_f32.powi(exponent as i32 - 7)
+    }
+}
+
+fn f32_to_e4m3fn(value: f32) -> u8 {
+    static POSITIVE: OnceLock<Vec<(f32, u8)>> = OnceLock::new();
+    let table = POSITIVE.get_or_init(|| {
+        let mut values = (0_u16..=0x7e)
+            .map(|bits| (e4m3fn_to_f32(bits as u8), bits as u8))
+            .collect::<Vec<_>>();
+        values.sort_by(|left, right| left.0.total_cmp(&right.0));
+        values
+    });
+    let negative = value.is_sign_negative();
+    let magnitude = value.abs().min(448.0);
+    let index = table.partition_point(|(candidate, _)| *candidate < magnitude);
+    let selected = match index {
+        0 => table[0],
+        value if value == table.len() => table[table.len() - 1],
+        value => {
+            let lower = table[value - 1];
+            let upper = table[value];
+            if magnitude - lower.0 <= upper.0 - magnitude { lower } else { upper }
+        }
+    };
+    selected.1 | if negative { 0x80 } else { 0 }
 }
 
 fn align_up(value: usize, alignment: usize) -> Result<usize> {
@@ -874,6 +917,19 @@ mod tests {
         );
         assert_ne!(
             gpu_cache_key(&descriptor, ScoringProfile::ExactFp16),
+            gpu_cache_key(&descriptor, ScoringProfile::Int8)
+        );
+    }
+
+    #[test]
+    fn fp8_encoding_uses_e4m3fn_and_a_distinct_cache_namespace() {
+        for value in [0.0, 0.5, 1.0, 12.0, 448.0, -1.0] {
+            let decoded = e4m3fn_to_f32(f32_to_e4m3fn(value));
+            assert!((decoded - value).abs() <= value.abs().max(1.0) / 8.0);
+        }
+        let descriptor = descriptor(1, "a", 1);
+        assert_ne!(
+            gpu_cache_key(&descriptor, ScoringProfile::Fp8E4m3),
             gpu_cache_key(&descriptor, ScoringProfile::Int8)
         );
     }

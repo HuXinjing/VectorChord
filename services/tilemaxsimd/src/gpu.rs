@@ -207,4 +207,27 @@ mod tests {
             .unwrap();
         assert!((scores[0] - 2.0).abs() < 1e-5, "scores={scores:?}");
     }
+
+    #[test]
+    #[ignore = "requires an explicitly assigned CUDA device"]
+    fn native_fp8_profile_scores_all_candidates() {
+        let device = std::env::var("VCTM_TEST_GPU")
+            .unwrap_or_else(|_| "0".to_owned())
+            .parse::<i32>()
+            .unwrap();
+        let mut gpu = Gpu::create(device, 64 * 1024 * 1024, 32 * 1024 * 1024).unwrap();
+        // E4M3FN 0x38 is 1.0; two identity rows with unit row scales.
+        let mut document = vec![0x38_u8, 0, 0, 0x38];
+        document.extend_from_slice(&1.0_f32.to_le_bytes());
+        document.extend_from_slice(&1.0_f32.to_le_bytes());
+        gpu.upload_batch(&[(0, &document)]).unwrap();
+        let query = [1.0_f32, 0.0, 0.0, 1.0]
+            .into_iter()
+            .flat_map(f32::to_le_bytes)
+            .collect::<Vec<_>>();
+        let scores = gpu
+            .score(&query, 2, 2, 1, 3, &[0], &[2])
+            .unwrap();
+        assert!((scores[0] - 2.0).abs() < 1e-5, "scores={scores:?}");
+    }
 }
