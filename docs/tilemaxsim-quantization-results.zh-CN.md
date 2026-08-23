@@ -20,13 +20,18 @@
    约 2.51% 的存储，平均延迟 405.80 ms、加速 25.83 倍，Recall@10 为 0.6914。
 4. **最激进组合不适合作为默认值。** `pool4-normalized-opq-rpq3-m16-b8`
    把存储进一步降至 1.88%，但 Recall@1/5/10 相对精确 FP16 分别下降
-   16.67、14.20 和 5.56 个百分点；端到端延迟与两阶段方案几乎相同。
+   16.67、14.20 和 5.56 个百分点。后续独占 GPU 三轮复测证明它的端到端延迟
+   确实低于两阶段方案；共享 GPU 单轮中“几乎相同”的现象主要来自传输噪声。
 5. **PQ/RPQ 的 fused ADC 已证明有明确价值。** `pq-m16-b8` 的融合版本在召回
    完全一致时比解码后执行 FP16 TileMaxSim 快约 6.00 倍；RPQ2 融合版本快约
    3.97 倍。
 6. **显存不足时系统可以正确流式执行，但本报告不是生产容量承诺。** 超大文档按
-   query-token 最大值进行数学等价的分块合并；最终实验在共享 RTX 4090 上运行，
-   因此应重视同轮相对结果，不应把绝对延迟直接外推到其他硬件或并发负载。
+   query-token 最大值进行数学等价的分块合并；最初 27 组矩阵在共享 RTX 4090 上
+   运行，后续关键策略做了独占复测。绝对延迟仍不能直接外推到其他硬件或并发负载。
+7. **独占 GPU 复测、并发和真实三级缓存测试已经补齐。** 三次同提交、干净工作树
+   的独占 RTX 4090 重复实验给出了分层 bootstrap 置信区间；另有 64 请求交叉优先级
+   并发测试和由 daemon 指标验证的 L2/L1/L0 冷热切换测试。跨架构和硬件性能计数器
+   仍未完成。
 
 ### 推荐配置
 
@@ -182,9 +187,12 @@ PQ/RPQ fused ADC 不生成完整解码后的 FP16 文档张量，而是由 query
 - 分阶段：query preparation 1.92 ms、传输 314.27 ms、kernel 89.35 ms；
 - 每个查询平均使用 4 个有界批次。
 
-激进组合的 kernel 比两阶段组合约快 17.7%，但 transfer 增加，最终端到端延迟没有
-改善；同时 Recall@1 再下降 4.94 个百分点、Recall@10 再下降 1.23 个百分点。它只
-适合存储容量具有压倒性优先级的场景，不应成为默认推荐。
+上述数字来自最初的共享 GPU 单轮实验。当时激进组合的 kernel 比两阶段组合约快
+17.7%，但 transfer 增加，使端到端延迟看起来没有改善。独占 GPU 三轮复测将两者的
+平均延迟分别测为 319.65 ms 和 233.38 ms，证明旧现象主要是共享环境的传输噪声，
+而不是算法固有结果。不过激进组合的 Recall@1 仍再下降 4.94 个百分点、Recall@10
+仍再下降 1.23 个百分点，所以它只适合容量和延迟具有压倒性优先级的场景，不应成为
+默认推荐。
 
 ### 9. 小显存与超大文档调度
 
@@ -211,25 +219,103 @@ PQ/RPQ fused ADC 不生成完整解码后的 FP16 文档张量，而是由 query
 - 超大规模冷数据可使用 OPQ/RPQ，并把热文档提升到更高质量编码或缓存层；
 - 编码 profile、codebook 和模型 contract 必须版本化，禁止不同版本静默混用。
 
-### 11. 局限与后续工作
+### 11. 独占 GPU、并发与三级缓存生产验证
+
+#### 11.1 三轮独占 GPU 重复实验
+
+复测固定在提交 `4848527df3c48580fff1c20335d9a89b95706fa7`，三轮均为干净
+工作树、同一 RTX 4090、相同 1,124 文档/81 查询和 0.12 GiB batch 配置。每轮首个
+查询只预热不计时，因此每个策略有 3 轮、240 个计时观测。区间采用确定性分层
+bootstrap，同时重采样运行轮次和轮内查询，共 10,000 次，置信度 95%。
+
+| 策略 | 平均 ms（95% CI） | p95 ms（95% CI） | Recall@10 |
+| --- | ---: | ---: | ---: |
+| `exact-fp16` | 9822.82 [9645.67, 10036.95] | 10804.94 [10244.03, 11567.41] | .7346 |
+| `int8` | 5287.22 [5232.79, 5344.12] | 5799.54 [5526.13, 6116.20] | .7346 |
+| `int8-unfused` | 4518.12 [4400.08, 4647.80] | 5082.65 [4554.80, 6130.89] | .7346 |
+| `pool4-normalized-fp16` | 2261.31 [2197.34, 2329.68] | 2574.03 [2314.49, 3226.03] | .7160 |
+| `pq-m32-b8` | 765.31 [691.03, 874.96] | 1121.78 [756.21, 1833.41] | .7037 |
+| `pq-m16-b8` | 316.70 [308.26, 327.54] | 371.08 [339.43, 395.92] | .6173 |
+| `pq-m16-b8-unfused` | 1964.87 [1926.66, 2007.24] | 2591.41 [2005.02, 2617.44] | .6173 |
+| `pool2-normalized-opq-rpq2-m16-b8` | 319.65 [310.84, 333.09] | 360.47 [350.30, 556.89] | .6914 |
+| `pool4-normalized-opq-rpq3-m16-b8` | 233.38 [225.72, 243.82] | 304.38 [261.71, 354.34] | .6790 |
+
+独占环境下，最激进组合相对均衡组合的平均延迟低约 27.0%，但以更低召回为代价。
+PQ16 fused 相对 unfused 的三轮均值加速约 6.20 倍。INT8 fused 仍比 unfused 慢约
+17.0%，说明该问题可稳定复现，尚不能将标量 fused 设为默认。
+
+#### 11.2 Nsight 分阶段证据
+
+Nsight Systems 对完整查询的跟踪显示，INT8 fused 的 ragged scaled kernel 总 GPU
+时间约 886.55 ms（93 次），unfused 的精确 ragged kernel 加解量化/复制 kernel
+合计约 875 ms；两者 Host→Device 总时间都约 1.113 s。纯 GPU 算术时间接近，当前
+fused 端点变慢更可能在主机批处理和传输组织，而不是简单归因于显存带宽不足。
+PQ fused ADC 的 kernel 总时间约 103.54 ms（5 次），与其显著端到端收益一致。
+
+Nsight Compute 因机器驱动策略返回 `ERR_NVGPUCTRPERM`，无法读取 occupancy、寄存器
+和硬件计数器。本次没有提升权限或修改驱动配置，因此不能对具体 stall 原因作无证据
+断言。
+
+#### 11.3 并发、公平与 priority
+
+64 个请求以 16 并发交叉覆盖 4 个 scheduling domain 和 4 档 priority，避免把租户
+与优先级混为一个变量。结果为 4.89 req/s，整体 p50/p95/p99 分别为 806.54 /
+10627.54 / 10872.02 ms；各 priority 平均延迟如下：
+
+| priority | -10 | 0 | 10 | 50 |
+| ---: | ---: | ---: | ---: | ---: |
+| 平均延迟 ms | 8126.81 | 1918.98 | 988.45 | 769.84 |
+
+四个 scheduling domain 的平均延迟为 3109.48、3041.67、2905.42、2747.51 ms，
+最大连续同 domain 完成数为 2。该结果验证了 cooperative priority 和跨 domain
+推进，但高负载 p95 仍很高；priority 不能中断已经执行的 CUDA kernel，只能影响后续
+可调度工作，所以长 kernel 仍会造成队头阻塞。
+
+#### 11.4 真实 L2/L1/L0 切换
+
+使用 50 个张量、23.904 MB 工作集，通过 daemon 自身的 GPU/host hit、storage read
+和 H2D 字节指标验证层级，而不是仅按调用顺序给冷热阶段命名：
+
+| 阶段 | 延迟 | 指标证据 |
+| --- | ---: | --- |
+| L2 冷读 | 81.975 ms | 50 GPU miss、50 host miss、3 shard read、23.904 MB H2D |
+| L1 host 命中 | 15.394 ms | 50 GPU miss、50 host hit、无 storage read、23.904 MB H2D |
+| L0 GPU 命中 | 4.303 ms | 50 GPU hit、无 H2D、无 storage read |
+
+L1 相对 L2 快约 5.3 倍，L0 相对 L1 快约 3.6 倍。另一个 34,054 descriptor 的缓存
+策略消融中，在相同容量下 LRU 命中率为 69.982%，TinyLFU/GDSF 为 76.185%，提高
+6.20 个百分点。这支持先以可解释策略作为学习型调度的基线。
+
+#### 11.5 量化 contract 迁移与回滚
+
+仓库现已提供内容寻址的量化 contract registry：对完整 payload 树计算摘要并拒绝
+符号链接，激活前在 staging 中校验 schema/摘要，使用文件锁、CAS、原子替换和目录
+`fsync` 发布状态；保留 previous 指针并在回滚时重新校验旧目标。这覆盖单机并发下的
+原子激活和确定性回滚，但还不是跨节点共识或数据库 migration 协议。
+
+### 12. 局限与后续工作
 
 本报告仍有以下限制：
 
-- 测试使用单台共享 RTX 4090，不是独占、稳频、多轮统计的生产基准；
-- 当前结果覆盖 1,124 份文档和 81 条查询，需在更大、更多领域数据上验证置信区间；
+- 独占重复实验仍只使用单台 RTX 4090，尚未跨 GPU 架构、驱动版本和互联拓扑验证；
+- 当前结果覆盖 1,124 份文档和 81 条查询，需在更大、更多领域数据上复核置信区间；
 - 只测视觉张量打分，不代表端到端 RAG 的候选生成、网络、PostgreSQL 或 LLM 延迟；
-- 标量 fused kernel 尚未优于 unfused，需要 profiler 驱动的 tile、流水和批处理优化；
-- 尚未完成多请求并发、公平/priority 调度与量化路径组合后的尾延迟测试；
+- 标量 fused kernel 尚未优于 unfused，需要硬件计数器可用后继续做 tile、流水和
+  主机批处理优化；
+- 单机并发、公平/priority 已有压力测试，但还缺持续 soak、取消/超时风暴、故障注入
+  和多 GPU 隔离测试；
 - 尚未验证不同 GPU 架构、PCIe 拓扑、NUMA、多个 SSD 或 GPUDirect Storage；
-- OPQ/PQ codebook 的在线升级、灰度切换、回滚和跨版本兼容仍需生产化协议；
+- OPQ/PQ contract 已支持单机原子激活与回滚，但在线灰度、跨节点协调和跨版本兼容
+  仍需生产化协议；
 - 当前方案是精确范围内打分和压缩，不是张量原生 ANN，不能消除全库算术复杂度。
 
-下一阶段应优先完成：独占 GPU 重复实验与置信区间、Nsight kernel profiling、并发
-p50/p95/p99、真实 L0/L1/L2 冷热切换、跨架构验证，以及量化 contract 的在线迁移
-与回滚测试。三级缓存的学习型换入换出预测属于后续研究项，必须先与 LRU、TinyLFU、
-GDSF 等可解释基线对照，并保留确定性降级路径。
+下一阶段应优先完成：跨架构复测、可读取硬件性能计数器的 Nsight Compute 分析、
+持续并发与故障注入，以及 contract 的跨节点灰度迁移。三级缓存的学习型换入换出预测
+属于后续研究项；当前已经建立 LRU、TinyLFU、GDSF 基线，下一步需采集不含敏感内容
+的真实访问 trace，进行时间切分的离线回放与 shadow evaluation，并始终保留确定性
+降级路径。没有真实 trace 前不应凭合成 workload 宣称学习调度优于这些基线。
 
-### 12. 复现入口
+### 13. 复现入口
 
 方法说明、命令和失败关闭条件见
 [`tilemaxsim-quantization-ablation.md`](tilemaxsim-quantization-ablation.md)。核心入口：
@@ -237,6 +323,10 @@ GDSF 等可解释基线对照，并保留确定性降级路径。
 - `services/prepare_tilemaxsim_quantization_dataset.py`：生成完整 execution manifest；
 - `services/benchmark_tilemaxsim_quantization.py`：训练编码并运行真实 GPU 矩阵；
 - `services/summarize_tilemaxsim_quantization.py`：汇总 JSON 与 Markdown；
+- `services/summarize_tilemaxsim_repetitions.py`：分层 bootstrap 重复实验置信区间；
+- `services/benchmark_tilemaxsim_concurrency.py`：交叉 domain/priority 并发与尾延迟；
+- `services/benchmark_tilemaxsim_cache_tiers.py`：指标验证的 L2/L1/L0 冷热切换；
+- `services/tilemaxsim_quantization_contract.py`：量化 contract 原子激活和回滚；
 - `services/test_tilemaxsim_quantization.py`：量化与融合正确性测试；
 - `services/test_benchmark_tilemaxsim_quantization.py`：评测契约、恢复和低显存测试。
 
