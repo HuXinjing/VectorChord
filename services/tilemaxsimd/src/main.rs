@@ -24,6 +24,7 @@ use protocol::{
     HEADER_BYTES, VERSION_EXTERNAL, VERSION_PROFILED_EXTERNAL, VERSION_QUANTIZED_EXTERNAL,
     VERSION_SCHEDULED_EXTERNAL,
 };
+use quant::QuantizationRegistry;
 use scheduler::{RequestQueue, Scheduled, SchedulerPolicy};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
@@ -83,6 +84,9 @@ struct Args {
     host_tenant_cache_max_percent: u8,
     #[arg(long = "contract-root", required = true, value_parser = parse_contract_root)]
     contract_roots: Vec<(String, PathBuf)>,
+    /// Atomic qtc1 contract registry containing production VCTQ/VCTC artifacts.
+    #[arg(long)]
+    quantization_registry_root: Option<PathBuf>,
     #[arg(long, default_value_t = 32)]
     gpu_block_kib: usize,
     #[arg(long, default_value_t = 64 * 1024 * 1024)]
@@ -272,6 +276,10 @@ fn main() -> Result<()> {
         args.host_tenant_cache_max_percent,
         args.verify_full_shards,
     )?;
+    let quantization_registry = args
+        .quantization_registry_root
+        .map(QuantizationRegistry::open)
+        .transpose()?;
     let gpus = args
         .gpu_memory_gb
         .iter()
@@ -291,6 +299,7 @@ fn main() -> Result<()> {
         args.tenant_cache_max_percent,
         args.pinned_cache_max_percent,
         &tenant_cache_reservations,
+        quantization_registry,
     )?;
     if args.gpu_cache_mode == "resident" && args.resident_manifests.is_empty() {
         bail!("resident GPU cache mode requires at least one resident manifest");

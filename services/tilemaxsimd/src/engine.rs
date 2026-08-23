@@ -11,6 +11,7 @@
 use crate::cache::{Admission, GpuCache};
 use crate::gpu::Gpu;
 use crate::protocol::{Descriptor, Request, ScoringProfile};
+use crate::quant::QuantizationRegistry;
 use crate::shard::{HostCacheStatus, ShardStore, cache_key};
 use anyhow::{Result, anyhow, bail};
 use std::collections::{HashMap, HashSet};
@@ -45,6 +46,7 @@ pub struct Engine {
     devices: Vec<DeviceState>,
     store: ShardStore,
     next_device: usize,
+    quantization_registry: Option<QuantizationRegistry>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -86,6 +88,7 @@ impl Engine {
         tenant_cache_max_percent: u8,
         pinned_cache_max_percent: u8,
         tenant_reservations: &HashMap<String, usize>,
+        quantization_registry: Option<QuantizationRegistry>,
     ) -> Result<Self> {
         if gpus.is_empty() {
             bail!("at least one GPU is required");
@@ -113,6 +116,7 @@ impl Engine {
             devices,
             store,
             next_device: 0,
+            quantization_registry,
         })
     }
 
@@ -228,6 +232,12 @@ impl Engine {
     }
 
     pub fn score(&mut self, request: &Request) -> Result<Vec<(u32, f32)>> {
+        if matches!(request.scoring_profile, ScoringProfile::Pq | ScoringProfile::OpqRpq) {
+            let contract_id = request.quantization_contract.as_deref().ok_or_else(|| anyhow!("PQ-family request has no quantization contract"))?;
+            let model_contract = request.candidates.first().ok_or_else(|| anyhow!("PQ-family request has no candidates"))?.contract.as_str();
+            self.quantization_registry.as_ref().ok_or_else(|| anyhow!("PQ-family scoring requires --quantization-registry-root"))?
+                .resolve_active(contract_id, model_contract, request.scoring_profile)?;
+        }
         if !matches!(
             request.scoring_profile,
             ScoringProfile::ExactFp16 | ScoringProfile::Int8 | ScoringProfile::Fp8E4m3

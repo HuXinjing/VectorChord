@@ -6,6 +6,10 @@
 
 use anyhow::{Result, anyhow, bail};
 use sha2::{Digest, Sha256};
+use serde::Deserialize;
+use std::collections::HashMap;
+use std::fs;
+use std::path::PathBuf;
 
 const QUANTIZER_MAGIC: &[u8; 4] = b"VCTQ";
 const CODES_MAGIC: &[u8; 4] = b"VCTC";
@@ -34,6 +38,130 @@ pub struct CodesArtifact {
     pub subspaces: u16,
     /// `[row][stage][subspace]` uint8 codes.
     pub codes: Vec<u8>,
+}
+
+#[derive(Clone, Debug)]
+pub struct ActiveQuantizer {
+    pub generation: u64,
+    pub contract_id: String,
+    pub artifact_root: PathBuf,
+    pub quantizer: QuantizerArtifact,
+}
+
+#[derive(Deserialize)]
+struct RegistryState {
+    version: u32,
+    generation: u64,
+    scopes: HashMap<String, ScopeState>,
+}
+
+#[derive(Deserialize)]
+struct ScopeState {
+    active: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct ContractRecord {
+    version: u32,
+    contract_id: String,
+    contract: ContractBody,
+    artifact_root: PathBuf,
+}
+
+#[derive(Deserialize)]
+struct ContractBody {
+    model_contract: String,
+    encoding: String,
+    dimension: u32,
+    subspaces: u16,
+    centroids: u16,
+    residual_stages: u16,
+    opq_iterations: u16,
+}
+
+#[derive(Clone, Debug)]
+pub struct QuantizationRegistry {
+    root: PathBuf,
+}
+
+impl QuantizationRegistry {
+    pub fn open(root: PathBuf) -> Result<Self> {
+        if !root.is_absolute() || fs::symlink_metadata(&root)?.file_type().is_symlink() {
+            bail!("quantization registry root must be an absolute, non-symlink directory");
+        }
+        Ok(Self { root })
+    }
+
+    pub fn resolve_active(
+        &self,
+        contract_id: &str,
+        model_contract: &str,
+        profile: crate::protocol::ScoringProfile,
+    ) -> Result<ActiveQuantizer> {
+        let encoding = match profile {
+            crate::protocol::ScoringProfile::Pq => "pq",
+            crate::protocol::ScoringProfile::OpqRpq => "pq",
+            _ => bail!("quantization registry is only valid for PQ-family profiles"),
+        };
+        let state: RegistryState = serde_json::from_slice(&fs::read(self.root.join("state.json"))?)?;
+        if state.version != 2 {
+            bail!("quantization registry must be migrated to state schema v2");
+        }
+        let scope = format!("{model_contract}\u{1f}{encoding}");
+        let active = state.scopes.get(&scope).and_then(|scope| scope.active.as_deref());
+        if active != Some(contract_id) {
+            bail!("requested quantization contract is not active for this model and encoding");
+        }
+        let record_path = self.root.join("contracts").join(format!("{contract_id}.json"));
+        if fs::symlink_metadata(&record_path)?.file_type().is_symlink() {
+            bail!("quantization contract record must not be a symlink");
+        }
+        let record: ContractRecord = serde_json::from_slice(&fs::read(record_path)?)?;
+        if record.version != 1 || record.contract_id != contract_id
+            || record.contract.model_contract != model_contract || record.contract.encoding != encoding
+        {
+            bail!("quantization contract record disagrees with the active request");
+        }
+        let expects_opq_rpq = record.contract.opq_iterations > 0 || record.contract.residual_stages > 1;
+        if (profile == crate::protocol::ScoringProfile::OpqRpq) != expects_opq_rpq {
+            bail!("PQ scoring profile disagrees with contract rotation/residual stages");
+        }
+        let artifact_root = record.artifact_root;
+        if !artifact_root.is_absolute() || fs::symlink_metadata(&artifact_root)?.file_type().is_symlink() {
+            bail!("quantization artifact root must be absolute and must not be a symlink");
+        }
+        let quantizer_path = artifact_root.join("quantizer.vctq");
+        if fs::symlink_metadata(&quantizer_path)?.file_type().is_symlink() {
+            bail!("quantizer artifact must not be a symlink");
+        }
+        let quantizer = parse_quantizer(&fs::read(quantizer_path)?)?;
+        let digest = hex::decode(contract_id.strip_prefix("qtc1-").ok_or_else(|| anyhow!("invalid contract ID"))?)?;
+        if digest.as_slice() != quantizer.contract_digest
+            || quantizer.dimension != record.contract.dimension
+            || quantizer.subspaces != record.contract.subspaces
+            || quantizer.centroids != record.contract.centroids
+            || quantizer.stages != record.contract.residual_stages
+        {
+            bail!("quantizer artifact shape or identity disagrees with its contract");
+        }
+        Ok(ActiveQuantizer { generation: state.generation, contract_id: contract_id.to_owned(), artifact_root, quantizer })
+    }
+
+    pub fn load_codes(&self, active: &ActiveQuantizer, source_digest: &str) -> Result<CodesArtifact> {
+        if source_digest.len() != 64 || !source_digest.bytes().all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase()) {
+            bail!("invalid source tensor digest");
+        }
+        let path = active.artifact_root.join("codes").join(&source_digest[..2]).join(format!("{source_digest}.vctc"));
+        if fs::symlink_metadata(&path)?.file_type().is_symlink() { bail!("PQ code artifact must not be a symlink"); }
+        let codes = parse_codes(&fs::read(path)?)?;
+        if codes.contract_digest != active.quantizer.contract_digest
+            || hex::encode(codes.source_digest) != source_digest
+            || codes.dimension != active.quantizer.dimension
+            || codes.stages != active.quantizer.stages
+            || codes.subspaces != active.quantizer.subspaces
+        { bail!("PQ code artifact disagrees with the active quantizer or source tensor"); }
+        Ok(codes)
+    }
 }
 
 fn u16_at(bytes: &[u8], offset: usize) -> u16 {
@@ -122,6 +250,7 @@ pub fn parse_codes(bytes: &[u8]) -> Result<CodesArtifact> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     fn frame(magic: &[u8; 4], payload: &[u8], checksum_offset: usize) -> Vec<u8> {
         let mut result = vec![0_u8; HEADER_BYTES];
@@ -159,5 +288,39 @@ mod tests {
         value[24..26].copy_from_slice(&2_u16.to_le_bytes());
         let parsed = parse_quantizer(&value).unwrap();
         assert_eq!((parsed.stages, parsed.subspaces, parsed.centroids), (1, 1, 2));
+    }
+
+    #[test]
+    fn registry_activation_and_rollback_are_observed_atomically() {
+        let root = std::env::temp_dir().join(format!("vctm-quant-registry-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("contracts")).unwrap();
+        let artifact = root.join("artifact");
+        fs::create_dir_all(&artifact).unwrap();
+        let digest = "a".repeat(64);
+        let contract_id = format!("qtc1-{digest}");
+        let payload = [0.0_f32, 0.0, 1.0, 1.0].into_iter().flat_map(f32::to_le_bytes).collect::<Vec<_>>();
+        let mut quantizer = frame(QUANTIZER_MAGIC, &payload, 60);
+        quantizer[8..12].copy_from_slice(&2_u32.to_le_bytes());
+        quantizer[12..14].copy_from_slice(&1_u16.to_le_bytes());
+        quantizer[14..16].copy_from_slice(&1_u16.to_le_bytes());
+        quantizer[24..26].copy_from_slice(&2_u16.to_le_bytes());
+        quantizer[28..60].copy_from_slice(&hex::decode(&digest).unwrap());
+        fs::write(artifact.join("quantizer.vctq"), quantizer).unwrap();
+        fs::write(root.join("contracts").join(format!("{contract_id}.json")), serde_json::to_vec(&json!({
+            "version": 1, "contract_id": contract_id, "artifact_root": artifact,
+            "contract": {"model_contract":"model@1","encoding":"pq","dimension":2,
+                "subspaces":1,"centroids":2,"residual_stages":1,"opq_iterations":0}
+        })).unwrap()).unwrap();
+        fs::write(root.join("state.json"), serde_json::to_vec(&json!({
+            "version":2,"generation":1,"scopes":{"model@1\u{1f}pq":{"active":contract_id,"previous":null}}
+        })).unwrap()).unwrap();
+        let registry = QuantizationRegistry::open(root.clone()).unwrap();
+        assert_eq!(registry.resolve_active(&contract_id, "model@1", crate::protocol::ScoringProfile::Pq).unwrap().generation, 1);
+        fs::write(root.join("state.json"), serde_json::to_vec(&json!({
+            "version":2,"generation":2,"scopes":{"model@1\u{1f}pq":{"active":null,"previous":contract_id}}
+        })).unwrap()).unwrap();
+        assert!(registry.resolve_active(&contract_id, "model@1", crate::protocol::ScoringProfile::Pq).is_err());
+        fs::remove_dir_all(root).unwrap();
     }
 }
