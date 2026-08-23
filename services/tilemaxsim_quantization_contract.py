@@ -51,7 +51,7 @@ class QuantizationContract:
         ):
             if len(value) != 64 or any(character not in string.hexdigits for character in value):
                 raise ValueError(f"invalid {name} checksum")
-        if self.schema_version != 1 or self.dimension <= 0 or self.pooling < 0:
+        if self.schema_version not in (1, 2) or self.dimension <= 0 or self.pooling < 0:
             raise ValueError("invalid quantization contract dimensions or version")
         if self.encoding not in {"fp16", "int8", "fp8", "pq"}:
             raise ValueError("unsupported quantization encoding")
@@ -69,7 +69,19 @@ class QuantizationContract:
 
     @property
     def contract_id(self) -> str:
-        return "qtc1-" + hashlib.sha256(self.canonical_bytes()).hexdigest()
+        if self.schema_version == 1:
+            identity = self.canonical_bytes()
+        else:
+            # v2 breaks the circular dependency between an immutable artifact
+            # header (which embeds this ID) and the separately verified artifact
+            # checksum. The checksum remains signed by the registry record and
+            # is revalidated at stage, activation, rollback, and resolve time.
+            fields = asdict(self)
+            del fields["artifact_checksum"]
+            identity = json.dumps(
+                fields, sort_keys=True, separators=(",", ":")
+            ).encode("utf-8")
+        return "qtc1-" + hashlib.sha256(identity).hexdigest()
 
 
 def file_sha256(path: Path) -> str:
