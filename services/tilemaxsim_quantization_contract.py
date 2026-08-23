@@ -125,11 +125,50 @@ class QuantizationContractRegistry:
 
     def _state(self) -> dict[str, object]:
         if not self.state_path.exists():
-            return {"version": 1, "generation": 0, "active": None, "previous": None}
+            return {"version": 2, "generation": 0, "scopes": {}}
         state = json.loads(self.state_path.read_text(encoding="utf-8"))
-        if state.get("version") != 1 or not isinstance(state.get("generation"), int):
+        if not isinstance(state.get("generation"), int):
+            raise ValueError("invalid quantization registry state")
+        if state.get("version") == 1:
+            return self._migrate_v1_state(state)
+        if state.get("version") != 2 or not isinstance(state.get("scopes"), dict):
             raise ValueError("invalid quantization registry state")
         return state
+
+    def _record(self, contract_id: str) -> dict[str, object]:
+        path = self.contracts / f"{contract_id}.json"
+        if not path.is_file():
+            raise ValueError("contract has not been staged")
+        return json.loads(path.read_text(encoding="utf-8"))
+
+    def _scope_for_record(self, record: dict[str, object]) -> str:
+        contract = QuantizationContract(**record["contract"])
+        return f"{contract.model_contract}\x1f{contract.encoding}"
+
+    def _migrate_v1_state(self, state: dict[str, object]) -> dict[str, object]:
+        """Translate the old singleton state without mutating it during reads."""
+
+        scopes: dict[str, dict[str, str | None]] = {}
+        active = state.get("active")
+        previous = state.get("previous")
+        if active is not None:
+            if not isinstance(active, str):
+                raise ValueError("invalid v1 quantization registry state")
+            active_record = self._record(active)
+            scope = self._scope_for_record(active_record)
+            if previous is not None:
+                if not isinstance(previous, str):
+                    raise ValueError("invalid v1 quantization registry state")
+                if self._scope_for_record(self._record(previous)) != scope:
+                    # A singleton v1 registry could switch between encodings.
+                    # Keeping the old contract as another scope's active value
+                    # preserves rollback data without inventing cross-format
+                    # rollback semantics in v2.
+                    previous_scope = self._scope_for_record(self._record(previous))
+                    scopes[previous_scope] = {"active": previous, "previous": None}
+                    previous = None
+            scopes[scope] = {"active": active, "previous": previous}
+        return {"version": 2, "generation": int(state["generation"]), "scopes": scopes}
 
     def _write_state(self, state: dict[str, object]) -> None:
         temporary = self.state_path.with_suffix(f".tmp.{os.getpid()}")
@@ -199,37 +238,55 @@ class QuantizationContractRegistry:
     def activate(self, contract_id: str, *, expected_active: str | None) -> int:
         with self._locked():
             self._verify_staged(contract_id)
+            scope = self._scope_for_record(self._record(contract_id))
             state = self._state()
-            if state.get("active") != expected_active:
+            scopes = state["scopes"]
+            current = scopes.get(scope, {"active": None, "previous": None})
+            if current.get("active") != expected_active:
                 raise RuntimeError("active contract changed concurrently")
             if contract_id == expected_active:
                 return int(state["generation"])
-            state["previous"] = state.get("active")
-            state["active"] = contract_id
+            scopes[scope] = {"previous": current.get("active"), "active": contract_id}
             state["generation"] = int(state["generation"]) + 1
             self._write_state(state)
             return int(state["generation"])
 
     def rollback(self, *, expected_active: str) -> int:
         with self._locked():
+            scope = self._scope_for_record(self._record(expected_active))
             state = self._state()
-            if state.get("active") != expected_active:
+            current = state["scopes"].get(scope, {"active": None, "previous": None})
+            if current.get("active") != expected_active:
                 raise RuntimeError("active contract changed concurrently")
-            previous = state.get("previous")
+            previous = current.get("previous")
             if not isinstance(previous, str):
                 raise ValueError("no previous contract is available")
             self._verify_staged(previous)
-            state["active"], state["previous"] = previous, state["active"]
+            current["active"], current["previous"] = previous, current["active"]
+            state["scopes"][scope] = current
             state["generation"] = int(state["generation"]) + 1
             self._write_state(state)
             return int(state["generation"])
 
-    def resolve_active(self) -> dict[str, object] | None:
+    def resolve_active(
+        self, *, model_contract: str | None = None, encoding: str | None = None
+    ) -> dict[str, object] | None:
         with self._locked():
-            active = self._state().get("active")
+            state = self._state()
+            if (model_contract is None) != (encoding is None):
+                raise ValueError("model_contract and encoding must be supplied together")
+            if model_contract is None:
+                active_scopes = [
+                    value for value in state["scopes"].values() if value.get("active")
+                ]
+                if not active_scopes:
+                    return None
+                if len(active_scopes) != 1:
+                    raise ValueError("multiple active scopes require an explicit model and encoding")
+                active = active_scopes[0]["active"]
+            else:
+                scope = f"{model_contract}\x1f{encoding}"
+                active = state["scopes"].get(scope, {}).get("active")
             if active is None:
                 return None
-            path = self.contracts / f"{active}.json"
-            if not path.is_file():
-                raise ValueError("active contract record is missing")
-            return json.loads(path.read_text(encoding="utf-8"))
+            return self._record(active)

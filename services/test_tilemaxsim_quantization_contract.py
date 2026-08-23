@@ -21,17 +21,19 @@ from services.tilemaxsim_quantization_contract import (
 )
 
 
-def contract(source: str, artifact: str) -> QuantizationContract:
+def contract(
+    source: str, artifact: str, *, encoding: str = "pq"
+) -> QuantizationContract:
     return QuantizationContract(
         model_contract="model@1",
         source_manifest_checksum=source,
-        encoding="pq",
+        encoding=encoding,
         dimension=320,
         pooling=2,
         normalize_pooling=True,
-        subspaces=16,
-        centroids=256,
-        residual_stages=2,
+        subspaces=16 if encoding == "pq" else 0,
+        centroids=256 if encoding == "pq" else 0,
+        residual_stages=2 if encoding == "pq" else 0,
         opq_iterations=4,
         artifact_checksum=artifact,
     )
@@ -139,6 +141,49 @@ class QuantizationContractRegistryTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "changed before activation"):
             self.registry.rollback(expected_active=second)
         self.assertEqual(self.registry.resolve_active()["contract_id"], second)
+
+    def test_encodings_activate_and_rollback_independently(self):
+        pq = self.registry.stage(
+            contract(self.source, artifact_tree_sha256(self.artifact)), self.artifact
+        )
+        int8 = self.registry.stage(
+            contract(
+                self.source,
+                artifact_tree_sha256(self.artifact),
+                encoding="int8",
+            ),
+            self.artifact,
+        )
+        self.registry.activate(pq, expected_active=None)
+        self.registry.activate(int8, expected_active=None)
+        self.assertEqual(
+            self.registry.resolve_active(model_contract="model@1", encoding="pq")[
+                "contract_id"
+            ],
+            pq,
+        )
+        self.assertEqual(
+            self.registry.resolve_active(model_contract="model@1", encoding="int8")[
+                "contract_id"
+            ],
+            int8,
+        )
+        with self.assertRaisesRegex(ValueError, "multiple active scopes"):
+            self.registry.resolve_active()
+
+    def test_v1_singleton_state_is_read_and_rewritten_as_v2(self):
+        identifier = self.registry.stage(
+            contract(self.source, artifact_tree_sha256(self.artifact)), self.artifact
+        )
+        self.registry.root.mkdir(parents=True, exist_ok=True)
+        self.registry.state_path.write_text(
+            json.dumps(
+                {"version": 1, "generation": 7, "active": identifier, "previous": None}
+            ),
+            encoding="utf-8",
+        )
+        self.assertEqual(self.registry.resolve_active()["contract_id"], identifier)
+        self.assertEqual(self.registry.activate(identifier, expected_active=identifier), 7)
 
 
 if __name__ == "__main__":
