@@ -31,6 +31,54 @@ struct VctmGpu {
   cudaStream_t compute_stream;
 };
 
+struct VctmQuantizer {
+  int device;
+  float *payload;
+  size_t payload_values;
+  uint32_t dimension;
+  uint16_t stages;
+  uint16_t subspaces;
+  uint16_t centroids;
+  uint16_t rotation_mask;
+};
+
+static int fail(char *error, size_t capacity, const char *message);
+static int cuda_fail(char *error, size_t capacity, const char *operation,
+                     cudaError_t status);
+
+extern "C" int vctm_quantizer_create(
+    int device, const unsigned char *payload, size_t payload_bytes,
+    uint32_t dimension, uint16_t stages, uint16_t subspaces,
+    uint16_t centroids, uint16_t rotation_mask, VctmQuantizer **output,
+    char *error, size_t error_capacity) {
+  if (output == nullptr || payload == nullptr || payload_bytes == 0 ||
+      payload_bytes % sizeof(float) != 0 || dimension == 0 || stages == 0 ||
+      subspaces == 0 || centroids < 2 || dimension % subspaces != 0) {
+    return fail(error, error_capacity, "invalid PQ quantizer");
+  }
+  cudaError_t status = cudaSetDevice(device);
+  if (status != cudaSuccess) return cuda_fail(error, error_capacity, "cudaSetDevice", status);
+  auto *quantizer = new VctmQuantizer{device, nullptr, payload_bytes / sizeof(float),
+      dimension, stages, subspaces, centroids, rotation_mask};
+  status = cudaMalloc(reinterpret_cast<void **>(&quantizer->payload), payload_bytes);
+  if (status == cudaSuccess)
+    status = cudaMemcpy(quantizer->payload, payload, payload_bytes, cudaMemcpyHostToDevice);
+  if (status != cudaSuccess) {
+    if (quantizer->payload != nullptr) cudaFree(quantizer->payload);
+    delete quantizer;
+    return cuda_fail(error, error_capacity, "PQ quantizer upload", status);
+  }
+  *output = quantizer;
+  return 0;
+}
+
+extern "C" void vctm_quantizer_destroy(VctmQuantizer *quantizer) {
+  if (quantizer == nullptr) return;
+  cudaSetDevice(quantizer->device);
+  cudaFree(quantizer->payload);
+  delete quantizer;
+}
+
 static int fail(char *error, size_t capacity, const char *message) {
   if (error != nullptr && capacity != 0) {
     std::snprintf(error, capacity, "%s", message);
@@ -339,6 +387,77 @@ __global__ void tilemaxsim_sum_kernel(const float *maxima, uint32_t query_rows,
   scores[candidate] = score;
 }
 
+template <typename QueryScalar>
+__global__ void pq_lut_kernel(
+    const QueryScalar *query, uint32_t query_rows, const VctmQuantizer quantizer,
+    float *luts, size_t count) {
+  const size_t index = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (index >= count) return;
+  size_t cursor = index;
+  const uint16_t centroid = cursor % quantizer.centroids; cursor /= quantizer.centroids;
+  const uint16_t subspace = cursor % quantizer.subspaces; cursor /= quantizer.subspaces;
+  const uint16_t stage = cursor % quantizer.stages; cursor /= quantizer.stages;
+  const uint32_t query_row = static_cast<uint32_t>(cursor);
+  const uint32_t subdimension = quantizer.dimension / quantizer.subspaces;
+  const size_t rotations = __popc(static_cast<unsigned int>(quantizer.rotation_mask));
+  const size_t codebook_base = rotations * quantizer.dimension * quantizer.dimension;
+  size_t rotation_rank = 0;
+  for (uint16_t item = 0; item < stage; ++item)
+    rotation_rank += (quantizer.rotation_mask >> item) & 1;
+  float dot = 0.0f;
+  for (uint32_t local = 0; local < subdimension; ++local) {
+    const uint32_t dimension = static_cast<uint32_t>(subspace) * subdimension + local;
+    float query_value = scalar_to_float(query[static_cast<size_t>(query_row) * quantizer.dimension + dimension]);
+    if ((quantizer.rotation_mask >> stage) & 1) {
+      query_value = 0.0f;
+      const float *rotation = quantizer.payload + rotation_rank * quantizer.dimension * quantizer.dimension;
+      for (uint32_t source = 0; source < quantizer.dimension; ++source)
+        query_value = fmaf(scalar_to_float(query[static_cast<size_t>(query_row) * quantizer.dimension + source]),
+                           rotation[static_cast<size_t>(source) * quantizer.dimension + dimension], query_value);
+    }
+    const size_t center = (((static_cast<size_t>(stage) * quantizer.subspaces + subspace)
+        * quantizer.centroids + centroid) * subdimension + local);
+    dot = fmaf(query_value, quantizer.payload[codebook_base + center], dot);
+  }
+  luts[index] = dot;
+}
+
+__global__ void pq_adc_maxsim_kernel(
+    const float *luts, uint32_t query_rows, const VctmQuantizer quantizer,
+    const unsigned char *documents, const uint64_t *document_offsets,
+    const uint32_t *document_rows, size_t task_count, float *maxima) {
+  const uint32_t lane = threadIdx.x & 31;
+  const uint32_t warp = threadIdx.x >> 5;
+  const uint32_t warps = blockDim.x >> 5;
+  __shared__ float warp_best[8];
+  for (size_t task = blockIdx.x; task < task_count; task += gridDim.x) {
+    const size_t candidate = task / query_rows;
+    const uint32_t query_row = static_cast<uint32_t>(task % query_rows);
+    const uint8_t *codes = documents + document_offsets[candidate];
+    float best = -CUDART_INF_F;
+    for (uint32_t row = warp; row < document_rows[candidate]; row += warps) {
+      float similarity = 0.0f;
+      const size_t row_base = static_cast<size_t>(row) * quantizer.stages * quantizer.subspaces;
+      const size_t lut_base = static_cast<size_t>(query_row) * quantizer.stages * quantizer.subspaces * quantizer.centroids;
+      for (uint32_t flat = lane; flat < static_cast<uint32_t>(quantizer.stages) * quantizer.subspaces; flat += 32) {
+        const uint8_t code = codes[row_base + flat];
+        similarity += luts[lut_base + static_cast<size_t>(flat) * quantizer.centroids + code];
+      }
+      for (int delta = 16; delta != 0; delta >>= 1)
+        similarity += __shfl_down_sync(0xffffffff, similarity, delta);
+      if (lane == 0) best = fmaxf(best, similarity);
+    }
+    if (lane == 0) warp_best[warp] = best;
+    __syncthreads();
+    if (threadIdx.x == 0) {
+      float maximum = -CUDART_INF_F;
+      for (uint32_t item = 0; item < warps; ++item) maximum = fmaxf(maximum, warp_best[item]);
+      maxima[task] = maximum;
+    }
+    __syncthreads();
+  }
+}
+
 static size_t aligned(size_t value, size_t alignment) {
   return (value + alignment - 1) / alignment * alignment;
 }
@@ -481,5 +600,58 @@ extern "C" int vctm_gpu_score(
   if (status != cudaSuccess) {
     return cuda_fail(error, error_capacity, "TileMaxSim CUDA execution", status);
   }
+  return 0;
+}
+
+extern "C" int vctm_gpu_score_pq(
+    VctmGpu *gpu, const VctmQuantizer *quantizer,
+    const unsigned char *query, size_t query_bytes, uint32_t query_rows,
+    uint8_t dtype, const uint64_t *document_offsets,
+    const uint32_t *document_rows, size_t count, float *output,
+    char *error, size_t error_capacity) {
+  if (gpu == nullptr || quantizer == nullptr || query == nullptr || query_rows == 0 ||
+      count == 0 || document_offsets == nullptr || document_rows == nullptr || output == nullptr ||
+      quantizer->device != gpu->device) return fail(error, error_capacity, "invalid PQ score request");
+  cudaError_t status = cudaSetDevice(gpu->device);
+  if (status != cudaSuccess) return cuda_fail(error, error_capacity, "cudaSetDevice", status);
+  const size_t maxima_count = count * query_rows;
+  const size_t lut_count = static_cast<size_t>(query_rows) * quantizer->stages *
+      quantizer->subspaces * quantizer->centroids;
+  unsigned char *workspace = gpu->allocation + gpu->tensor_bytes;
+  size_t cursor = 0, query_offset = 0, offsets_offset = 0, rows_offset = 0,
+         lut_offset = 0, maxima_offset = 0, scores_offset = 0;
+  if (!reserve_aligned(&cursor, query_bytes, &query_offset) ||
+      !reserve_aligned(&cursor, count * sizeof(uint64_t), &offsets_offset) ||
+      !reserve_aligned(&cursor, count * sizeof(uint32_t), &rows_offset) ||
+      !reserve_aligned(&cursor, lut_count * sizeof(float), &lut_offset) ||
+      !reserve_aligned(&cursor, maxima_count * sizeof(float), &maxima_offset) ||
+      !reserve_aligned(&cursor, count * sizeof(float), &scores_offset) ||
+      cursor > gpu->workspace_bytes)
+    return fail(error, error_capacity, "PQ request exceeds configured GPU workspace");
+  status = cudaMemcpyAsync(workspace + query_offset, query, query_bytes, cudaMemcpyHostToDevice, gpu->compute_stream);
+  if (status == cudaSuccess) status = cudaMemcpyAsync(workspace + offsets_offset, document_offsets, count * sizeof(uint64_t), cudaMemcpyHostToDevice, gpu->compute_stream);
+  if (status == cudaSuccess) status = cudaMemcpyAsync(workspace + rows_offset, document_rows, count * sizeof(uint32_t), cudaMemcpyHostToDevice, gpu->compute_stream);
+  constexpr unsigned int threads = 256;
+  const unsigned int lut_blocks = static_cast<unsigned int>((lut_count + threads - 1) / threads);
+  if (status == cudaSuccess && dtype == 2)
+    pq_lut_kernel<half><<<lut_blocks, threads, 0, gpu->compute_stream>>>(reinterpret_cast<const half *>(workspace + query_offset), query_rows, *quantizer, reinterpret_cast<float *>(workspace + lut_offset), lut_count);
+  else if (status == cudaSuccess && dtype == 1)
+    pq_lut_kernel<float><<<lut_blocks, threads, 0, gpu->compute_stream>>>(reinterpret_cast<const float *>(workspace + query_offset), query_rows, *quantizer, reinterpret_cast<float *>(workspace + lut_offset), lut_count);
+  else if (status == cudaSuccess) return fail(error, error_capacity, "unsupported PQ query dtype");
+  if (status == cudaSuccess) status = cudaGetLastError();
+  const size_t kernel_blocks = std::min(maxima_count, static_cast<size_t>(65'535));
+  if (status == cudaSuccess) pq_adc_maxsim_kernel<<<static_cast<unsigned int>(kernel_blocks), threads, 0, gpu->compute_stream>>>(
+      reinterpret_cast<const float *>(workspace + lut_offset), query_rows, *quantizer,
+      gpu->allocation, reinterpret_cast<const uint64_t *>(workspace + offsets_offset),
+      reinterpret_cast<const uint32_t *>(workspace + rows_offset), maxima_count,
+      reinterpret_cast<float *>(workspace + maxima_offset));
+  if (status == cudaSuccess) status = cudaGetLastError();
+  if (status == cudaSuccess) tilemaxsim_sum_kernel<<<static_cast<unsigned int>((count + threads - 1) / threads), threads, 0, gpu->compute_stream>>>(
+      reinterpret_cast<const float *>(workspace + maxima_offset), query_rows, count,
+      reinterpret_cast<float *>(workspace + scores_offset));
+  if (status == cudaSuccess) status = cudaGetLastError();
+  if (status == cudaSuccess) status = cudaMemcpyAsync(output, workspace + scores_offset, count * sizeof(float), cudaMemcpyDeviceToHost, gpu->compute_stream);
+  if (status == cudaSuccess) status = cudaStreamSynchronize(gpu->compute_stream);
+  if (status != cudaSuccess) return cuda_fail(error, error_capacity, "PQ ADC-MaxSim CUDA execution", status);
   return 0;
 }

@@ -11,7 +11,7 @@
 use crate::cache::{Admission, GpuCache};
 use crate::gpu::Gpu;
 use crate::protocol::{Descriptor, Request, ScoringProfile};
-use crate::quant::QuantizationRegistry;
+use crate::quant::{ActiveQuantizer, QuantizationRegistry};
 use crate::shard::{HostCacheStatus, ShardStore, cache_key};
 use anyhow::{Result, anyhow, bail};
 use std::collections::{HashMap, HashSet};
@@ -232,15 +232,16 @@ impl Engine {
     }
 
     pub fn score(&mut self, request: &Request) -> Result<Vec<(u32, f32)>> {
-        if matches!(request.scoring_profile, ScoringProfile::Pq | ScoringProfile::OpqRpq) {
+        let active_quantizer = if matches!(request.scoring_profile, ScoringProfile::Pq | ScoringProfile::OpqRpq) {
             let contract_id = request.quantization_contract.as_deref().ok_or_else(|| anyhow!("PQ-family request has no quantization contract"))?;
             let model_contract = request.candidates.first().ok_or_else(|| anyhow!("PQ-family request has no candidates"))?.contract.as_str();
-            self.quantization_registry.as_ref().ok_or_else(|| anyhow!("PQ-family scoring requires --quantization-registry-root"))?
-                .resolve_active(contract_id, model_contract, request.scoring_profile)?;
-        }
+            Some(self.quantization_registry.as_ref().ok_or_else(|| anyhow!("PQ-family scoring requires --quantization-registry-root"))?
+                .resolve_active(contract_id, model_contract, request.scoring_profile)?)
+        } else { None };
         if !matches!(
             request.scoring_profile,
             ScoringProfile::ExactFp16 | ScoringProfile::Int8 | ScoringProfile::Fp8E4m3
+                | ScoringProfile::Pq | ScoringProfile::OpqRpq
         ) {
             anyhow::bail!(
                 "requested TileMaxSim scoring profile {:?} is not enabled by the native daemon",
@@ -278,7 +279,7 @@ impl Engine {
                     .cache
                     .get(&key)
                     .expect("cache hit disappeared");
-                validate_entry(descriptor, &entry, request.scoring_profile)?;
+                validate_entry(descriptor, &entry, request.scoring_profile, active_quantizer.as_ref())?;
                 hit_chunks[device_index].push(ResidentTensor {
                     candidate_index: index,
                     device: device_index,
@@ -299,20 +300,29 @@ impl Engine {
             }
         }
 
-        let hit_result = self.score_devices(request, &hit_chunks, &mut scores);
+        let hit_result = self.score_devices(request, active_quantizer.as_ref(), &hit_chunks, &mut scores);
         let hit_cleanup = self.release_chunks(&hit_chunks);
         hit_result?;
         hit_cleanup?;
 
-        let payloads = self
-            .store
-            .resolve_many(&missing_descriptors, &request.tenant)?;
+        let payloads = if let Some(active) = active_quantizer.as_ref() {
+            let registry = self.quantization_registry.as_ref().unwrap();
+            missing_descriptors.iter().map(|descriptor| {
+                let codes = registry.load_codes(active, &descriptor.digest)?;
+                if codes.rows != descriptor.rows { bail!("PQ code rows disagree with tensor descriptor"); }
+                Ok(Arc::<[u8]>::from(codes.codes))
+            }).collect::<Result<Vec<_>>>()?
+        } else {
+            self.store.resolve_many(&missing_descriptors, &request.tenant)?
+        };
         let mut pending = missing_indices
             .into_iter()
             .zip(missing_descriptors)
             .zip(payloads)
             .map(|((candidate_index, descriptor), payload)| {
-                let payload = encode_for_profile(&descriptor, payload, request.scoring_profile)?;
+                let payload = if active_quantizer.is_some() { payload } else {
+                    encode_for_profile(&descriptor, payload, request.scoring_profile)?
+                };
                 Ok(MissingTensor {
                     candidate_index,
                     key: gpu_cache_key(
@@ -434,7 +444,7 @@ impl Engine {
                 }
             };
             debug_assert!(upload_succeeded.iter().all(|succeeded| *succeeded));
-            let score_result = self.score_devices(request, &chunks, &mut scores);
+            let score_result = self.score_devices(request, active_quantizer.as_ref(), &chunks, &mut scores);
             let cleanup_result = self.release_chunks(&chunks);
             score_result?;
             cleanup_result?;
@@ -531,6 +541,7 @@ impl Engine {
     fn score_devices(
         &mut self,
         request: &Request,
+        active_quantizer: Option<&ActiveQuantizer>,
         chunks: &[Vec<ResidentTensor>],
         scores: &mut [Option<f32>],
     ) -> Result<()> {
@@ -540,18 +551,27 @@ impl Engine {
                 if chunk.is_empty() {
                     continue;
                 }
+                if let Some(active) = active_quantizer {
+                    device.gpu.ensure_quantizer(&active.contract_id, &active.quantizer.payload,
+                        active.quantizer.dimension, active.quantizer.stages,
+                        active.quantizer.subspaces, active.quantizer.centroids,
+                        active.quantizer.rotation_mask)?;
+                }
                 workers.push(scope.spawn(move || -> Result<Vec<(usize, f32)>> {
                     let offsets = chunk.iter().map(|item| item.offset).collect::<Vec<_>>();
                     let rows = chunk.iter().map(|item| item.rows).collect::<Vec<_>>();
-                    let computed = device.gpu.score(
-                        &request.query,
-                        request.query_rows,
-                        request.dimension,
-                        request.dtype,
-                        request.scoring_profile.native_code(),
-                        &offsets,
-                        &rows,
-                    )?;
+                    let computed = if let Some(active) = active_quantizer {
+                        device.gpu.score_pq(
+                            &active.contract_id, &request.query, request.query_rows,
+                            request.dtype, &offsets, &rows,
+                        )?
+                    } else {
+                        device.gpu.score(
+                            &request.query, request.query_rows, request.dimension,
+                            request.dtype, request.scoring_profile.native_code(),
+                            &offsets, &rows,
+                        )?
+                    };
                     Ok(chunk
                         .iter()
                         .zip(computed)
@@ -729,6 +749,7 @@ fn validate_entry(
     descriptor: &Descriptor,
     entry: &crate::cache::CacheEntry,
     profile: ScoringProfile,
+    active_quantizer: Option<&ActiveQuantizer>,
 ) -> Result<()> {
     let scalar_bytes = if descriptor.dtype == 1 { 4 } else { 2 };
     let exact_bytes = descriptor.rows as usize * descriptor.dimension as usize * scalar_bytes;
@@ -737,7 +758,11 @@ fn validate_entry(
         ScoringProfile::Int8 | ScoringProfile::Fp8E4m3 => {
             scaled_payload_bytes(descriptor.rows, descriptor.dimension)?
         }
-        _ => bail!("unsupported GPU cache scoring profile"),
+        ScoringProfile::Pq | ScoringProfile::OpqRpq => {
+            let quantizer = active_quantizer.ok_or_else(|| anyhow!("PQ cache entry has no active quantizer"))?;
+            descriptor.rows as usize * quantizer.quantizer.stages as usize
+                * quantizer.quantizer.subspaces as usize
+        }
     };
     if entry.rows != descriptor.rows
         || entry.dimension != descriptor.dimension

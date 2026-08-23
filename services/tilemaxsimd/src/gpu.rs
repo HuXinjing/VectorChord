@@ -10,10 +10,13 @@
 
 use anyhow::{Result, anyhow, bail};
 use std::ffi::{CStr, c_char, c_int, c_uchar, c_void};
+use std::collections::HashMap;
 use std::ptr::NonNull;
 
 #[repr(C)]
 struct NativeGpu(c_void);
+#[repr(C)]
+struct NativeQuantizer(c_void);
 
 unsafe extern "C" {
     fn vctm_gpu_create(
@@ -26,6 +29,20 @@ unsafe extern "C" {
     ) -> c_int;
     fn vctm_gpu_destroy(gpu: *mut NativeGpu);
     fn vctm_gpu_tensor_bytes(gpu: *const NativeGpu) -> usize;
+    fn vctm_quantizer_create(
+        device: c_int,
+        payload: *const c_uchar,
+        payload_bytes: usize,
+        dimension: u32,
+        stages: u16,
+        subspaces: u16,
+        centroids: u16,
+        rotation_mask: u16,
+        output: *mut *mut NativeQuantizer,
+        error: *mut c_char,
+        error_capacity: usize,
+    ) -> c_int;
+    fn vctm_quantizer_destroy(quantizer: *mut NativeQuantizer);
     fn vctm_gpu_upload_batch(
         gpu: *mut NativeGpu,
         offsets: *const u64,
@@ -50,12 +67,27 @@ unsafe extern "C" {
         error: *mut c_char,
         error_capacity: usize,
     ) -> c_int;
+    fn vctm_gpu_score_pq(
+        gpu: *mut NativeGpu,
+        quantizer: *const NativeQuantizer,
+        query: *const c_uchar,
+        query_bytes: usize,
+        query_rows: u32,
+        dtype: u8,
+        document_offsets: *const u64,
+        document_rows: *const u32,
+        count: usize,
+        output: *mut f32,
+        error: *mut c_char,
+        error_capacity: usize,
+    ) -> c_int;
 }
 
 pub struct Gpu {
     native: NonNull<NativeGpu>,
     device: i32,
     tensor_bytes: usize,
+    quantizers: HashMap<String, NonNull<NativeQuantizer>>,
 }
 
 // SAFETY: `Gpu` uniquely owns the native handle. It may move to a scoped
@@ -87,6 +119,7 @@ impl Gpu {
             native,
             device,
             tensor_bytes,
+            quantizers: HashMap::new(),
         })
     }
 
@@ -96,6 +129,47 @@ impl Gpu {
 
     pub fn tensor_bytes(&self) -> usize {
         self.tensor_bytes
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn ensure_quantizer(
+        &mut self,
+        contract_id: &str,
+        payload: &[u8],
+        dimension: u32,
+        stages: u16,
+        subspaces: u16,
+        centroids: u16,
+        rotation_mask: u16,
+    ) -> Result<()> {
+        if self.quantizers.contains_key(contract_id) {
+            return Ok(());
+        }
+        let mut native = std::ptr::null_mut();
+        let mut error = [0_i8; 512];
+        let status = unsafe {
+            vctm_quantizer_create(
+                self.device,
+                payload.as_ptr(),
+                payload.len(),
+                dimension,
+                stages,
+                subspaces,
+                centroids,
+                rotation_mask,
+                &mut native,
+                error.as_mut_ptr(),
+                error.len(),
+            )
+        };
+        if status != 0 {
+            bail!(native_error(&error));
+        }
+        self.quantizers.insert(
+            contract_id.to_owned(),
+            NonNull::new(native).ok_or_else(|| anyhow!("CUDA returned a null quantizer"))?,
+        );
+        Ok(())
     }
 
     pub fn upload_batch(&mut self, items: &[(u64, &[u8])]) -> Result<()> {
@@ -165,10 +239,38 @@ impl Gpu {
         }
         Ok(output)
     }
+
+    pub fn score_pq(
+        &mut self,
+        contract_id: &str,
+        query: &[u8],
+        query_rows: u32,
+        dtype: u8,
+        document_offsets: &[u64],
+        document_rows: &[u32],
+    ) -> Result<Vec<f32>> {
+        let quantizer = self.quantizers.get(contract_id)
+            .ok_or_else(|| anyhow!("PQ quantizer is not resident on this GPU"))?;
+        if document_offsets.len() != document_rows.len() || document_offsets.is_empty() {
+            bail!("invalid PQ document metadata");
+        }
+        let mut output = vec![0.0_f32; document_offsets.len()];
+        let mut error = [0_i8; 512];
+        let status = unsafe { vctm_gpu_score_pq(
+            self.native.as_ptr(), quantizer.as_ptr(), query.as_ptr(), query.len(),
+            query_rows, dtype, document_offsets.as_ptr(), document_rows.as_ptr(),
+            document_offsets.len(), output.as_mut_ptr(), error.as_mut_ptr(), error.len()) };
+        if status != 0 { bail!(native_error(&error)); }
+        if output.iter().any(|score| !score.is_finite()) { bail!("native PQ TileMaxSim returned a non-finite score"); }
+        Ok(output)
+    }
 }
 
 impl Drop for Gpu {
     fn drop(&mut self) {
+        for (_, quantizer) in self.quantizers.drain() {
+            unsafe { vctm_quantizer_destroy(quantizer.as_ptr()) };
+        }
         // SAFETY: this is the unique owned native pointer.
         unsafe { vctm_gpu_destroy(self.native.as_ptr()) };
     }
@@ -229,5 +331,53 @@ mod tests {
             .score(&query, 2, 2, 1, 3, &[0], &[2])
             .unwrap();
         assert!((scores[0] - 2.0).abs() < 1e-5, "scores={scores:?}");
+    }
+
+
+    fn pq_gpu() -> Gpu {
+        let device = std::env::var("VCTM_TEST_GPU").unwrap_or_else(|_| "0".to_owned()).parse().unwrap();
+        Gpu::create(device, 64 * 1024 * 1024, 32 * 1024 * 1024).unwrap()
+    }
+
+    fn f32_payload(values: &[f32]) -> Vec<u8> {
+        values.iter().copied().flat_map(f32::to_le_bytes).collect()
+    }
+
+    #[test]
+    #[ignore = "requires an explicitly assigned CUDA device"]
+    fn native_pq_adc_maxsim_matches_identity_oracle() {
+        let mut gpu = pq_gpu();
+        gpu.ensure_quantizer("pq", &f32_payload(&[1.0, 0.0, 0.0, 1.0]), 2, 1, 1, 2, 0).unwrap();
+        gpu.upload_batch(&[(0, &[0_u8, 1])]).unwrap();
+        let query = f32_payload(&[1.0, 0.0, 0.0, 1.0]);
+        let scores = gpu.score_pq("pq", &query, 2, 1, &[0], &[2]).unwrap();
+        assert!((scores[0] - 2.0).abs() < 1e-5, "scores={scores:?}");
+    }
+
+    #[test]
+    #[ignore = "requires an explicitly assigned CUDA device"]
+    fn native_opq_rotation_is_applied_before_adc() {
+        let mut gpu = pq_gpu();
+        // Swap-coordinate rotation, followed by identity centroids.
+        let payload = f32_payload(&[0.0, 1.0, 1.0, 0.0, 1.0, 0.0, 0.0, 1.0]);
+        gpu.ensure_quantizer("opq", &payload, 2, 1, 1, 2, 1).unwrap();
+        gpu.upload_batch(&[(0, &[1_u8, 0])]).unwrap();
+        let query = f32_payload(&[1.0, 0.0, 0.0, 1.0]);
+        let scores = gpu.score_pq("opq", &query, 2, 1, &[0], &[2]).unwrap();
+        assert!((scores[0] - 2.0).abs() < 1e-5, "scores={scores:?}");
+    }
+
+    #[test]
+    #[ignore = "requires an explicitly assigned CUDA device"]
+    fn native_residual_pq_accumulates_all_stages_before_max() {
+        let mut gpu = pq_gpu();
+        // Stage 0 contributes identity; stage 1 contributes 0.5 * identity.
+        let payload = f32_payload(&[1.0, 0.0, 0.0, 1.0, 0.5, 0.0, 0.0, 0.5]);
+        gpu.ensure_quantizer("rpq", &payload, 2, 2, 1, 2, 0).unwrap();
+        // row-major [row][stage][subspace]
+        gpu.upload_batch(&[(0, &[0_u8, 0, 1, 1])]).unwrap();
+        let query = f32_payload(&[1.0, 0.0, 0.0, 1.0]);
+        let scores = gpu.score_pq("rpq", &query, 2, 1, &[0], &[2]).unwrap();
+        assert!((scores[0] - 3.0).abs() < 1e-5, "scores={scores:?}");
     }
 }
