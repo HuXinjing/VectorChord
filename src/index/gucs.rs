@@ -39,6 +39,26 @@ pub enum PostgresMaxsimBackend {
     Auto,
 }
 
+/// Physical scoring representation requested from TileMaxSim.
+///
+/// This is deliberately independent of `maxsim_backend`: callers may choose
+/// where scoring runs and how tensors are represented as two orthogonal
+/// decisions.  The daemon rejects profiles it has not enabled; it must never
+/// silently substitute a lower-quality representation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PostgresGucEnum)]
+pub enum PostgresMaxsimScoringProfile {
+    #[name = c"exact_fp16"]
+    ExactFp16,
+    #[name = c"int8"]
+    Int8,
+    #[name = c"fp8_e4m3"]
+    Fp8E4m3,
+    #[name = c"pq"]
+    Pq,
+    #[name = c"opq_rpq"]
+    OpqRpq,
+}
+
 static VCHORDRQ_QUERY_SAMPLING_ENABLE: GucSetting<bool> = GucSetting::<bool>::new(false);
 
 static VCHORDRQ_QUERY_SAMPLING_MAX_RECORDS: GucSetting<i32> = GucSetting::<i32>::new(0);
@@ -100,6 +120,9 @@ static VCHORDRQ_MAXSIM_PLANNER_DOCUMENT_TOKENS: GucSetting<i32> = GucSetting::<i
 
 static VCHORDRQ_MAXSIM_BACKEND: GucSetting<PostgresMaxsimBackend> =
     GucSetting::<PostgresMaxsimBackend>::new(PostgresMaxsimBackend::CoarseOnly);
+
+static VCHORDRQ_MAXSIM_SCORING_PROFILE: GucSetting<PostgresMaxsimScoringProfile> =
+    GucSetting::<PostgresMaxsimScoringProfile>::new(PostgresMaxsimScoringProfile::ExactFp16);
 
 static VCHORDRQ_MAXSIM_GPU_ENDPOINT: GucSetting<Option<CString>> =
     GucSetting::<Option<CString>>::new(Some(c""));
@@ -231,6 +254,14 @@ pub fn init() {
         c"Page-level MaxSim rerank backend.",
         c"GPU and auto modes require the native sidecar integration.",
         &VCHORDRQ_MAXSIM_BACKEND,
+        GucContext::Userset,
+        GucFlags::default(),
+    );
+    GucRegistry::define_enum_guc(
+        c"vchordrq.maxsim_scoring_profile",
+        c"TileMaxSim tensor representation and scoring kernel.",
+        c"Set transaction-locally for each request; unavailable profiles fail instead of silently degrading.",
+        &VCHORDRQ_MAXSIM_SCORING_PROFILE,
         GucContext::Userset,
         GucFlags::default(),
     );
@@ -633,6 +664,10 @@ pub fn vchordrq_maxsim_planner_document_tokens() -> u32 {
 
 pub fn vchordrq_maxsim_backend() -> PostgresMaxsimBackend {
     VCHORDRQ_MAXSIM_BACKEND.get()
+}
+
+pub fn vchordrq_maxsim_scoring_profile() -> PostgresMaxsimScoringProfile {
+    VCHORDRQ_MAXSIM_SCORING_PROFILE.get()
 }
 
 pub fn vchordrq_maxsim_gpu_endpoint() -> Option<CString> {

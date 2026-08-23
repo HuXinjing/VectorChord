@@ -54,6 +54,32 @@ TileMaxSim 是可选功能。传统单向量通路不会启动 CUDA daemon，也
 启用时，`tilemaxsimd` 会在启动阶段一次性预占用户指定设备上的 GiB 级显存；任何
 设备或容量无法获得都会直接退出。
 
+## 上层应用调用契约
+
+NeoClaw/GBrain 等上层应用可以在一个事务内选择检索路径，连接池不会继承
+`SET LOCAL` 的请求参数：
+
+```sql
+BEGIN;
+SET LOCAL vchordrq.maxsim_backend = 'gpu';
+SET LOCAL vchordrq.maxsim_scoring_profile = 'exact_fp16';
+SET LOCAL vchordrq.maxsim_tenant = 'scheduler-domain';
+SET LOCAL vchordrq.maxsim_priority = 20;
+-- 调用 vchordrq_tilemaxsim_search 或 vchordrq_tilemaxsim_rerank
+COMMIT;
+```
+
+`maxsim_backend` 决定运行位置，`maxsim_scoring_profile` 独立决定张量表示和打分
+kernel。可选 profile 为 `exact_fp16`、`int8`、`fp8_e4m3`、`pq` 和
+`opq_rpq`。当前原生 daemon 只启用 `exact_fp16`；其他 profile 已进入协议和
+实验 contract，但在对应持久格式、迁移和原生 kernel 接通前会明确报错。系统绝不
+静默改用另一精度。默认 backend 仍为 `coarse_only`，所以未显式启用 TileMaxSim
+的应用不需要 GPU。
+
+候选范围与打分精度是另外两个独立决策：GBrain 可以传入结构化关系范围、授权范围
+或普通语义查询的全 source 范围；VectorChord 不会把 scheduler tenant 当成权限，
+也不会用量化粗排暗中裁掉调用方给出的候选。
+
 ## 架构
 
 ```text

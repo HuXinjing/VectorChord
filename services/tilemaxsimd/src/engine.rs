@@ -227,6 +227,12 @@ impl Engine {
     }
 
     pub fn score(&mut self, request: &Request) -> Result<Vec<(u32, f32)>> {
+        if request.scoring_profile != crate::protocol::ScoringProfile::ExactFp16 {
+            anyhow::bail!(
+                "requested TileMaxSim scoring profile {:?} is not enabled by the native daemon",
+                request.scoring_profile
+            );
+        }
         if request.candidates.is_empty() {
             return Ok(Vec::new());
         }

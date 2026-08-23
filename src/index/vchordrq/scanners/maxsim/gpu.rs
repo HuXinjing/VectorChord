@@ -13,6 +13,7 @@ use super::external::{
     CandidateTensorDescriptorSource, ExternalTensorDescriptor, ExternalTensorDtype,
 };
 use super::rerank::{CandidateTensorSource, ExactMaxsimBackend, RerankError, RerankResults};
+use crate::index::gucs::PostgresMaxsimScoringProfile;
 use distance::Distance;
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
@@ -27,6 +28,7 @@ const MAGIC: &[u8; 4] = b"VCTM";
 const VERSION: u16 = 1;
 const EXTERNAL_VERSION: u16 = 2;
 const SCHEDULED_EXTERNAL_VERSION: u16 = 3;
+const PROFILED_EXTERNAL_VERSION: u16 = 4;
 const REQUEST_KIND: u16 = 1;
 const RESPONSE_KIND: u16 = 2;
 const HEADER_LEN: usize = 24;
@@ -139,6 +141,7 @@ pub(super) struct GpuExternalTileMaxsimBackend<T> {
     max_batch_tokens: usize,
     max_batch_bytes: usize,
     scheduling: Option<TileMaxsimScheduling>,
+    scoring_profile: PostgresMaxsimScoringProfile,
 }
 
 #[derive(Clone, Debug)]
@@ -162,7 +165,16 @@ impl<T> GpuExternalTileMaxsimBackend<T> {
             max_batch_tokens,
             max_batch_bytes,
             scheduling: None,
+            scoring_profile: PostgresMaxsimScoringProfile::ExactFp16,
         }
+    }
+
+    pub(super) fn with_scoring_profile(
+        mut self,
+        scoring_profile: PostgresMaxsimScoringProfile,
+    ) -> Self {
+        self.scoring_profile = scoring_profile;
+        self
     }
 
     pub(super) fn with_scheduling(mut self, tenant: String, priority: i32) -> Self {
@@ -234,6 +246,7 @@ impl<T: TileMaxsimTransport> GpuExternalTileMaxsimBackend<T> {
                 self.max_batch_tokens,
                 self.max_batch_bytes,
                 self.scheduling.as_ref(),
+                self.scoring_profile,
                 remaining,
             )?;
             let max_response_bytes = HEADER_LEN
@@ -295,6 +308,7 @@ fn encode_external_request<S: CandidateTensorDescriptorSource>(
         max_batch_tokens,
         max_batch_bytes,
         scheduling,
+        PostgresMaxsimScoringProfile::ExactFp16,
         timeout,
     )
 }
@@ -307,6 +321,7 @@ fn encode_external_descriptors(
     max_batch_tokens: usize,
     max_batch_bytes: usize,
     scheduling: Option<&TileMaxsimScheduling>,
+    scoring_profile: PostgresMaxsimScoringProfile,
     timeout: Duration,
 ) -> Result<EncodedRequest, RerankError> {
     if model_contract_id.is_empty()
@@ -344,6 +359,10 @@ fn encode_external_descriptors(
     }
 
     let mut writer = BoundedWriter::new(max_batch_bytes);
+    let profiled =
+        scheduling.is_some() || scoring_profile != PostgresMaxsimScoringProfile::ExactFp16;
+    let tenant = scheduling.map_or("__default__", |value| value.tenant.as_str());
+    let priority = scheduling.map_or(0, |value| value.priority);
     writer.zeros(HEADER_LEN)?;
     writer.u32(dimension)?;
     writer.u32(query_rows)?;
@@ -351,25 +370,28 @@ fn encode_external_descriptors(
     writer.u32(0)?;
     writer.u8(dtype as u8)?;
     writer.u8(1)?; // sum_query_max_document_dot
-    writer.u16(0)?;
+    if profiled {
+        writer.u8(scoring_profile_code(scoring_profile))?;
+        writer.u8(0)?;
+    } else {
+        writer.u16(0)?;
+    }
     writer
         .u32(u32::try_from(model_contract_id.len()).map_err(|_| RerankError::RequestTooLarge)?)?;
-    let version = if let Some(scheduling) = scheduling {
-        writer.i32(scheduling.priority)?;
+    let version = if profiled {
+        writer.i32(priority)?;
         writer.u32(
             u32::try_from(timeout.as_millis().clamp(1, 600_000))
                 .map_err(|_| RerankError::RequestTooLarge)?,
         )?;
-        writer.u32(
-            u32::try_from(scheduling.tenant.len()).map_err(|_| RerankError::RequestTooLarge)?,
-        )?;
-        SCHEDULED_EXTERNAL_VERSION
+        writer.u32(u32::try_from(tenant.len()).map_err(|_| RerankError::RequestTooLarge)?)?;
+        PROFILED_EXTERNAL_VERSION
     } else {
         EXTERNAL_VERSION
     };
     writer.bytes(model_contract_id.as_bytes())?;
-    if let Some(scheduling) = scheduling {
-        writer.bytes(scheduling.tenant.as_bytes())?;
+    if profiled {
+        writer.bytes(tenant.as_bytes())?;
     }
     encode_tensor_values(&mut writer, query, dtype)?;
 
@@ -433,6 +455,16 @@ fn encode_external_descriptors(
         heap_keys,
         version,
     })
+}
+
+fn scoring_profile_code(profile: PostgresMaxsimScoringProfile) -> u8 {
+    match profile {
+        PostgresMaxsimScoringProfile::ExactFp16 => 1,
+        PostgresMaxsimScoringProfile::Int8 => 2,
+        PostgresMaxsimScoringProfile::Fp8E4m3 => 3,
+        PostgresMaxsimScoringProfile::Pq => 4,
+        PostgresMaxsimScoringProfile::OpqRpq => 5,
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1432,7 +1464,10 @@ mod tests {
                 let call = observations.candidate_counts.len();
                 observations.candidate_counts.push(candidate_count);
                 observations.transport_timeouts.push(timeout);
-                if version == SCHEDULED_EXTERNAL_VERSION {
+                if matches!(
+                    version,
+                    SCHEDULED_EXTERNAL_VERSION | PROFILED_EXTERNAL_VERSION
+                ) {
                     observations
                         .scheduled_timeouts_ms
                         .push(u32::from_le_bytes(request[48..52].try_into().unwrap()));
@@ -1772,10 +1807,10 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(encoded.version, SCHEDULED_EXTERNAL_VERSION);
+        assert_eq!(encoded.version, PROFILED_EXTERNAL_VERSION);
         assert_eq!(
             u16::from_le_bytes(encoded.frame[4..6].try_into().unwrap()),
-            SCHEDULED_EXTERNAL_VERSION
+            PROFILED_EXTERNAL_VERSION
         );
         assert_eq!(
             i32::from_le_bytes(encoded.frame[44..48].try_into().unwrap()),

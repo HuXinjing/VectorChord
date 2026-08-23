@@ -1193,6 +1193,7 @@ fn run_scheduler(
                 query_rows: work.request.query_rows,
                 dimension: work.request.dimension,
                 dtype: work.request.dtype,
+                scoring_profile: work.request.scoring_profile,
                 query: work.request.query.clone(),
                 candidates: work.request.candidates[work.next_candidate..end].to_vec(),
             };

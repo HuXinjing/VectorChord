@@ -145,6 +145,36 @@ operator enables TileMaxSim, `tilemaxsimd` reserves exactly the configured
 CUDA devices and GiB allocations at startup and fails closed if any allocation
 cannot be obtained.
 
+## Application request contract
+
+Applications such as NeoClaw/GBrain select a path transaction-locally, which
+also keeps request settings from leaking through a connection pool:
+
+```sql
+BEGIN;
+SET LOCAL vchordrq.maxsim_backend = 'gpu';
+SET LOCAL vchordrq.maxsim_scoring_profile = 'exact_fp16';
+SET LOCAL vchordrq.maxsim_tenant = 'scheduler-domain';
+SET LOCAL vchordrq.maxsim_priority = 20;
+-- call vchordrq_tilemaxsim_search or vchordrq_tilemaxsim_rerank
+COMMIT;
+```
+
+`maxsim_backend` selects where scoring runs; `maxsim_scoring_profile`
+independently selects the tensor representation and kernel. The public profile
+names are `exact_fp16`, `int8`, `fp8_e4m3`, `pq`, and `opq_rpq`. The native
+daemon currently enables only `exact_fp16`. The remaining profiles are present
+in the request and experiment contracts, but fail explicitly until their
+persistent formats, migrations, and native kernels are connected. No request
+is silently substituted with another precision. The default backend remains
+`coarse_only`, so applications that do not opt into TileMaxSim need no GPU.
+
+Candidate scope and scoring precision remain separate decisions. GBrain may
+submit a structured relationship scope, an authorized scope, or the full
+source scope for ordinary semantic retrieval. VectorChord does not treat a
+scheduler tenant as authorization and does not use quantized coarse ranking to
+silently remove caller-supplied candidates.
+
 The default `fair-priority` scheduler combines explicit request urgency with
 weighted tenant fairness. Higher numeric priority is more urgent; requests in
 the configured priority band are selected by normalized GPU service consumed,

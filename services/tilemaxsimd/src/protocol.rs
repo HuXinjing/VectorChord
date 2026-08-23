@@ -14,6 +14,7 @@ use std::collections::HashSet;
 pub const HEADER_BYTES: usize = 24;
 pub const VERSION_EXTERNAL: u16 = 2;
 pub const VERSION_SCHEDULED_EXTERNAL: u16 = 3;
+pub const VERSION_PROFILED_EXTERNAL: u16 = 4;
 const MAGIC: &[u8; 4] = b"VCTM";
 const REQUEST_KIND: u16 = 1;
 const RESPONSE_KIND: u16 = 2;
@@ -42,8 +43,31 @@ pub struct Request {
     pub query_rows: u32,
     pub dimension: u32,
     pub dtype: u8,
+    pub scoring_profile: ScoringProfile,
     pub query: Vec<u8>,
     pub candidates: Vec<Descriptor>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ScoringProfile {
+    ExactFp16,
+    Int8,
+    Fp8E4m3,
+    Pq,
+    OpqRpq,
+}
+
+impl ScoringProfile {
+    fn parse(value: u8) -> Result<Self> {
+        Ok(match value {
+            1 => Self::ExactFp16,
+            2 => Self::Int8,
+            3 => Self::Fp8E4m3,
+            4 => Self::Pq,
+            5 => Self::OpqRpq,
+            _ => bail!("unsupported TileMaxSim scoring profile"),
+        })
+    }
 }
 
 struct Reader<'a> {
@@ -148,8 +172,8 @@ pub fn parse(frame: &[u8]) -> Result<Request> {
     let kind = u16::from_le_bytes(frame[6..8].try_into().unwrap());
     let request_id = u64::from_le_bytes(frame[8..16].try_into().unwrap());
     let body_bytes = u64::from_le_bytes(frame[16..24].try_into().unwrap());
-    if !matches!(version, VERSION_EXTERNAL | VERSION_SCHEDULED_EXTERNAL) || kind != REQUEST_KIND {
-        bail!("Rust daemon requires TileMaxSim external protocol v2 or v3");
+    if !matches!(version, VERSION_EXTERNAL | VERSION_SCHEDULED_EXTERNAL | VERSION_PROFILED_EXTERNAL) || kind != REQUEST_KIND {
+        bail!("Rust daemon requires TileMaxSim external protocol v2, v3, or v4");
     }
     if usize::try_from(body_bytes).ok() != Some(frame.len() - HEADER_BYTES) {
         bail!("request body length mismatch");
@@ -160,15 +184,26 @@ pub fn parse(frame: &[u8]) -> Result<Request> {
     let candidate_count = reader.u32()?;
     let dtype = reader.u8()?;
     let scoring = reader.u8()?;
-    let reserved = reader.u16()?;
+    let scoring_profile = if version == VERSION_PROFILED_EXTERNAL {
+        let profile = ScoringProfile::parse(reader.u8()?)?;
+        if reader.u8()? != 0 {
+            bail!("unsupported reserved bits");
+        }
+        profile
+    } else {
+        if reader.u16()? != 0 {
+            bail!("unsupported reserved bits");
+        }
+        ScoringProfile::ExactFp16
+    };
     let contract_bytes = reader.u32()? as usize;
-    if scoring != 1 || reserved != 0 {
+    if scoring != 1 {
         bail!("unsupported scoring function or reserved bits");
     }
     if candidate_count > 65_536 {
         bail!("too many candidates");
     }
-    let (priority, timeout_ms, tenant_bytes) = if version == VERSION_SCHEDULED_EXTERNAL {
+    let (priority, timeout_ms, tenant_bytes) = if matches!(version, VERSION_SCHEDULED_EXTERNAL | VERSION_PROFILED_EXTERNAL) {
         (reader.i32()?, reader.u32()?, reader.u32()? as usize)
     } else {
         (0, 0, 0)
@@ -176,11 +211,11 @@ pub fn parse(frame: &[u8]) -> Result<Request> {
     if !(-100..=100).contains(&priority) {
         bail!("scheduler priority must be between -100 and 100");
     }
-    if version == VERSION_SCHEDULED_EXTERNAL && !(1..=600_000).contains(&timeout_ms) {
+    if matches!(version, VERSION_SCHEDULED_EXTERNAL | VERSION_PROFILED_EXTERNAL) && !(1..=600_000).contains(&timeout_ms) {
         bail!("scheduler timeout must be between 1 and 600000 milliseconds");
     }
     let contract = reader.text(contract_bytes, 512, "model contract")?;
-    let tenant = if version == VERSION_SCHEDULED_EXTERNAL {
+    let tenant = if matches!(version, VERSION_SCHEDULED_EXTERNAL | VERSION_PROFILED_EXTERNAL) {
         reader.text(tenant_bytes, 256, "scheduler tenant")?
     } else {
         "__default__".to_owned()
@@ -242,6 +277,7 @@ pub fn parse(frame: &[u8]) -> Result<Request> {
         query_rows,
         dimension,
         dtype,
+        scoring_profile,
         query,
         candidates,
     })
@@ -285,6 +321,16 @@ mod tests {
     use super::*;
 
     fn scheduled_frame(priority: i32, timeout_ms: u32, tenant: &str) -> Vec<u8> {
+        profiled_frame(VERSION_SCHEDULED_EXTERNAL, 0, priority, timeout_ms, tenant)
+    }
+
+    fn profiled_frame(
+        version: u16,
+        profile: u8,
+        priority: i32,
+        timeout_ms: u32,
+        tenant: &str,
+    ) -> Vec<u8> {
         let contract = "model@1";
         let digest = "a".repeat(64);
         let reference = format!("sha256://{digest}");
@@ -295,7 +341,12 @@ mod tests {
         body.extend_from_slice(&1_u32.to_le_bytes());
         body.push(2);
         body.push(1);
-        body.extend_from_slice(&0_u16.to_le_bytes());
+        if version == VERSION_PROFILED_EXTERNAL {
+            body.push(profile);
+            body.push(0);
+        } else {
+            body.extend_from_slice(&0_u16.to_le_bytes());
+        }
         body.extend_from_slice(&(contract.len() as u32).to_le_bytes());
         body.extend_from_slice(&priority.to_le_bytes());
         body.extend_from_slice(&timeout_ms.to_le_bytes());
@@ -312,7 +363,7 @@ mod tests {
         body.extend_from_slice(checksum.as_bytes());
         let mut frame = Vec::new();
         frame.extend_from_slice(MAGIC);
-        frame.extend_from_slice(&VERSION_SCHEDULED_EXTERNAL.to_le_bytes());
+        frame.extend_from_slice(&version.to_le_bytes());
         frame.extend_from_slice(&REQUEST_KIND.to_le_bytes());
         frame.extend_from_slice(&42_u64.to_le_bytes());
         frame.extend_from_slice(&(body.len() as u64).to_le_bytes());
@@ -334,6 +385,34 @@ mod tests {
     #[test]
     fn scheduled_protocol_rejects_priority_outside_the_public_contract() {
         assert!(parse(&scheduled_frame(101, 4_000, "tenant-a")).is_err());
+    }
+
+    #[test]
+    fn profiled_protocol_carries_an_explicit_quantized_profile() {
+        let request = parse(&profiled_frame(
+            VERSION_PROFILED_EXTERNAL,
+            2,
+            17,
+            4_000,
+            "tenant-a",
+        ))
+        .unwrap();
+        assert_eq!(request.scoring_profile, ScoringProfile::Int8);
+        assert_eq!(request.tenant, "tenant-a");
+    }
+
+    #[test]
+    fn profiled_protocol_rejects_unknown_profiles() {
+        assert!(
+            parse(&profiled_frame(
+                VERSION_PROFILED_EXTERNAL,
+                99,
+                0,
+                4_000,
+                "tenant-a",
+            ))
+            .is_err()
+        );
     }
 
     #[test]
