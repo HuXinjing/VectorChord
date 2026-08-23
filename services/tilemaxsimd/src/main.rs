@@ -20,7 +20,8 @@ use clap::Parser;
 use engine::{Engine, EngineStatus};
 use gpu::Gpu;
 use protocol::{
-    HEADER_BYTES, VERSION_EXTERNAL, VERSION_PROFILED_EXTERNAL, VERSION_SCHEDULED_EXTERNAL,
+    HEADER_BYTES, VERSION_EXTERNAL, VERSION_PROFILED_EXTERNAL, VERSION_QUANTIZED_EXTERNAL,
+    VERSION_SCHEDULED_EXTERNAL,
 };
 use scheduler::{RequestQueue, Scheduled, SchedulerPolicy};
 use serde::Deserialize;
@@ -1196,6 +1197,7 @@ fn run_scheduler(
                 dimension: work.request.dimension,
                 dtype: work.request.dtype,
                 scoring_profile: work.request.scoring_profile,
+                quantization_contract: work.request.quantization_contract.clone(),
                 query: work.request.query.clone(),
                 candidates: work.request.candidates[work.next_candidate..end].to_vec(),
             };
@@ -2114,6 +2116,7 @@ fn header_version(frame: &[u8]) -> u16 {
         match u16::from_le_bytes(frame[4..6].try_into().unwrap()) {
             VERSION_SCHEDULED_EXTERNAL => VERSION_SCHEDULED_EXTERNAL,
             VERSION_PROFILED_EXTERNAL => VERSION_PROFILED_EXTERNAL,
+            VERSION_QUANTIZED_EXTERNAL => VERSION_QUANTIZED_EXTERNAL,
             _ => VERSION_EXTERNAL,
         }
     }

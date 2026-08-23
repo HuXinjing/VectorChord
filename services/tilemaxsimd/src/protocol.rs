@@ -15,6 +15,7 @@ pub const HEADER_BYTES: usize = 24;
 pub const VERSION_EXTERNAL: u16 = 2;
 pub const VERSION_SCHEDULED_EXTERNAL: u16 = 3;
 pub const VERSION_PROFILED_EXTERNAL: u16 = 4;
+pub const VERSION_QUANTIZED_EXTERNAL: u16 = 5;
 const MAGIC: &[u8; 4] = b"VCTM";
 const REQUEST_KIND: u16 = 1;
 const RESPONSE_KIND: u16 = 2;
@@ -44,6 +45,7 @@ pub struct Request {
     pub dimension: u32,
     pub dtype: u8,
     pub scoring_profile: ScoringProfile,
+    pub quantization_contract: Option<String>,
     pub query: Vec<u8>,
     pub candidates: Vec<Descriptor>,
 }
@@ -192,8 +194,8 @@ pub fn parse(frame: &[u8]) -> Result<Request> {
     let kind = u16::from_le_bytes(frame[6..8].try_into().unwrap());
     let request_id = u64::from_le_bytes(frame[8..16].try_into().unwrap());
     let body_bytes = u64::from_le_bytes(frame[16..24].try_into().unwrap());
-    if !matches!(version, VERSION_EXTERNAL | VERSION_SCHEDULED_EXTERNAL | VERSION_PROFILED_EXTERNAL) || kind != REQUEST_KIND {
-        bail!("Rust daemon requires TileMaxSim external protocol v2, v3, or v4");
+    if !matches!(version, VERSION_EXTERNAL | VERSION_SCHEDULED_EXTERNAL | VERSION_PROFILED_EXTERNAL | VERSION_QUANTIZED_EXTERNAL) || kind != REQUEST_KIND {
+        bail!("Rust daemon requires TileMaxSim external protocol v2 through v5");
     }
     if usize::try_from(body_bytes).ok() != Some(frame.len() - HEADER_BYTES) {
         bail!("request body length mismatch");
@@ -204,7 +206,7 @@ pub fn parse(frame: &[u8]) -> Result<Request> {
     let candidate_count = reader.u32()?;
     let dtype = reader.u8()?;
     let scoring = reader.u8()?;
-    let scoring_profile = if version == VERSION_PROFILED_EXTERNAL {
+    let scoring_profile = if matches!(version, VERSION_PROFILED_EXTERNAL | VERSION_QUANTIZED_EXTERNAL) {
         let profile = ScoringProfile::parse(reader.u8()?)?;
         if reader.u8()? != 0 {
             bail!("unsupported reserved bits");
@@ -217,13 +219,18 @@ pub fn parse(frame: &[u8]) -> Result<Request> {
         ScoringProfile::ExactFp16
     };
     let contract_bytes = reader.u32()? as usize;
+    let quantization_contract_bytes = if version == VERSION_QUANTIZED_EXTERNAL {
+        reader.u32()? as usize
+    } else {
+        0
+    };
     if scoring != 1 {
         bail!("unsupported scoring function or reserved bits");
     }
     if candidate_count > 65_536 {
         bail!("too many candidates");
     }
-    let (priority, timeout_ms, tenant_bytes) = if matches!(version, VERSION_SCHEDULED_EXTERNAL | VERSION_PROFILED_EXTERNAL) {
+    let (priority, timeout_ms, tenant_bytes) = if matches!(version, VERSION_SCHEDULED_EXTERNAL | VERSION_PROFILED_EXTERNAL | VERSION_QUANTIZED_EXTERNAL) {
         (reader.i32()?, reader.u32()?, reader.u32()? as usize)
     } else {
         (0, 0, 0)
@@ -231,11 +238,28 @@ pub fn parse(frame: &[u8]) -> Result<Request> {
     if !(-100..=100).contains(&priority) {
         bail!("scheduler priority must be between -100 and 100");
     }
-    if matches!(version, VERSION_SCHEDULED_EXTERNAL | VERSION_PROFILED_EXTERNAL) && !(1..=600_000).contains(&timeout_ms) {
+    if matches!(version, VERSION_SCHEDULED_EXTERNAL | VERSION_PROFILED_EXTERNAL | VERSION_QUANTIZED_EXTERNAL) && !(1..=600_000).contains(&timeout_ms) {
         bail!("scheduler timeout must be between 1 and 600000 milliseconds");
     }
     let contract = reader.text(contract_bytes, 512, "model contract")?;
-    let tenant = if matches!(version, VERSION_SCHEDULED_EXTERNAL | VERSION_PROFILED_EXTERNAL) {
+    let quantization_contract = if version == VERSION_QUANTIZED_EXTERNAL {
+        let value = reader.text(quantization_contract_bytes, 128, "quantization contract")?;
+        if value.len() != 69
+            || !value.starts_with("qtc1-")
+            || !value[5..].bytes().all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+        {
+            bail!("invalid quantization contract ID");
+        }
+        Some(value)
+    } else {
+        None
+    };
+    if matches!(scoring_profile, ScoringProfile::Pq | ScoringProfile::OpqRpq)
+        != quantization_contract.is_some()
+    {
+        bail!("PQ-family profile and quantization contract must be supplied together");
+    }
+    let tenant = if matches!(version, VERSION_SCHEDULED_EXTERNAL | VERSION_PROFILED_EXTERNAL | VERSION_QUANTIZED_EXTERNAL) {
         reader.text(tenant_bytes, 256, "scheduler tenant")?
     } else {
         "__default__".to_owned()
@@ -298,6 +322,7 @@ pub fn parse(frame: &[u8]) -> Result<Request> {
         dimension,
         dtype,
         scoring_profile,
+        quantization_contract,
         query,
         candidates,
     })
@@ -391,6 +416,27 @@ mod tests {
         frame
     }
 
+    fn quantized_frame(profile: u8, contract_id: &str) -> Vec<u8> {
+        let mut frame = profiled_frame(VERSION_PROFILED_EXTERNAL, profile, 0, 4_000, "tenant-a");
+        let body = frame.split_off(HEADER_BYTES);
+        let model_len = u32::from_le_bytes(body[16..20].try_into().unwrap()) as usize;
+        let mut upgraded = Vec::with_capacity(body.len() + 4 + contract_id.len());
+        upgraded.extend_from_slice(&body[..20]);
+        upgraded.extend_from_slice(&(contract_id.len() as u32).to_le_bytes());
+        upgraded.extend_from_slice(&body[20..32]);
+        upgraded.extend_from_slice(&body[32..32 + model_len]);
+        upgraded.extend_from_slice(contract_id.as_bytes());
+        upgraded.extend_from_slice(&body[32 + model_len..]);
+        frame.truncate(0);
+        frame.extend_from_slice(MAGIC);
+        frame.extend_from_slice(&VERSION_QUANTIZED_EXTERNAL.to_le_bytes());
+        frame.extend_from_slice(&REQUEST_KIND.to_le_bytes());
+        frame.extend_from_slice(&42_u64.to_le_bytes());
+        frame.extend_from_slice(&(upgraded.len() as u64).to_le_bytes());
+        frame.extend_from_slice(&upgraded);
+        frame
+    }
+
     #[test]
     fn scheduled_protocol_carries_tenant_priority_and_deadline() {
         let request = parse(&scheduled_frame(17, 4_000, "tenant-a")).unwrap();
@@ -433,6 +479,19 @@ mod tests {
             ))
             .is_err()
         );
+    }
+
+    #[test]
+    fn quantized_protocol_binds_the_immutable_contract() {
+        let contract = format!("qtc1-{}", "a".repeat(64));
+        let request = parse(&quantized_frame(4, &contract)).unwrap();
+        assert_eq!(request.scoring_profile, ScoringProfile::Pq);
+        assert_eq!(request.quantization_contract.as_deref(), Some(contract.as_str()));
+    }
+
+    #[test]
+    fn pq_profile_without_a_contract_fails_closed() {
+        assert!(parse(&profiled_frame(VERSION_PROFILED_EXTERNAL, 4, 0, 4_000, "tenant-a")).is_err());
     }
 
     #[test]

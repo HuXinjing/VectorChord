@@ -137,7 +137,7 @@ impl Engine {
                 .collect::<Vec<_>>();
             let mut acquired = Vec::<(usize, String, bool)>::new();
             for (descriptor, payload) in batch.iter().zip(&payloads) {
-                let key = gpu_cache_key(descriptor, ScoringProfile::ExactFp16);
+                let key = gpu_cache_key(descriptor, ScoringProfile::ExactFp16, None);
                 if let Some((device, _)) =
                     self.devices
                         .iter_mut()
@@ -249,7 +249,11 @@ impl Engine {
         let mut first_candidate_by_key = HashMap::<String, usize>::new();
         let mut duplicate_candidates = Vec::<(usize, usize)>::new();
         for (index, descriptor) in request.candidates.iter().enumerate() {
-            let key = gpu_cache_key(descriptor, request.scoring_profile);
+            let key = gpu_cache_key(
+                descriptor,
+                request.scoring_profile,
+                request.quantization_contract.as_deref(),
+            );
             if let Some(first_index) = first_candidate_by_key.get(&key) {
                 duplicate_candidates.push((index, *first_index));
                 continue;
@@ -301,7 +305,11 @@ impl Engine {
                 let payload = encode_for_profile(&descriptor, payload, request.scoring_profile)?;
                 Ok(MissingTensor {
                     candidate_index,
-                    key: gpu_cache_key(&descriptor, request.scoring_profile),
+                    key: gpu_cache_key(
+                        &descriptor,
+                        request.scoring_profile,
+                        request.quantization_contract.as_deref(),
+                    ),
                     descriptor,
                     payload,
                 })
@@ -694,8 +702,17 @@ fn unique_descriptors(descriptors: &[Descriptor]) -> Vec<Descriptor> {
         .collect()
 }
 
-fn gpu_cache_key(descriptor: &Descriptor, profile: ScoringProfile) -> String {
-    format!("{}:{}", profile.cache_tag(), cache_key(descriptor))
+fn gpu_cache_key(
+    descriptor: &Descriptor,
+    profile: ScoringProfile,
+    quantization_contract: Option<&str>,
+) -> String {
+    format!(
+        "{}:{}:{}",
+        profile.cache_tag(),
+        quantization_contract.unwrap_or("-"),
+        cache_key(descriptor)
+    )
 }
 
 fn validate_entry(
@@ -916,8 +933,8 @@ mod tests {
             1.0 / 127.0
         );
         assert_ne!(
-            gpu_cache_key(&descriptor, ScoringProfile::ExactFp16),
-            gpu_cache_key(&descriptor, ScoringProfile::Int8)
+            gpu_cache_key(&descriptor, ScoringProfile::ExactFp16, None),
+            gpu_cache_key(&descriptor, ScoringProfile::Int8, None)
         );
     }
 
@@ -929,8 +946,8 @@ mod tests {
         }
         let descriptor = descriptor(1, "a", 1);
         assert_ne!(
-            gpu_cache_key(&descriptor, ScoringProfile::Fp8E4m3),
-            gpu_cache_key(&descriptor, ScoringProfile::Int8)
+            gpu_cache_key(&descriptor, ScoringProfile::Fp8E4m3, None),
+            gpu_cache_key(&descriptor, ScoringProfile::Int8, None)
         );
     }
 }

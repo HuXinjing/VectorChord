@@ -124,6 +124,9 @@ static VCHORDRQ_MAXSIM_BACKEND: GucSetting<PostgresMaxsimBackend> =
 static VCHORDRQ_MAXSIM_SCORING_PROFILE: GucSetting<PostgresMaxsimScoringProfile> =
     GucSetting::<PostgresMaxsimScoringProfile>::new(PostgresMaxsimScoringProfile::ExactFp16);
 
+static VCHORDRQ_MAXSIM_QUANTIZATION_CONTRACT: GucSetting<Option<CString>> =
+    GucSetting::<Option<CString>>::new(Some(c""));
+
 static VCHORDRQ_MAXSIM_GPU_ENDPOINT: GucSetting<Option<CString>> =
     GucSetting::<Option<CString>>::new(Some(c""));
 
@@ -254,6 +257,14 @@ pub fn init() {
         c"Page-level MaxSim rerank backend.",
         c"GPU and auto modes require the native sidecar integration.",
         &VCHORDRQ_MAXSIM_BACKEND,
+        GucContext::Userset,
+        GucFlags::default(),
+    );
+    GucRegistry::define_string_guc(
+        c"vchordrq.maxsim_quantization_contract",
+        c"Immutable quantization contract ID for PQ, OPQ, or residual-PQ scoring.",
+        c"Set transaction-locally; compressed scoring fails closed when it is absent or inactive.",
+        &VCHORDRQ_MAXSIM_QUANTIZATION_CONTRACT,
         GucContext::Userset,
         GucFlags::default(),
     );
@@ -668,6 +679,15 @@ pub fn vchordrq_maxsim_backend() -> PostgresMaxsimBackend {
 
 pub fn vchordrq_maxsim_scoring_profile() -> PostgresMaxsimScoringProfile {
     VCHORDRQ_MAXSIM_SCORING_PROFILE.get()
+}
+
+pub fn vchordrq_maxsim_quantization_contract() -> Option<String> {
+    VCHORDRQ_MAXSIM_QUANTIZATION_CONTRACT
+        .get()
+        .and_then(|value| {
+            let value = value.to_string_lossy().into_owned();
+            (!value.is_empty()).then_some(value)
+        })
 }
 
 pub fn vchordrq_maxsim_gpu_endpoint() -> Option<CString> {

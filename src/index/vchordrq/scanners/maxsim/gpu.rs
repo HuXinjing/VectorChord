@@ -29,6 +29,7 @@ const VERSION: u16 = 1;
 const EXTERNAL_VERSION: u16 = 2;
 const SCHEDULED_EXTERNAL_VERSION: u16 = 3;
 const PROFILED_EXTERNAL_VERSION: u16 = 4;
+const QUANTIZED_EXTERNAL_VERSION: u16 = 5;
 const REQUEST_KIND: u16 = 1;
 const RESPONSE_KIND: u16 = 2;
 const HEADER_LEN: usize = 24;
@@ -142,6 +143,7 @@ pub(super) struct GpuExternalTileMaxsimBackend<T> {
     max_batch_bytes: usize,
     scheduling: Option<TileMaxsimScheduling>,
     scoring_profile: PostgresMaxsimScoringProfile,
+    quantization_contract: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -166,7 +168,13 @@ impl<T> GpuExternalTileMaxsimBackend<T> {
             max_batch_bytes,
             scheduling: None,
             scoring_profile: PostgresMaxsimScoringProfile::ExactFp16,
+            quantization_contract: None,
         }
+    }
+
+    pub(super) fn with_quantization_contract(mut self, contract: Option<String>) -> Self {
+        self.quantization_contract = contract;
+        self
     }
 
     pub(super) fn with_scoring_profile(
@@ -247,6 +255,7 @@ impl<T: TileMaxsimTransport> GpuExternalTileMaxsimBackend<T> {
                 self.max_batch_bytes,
                 self.scheduling.as_ref(),
                 self.scoring_profile,
+                self.quantization_contract.as_deref(),
                 remaining,
             )?;
             let max_response_bytes = HEADER_LEN
@@ -309,6 +318,7 @@ fn encode_external_request<S: CandidateTensorDescriptorSource>(
         max_batch_bytes,
         scheduling,
         PostgresMaxsimScoringProfile::ExactFp16,
+        None,
         timeout,
     )
 }
@@ -322,6 +332,7 @@ fn encode_external_descriptors(
     max_batch_bytes: usize,
     scheduling: Option<&TileMaxsimScheduling>,
     scoring_profile: PostgresMaxsimScoringProfile,
+    quantization_contract: Option<&str>,
     timeout: Duration,
 ) -> Result<EncodedRequest, RerankError> {
     if model_contract_id.is_empty()
@@ -359,6 +370,17 @@ fn encode_external_descriptors(
     }
 
     let mut writer = BoundedWriter::new(max_batch_bytes);
+    let quantized = matches!(
+        scoring_profile,
+        PostgresMaxsimScoringProfile::Pq | PostgresMaxsimScoringProfile::OpqRpq
+    );
+    if quantized
+        && !matches!(quantization_contract, Some(value) if value.starts_with("qtc1-") && value.len() == 69 && value[5..].bytes().all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase()))
+    {
+        return Err(RerankError::Configuration(
+            "PQ/OPQ/RPQ requires a canonical qtc1 quantization contract",
+        ));
+    }
     let profiled =
         scheduling.is_some() || scoring_profile != PostgresMaxsimScoringProfile::ExactFp16;
     let tenant = scheduling.map_or("__default__", |value| value.tenant.as_str());
@@ -378,6 +400,9 @@ fn encode_external_descriptors(
     }
     writer
         .u32(u32::try_from(model_contract_id.len()).map_err(|_| RerankError::RequestTooLarge)?)?;
+    if quantized {
+        writer.u32(69)?;
+    }
     let version = if profiled {
         writer.i32(priority)?;
         writer.u32(
@@ -385,11 +410,18 @@ fn encode_external_descriptors(
                 .map_err(|_| RerankError::RequestTooLarge)?,
         )?;
         writer.u32(u32::try_from(tenant.len()).map_err(|_| RerankError::RequestTooLarge)?)?;
-        PROFILED_EXTERNAL_VERSION
+        if quantized {
+            QUANTIZED_EXTERNAL_VERSION
+        } else {
+            PROFILED_EXTERNAL_VERSION
+        }
     } else {
         EXTERNAL_VERSION
     };
     writer.bytes(model_contract_id.as_bytes())?;
+    if let Some(contract) = quantization_contract.filter(|_| quantized) {
+        writer.bytes(contract.as_bytes())?;
+    }
     if profiled {
         writer.bytes(tenant.as_bytes())?;
     }
