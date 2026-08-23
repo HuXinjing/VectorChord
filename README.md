@@ -154,6 +154,8 @@ also keeps request settings from leaking through a connection pool:
 BEGIN;
 SET LOCAL vchordrq.maxsim_backend = 'gpu';
 SET LOCAL vchordrq.maxsim_scoring_profile = 'exact_fp16';
+-- PQ/OPQ/RPQ additionally requires an active qtc1 contract:
+-- SET LOCAL vchordrq.maxsim_quantization_contract = 'qtc1-...';
 SET LOCAL vchordrq.maxsim_tenant = 'scheduler-domain';
 SET LOCAL vchordrq.maxsim_priority = 20;
 -- call vchordrq_tilemaxsim_search or vchordrq_tilemaxsim_rerank
@@ -163,11 +165,18 @@ COMMIT;
 `maxsim_backend` selects where scoring runs; `maxsim_scoring_profile`
 independently selects the tensor representation and kernel. The public profile
 names are `exact_fp16`, `int8`, `fp8_e4m3`, `pq`, and `opq_rpq`. The native
-daemon currently enables `exact_fp16` plus fused row-scaled `int8` and `fp8_e4m3`. The remaining
-profiles are present in the request and experiment contracts, but fail explicitly until their
-persistent formats, migrations, and native kernels are connected. No request
+daemon enables all listed profiles. PQ-family execution uses authenticated VCTQ
+codebook/rotation artifacts and content-addressed VCTC codes. After query
+rotation/LUT construction, ADC, residual-stage accumulation, and document-token
+max are fused in the native CUDA kernel. Inactive, mismatched, or corrupted
+contracts fail explicitly. No request
 is silently substituted with another precision. The default backend remains
 `coarse_only`, so applications that do not opt into TileMaxSim need no GPU.
+Production publishers use `inspect_quantizer` to bind the trained codebook
+digest into a schema-v2 contract ID, write VCTQ/VCTC files atomically, and call
+`finalize_artifact` before registry staging. The registry and daemon independently
+recheck the artifact tree, embedded contract digest, codebook digest, shapes,
+and per-file checksums; activation and rollback use generation-checked snapshots.
 
 Candidate scope and scoring precision remain separate decisions. GBrain may
 submit a structured relationship scope, an authorized scope, or the full
@@ -217,6 +226,7 @@ tilemaxsimd \
   --host-cache-gb 8 \
   --max-inflight-request-gb 1 \
   --contract-root MODEL_CONTRACT_ID=/srv/vectorchord/tensors \
+  --quantization-registry-root /srv/vectorchord/quantization-registry \
   --scheduler-policy fair-priority \
   --max-queued-requests 128 \
   --max-tenant-queued-requests 16 \

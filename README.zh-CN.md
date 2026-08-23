@@ -63,6 +63,8 @@ NeoClaw/GBrain 等上层应用可以在一个事务内选择检索路径，连�
 BEGIN;
 SET LOCAL vchordrq.maxsim_backend = 'gpu';
 SET LOCAL vchordrq.maxsim_scoring_profile = 'exact_fp16';
+-- PQ/OPQ/RPQ 还需设置已激活的 qtc1 contract：
+-- SET LOCAL vchordrq.maxsim_quantization_contract = 'qtc1-...';
 SET LOCAL vchordrq.maxsim_tenant = 'scheduler-domain';
 SET LOCAL vchordrq.maxsim_priority = 20;
 -- 调用 vchordrq_tilemaxsim_search 或 vchordrq_tilemaxsim_rerank
@@ -71,11 +73,16 @@ COMMIT;
 
 `maxsim_backend` 决定运行位置，`maxsim_scoring_profile` 独立决定张量表示和打分
 kernel。可选 profile 为 `exact_fp16`、`int8`、`fp8_e4m3`、`pq` 和
-`opq_rpq`。当前原生 daemon 已启用 `exact_fp16`、按行缩放的融合 `int8` 和
-`fp8_e4m3`；其他 profile 已进入协议和实验 contract，但在对应持久格式、迁移和原生 kernel 接通前
-会明确报错。系统绝不
+`opq_rpq`。原生 daemon 已启用全部这些 profile。PQ family 使用带 SHA-256 身份校验的
+VCTQ codebook/rotation 和内容寻址 VCTC codes；query rotation/LUT 构建后，ADC、
+residual stage 累加和文档 token max 在原生 CUDA kernel 中融合。未激活、错配或损坏的
+contract 会明确报错。系统绝不
 静默改用另一精度。默认 backend 仍为 `coarse_only`，所以未显式启用 TileMaxSim
 的应用不需要 GPU。
+生产发布流程先用 `inspect_quantizer` 将训练所得 codebook digest 绑定进 schema-v2
+contract ID，再原子写入 VCTQ/VCTC，并在 registry stage 前调用 `finalize_artifact`。
+registry 和 daemon 会分别复核 artifact tree、内嵌 contract digest、codebook digest、
+shape 与逐文件 checksum；激活和回滚使用带 generation 的一致快照。
 
 候选范围与打分精度是另外两个独立决策：GBrain 可以传入结构化关系范围、授权范围
 或普通语义查询的全 source 范围；VectorChord 不会把 scheduler tenant 当成权限，
@@ -127,6 +134,7 @@ tilemaxsimd \
   --host-cache-gb 8 \
   --max-inflight-request-gb 1 \
   --contract-root MODEL_CONTRACT_ID=/srv/vectorchord/tensors \
+  --quantization-registry-root /srv/vectorchord/quantization-registry \
   --scheduler-policy fair-priority \
   --max-queued-requests 128 \
   --max-tenant-queued-requests 16 \
