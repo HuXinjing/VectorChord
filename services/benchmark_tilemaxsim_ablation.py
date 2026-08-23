@@ -450,11 +450,48 @@ def encode_frame(
     )
 
 
+def encode_scheduled_frame(
+    records: list[dict[str, object]],
+    contract: str,
+    query: np.ndarray,
+    request_id: int,
+    tenant: str,
+    priority: int,
+    timeout_ms: int,
+) -> bytes:
+    """Encode protocol v3 scheduling hints without giving them ACL meaning."""
+
+    legacy = encode_frame(records, contract, query, request_id)
+    body = legacy[protocol.HEADER.size :]
+    fixed = protocol.EXTERNAL_REQUEST_FIXED.unpack_from(body)
+    tenant_bytes = tenant.encode("utf-8")
+    scheduled = bytearray(
+        protocol.SCHEDULED_EXTERNAL_REQUEST_FIXED.pack(
+            *fixed, priority, timeout_ms, len(tenant_bytes)
+        )
+    )
+    contract_length = fixed[-1]
+    payload = body[protocol.EXTERNAL_REQUEST_FIXED.size :]
+    scheduled.extend(payload[:contract_length])
+    scheduled.extend(tenant_bytes)
+    scheduled.extend(payload[contract_length:])
+    return (
+        protocol.HEADER.pack(
+            protocol.MAGIC,
+            protocol.SCHEDULED_EXTERNAL_VERSION,
+            protocol.REQUEST_KIND,
+            request_id,
+            len(scheduled),
+        )
+        + scheduled
+    )
 def request_round_trip(
-    socket_path: Path, frame: bytes
+    socket_path: Path, frame: bytes, timeout_s: float | None = None
 ) -> tuple[float, list[tuple[int, float]]]:
     started = time.perf_counter()
     with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
+        if timeout_s is not None:
+            connection.settimeout(timeout_s)
         connection.connect(os.fspath(socket_path))
         connection.sendall(frame)
         header = protocol.receive_exact(connection, protocol.HEADER.size)
