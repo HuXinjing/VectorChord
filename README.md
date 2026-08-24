@@ -410,6 +410,33 @@ For more usage, please read:
 - [Partitioning Tuning](https://docs.vectorchord.ai/vectorchord/usage/partitioning-tuning.html)
 - [External Build](https://docs.vectorchord.ai/vectorchord/usage/external-index-precomputation.html)
 
+## Acknowledgements and provenance
+
+VectorChord TileMaxSim is built on the upstream
+[supervc-stack/VectorChord](https://github.com/supervc-stack/VectorChord)
+PostgreSQL extension, vector types, `vchordrq` index, and existing MaxSim
+capabilities. We thank its maintainers and contributors.
+
+The I/O-aware GPU MaxSim direction and the `TileMaxSim` name are based on and
+inspired by Ashutosh Sharma's
+[ashutoshuiuc/tilemaxsim](https://github.com/ashutoshuiuc/tilemaxsim) work,
+including tiled MaxSim, dimension tiling, and fused product-quantized scoring.
+This project does not claim those core GPU scoring ideas as original
+contributions.
+
+This repository is an independent PostgreSQL/Rust/CUDA systems integration.
+Its independently authored additions include the versioned database/backend
+boundary, GPU/host/disk tensor caches, allocators, multi-user scheduling,
+database-visible candidate binding, operational failure handling, and further
+quantized runtime and kernel experiments. It does not vendor the upstream
+Triton repository, and this acknowledgement does not imply endorsement or
+joint maintenance by its author.
+
+The referenced TileMaxSim repository currently publishes no license file.
+Accordingly, its source code must not be copied or adapted into this repository
+without explicit permission; any future authorized reuse must retain all
+applicable copyright and license notices.
+
 ## License
 
 This software is licensed under a dual license model:
@@ -419,8 +446,8 @@ This software is licensed under a dual license model:
 2. **Elastic License v2 (ELv2)**: You may also use, modify, and distribute this software under the Elastic License v2, which has specific restrictions.
 
 You may choose either license based on its terms. The original VectorChord code
-retains its upstream copyright notices. TileMaxSim fork additions are Copyright
-(c) 2026 Hu Xinjing; use this fork's
+retains its upstream copyright notices. Independently authored additions in
+this fork are Copyright (c) 2026 Hu Xinjing; use this fork's
 [issue tracker](https://github.com/HuXinjing/VectorChord/issues) for support.
 
 [cost-estimation]: https://github.com/user-attachments/assets/168fe550-6465-4eee-a224-8c848c301e3d

@@ -340,11 +340,15 @@ MaxSim 能力构成了本项目继续开发的基础。
 张量缓存、分配器、多用户调度、数据库绑定和部署运维由本项目维护。上述致谢不表示
 上游项目或论文作者对本项目背书，也不表示双方共同维护。
 
+截至本文更新时，所引用的 TileMaxSim 仓库未发布许可证文件。因此，在未获得明确
+授权前，不得将其源代码复制或改写进本仓库；未来任何获授权的复用也必须保留适用的
+版权和许可声明。本仓库不直接包含该上游 Triton 仓库的源文件。
+
 ## 项目来源与许可
 
 本项目源自 [supervc-stack/VectorChord](https://github.com/supervc-stack/VectorChord)，
-原始源文件保留其上游版权和许可声明。TileMaxSim 项目新增部分 Copyright (c) 2026
-Hu Xinjing。
+原始源文件保留其上游版权和许可声明。本 fork 中独立创作的新增部分 Copyright
+(c) 2026 Hu Xinjing。
 
 仓库按 [`LICENSE`](LICENSE) 中的许可条款提供，在适用范围内包括 AGPLv3 和
 Elastic License v2 选项。项目问题与支持请求请提交到本项目的
