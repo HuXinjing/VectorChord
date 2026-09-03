@@ -213,7 +213,7 @@ pub struct ShardStore {
     verify_full_shards: bool,
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, serde::Serialize)]
 pub struct HostCacheStatus {
     pub capacity_bytes: usize,
     pub used_bytes: usize,

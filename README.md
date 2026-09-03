@@ -270,6 +270,21 @@ network-isolated orchestrator probes, serve HTTP `GET /healthz` and Prometheus
 completed/error/timeout/disconnect outcomes, and global/per-tenant admission
 rejections without exporting tenant identifiers.
 
+The management view is versioned and bounded. `GET /v1/config` returns the
+effective GPU/cache/admission/scheduler settings and stable application
+controls. `GET /v1/cache` returns L0/L1 occupancy, fragmentation, hit/miss,
+transfer, eviction, and adaptive-kernel calibration state. `POST /v1/reload`
+atomically reloads shard and quantization registries, but is accepted only on
+the permission-controlled Unix status socket; TCP status is always read-only.
+
+Applications should select candidate scope, backend, scoring profile,
+quantization contract, scheduling domain, priority, and deadline. GPU memory,
+tenant reservations, admission limits, batching thresholds, and quantum sizes
+remain operator-owned instance settings. Raw eviction and forced-kernel APIs
+are deliberately not exposed because they could bypass cache isolation or
+calibrated fallback. Runtime community-cache warming remains a future API;
+startup resident manifests are the current pinned-prewarm mechanism.
+
 `GET /livez` reports process liveness separately from readiness. The packaged
 `tilemaxsimctl --probe live|ready` probe can wait on the status socket without
 curl or a TCP port.

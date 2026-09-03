@@ -86,6 +86,11 @@ The status Unix socket serves:
   storage, latency, timeout, and outcome metrics. GPU labels contain only the
   configured numeric device/slot; application scheduling-domain names are
   never exported.
+- `GET /v1/config`: effective non-secret instance settings and the stable
+  application request-control contract;
+- `GET /v1/cache`: JSON L0/L1 cache and adaptive GPU state;
+- `POST /v1/reload`: atomically reload shard and quantizer registries. It is
+  accepted only over the Unix status socket; TCP status is read-only.
 
 Use the image's dependency-free probe from systemd, Docker, or Kubernetes:
 

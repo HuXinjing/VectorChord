@@ -356,6 +356,52 @@ fn main() -> Result<()> {
         args.max_tenant_queued_requests,
         args.max_inflight_request_gb,
     ));
+    let public_config = Arc::new(serde_json::json!({
+        "api_version": "tilemaxsim.management.v1",
+        "gpu": args.gpu_memory_gb.iter().map(|item| serde_json::json!({
+            "device": item.device,
+            "memory_gb": item.bytes as f64 / GIB as f64,
+            "workspace_gb": args.gpu_workspace_gb as f64 / GIB as f64,
+        })).collect::<Vec<_>>(),
+        "cache": {
+            "mode": args.gpu_cache_mode,
+            "host_gb": args.host_cache_gb as f64 / GIB as f64,
+            "gpu_block_kib": args.gpu_block_kib,
+            "tenant_max_percent": args.tenant_cache_max_percent,
+            "host_tenant_max_percent": args.host_tenant_cache_max_percent,
+            "pinned_max_percent": args.pinned_cache_max_percent,
+            "prewarm_batch_size": args.prewarm_batch_size,
+        },
+        "admission": {
+            "max_connections": args.max_connections,
+            "max_queued_requests": args.max_queued_requests,
+            "max_tenant_queued_requests": args.max_tenant_queued_requests,
+            "max_request_bytes": args.max_request_bytes,
+            "max_inflight_request_gb": args.max_inflight_request_gb as f64 / GIB as f64,
+            "request_timeout_ms": args.request_timeout_ms,
+        },
+        "scheduler": {
+            "policy": format!("{:?}", args.scheduler_policy),
+            "priority_range": [-100, 100],
+            "priority_aging_ms": args.priority_aging_ms,
+            "priority_band": args.priority_band,
+            "batch_window_ms": args.scheduler_batch_window_ms,
+            "max_microbatch_requests": args.scheduler_max_microbatch_requests,
+            "min_shared_candidates_milli": args.scheduler_min_shared_candidates_milli,
+            "quantum_candidates": args.scheduler_quantum_candidates,
+            "quantum_tokens": args.scheduler_quantum_tokens,
+            "quantum_fmas": args.scheduler_quantum_fmas,
+        },
+        "request_controls": [
+            "backend", "scoring_profile", "quantization_contract", "tenant",
+            "priority", "deadline", "candidate_scope", "candidate_limit"
+        ],
+        "management": {
+            "reload": "POST /v1/reload on the Unix status socket only",
+            "runtime_cache_warm": false,
+            "forced_kernel_selection": false,
+        }
+    }));
     metrics.update_engine(engine.status_snapshot());
     install_signal_handlers()?;
     let ready_cache = engine.status_json();
@@ -404,10 +450,20 @@ fn main() -> Result<()> {
         fs::set_permissions(&path, fs::Permissions::from_mode(args.status_socket_mode))?;
         status_listener.set_nonblocking(true)?;
         let status_metrics = Arc::clone(&metrics);
+        let status_config = Arc::clone(&public_config);
+        let status_reload = Arc::clone(&reload);
         Some(
             thread::Builder::new()
                 .name("tilemaxsim-status".to_owned())
-                .spawn(move || run_status_server(status_listener, path, status_metrics))?,
+                .spawn(move || {
+                    run_status_server(
+                        status_listener,
+                        path,
+                        status_metrics,
+                        status_config,
+                        status_reload,
+                    )
+                })?,
         )
     } else {
         None
@@ -417,10 +473,19 @@ fn main() -> Result<()> {
             .with_context(|| format!("cannot bind status listener {address}"))?;
         status_listener.set_nonblocking(true)?;
         let status_metrics = Arc::clone(&metrics);
+        let status_config = Arc::clone(&public_config);
+        let status_reload = Arc::clone(&reload);
         Some(
             thread::Builder::new()
                 .name("tilemaxsim-status-tcp".to_owned())
-                .spawn(move || run_tcp_status_server(status_listener, status_metrics))?,
+                .spawn(move || {
+                    run_tcp_status_server(
+                        status_listener,
+                        status_metrics,
+                        status_config,
+                        status_reload,
+                    )
+                })?,
         )
     } else {
         None
@@ -1643,7 +1708,13 @@ fn write_response_nonfatal(connection: &mut ClientStream, response: &[u8]) {
     }
 }
 
-fn run_status_server(listener: UnixListener, path: PathBuf, metrics: Arc<RuntimeMetrics>) {
+fn run_status_server(
+    listener: UnixListener,
+    path: PathBuf,
+    metrics: Arc<RuntimeMetrics>,
+    config: Arc<serde_json::Value>,
+    reload: Arc<AtomicBool>,
+) {
     while !SHUTDOWN_REQUESTED.load(Ordering::Relaxed) {
         match listener.accept() {
             Ok((mut connection, _)) => {
@@ -1653,7 +1724,7 @@ fn run_status_server(listener: UnixListener, path: PathBuf, metrics: Arc<Runtime
                 connection
                     .set_write_timeout(Some(Duration::from_millis(250)))
                     .ok();
-                handle_status_connection(&mut connection, &metrics);
+                handle_status_connection(&mut connection, &metrics, &config, &reload, true);
             }
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                 thread::sleep(Duration::from_millis(20));
@@ -1673,12 +1744,17 @@ fn run_status_server(listener: UnixListener, path: PathBuf, metrics: Arc<Runtime
     }
 }
 
-fn run_tcp_status_server(listener: TcpListener, metrics: Arc<RuntimeMetrics>) {
+fn run_tcp_status_server(
+    listener: TcpListener,
+    metrics: Arc<RuntimeMetrics>,
+    config: Arc<serde_json::Value>,
+    reload: Arc<AtomicBool>,
+) {
     while !SHUTDOWN_REQUESTED.load(Ordering::Relaxed) {
         match listener.accept() {
             Ok((mut connection, _)) => {
                 configure_tcp_status_connection(&connection);
-                handle_status_connection(&mut connection, &metrics);
+                handle_status_connection(&mut connection, &metrics, &config, &reload, false);
             }
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                 thread::sleep(Duration::from_millis(20));
@@ -1701,7 +1777,13 @@ fn configure_tcp_status_connection(connection: &TcpStream) {
         .ok();
 }
 
-fn handle_status_connection(connection: &mut (impl Read + Write), metrics: &RuntimeMetrics) {
+fn handle_status_connection(
+    connection: &mut (impl Read + Write),
+    metrics: &RuntimeMetrics,
+    config: &serde_json::Value,
+    reload: &AtomicBool,
+    local_admin: bool,
+) {
     let mut request = [0_u8; 1024];
     let Ok(count) = connection.read(&mut request) else {
         return;
@@ -1730,6 +1812,35 @@ fn handle_status_connection(connection: &mut (impl Read + Write), metrics: &Runt
             "text/plain; version=0.0.4",
             render_metrics(metrics),
         )
+    } else if request.starts_with("GET /v1/config ") {
+        ("200 OK", "application/json", config.to_string())
+    } else if request.starts_with("GET /v1/cache ") {
+        let engine = metrics
+            .engine
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone();
+        (
+            "200 OK",
+            "application/json",
+            serde_json::to_string(&engine).expect("engine status is serializable"),
+        )
+    } else if request.starts_with("POST /v1/reload ") {
+        if local_admin {
+            reload.store(true, Ordering::Release);
+            (
+                "202 Accepted",
+                "application/json",
+                serde_json::json!({"accepted": true}).to_string(),
+            )
+        } else {
+            (
+                "403 Forbidden",
+                "application/json",
+                serde_json::json!({"error": "reload is restricted to the Unix status socket"})
+                    .to_string(),
+            )
+        }
     } else {
         ("404 Not Found", "text/plain", "not found\n".to_owned())
     };
@@ -2553,13 +2664,77 @@ fn load_resident_manifests(values: &[(String, PathBuf)]) -> Result<Vec<protocol:
 #[cfg(test)]
 mod tests {
     use super::{
-        ByteAdmission, PendingAdmission, RuntimeMetrics, candidate_fmas, is_fatal_cuda_diagnostic,
-        kib_to_bytes, quantum_end, render_metrics, tenant_hash,
+        ByteAdmission, PendingAdmission, RuntimeMetrics, candidate_fmas, handle_status_connection,
+        is_fatal_cuda_diagnostic, kib_to_bytes, quantum_end, render_metrics, tenant_hash,
     };
     use crate::engine::{DeviceStatus, EngineStatus};
     use crate::protocol::Descriptor;
     use crate::shard::HostCacheStatus;
+    use std::io::{Read, Write};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    struct StatusExchange {
+        request: std::io::Cursor<Vec<u8>>,
+        response: Vec<u8>,
+    }
+
+    impl StatusExchange {
+        fn new(request: &str) -> Self {
+            Self {
+                request: std::io::Cursor::new(request.as_bytes().to_vec()),
+                response: Vec::new(),
+            }
+        }
+    }
+
+    impl Read for StatusExchange {
+        fn read(&mut self, output: &mut [u8]) -> std::io::Result<usize> {
+            self.request.read(output)
+        }
+    }
+
+    impl Write for StatusExchange {
+        fn write(&mut self, input: &[u8]) -> std::io::Result<usize> {
+            self.response.extend_from_slice(input);
+            Ok(input.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn management_reads_are_public_but_reload_is_unix_only() {
+        let metrics = RuntimeMetrics::default();
+        let config = serde_json::json!({"api_version": "tilemaxsim.management.v1"});
+        let reload = AtomicBool::new(false);
+
+        let mut config_request = StatusExchange::new("GET /v1/config HTTP/1.1\r\n\r\n");
+        handle_status_connection(&mut config_request, &metrics, &config, &reload, false);
+        let response = String::from_utf8(config_request.response).unwrap();
+        assert!(response.starts_with("HTTP/1.1 200 OK"));
+        assert!(response.contains("tilemaxsim.management.v1"));
+
+        let mut remote_reload = StatusExchange::new("POST /v1/reload HTTP/1.1\r\n\r\n");
+        handle_status_connection(&mut remote_reload, &metrics, &config, &reload, false);
+        assert!(
+            String::from_utf8(remote_reload.response)
+                .unwrap()
+                .starts_with("HTTP/1.1 403 Forbidden")
+        );
+        assert!(!reload.load(Ordering::Acquire));
+
+        let mut local_reload = StatusExchange::new("POST /v1/reload HTTP/1.1\r\n\r\n");
+        handle_status_connection(&mut local_reload, &metrics, &config, &reload, true);
+        assert!(
+            String::from_utf8(local_reload.response)
+                .unwrap()
+                .starts_with("HTTP/1.1 202 Accepted")
+        );
+        assert!(reload.load(Ordering::Acquire));
+    }
 
     #[test]
     fn gpu_block_kib_is_converted_once() {

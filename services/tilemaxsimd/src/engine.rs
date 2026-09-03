@@ -51,7 +51,7 @@ pub struct Engine {
 
 type BatchedCandidateScores = Vec<Vec<(u32, f32)>>;
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, serde::Serialize)]
 pub struct DeviceStatus {
     pub slot: usize,
     pub device: i32,
@@ -80,7 +80,7 @@ pub struct DeviceStatus {
     pub calibration_failures: u64,
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, serde::Serialize)]
 pub struct EngineStatus {
     pub devices: Vec<DeviceStatus>,
     pub host: HostCacheStatus,
