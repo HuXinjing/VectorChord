@@ -143,6 +143,10 @@ struct Args {
     scheduler_quantum_tokens: u64,
     #[arg(long, default_value_t = 4_000_000_000)]
     scheduler_quantum_fmas: u64,
+    #[arg(long, default_value_t = 8)]
+    scheduler_max_microbatch_requests: usize,
+    #[arg(long, default_value_t = 500)]
+    scheduler_min_shared_candidates_milli: u16,
     #[arg(long = "tenant-weight", value_parser = parse_tenant_weight)]
     tenant_weights: Vec<(String, f64)>,
 }
@@ -256,6 +260,8 @@ fn main() -> Result<()> {
         || args.scheduler_quantum_candidates == 0
         || args.scheduler_quantum_tokens == 0
         || args.scheduler_quantum_fmas == 0
+        || args.scheduler_max_microbatch_requests == 0
+        || args.scheduler_min_shared_candidates_milli > 1000
     {
         bail!("connection, queue, timeout, and priority-aging limits must be positive");
     }
@@ -373,6 +379,8 @@ fn main() -> Result<()> {
         quantum_candidates: args.scheduler_quantum_candidates,
         quantum_tokens: args.scheduler_quantum_tokens,
         quantum_fmas: args.scheduler_quantum_fmas,
+        max_microbatch_requests: args.scheduler_max_microbatch_requests,
+        min_shared_candidates_milli: args.scheduler_min_shared_candidates_milli,
         socket_io_timeout: Duration::from_millis(args.socket_io_timeout_ms),
         tenant_weights,
     };
@@ -671,6 +679,8 @@ struct SchedulerConfig {
     quantum_candidates: usize,
     quantum_tokens: u64,
     quantum_fmas: u64,
+    max_microbatch_requests: usize,
+    min_shared_candidates_milli: u16,
     socket_io_timeout: Duration,
     tenant_weights: std::collections::HashMap<String, f64>,
 }
@@ -719,6 +729,8 @@ struct RuntimeMetrics {
     shadow_dispatch_warp: AtomicU64,
     shadow_dispatch_tile: AtomicU64,
     shadow_dispatch_tensor: AtomicU64,
+    scheduler_microbatches: AtomicU64,
+    scheduler_microbatch_requests: AtomicU64,
     latency_observations: AtomicU64,
     total_latency_us: AtomicU64,
     gpu_latency_us: AtomicU64,
@@ -1142,7 +1154,17 @@ fn run_scheduler(
                 Err(mpsc::RecvTimeoutError::Disconnected) => channel_open = false,
             }
         }
-        if channel_open {
+        // Only a newly admitted normal-priority request may pay the batching
+        // window. High-priority traffic and requeued long requests proceed
+        // immediately at their next cooperative quantum boundary.
+        let may_wait_for_batch = channel_open
+            && queue.len() == 1
+            && queue.iter().all(|item| item.payload.next_candidate == 0)
+            && queue
+                .highest_effective_priority(Instant::now())
+                .unwrap_or(0)
+                <= 0;
+        if may_wait_for_batch {
             let batching_deadline = Instant::now() + config.batch_window;
             loop {
                 let remaining = batching_deadline.saturating_duration_since(Instant::now());
@@ -1179,141 +1201,199 @@ fn run_scheduler(
         let Some(scheduled) = queue.pop(Instant::now()) else {
             continue;
         };
-        metrics.update_scheduler_depth(queue.len());
-        if peer_disconnected(&scheduled.payload.connection) {
-            metrics.disconnected.fetch_add(1, Ordering::Relaxed);
-            metrics.observe_latency(scheduled.payload.accepted_at.elapsed(), Duration::ZERO);
-            continue;
-        }
-        let started = Instant::now();
-        let mut work = scheduled.payload;
-        let request_id = work.request.request_id;
-        let version = work.request.protocol_version;
-        let tenant = work.request.tenant.clone();
-        let priority = work.request.priority;
-        let response = if work.deadline <= started {
-            metrics.timed_out.fetch_add(1, Ordering::Relaxed);
-            metrics
-                .timeout_before_execution
-                .fetch_add(1, Ordering::Relaxed);
-            Some(protocol::failure(
-                version,
-                request_id,
-                2,
-                "request deadline expired before execution",
-            ))
-        } else {
-            let end = next_quantum_end(&work, &config);
-            let quantum = protocol::Request {
-                protocol_version: work.request.protocol_version,
-                request_id: work.request.request_id,
-                tenant: work.request.tenant.clone(),
-                priority: work.request.priority,
-                timeout_ms: work.request.timeout_ms,
-                query_rows: work.request.query_rows,
-                dimension: work.request.dimension,
-                dtype: work.request.dtype,
-                scoring_profile: work.request.scoring_profile,
-                quantization_contract: work.request.quantization_contract.clone(),
-                query: work.request.query.clone(),
-                candidates: work.request.candidates[work.next_candidate..end].to_vec(),
+        let mut microbatch = vec![scheduled];
+        while microbatch.len() < config.max_microbatch_requests {
+            let leader = &microbatch[0].payload;
+            let Some(next) = queue.pop_if(Instant::now(), |candidate| {
+                works_are_batch_compatible(
+                    leader,
+                    &candidate.payload,
+                    config.min_shared_candidates_milli,
+                )
+            }) else {
+                break;
             };
-            let quantum_started = Instant::now();
-            metrics.gpu_quantums.fetch_add(1, Ordering::Relaxed);
-            saturating_atomic_add(
-                &metrics.candidates_scored,
-                u64::try_from(end - work.next_candidate).unwrap_or(u64::MAX),
-            );
-            saturating_atomic_add(
-                &metrics.document_rows_scored,
-                quantum
-                    .candidates
-                    .iter()
-                    .map(|candidate| u64::from(candidate.rows))
-                    .sum(),
-            );
-            metrics.gpu_active.store(1, Ordering::Relaxed);
-            let score_result = engine.score(&quantum);
-            metrics.gpu_active.store(0, Ordering::Relaxed);
-            metrics.update_engine(engine.status_snapshot());
-            match score_result {
-                Ok(results) => {
-                    work.gpu_elapsed += quantum_started.elapsed();
-                    work.results.extend(results);
-                    work.next_candidate = end;
-                    if work.deadline <= Instant::now() {
-                        metrics.timed_out.fetch_add(1, Ordering::Relaxed);
-                        metrics
-                            .timeout_during_execution
-                            .fetch_add(1, Ordering::Relaxed);
-                        Some(protocol::failure(
-                            version,
-                            request_id,
-                            2,
-                            "request deadline expired during GPU execution",
-                        ))
-                    } else if end < work.request.candidates.len() {
-                        metrics.scheduler_requeues.fetch_add(1, Ordering::Relaxed);
-                        let cost = estimated_next_work(&work, &config);
-                        queue.push(Scheduled::new(
-                            tenant.clone(),
-                            priority,
-                            cost,
-                            work.accepted_at,
-                            work.deadline,
-                            work,
-                        ));
-                        metrics.update_scheduler_depth(queue.len());
-                        continue;
-                    } else {
-                        metrics.completed.fetch_add(1, Ordering::Relaxed);
-                        Some(protocol::success(version, request_id, &work.results))
-                    }
-                }
-                Err(error) => {
-                    metrics.failed.fetch_add(1, Ordering::Relaxed);
-                    metrics.gpu_failures.fetch_add(1, Ordering::Relaxed);
-                    work.gpu_elapsed += quantum_started.elapsed();
-                    let diagnostic = format!("{error:#}");
-                    let failure = protocol::failure(version, request_id, 3, &diagnostic);
-                    if is_fatal_cuda_diagnostic(&diagnostic) {
-                        // CUDA execution/context failures are not ordinary bad
-                        // requests. Stop advertising readiness and terminate
-                        // the scheduler after best-effort notification so the
-                        // service supervisor can recreate the CUDA context.
-                        metrics.ready.store(false, Ordering::Release);
-                        write_response_nonfatal(&mut work.connection, &failure);
-                        metrics.observe_latency(work.accepted_at.elapsed(), work.gpu_elapsed);
-                        return Err(anyhow!("fatal CUDA failure: {diagnostic}"));
-                    }
-                    Some(failure)
-                }
-            }
-        };
-        let Some(response) = response else {
-            continue;
-        };
-        work.connection
-            .set_write_timeout(Some(config.socket_io_timeout))
-            .ok();
-        write_response_nonfatal(&mut work.connection, &response);
-        metrics.observe_latency(work.accepted_at.elapsed(), work.gpu_elapsed);
-        println!(
-            "{}",
-            serde_json::json!({
-                "event": "tilemaxsim_rust_request",
-                "request_id": request_id,
-                "tenant_hash": tenant_hash(&tenant),
-                "priority": priority,
-                "total_ms": work.accepted_at.elapsed().as_secs_f64() * 1000.0,
-                "gpu_ms": work.gpu_elapsed.as_secs_f64() * 1000.0,
-                "queue_ms": work.accepted_at.elapsed().saturating_sub(work.gpu_elapsed).as_secs_f64() * 1000.0,
-                "queue_depth": queue.len(),
-                "cache": engine.status_json(),
-            })
+            microbatch.push(next);
+        }
+        metrics
+            .scheduler_microbatches
+            .fetch_add(1, Ordering::Relaxed);
+        saturating_atomic_add(
+            &metrics.scheduler_microbatch_requests,
+            u64::try_from(microbatch.len()).unwrap_or(u64::MAX),
         );
+        metrics.update_scheduler_depth(queue.len());
+        for scheduled in microbatch {
+            if peer_disconnected(&scheduled.payload.connection) {
+                metrics.disconnected.fetch_add(1, Ordering::Relaxed);
+                metrics.observe_latency(scheduled.payload.accepted_at.elapsed(), Duration::ZERO);
+                continue;
+            }
+            let started = Instant::now();
+            let mut work = scheduled.payload;
+            let request_id = work.request.request_id;
+            let version = work.request.protocol_version;
+            let tenant = work.request.tenant.clone();
+            let priority = work.request.priority;
+            let response = if work.deadline <= started {
+                metrics.timed_out.fetch_add(1, Ordering::Relaxed);
+                metrics
+                    .timeout_before_execution
+                    .fetch_add(1, Ordering::Relaxed);
+                Some(protocol::failure(
+                    version,
+                    request_id,
+                    2,
+                    "request deadline expired before execution",
+                ))
+            } else {
+                let end = next_quantum_end(&work, &config);
+                let quantum = protocol::Request {
+                    protocol_version: work.request.protocol_version,
+                    request_id: work.request.request_id,
+                    tenant: work.request.tenant.clone(),
+                    priority: work.request.priority,
+                    timeout_ms: work.request.timeout_ms,
+                    query_rows: work.request.query_rows,
+                    dimension: work.request.dimension,
+                    dtype: work.request.dtype,
+                    scoring_profile: work.request.scoring_profile,
+                    quantization_contract: work.request.quantization_contract.clone(),
+                    query: work.request.query.clone(),
+                    candidates: work.request.candidates[work.next_candidate..end].to_vec(),
+                };
+                let quantum_started = Instant::now();
+                metrics.gpu_quantums.fetch_add(1, Ordering::Relaxed);
+                saturating_atomic_add(
+                    &metrics.candidates_scored,
+                    u64::try_from(end - work.next_candidate).unwrap_or(u64::MAX),
+                );
+                saturating_atomic_add(
+                    &metrics.document_rows_scored,
+                    quantum
+                        .candidates
+                        .iter()
+                        .map(|candidate| u64::from(candidate.rows))
+                        .sum(),
+                );
+                metrics.gpu_active.store(1, Ordering::Relaxed);
+                let score_result = engine.score(&quantum);
+                metrics.gpu_active.store(0, Ordering::Relaxed);
+                metrics.update_engine(engine.status_snapshot());
+                match score_result {
+                    Ok(results) => {
+                        work.gpu_elapsed += quantum_started.elapsed();
+                        work.results.extend(results);
+                        work.next_candidate = end;
+                        if work.deadline <= Instant::now() {
+                            metrics.timed_out.fetch_add(1, Ordering::Relaxed);
+                            metrics
+                                .timeout_during_execution
+                                .fetch_add(1, Ordering::Relaxed);
+                            Some(protocol::failure(
+                                version,
+                                request_id,
+                                2,
+                                "request deadline expired during GPU execution",
+                            ))
+                        } else if end < work.request.candidates.len() {
+                            metrics.scheduler_requeues.fetch_add(1, Ordering::Relaxed);
+                            let cost = estimated_next_work(&work, &config);
+                            queue.push(Scheduled::new(
+                                tenant.clone(),
+                                priority,
+                                cost,
+                                work.accepted_at,
+                                work.deadline,
+                                work,
+                            ));
+                            metrics.update_scheduler_depth(queue.len());
+                            continue;
+                        } else {
+                            metrics.completed.fetch_add(1, Ordering::Relaxed);
+                            Some(protocol::success(version, request_id, &work.results))
+                        }
+                    }
+                    Err(error) => {
+                        metrics.failed.fetch_add(1, Ordering::Relaxed);
+                        metrics.gpu_failures.fetch_add(1, Ordering::Relaxed);
+                        work.gpu_elapsed += quantum_started.elapsed();
+                        let diagnostic = format!("{error:#}");
+                        let failure = protocol::failure(version, request_id, 3, &diagnostic);
+                        if is_fatal_cuda_diagnostic(&diagnostic) {
+                            // CUDA execution/context failures are not ordinary bad
+                            // requests. Stop advertising readiness and terminate
+                            // the scheduler after best-effort notification so the
+                            // service supervisor can recreate the CUDA context.
+                            metrics.ready.store(false, Ordering::Release);
+                            write_response_nonfatal(&mut work.connection, &failure);
+                            metrics.observe_latency(work.accepted_at.elapsed(), work.gpu_elapsed);
+                            return Err(anyhow!("fatal CUDA failure: {diagnostic}"));
+                        }
+                        Some(failure)
+                    }
+                }
+            };
+            let Some(response) = response else {
+                continue;
+            };
+            work.connection
+                .set_write_timeout(Some(config.socket_io_timeout))
+                .ok();
+            write_response_nonfatal(&mut work.connection, &response);
+            metrics.observe_latency(work.accepted_at.elapsed(), work.gpu_elapsed);
+            println!(
+                "{}",
+                serde_json::json!({
+                    "event": "tilemaxsim_rust_request",
+                    "request_id": request_id,
+                    "tenant_hash": tenant_hash(&tenant),
+                    "priority": priority,
+                    "total_ms": work.accepted_at.elapsed().as_secs_f64() * 1000.0,
+                    "gpu_ms": work.gpu_elapsed.as_secs_f64() * 1000.0,
+                    "queue_ms": work.accepted_at.elapsed().saturating_sub(work.gpu_elapsed).as_secs_f64() * 1000.0,
+                    "queue_depth": queue.len(),
+                    "cache": engine.status_json(),
+                })
+            );
+        }
     }
     Ok(())
+}
+
+fn works_are_batch_compatible(left: &Work, right: &Work, minimum_overlap_milli: u16) -> bool {
+    use std::collections::HashSet;
+    let left_request = &left.request;
+    let right_request = &right.request;
+    if left_request.tenant != right_request.tenant
+        || left_request.priority != right_request.priority
+        || left_request.dimension != right_request.dimension
+        || left_request.dtype != right_request.dtype
+        || left_request.scoring_profile != right_request.scoring_profile
+        || left_request.quantization_contract != right_request.quantization_contract
+    {
+        return false;
+    }
+    let left_end = next_quantum_end_unconfigured(left);
+    let right_end = next_quantum_end_unconfigured(right);
+    let keys = left_request.candidates[left.next_candidate..left_end]
+        .iter()
+        .map(|item| (&item.contract, &item.digest))
+        .collect::<HashSet<_>>();
+    let right_slice = &right_request.candidates[right.next_candidate..right_end];
+    let shared = right_slice
+        .iter()
+        .filter(|item| keys.contains(&(&item.contract, &item.digest)))
+        .count();
+    let denominator = keys.len().max(right_slice.len()).max(1);
+    shared.saturating_mul(1000) / denominator >= usize::from(minimum_overlap_milli)
+}
+
+fn next_quantum_end_unconfigured(work: &Work) -> usize {
+    // Compatibility is rechecked on the actual bounded quantum during GPU
+    // submission. Looking at all remaining candidates avoids claiming reuse
+    // when only unrelated prefixes happen to be queued together.
+    work.request.candidates.len()
 }
 
 fn enqueue_work(
@@ -1937,6 +2017,32 @@ fn render_metrics(metrics: &RuntimeMetrics) -> String {
         output,
         "tilemaxsim_batch_shared_candidates_total {}",
         metrics.batch_shared_candidates.load(Ordering::Relaxed)
+    )
+    .unwrap();
+    writeln!(output, "# HELP tilemaxsim_scheduler_microbatches_total Continuous microbatches selected at quantum boundaries.").unwrap();
+    writeln!(
+        output,
+        "# TYPE tilemaxsim_scheduler_microbatches_total counter"
+    )
+    .unwrap();
+    writeln!(
+        output,
+        "tilemaxsim_scheduler_microbatches_total {}",
+        metrics.scheduler_microbatches.load(Ordering::Relaxed)
+    )
+    .unwrap();
+    writeln!(output, "# HELP tilemaxsim_scheduler_microbatch_requests_total Requests selected into continuous microbatches.").unwrap();
+    writeln!(
+        output,
+        "# TYPE tilemaxsim_scheduler_microbatch_requests_total counter"
+    )
+    .unwrap();
+    writeln!(
+        output,
+        "tilemaxsim_scheduler_microbatch_requests_total {}",
+        metrics
+            .scheduler_microbatch_requests
+            .load(Ordering::Relaxed)
     )
     .unwrap();
     writeln!(output, "# HELP tilemaxsim_shadow_kernel_dispatch_total Shadow-only adaptive kernel decisions; execution remains on the current kernel.").unwrap();

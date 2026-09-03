@@ -102,6 +102,13 @@ impl<T> RequestQueue<T> {
         self.pending.iter()
     }
 
+    pub fn highest_effective_priority(&self, now: Instant) -> Option<i32> {
+        self.pending
+            .iter()
+            .map(|item| self.effective_priority(item, now))
+            .max()
+    }
+
     pub fn push(&mut self, mut item: Scheduled<T>) {
         item.sequence = self.next_sequence;
         self.next_sequence = self.next_sequence.wrapping_add(1);
@@ -145,6 +152,17 @@ impl<T> RequestQueue<T> {
     }
 
     pub fn pop(&mut self, now: Instant) -> Option<Scheduled<T>> {
+        self.pop_if(now, |_| true)
+    }
+
+    /// Pop the globally next item only when it satisfies `predicate`. This is
+    /// deliberately not a search: microbatch formation must not skip a tenant
+    /// or priority item that the configured scheduling policy selected first.
+    pub fn pop_if(
+        &mut self,
+        now: Instant,
+        predicate: impl FnOnce(&Scheduled<T>) -> bool,
+    ) -> Option<Scheduled<T>> {
         if self.pending.is_empty() {
             return None;
         }
@@ -159,6 +177,9 @@ impl<T> RequestQueue<T> {
             if self.better(candidate, best, &effective, highest) {
                 best = candidate;
             }
+        }
+        if !predicate(&self.pending[best]) {
+            return None;
         }
         let item = self.pending.swap_remove(best);
         let weight = self.weights.get(&item.tenant).copied().unwrap_or(1.0);
@@ -321,6 +342,30 @@ mod tests {
             queue.pop(now + Duration::from_millis(60)).unwrap().payload,
             1
         );
+    }
+
+    #[test]
+    fn conditional_pop_never_skips_the_policy_winner() {
+        let now = Instant::now();
+        let mut queue =
+            RequestQueue::new(SchedulerPolicy::Priority, Duration::ZERO, 0, HashMap::new());
+        queue.push(item("high", 10, 1, now, 1));
+        queue.push(item("low", 0, 1, now, 2));
+        assert!(queue.pop_if(now, |item| item.payload == 2).is_none());
+        assert_eq!(queue.pop(now).unwrap().payload, 1);
+    }
+
+    #[test]
+    fn batching_gate_observes_aged_effective_priority() {
+        let now = Instant::now();
+        let mut queue = RequestQueue::new(
+            SchedulerPolicy::FairPriority,
+            Duration::from_millis(10),
+            0,
+            HashMap::new(),
+        );
+        queue.push(item("urgent", 1, 1, now, 1));
+        assert_eq!(queue.highest_effective_priority(now), Some(1));
     }
 
     #[test]
