@@ -98,6 +98,10 @@ impl<T> RequestQueue<T> {
         self.pending.len()
     }
 
+    pub fn iter(&self) -> impl Iterator<Item = &Scheduled<T>> {
+        self.pending.iter()
+    }
+
     pub fn push(&mut self, mut item: Scheduled<T>) {
         item.sequence = self.next_sequence;
         self.next_sequence = self.next_sequence.wrapping_add(1);

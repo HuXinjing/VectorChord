@@ -9,6 +9,7 @@
 // Copyright (c) 2026 Hu Xinjing
 
 mod cache;
+mod dispatch;
 mod engine;
 mod gpu;
 mod protocol;
@@ -18,6 +19,7 @@ mod shard;
 
 use anyhow::{Context, Result, anyhow, bail};
 use clap::Parser;
+use dispatch::{DispatchInput, DispatchThresholds, KernelKind};
 use engine::{Engine, EngineStatus};
 use gpu::Gpu;
 use protocol::{
@@ -712,6 +714,11 @@ struct RuntimeMetrics {
     admitted_priority_positive: AtomicU64,
     candidates_scored: AtomicU64,
     document_rows_scored: AtomicU64,
+    batch_compatible_pairs: AtomicU64,
+    batch_shared_candidates: AtomicU64,
+    shadow_dispatch_warp: AtomicU64,
+    shadow_dispatch_tile: AtomicU64,
+    shadow_dispatch_tensor: AtomicU64,
     latency_observations: AtomicU64,
     total_latency_us: AtomicU64,
     gpu_latency_us: AtomicU64,
@@ -1315,6 +1322,7 @@ fn enqueue_work(
     config: &SchedulerConfig,
     metrics: &RuntimeMetrics,
 ) {
+    observe_batch_opportunity(queue, &work, metrics);
     match work.request.priority.cmp(&0) {
         std::cmp::Ordering::Less => metrics
             .admitted_priority_negative
@@ -1336,6 +1344,67 @@ fn enqueue_work(
         work,
     ));
     metrics.update_scheduler_depth(queue.len());
+}
+
+fn observe_batch_opportunity(
+    queue: &RequestQueue<Work>,
+    incoming: &Work,
+    metrics: &RuntimeMetrics,
+) {
+    use std::collections::HashSet;
+    let request = &incoming.request;
+    let incoming_keys = request
+        .candidates
+        .iter()
+        .map(|item| (&item.contract, &item.digest))
+        .collect::<HashSet<_>>();
+    for queued in queue.iter() {
+        let other = &queued.payload.request;
+        if request.tenant != other.tenant
+            || request.dimension != other.dimension
+            || request.dtype != other.dtype
+            || request.scoring_profile != other.scoring_profile
+            || request.quantization_contract != other.quantization_contract
+        {
+            continue;
+        }
+        let shared = other
+            .candidates
+            .iter()
+            .filter(|item| incoming_keys.contains(&(&item.contract, &item.digest)))
+            .count();
+        let denominator = request.candidates.len().max(other.candidates.len()).max(1);
+        let ratio = u16::try_from(shared.saturating_mul(1000) / denominator).unwrap_or(1000);
+        metrics
+            .batch_compatible_pairs
+            .fetch_add(1, Ordering::Relaxed);
+        saturating_atomic_add(
+            &metrics.batch_shared_candidates,
+            u64::try_from(shared).unwrap_or(u64::MAX),
+        );
+        let storage_bytes = match request.scoring_profile {
+            protocol::ScoringProfile::ExactFp16 => request.dtype,
+            _ => 1,
+        };
+        let decision = dispatch::choose(
+            DispatchInput {
+                query_rows: u64::from(request.query_rows) + u64::from(other.query_rows),
+                storage_bytes_per_scalar: storage_bytes,
+                shared_candidate_ratio_milli: ratio,
+                // This is opportunity telemetry, not execution dispatch. The
+                // calibrated device-specific counters report what actually ran.
+                tensor_available: true,
+                tile_available: true,
+            },
+            DispatchThresholds::default(),
+        );
+        match decision {
+            KernelKind::Warp => &metrics.shadow_dispatch_warp,
+            KernelKind::Tile => &metrics.shadow_dispatch_tile,
+            KernelKind::Tensor => &metrics.shadow_dispatch_tensor,
+        }
+        .fetch_add(1, Ordering::Relaxed);
+    }
 }
 
 fn tenant_hash(tenant: &str) -> String {
@@ -1846,6 +1915,50 @@ fn render_metrics(metrics: &RuntimeMetrics) -> String {
         metrics.document_rows_scored.load(Ordering::Relaxed)
     )
     .unwrap();
+    writeln!(output, "# HELP tilemaxsim_batch_compatible_pairs_total Same-tenant queued request pairs compatible for microbatching.").unwrap();
+    writeln!(
+        output,
+        "# TYPE tilemaxsim_batch_compatible_pairs_total counter"
+    )
+    .unwrap();
+    writeln!(
+        output,
+        "tilemaxsim_batch_compatible_pairs_total {}",
+        metrics.batch_compatible_pairs.load(Ordering::Relaxed)
+    )
+    .unwrap();
+    writeln!(output, "# HELP tilemaxsim_batch_shared_candidates_total Content-addressed candidates shared by compatible request pairs.").unwrap();
+    writeln!(
+        output,
+        "# TYPE tilemaxsim_batch_shared_candidates_total counter"
+    )
+    .unwrap();
+    writeln!(
+        output,
+        "tilemaxsim_batch_shared_candidates_total {}",
+        metrics.batch_shared_candidates.load(Ordering::Relaxed)
+    )
+    .unwrap();
+    writeln!(output, "# HELP tilemaxsim_shadow_kernel_dispatch_total Shadow-only adaptive kernel decisions; execution remains on the current kernel.").unwrap();
+    writeln!(
+        output,
+        "# TYPE tilemaxsim_shadow_kernel_dispatch_total counter"
+    )
+    .unwrap();
+    for (kernel, value) in [
+        ("warp", metrics.shadow_dispatch_warp.load(Ordering::Relaxed)),
+        ("tile", metrics.shadow_dispatch_tile.load(Ordering::Relaxed)),
+        (
+            "tensor",
+            metrics.shadow_dispatch_tensor.load(Ordering::Relaxed),
+        ),
+    ] {
+        writeln!(
+            output,
+            "tilemaxsim_shadow_kernel_dispatch_total{{kernel=\"{kernel}\"}} {value}"
+        )
+        .unwrap();
+    }
     let observations = metrics.latency_observations.load(Ordering::Relaxed);
     let total_us = metrics.total_latency_us.load(Ordering::Relaxed);
     let gpu_us = metrics.gpu_latency_us.load(Ordering::Relaxed);
