@@ -67,6 +67,22 @@ unsafe extern "C" {
         error: *mut c_char,
         error_capacity: usize,
     ) -> c_int;
+    fn vctm_gpu_score_batch(
+        gpu: *mut NativeGpu,
+        queries: *const c_uchar,
+        query_bytes: usize,
+        query_offsets: *const u32,
+        request_count: u32,
+        total_query_rows: u32,
+        dimension: u32,
+        dtype: u8,
+        document_offsets: *const u64,
+        document_rows: *const u32,
+        count: usize,
+        output: *mut f32,
+        error: *mut c_char,
+        error_capacity: usize,
+    ) -> c_int;
     fn vctm_gpu_score_pq(
         gpu: *mut NativeGpu,
         quantizer: *const NativeQuantizer,
@@ -293,6 +309,52 @@ impl Gpu {
         }
         Ok(output)
     }
+
+    pub fn score_batch(
+        &mut self,
+        queries: &[u8],
+        query_offsets: &[u32],
+        dimension: u32,
+        dtype: u8,
+        document_offsets: &[u64],
+        document_rows: &[u32],
+    ) -> Result<Vec<Vec<f32>>> {
+        if query_offsets.len() < 3 || query_offsets[0] != 0 {
+            bail!("a native multi-query batch requires at least two queries");
+        }
+        let request_count = query_offsets.len() - 1;
+        let total_query_rows = *query_offsets.last().unwrap();
+        let mut output = vec![0.0_f32; request_count * document_offsets.len()];
+        let mut error = [0_i8; 512];
+        let status = unsafe {
+            vctm_gpu_score_batch(
+                self.native.as_ptr(),
+                queries.as_ptr(),
+                queries.len(),
+                query_offsets.as_ptr(),
+                u32::try_from(request_count).map_err(|_| anyhow!("too many batched queries"))?,
+                total_query_rows,
+                dimension,
+                dtype,
+                document_offsets.as_ptr(),
+                document_rows.as_ptr(),
+                document_offsets.len(),
+                output.as_mut_ptr(),
+                error.as_mut_ptr(),
+                error.len(),
+            )
+        };
+        if status != 0 {
+            bail!(native_error(&error));
+        }
+        if output.iter().any(|score| !score.is_finite()) {
+            bail!("native multi-query TileMaxSim returned a non-finite score");
+        }
+        Ok(output
+            .chunks(document_offsets.len())
+            .map(<[f32]>::to_vec)
+            .collect())
+    }
 }
 
 impl Drop for Gpu {
@@ -315,6 +377,27 @@ fn native_error(buffer: &[c_char]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[ignore = "requires an explicitly assigned CUDA device"]
+    fn native_multiquery_scores_shared_documents_once_per_tile() {
+        let device = std::env::var("VCTM_TEST_GPU")
+            .unwrap_or_else(|_| "0".to_owned())
+            .parse::<i32>()
+            .unwrap();
+        let mut gpu = Gpu::create(device, 64 * 1024 * 1024, 32 * 1024 * 1024).unwrap();
+        let half_one = 0x3c00_u16.to_le_bytes();
+        let half_zero = 0_u16.to_le_bytes();
+        let document = [half_one, half_zero, half_zero, half_one].concat();
+        gpu.upload_batch(&[(0, &document)]).unwrap();
+        let queries = [half_one, half_zero, half_zero, half_one].concat();
+        let scores = gpu
+            .score_batch(&queries, &[0, 1, 2], 2, 2, &[0], &[2])
+            .unwrap();
+        assert_eq!(scores.len(), 2);
+        assert!((scores[0][0] - 1.0).abs() < 1e-5, "scores={scores:?}");
+        assert!((scores[1][0] - 1.0).abs() < 1e-5, "scores={scores:?}");
+    }
 
     #[test]
     #[ignore = "requires an explicitly assigned CUDA device"]

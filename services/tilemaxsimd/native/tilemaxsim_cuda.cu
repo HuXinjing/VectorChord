@@ -45,6 +45,7 @@ struct VctmQuantizer {
 static int fail(char *error, size_t capacity, const char *message);
 static int cuda_fail(char *error, size_t capacity, const char *operation,
                      cudaError_t status);
+static bool reserve_aligned(size_t *cursor, size_t bytes, size_t *offset);
 
 static bool checked_mul(size_t left, size_t right, size_t *output) {
   if (right != 0 && left > std::numeric_limits<size_t>::max() / right) return false;
@@ -404,6 +405,114 @@ __global__ void tilemaxsim_sum_kernel(const float *maxima, uint32_t query_rows,
     score += maxima[candidate * query_rows + query_row];
   }
   scores[candidate] = score;
+}
+
+template <typename Scalar>
+__global__ void tilemaxsim_multiquery_kernel(
+    const Scalar *queries, uint32_t total_query_rows, uint32_t dimension,
+    const unsigned char *documents, const uint64_t *document_offsets,
+    const uint32_t *document_rows, size_t candidate_count, float *maxima) {
+  extern __shared__ unsigned char shared_bytes[];
+  auto *document_vector = reinterpret_cast<Scalar *>(shared_bytes);
+  const uint32_t lane = threadIdx.x & 31;
+  const uint32_t warp = threadIdx.x >> 5;
+  constexpr uint32_t warps = 8;
+  for (size_t candidate = blockIdx.x; candidate < candidate_count; candidate += gridDim.x) {
+    const auto *document = reinterpret_cast<const Scalar *>(documents + document_offsets[candidate]);
+    for (uint32_t query_base = 0; query_base < total_query_rows; query_base += warps) {
+      const uint32_t query_row = query_base + warp;
+      float best = -CUDART_INF_F;
+      for (uint32_t row = 0; row < document_rows[candidate]; ++row) {
+        for (uint32_t column = threadIdx.x; column < dimension; column += blockDim.x)
+          document_vector[column] = document[static_cast<size_t>(row) * dimension + column];
+        __syncthreads();
+        if (query_row < total_query_rows) {
+          const Scalar *query = queries + static_cast<size_t>(query_row) * dimension;
+          float dot = 0.0f;
+          for (uint32_t column = lane; column < dimension; column += 32)
+            dot = fmaf(scalar_to_float(query[column]), scalar_to_float(document_vector[column]), dot);
+          for (int delta = 16; delta != 0; delta >>= 1)
+            dot += __shfl_down_sync(0xffffffff, dot, delta);
+          if (lane == 0) best = fmaxf(best, dot);
+        }
+        __syncthreads();
+      }
+      if (lane == 0 && query_row < total_query_rows)
+        maxima[candidate * total_query_rows + query_row] = best;
+    }
+  }
+}
+
+__global__ void tilemaxsim_segmented_sum_kernel(
+    const float *maxima, uint32_t total_query_rows,
+    const uint32_t *query_offsets, uint32_t request_count,
+    size_t candidate_count, float *scores) {
+  const size_t task_count = candidate_count * request_count;
+  for (size_t task = blockIdx.x * blockDim.x + threadIdx.x; task < task_count;
+       task += static_cast<size_t>(gridDim.x) * blockDim.x) {
+    const size_t candidate = task / request_count;
+    const uint32_t request = static_cast<uint32_t>(task % request_count);
+    float score = 0.0f;
+    for (uint32_t row = query_offsets[request]; row < query_offsets[request + 1]; ++row)
+      score += maxima[candidate * total_query_rows + row];
+    scores[static_cast<size_t>(request) * candidate_count + candidate] = score;
+  }
+}
+
+extern "C" int vctm_gpu_score_batch(
+    VctmGpu *gpu, const unsigned char *queries, size_t query_bytes,
+    const uint32_t *query_offsets, uint32_t request_count,
+    uint32_t total_query_rows, uint32_t dimension, uint8_t dtype,
+    const uint64_t *document_offsets, const uint32_t *document_rows,
+    size_t count, float *output, char *error, size_t error_capacity) {
+  if (gpu == nullptr || queries == nullptr || query_offsets == nullptr || request_count < 2 ||
+      total_query_rows == 0 || dimension == 0 || document_offsets == nullptr ||
+      document_rows == nullptr || count == 0 || output == nullptr ||
+      query_offsets[0] != 0 || query_offsets[request_count] != total_query_rows)
+    return fail(error, error_capacity, "invalid multi-query TileMaxSim request");
+  const size_t scalar_bytes = dtype == 1 ? sizeof(float) : dtype == 2 ? sizeof(half) : 0;
+  size_t expected_values = 0, expected_bytes = 0;
+  if (scalar_bytes == 0 || !checked_mul(total_query_rows, dimension, &expected_values) ||
+      !checked_mul(expected_values, scalar_bytes, &expected_bytes) || expected_bytes != query_bytes)
+    return fail(error, error_capacity, "multi-query byte length disagrees with shape");
+  for (uint32_t index = 0; index < request_count; ++index)
+    if (query_offsets[index] >= query_offsets[index + 1])
+      return fail(error, error_capacity, "multi-query offsets must be strictly increasing");
+  cudaError_t status = cudaSetDevice(gpu->device);
+  if (status != cudaSuccess) return cuda_fail(error, error_capacity, "cudaSetDevice", status);
+  size_t maxima_count = 0, score_count = 0;
+  if (!checked_mul(count, total_query_rows, &maxima_count) ||
+      !checked_mul(count, request_count, &score_count))
+    return fail(error, error_capacity, "multi-query workspace shape overflow");
+  unsigned char *workspace = gpu->allocation + gpu->tensor_bytes;
+  size_t cursor = 0, query_offset = 0, query_offsets_offset = 0,
+         offsets_offset = 0, rows_offset = 0, maxima_offset = 0, scores_offset = 0;
+  if (!reserve_aligned(&cursor, query_bytes, &query_offset) ||
+      !reserve_aligned(&cursor, (request_count + 1) * sizeof(uint32_t), &query_offsets_offset) ||
+      !reserve_aligned(&cursor, count * sizeof(uint64_t), &offsets_offset) ||
+      !reserve_aligned(&cursor, count * sizeof(uint32_t), &rows_offset) ||
+      !reserve_aligned(&cursor, maxima_count * sizeof(float), &maxima_offset) ||
+      !reserve_aligned(&cursor, score_count * sizeof(float), &scores_offset) ||
+      cursor > gpu->workspace_bytes)
+    return fail(error, error_capacity, "multi-query request exceeds configured GPU workspace");
+  status = cudaMemcpyAsync(workspace + query_offset, queries, query_bytes, cudaMemcpyHostToDevice, gpu->compute_stream);
+  if (status == cudaSuccess) status = cudaMemcpyAsync(workspace + query_offsets_offset, query_offsets, (request_count + 1) * sizeof(uint32_t), cudaMemcpyHostToDevice, gpu->compute_stream);
+  if (status == cudaSuccess) status = cudaMemcpyAsync(workspace + offsets_offset, document_offsets, count * sizeof(uint64_t), cudaMemcpyHostToDevice, gpu->compute_stream);
+  if (status == cudaSuccess) status = cudaMemcpyAsync(workspace + rows_offset, document_rows, count * sizeof(uint32_t), cudaMemcpyHostToDevice, gpu->compute_stream);
+  const unsigned int blocks = static_cast<unsigned int>(std::min(count, static_cast<size_t>(65'535)));
+  const size_t shared_bytes = static_cast<size_t>(dimension) * scalar_bytes;
+  if (status == cudaSuccess && dtype == 2)
+    tilemaxsim_multiquery_kernel<half><<<blocks, 256, shared_bytes, gpu->compute_stream>>>(reinterpret_cast<const half *>(workspace + query_offset), total_query_rows, dimension, gpu->allocation, reinterpret_cast<const uint64_t *>(workspace + offsets_offset), reinterpret_cast<const uint32_t *>(workspace + rows_offset), count, reinterpret_cast<float *>(workspace + maxima_offset));
+  else if (status == cudaSuccess && dtype == 1)
+    tilemaxsim_multiquery_kernel<float><<<blocks, 256, shared_bytes, gpu->compute_stream>>>(reinterpret_cast<const float *>(workspace + query_offset), total_query_rows, dimension, gpu->allocation, reinterpret_cast<const uint64_t *>(workspace + offsets_offset), reinterpret_cast<const uint32_t *>(workspace + rows_offset), count, reinterpret_cast<float *>(workspace + maxima_offset));
+  if (status == cudaSuccess) status = cudaGetLastError();
+  constexpr unsigned int threads = 256;
+  if (status == cudaSuccess) tilemaxsim_segmented_sum_kernel<<<static_cast<unsigned int>(std::min((score_count + threads - 1) / threads, static_cast<size_t>(65'535))), threads, 0, gpu->compute_stream>>>(reinterpret_cast<const float *>(workspace + maxima_offset), total_query_rows, reinterpret_cast<const uint32_t *>(workspace + query_offsets_offset), request_count, count, reinterpret_cast<float *>(workspace + scores_offset));
+  if (status == cudaSuccess) status = cudaGetLastError();
+  if (status == cudaSuccess) status = cudaMemcpyAsync(output, workspace + scores_offset, score_count * sizeof(float), cudaMemcpyDeviceToHost, gpu->compute_stream);
+  if (status == cudaSuccess) status = cudaStreamSynchronize(gpu->compute_stream);
+  if (status != cudaSuccess) return cuda_fail(error, error_capacity, "multi-query TileMaxSim CUDA execution", status);
+  return 0;
 }
 
 template <typename QueryScalar>

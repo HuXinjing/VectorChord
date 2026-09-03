@@ -519,6 +519,137 @@ impl Engine {
             .collect()
     }
 
+    /// Score an exact-profile microbatch that shares the same candidate list.
+    /// The fast path is intentionally L0-only: a miss returns `None` so the
+    /// established per-request loader retains ownership of admission, tenant
+    /// reservations, and rollback semantics.
+    pub fn score_resident_batch(
+        &mut self,
+        requests: &[Request],
+    ) -> Result<Option<Vec<Vec<(u32, f32)>>>> {
+        if requests.len() < 2 {
+            return Ok(None);
+        }
+        let leader = &requests[0];
+        if leader.scoring_profile != crate::protocol::ScoringProfile::ExactFp16 {
+            return Ok(None);
+        }
+        let scalar_bytes = if leader.dtype == 1 {
+            4
+        } else if leader.dtype == 2 {
+            2
+        } else {
+            return Ok(None);
+        };
+        if usize::try_from(leader.dimension)
+            .unwrap_or(usize::MAX)
+            .saturating_mul(scalar_bytes)
+            > 32 * 1024
+        {
+            return Ok(None);
+        }
+        if requests.iter().skip(1).any(|request| {
+            request.dimension != leader.dimension
+                || request.dtype != leader.dtype
+                || request.scoring_profile != leader.scoring_profile
+                || request.candidates.len() != leader.candidates.len()
+                || request
+                    .candidates
+                    .iter()
+                    .zip(&leader.candidates)
+                    .any(|(left, right)| cache_key(left) != cache_key(right))
+        }) {
+            return Ok(None);
+        }
+        let mut chunks = (0..self.devices.len())
+            .map(|_| Vec::<ResidentTensor>::new())
+            .collect::<Vec<_>>();
+        for (candidate_index, descriptor) in leader.candidates.iter().enumerate() {
+            let key = gpu_cache_key(
+                descriptor,
+                leader.scoring_profile,
+                leader.quantization_contract.as_deref(),
+            );
+            let Some(device_index) = self
+                .devices
+                .iter()
+                .position(|device| device.cache.contains(&key))
+            else {
+                self.release_chunks(&chunks)?;
+                return Ok(None);
+            };
+            let entry = self.devices[device_index]
+                .cache
+                .get(&key)
+                .expect("resident batch cache hit disappeared");
+            validate_entry(descriptor, &entry, leader.scoring_profile, None)?;
+            chunks[device_index].push(ResidentTensor {
+                candidate_index,
+                device: device_index,
+                key,
+                offset: entry.offset,
+                rows: entry.rows,
+                transient: false,
+                newly_admitted: false,
+            });
+        }
+        let mut query_offsets = Vec::with_capacity(requests.len() + 1);
+        let mut queries = Vec::new();
+        query_offsets.push(0_u32);
+        let mut total_rows = 0_u32;
+        for request in requests {
+            total_rows = total_rows
+                .checked_add(request.query_rows)
+                .ok_or_else(|| anyhow!("batched query row count overflow"))?;
+            query_offsets.push(total_rows);
+            queries.extend_from_slice(&request.query);
+        }
+        let mut scores = vec![vec![None; leader.candidates.len()]; requests.len()];
+        let result = (|| -> Result<()> {
+            for (device, chunk) in self.devices.iter_mut().zip(&chunks) {
+                if chunk.is_empty() {
+                    continue;
+                }
+                let offsets = chunk.iter().map(|item| item.offset).collect::<Vec<_>>();
+                let rows = chunk.iter().map(|item| item.rows).collect::<Vec<_>>();
+                let computed = device.gpu.score_batch(
+                    &queries,
+                    &query_offsets,
+                    leader.dimension,
+                    leader.dtype,
+                    &offsets,
+                    &rows,
+                )?;
+                for (request_scores, values) in scores.iter_mut().zip(computed) {
+                    for (tensor, value) in chunk.iter().zip(values) {
+                        request_scores[tensor.candidate_index] = Some(value);
+                    }
+                }
+            }
+            Ok(())
+        })();
+        let cleanup = self.release_chunks(&chunks);
+        result?;
+        cleanup?;
+        Ok(Some(
+            scores
+                .into_iter()
+                .map(|request_scores| {
+                    leader
+                        .candidates
+                        .iter()
+                        .zip(request_scores)
+                        .map(|(candidate, score)| {
+                            score
+                                .map(|value| (candidate.candidate_id, value))
+                                .ok_or_else(|| anyhow!("missing batched TileMaxSim score"))
+                        })
+                        .collect::<Result<Vec<_>>>()
+                })
+                .collect::<Result<Vec<_>>>()?,
+        ))
+    }
+
     fn upload_devices(
         &mut self,
         chunks: &[Vec<ResidentTensor>],

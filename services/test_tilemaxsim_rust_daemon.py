@@ -722,6 +722,110 @@ class RustDaemonTest(unittest.TestCase):
                     process.wait(timeout=10)
 
     @unittest.skipUnless(torch.cuda.is_available(), "CUDA is unavailable")
+    def test_concurrent_resident_requests_use_fused_microbatch(self) -> None:
+        binary = self._release_binary()
+        if not binary.exists():
+            self.skipTest("release tilemaxsimd binary has not been built")
+        device = max(
+            range(torch.cuda.device_count()),
+            key=lambda index: torch.cuda.mem_get_info(index)[0],
+        )
+        generator = np.random.default_rng(20260903)
+        documents = generator.standard_normal((16, 32, 320)).astype(np.float32)
+        documents /= np.maximum(np.linalg.norm(documents, axis=2, keepdims=True), 1e-12)
+        documents = documents.astype("<f2")
+        queries = generator.standard_normal((16, 24, 320)).astype(np.float32)
+        queries /= np.maximum(np.linalg.norm(queries, axis=2, keepdims=True), 1e-12)
+        queries = queries.astype("<f2")
+        with tempfile.TemporaryDirectory(prefix="tilemaxsim-fused-e2e-") as directory:
+            root = Path(directory)
+            shard_root = root / "shards"
+            shard_root.mkdir()
+            records = []
+            writer = ImmutableShardWriter(shard_root, target_bytes=8 * 1024**2, alignment=256, fsync=False)
+            try:
+                for index, document in enumerate(documents):
+                    payload = document.tobytes()
+                    digest = hashlib.sha256(payload).hexdigest()
+                    writer.add(digest, payload, document.shape[0], document.shape[1], "float16")
+                    records.append((100 + index, f"sha256://{digest}", document.tolist()))
+                writer.finish()
+            finally:
+                writer.close()
+            manifest = root / "resident.jsonl"
+            with manifest.open("w", encoding="utf-8") as stream:
+                for index, (candidate_id, reference, _) in enumerate(records):
+                    digest = reference.removeprefix("sha256://")
+                    stream.write(json.dumps({
+                        "page_key": str(candidate_id), "tensor_ref": reference,
+                        "tensor_rows": 32, "tensor_dim": 320,
+                        "tensor_dtype": "float16", "tensor_checksum": f"sha256:{digest}",
+                        "canonical_bytes": int(documents[index].nbytes),
+                    }) + "\n")
+            frames = [scheduled_external_request_frame(
+                30_000 + index, protocol.DTYPE_F16, query.tolist(), "model@1",
+                records, "synthetic-tenant", 0, 30_000,
+            )[0] for index, query in enumerate(queries)]
+            socket_path = root / "tilemaxsimd.sock"
+            status_path = root / "status.sock"
+            process = subprocess.Popen([
+                os.fspath(binary), "--socket", os.fspath(socket_path),
+                "--status-socket", os.fspath(status_path),
+                "--gpu-memory-gb", f"{device}=0.1", "--gpu-workspace-gb", "0.05",
+                "--host-cache-gb", "0.05", "--contract-root", f"model@1={shard_root}",
+                "--gpu-cache-mode", "resident", "--resident-manifest", f"model@1={manifest}",
+                "--scheduler-batch-window-ms", "100", "--scheduler-max-microbatch-requests", "16",
+                "--scheduler-min-shared-candidates-milli", "1000",
+                "--request-timeout-ms", "30000", "--socket-io-timeout-ms", "30000",
+            ], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+            try:
+                for _ in range(1500):
+                    if (socket_path.exists() and status_path.exists()) or process.poll() is not None:
+                        break
+                    time.sleep(0.01)
+                self.assertIsNone(process.poll())
+
+                def call(frame: bytes):
+                    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
+                        connection.settimeout(30)
+                        connection.connect(os.fspath(socket_path))
+                        connection.sendall(frame)
+                        header = protocol.receive_exact(connection, protocol.HEADER.size)
+                        body_bytes = protocol.HEADER.unpack(header)[4]
+                        return decode_response(header + protocol.receive_exact(connection, body_bytes))
+
+                with ThreadPoolExecutor(max_workers=16) as executor:
+                    responses = list(executor.map(call, frames))
+                for query_index, (request_id, status, results) in enumerate(responses):
+                    self.assertEqual((request_id, status), (30_000 + query_index, 0))
+                    oracle = []
+                    query = queries[query_index].astype(np.float32)
+                    for candidate_index, document in enumerate(documents.astype(np.float32)):
+                        oracle.append((100 + candidate_index, float((query @ document.T).max(axis=1).sum())))
+                    self.assertEqual([item[0] for item in results], [item[0] for item in oracle])
+                    np.testing.assert_allclose(
+                        [item[1] for item in results], [item[1] for item in oracle], rtol=3e-3, atol=3e-3
+                    )
+                with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as status_connection:
+                    status_connection.connect(os.fspath(status_path))
+                    status_connection.sendall(b"GET /metrics HTTP/1.1\r\nHost: localhost\r\n\r\n")
+                    response = b""
+                    while part := status_connection.recv(65536):
+                        response += part
+                metrics = response.decode("utf-8")
+                fused_batches = int(next(line.split()[-1] for line in metrics.splitlines()
+                    if line.startswith("tilemaxsim_gpu_fused_microbatches_total ")))
+                fused_requests = int(next(line.split()[-1] for line in metrics.splitlines()
+                    if line.startswith("tilemaxsim_gpu_fused_requests_total ")))
+                self.assertGreaterEqual(fused_batches, 1, metrics)
+                self.assertGreaterEqual(fused_requests, 2, metrics)
+            finally:
+                if process.poll() is None:
+                    process.terminate()
+                output, _ = process.communicate(timeout=30)
+                self.assertEqual(process.returncode, 0, output)
+
+    @unittest.skipUnless(torch.cuda.is_available(), "CUDA is unavailable")
     def test_overload_rejects_one_tenant_without_crashing_daemon(self) -> None:
         binary = self._release_binary()
         if not binary.exists():

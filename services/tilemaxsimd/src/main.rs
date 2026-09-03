@@ -731,6 +731,8 @@ struct RuntimeMetrics {
     shadow_dispatch_tensor: AtomicU64,
     scheduler_microbatches: AtomicU64,
     scheduler_microbatch_requests: AtomicU64,
+    gpu_fused_microbatches: AtomicU64,
+    gpu_fused_requests: AtomicU64,
     latency_observations: AtomicU64,
     total_latency_us: AtomicU64,
     gpu_latency_us: AtomicU64,
@@ -1223,6 +1225,36 @@ fn run_scheduler(
             u64::try_from(microbatch.len()).unwrap_or(u64::MAX),
         );
         metrics.update_scheduler_depth(queue.len());
+        let mut fused_results = HashMap::new();
+        if microbatch.len() > 1
+            && microbatch.iter().all(|scheduled| {
+                scheduled.payload.deadline > Instant::now()
+                    && !peer_disconnected(&scheduled.payload.connection)
+            })
+        {
+            let quantums = microbatch
+                .iter()
+                .map(|scheduled| request_quantum(&scheduled.payload, &config))
+                .collect::<Vec<_>>();
+            let fused_started = Instant::now();
+            metrics.gpu_active.store(1, Ordering::Relaxed);
+            let fused = engine.score_resident_batch(&quantums);
+            metrics.gpu_active.store(0, Ordering::Relaxed);
+            metrics.update_engine(engine.status_snapshot());
+            if let Some(results) = fused? {
+                let elapsed = fused_started.elapsed();
+                metrics
+                    .gpu_fused_microbatches
+                    .fetch_add(1, Ordering::Relaxed);
+                saturating_atomic_add(
+                    &metrics.gpu_fused_requests,
+                    u64::try_from(results.len()).unwrap_or(u64::MAX),
+                );
+                for (request, scores) in quantums.iter().zip(results) {
+                    fused_results.insert(request.request_id, (scores, elapsed));
+                }
+            }
+        }
         for scheduled in microbatch {
             if peer_disconnected(&scheduled.payload.connection) {
                 metrics.disconnected.fetch_add(1, Ordering::Relaxed);
@@ -1248,20 +1280,7 @@ fn run_scheduler(
                 ))
             } else {
                 let end = next_quantum_end(&work, &config);
-                let quantum = protocol::Request {
-                    protocol_version: work.request.protocol_version,
-                    request_id: work.request.request_id,
-                    tenant: work.request.tenant.clone(),
-                    priority: work.request.priority,
-                    timeout_ms: work.request.timeout_ms,
-                    query_rows: work.request.query_rows,
-                    dimension: work.request.dimension,
-                    dtype: work.request.dtype,
-                    scoring_profile: work.request.scoring_profile,
-                    quantization_contract: work.request.quantization_contract.clone(),
-                    query: work.request.query.clone(),
-                    candidates: work.request.candidates[work.next_candidate..end].to_vec(),
-                };
+                let quantum = request_quantum(&work, &config);
                 let quantum_started = Instant::now();
                 metrics.gpu_quantums.fetch_add(1, Ordering::Relaxed);
                 saturating_atomic_add(
@@ -1276,13 +1295,20 @@ fn run_scheduler(
                         .map(|candidate| u64::from(candidate.rows))
                         .sum(),
                 );
-                metrics.gpu_active.store(1, Ordering::Relaxed);
-                let score_result = engine.score(&quantum);
-                metrics.gpu_active.store(0, Ordering::Relaxed);
-                metrics.update_engine(engine.status_snapshot());
+                let (score_result, measured_elapsed) =
+                    if let Some((scores, elapsed)) = fused_results.remove(&request_id) {
+                        (Ok(scores), Some(elapsed))
+                    } else {
+                        metrics.gpu_active.store(1, Ordering::Relaxed);
+                        let result = engine.score(&quantum);
+                        metrics.gpu_active.store(0, Ordering::Relaxed);
+                        metrics.update_engine(engine.status_snapshot());
+                        (result, None)
+                    };
                 match score_result {
                     Ok(results) => {
-                        work.gpu_elapsed += quantum_started.elapsed();
+                        work.gpu_elapsed +=
+                            measured_elapsed.unwrap_or_else(|| quantum_started.elapsed());
                         work.results.extend(results);
                         work.next_candidate = end;
                         if work.deadline <= Instant::now() {
@@ -1387,6 +1413,24 @@ fn works_are_batch_compatible(left: &Work, right: &Work, minimum_overlap_milli: 
         .count();
     let denominator = keys.len().max(right_slice.len()).max(1);
     shared.saturating_mul(1000) / denominator >= usize::from(minimum_overlap_milli)
+}
+
+fn request_quantum(work: &Work, config: &SchedulerConfig) -> protocol::Request {
+    let end = next_quantum_end(work, config);
+    protocol::Request {
+        protocol_version: work.request.protocol_version,
+        request_id: work.request.request_id,
+        tenant: work.request.tenant.clone(),
+        priority: work.request.priority,
+        timeout_ms: work.request.timeout_ms,
+        query_rows: work.request.query_rows,
+        dimension: work.request.dimension,
+        dtype: work.request.dtype,
+        scoring_profile: work.request.scoring_profile,
+        quantization_contract: work.request.quantization_contract.clone(),
+        query: work.request.query.clone(),
+        candidates: work.request.candidates[work.next_candidate..end].to_vec(),
+    }
 }
 
 fn next_quantum_end_unconfigured(work: &Work) -> usize {
@@ -2043,6 +2087,26 @@ fn render_metrics(metrics: &RuntimeMetrics) -> String {
         metrics
             .scheduler_microbatch_requests
             .load(Ordering::Relaxed)
+    )
+    .unwrap();
+    writeln!(output, "# HELP tilemaxsim_gpu_fused_microbatches_total Resident shared-candidate microbatches executed by one GPU submission.").unwrap();
+    writeln!(
+        output,
+        "# TYPE tilemaxsim_gpu_fused_microbatches_total counter"
+    )
+    .unwrap();
+    writeln!(
+        output,
+        "tilemaxsim_gpu_fused_microbatches_total {}",
+        metrics.gpu_fused_microbatches.load(Ordering::Relaxed)
+    )
+    .unwrap();
+    writeln!(output, "# HELP tilemaxsim_gpu_fused_requests_total Requests completed through fused multi-query GPU submissions.").unwrap();
+    writeln!(output, "# TYPE tilemaxsim_gpu_fused_requests_total counter").unwrap();
+    writeln!(
+        output,
+        "tilemaxsim_gpu_fused_requests_total {}",
+        metrics.gpu_fused_requests.load(Ordering::Relaxed)
     )
     .unwrap();
     writeln!(output, "# HELP tilemaxsim_shadow_kernel_dispatch_total Shadow-only adaptive kernel decisions; execution remains on the current kernel.").unwrap();
