@@ -116,6 +116,19 @@ token 数和实际 `query rows × document rows × dimension` 计算量切分。
 launch 结束后，请求重新进入调度器，因此其他调度域可以插入执行。已经开始的
 CUDA kernel 不能被中断，FMA quantum 用来限制这段协作式不可抢占时间。
 
+普通优先级的新一轮 busy period 最多等待 `--scheduler-batch-window-ms`，并在每个
+quantum 边界连续吸收不超过 `--scheduler-max-microbatch-requests` 个兼容请求。
+高优先级请求和已经恢复执行的长请求不会为了凑批额外等待。兼容条件包含租户、
+priority、模型/量化 contract、shape，以及由
+`--scheduler-min-shared-candidates-milli` 控制的内容寻址候选重叠率。候选完全一致、
+采用精确 FP16 且全部命中 L0 的批次会进入共享候选 GPU 路径；其他情况确定性保持
+原执行路径。
+
+每张 GPU 启动时用 32/96/256/512 个 query rows 做有界交叉点校准，对比共享内存
+tile kernel 与 cuBLAS FP16 Tensor Core GEMM + 分段 MaxSim 归约。只有数值结果在
+容差内一致时才采纳实测交叉点；校准失败时使用架构保守表，硬件不支持、workspace
+不足、数值不一致或后端失败时回退 tile/warp。分派和校准结果均由 `/metrics` 暴露。
+
 GPU 和 host cache 都有调度域最大占用限制。可选的
 `--tenant-cache-reservation TENANT=GB` 会保护已经预热的 GPU 页面，使其他调度域
 不能把它淘汰到低于指定容量。不过它当前只是“聚合字节保底”，不是某个知识库的
@@ -139,6 +152,8 @@ tilemaxsimd \
   --max-queued-requests 128 \
   --max-tenant-queued-requests 16 \
   --scheduler-quantum-fmas 4000000000 \
+  --scheduler-max-microbatch-requests 8 \
+  --scheduler-min-shared-candidates-milli 500 \
   --tenant-weight foreground=2 \
   --tenant-cache-reservation foreground=4
 ```

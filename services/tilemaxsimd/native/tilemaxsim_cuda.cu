@@ -10,6 +10,7 @@
 
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
+#include <cublas_v2.h>
 #include <math_constants.h>
 
 #include <algorithm>
@@ -29,6 +30,7 @@ struct VctmGpu {
   size_t host_staging_bytes;
   cudaStream_t upload_stream;
   cudaStream_t compute_stream;
+  cublasHandle_t cublas;
 };
 
 struct VctmQuantizer {
@@ -45,6 +47,12 @@ struct VctmQuantizer {
 static int fail(char *error, size_t capacity, const char *message);
 static int cuda_fail(char *error, size_t capacity, const char *operation,
                      cudaError_t status);
+static int cublas_fail(char *error, size_t capacity, const char *operation,
+                       cublasStatus_t status) {
+  if (error != nullptr && capacity != 0)
+    std::snprintf(error, capacity, "%s: cuBLAS status %d", operation, static_cast<int>(status));
+  return 1;
+}
 static bool reserve_aligned(size_t *cursor, size_t bytes, size_t *offset);
 
 static bool checked_mul(size_t left, size_t right, size_t *output) {
@@ -166,6 +174,20 @@ extern "C" int vctm_gpu_create(int device, size_t total_bytes,
     delete gpu;
     return cuda_fail(error, error_capacity, "cudaHostAlloc", status);
   }
+  cublasStatus_t blas_status = cublasCreate(&gpu->cublas);
+  if (blas_status == CUBLAS_STATUS_SUCCESS)
+    blas_status = cublasSetStream(gpu->cublas, gpu->compute_stream);
+  if (blas_status == CUBLAS_STATUS_SUCCESS)
+    blas_status = cublasSetMathMode(gpu->cublas, CUBLAS_TENSOR_OP_MATH);
+  if (blas_status != CUBLAS_STATUS_SUCCESS) {
+    if (gpu->cublas != nullptr) cublasDestroy(gpu->cublas);
+    cudaFreeHost(gpu->host_staging);
+    cudaStreamDestroy(gpu->upload_stream);
+    cudaStreamDestroy(gpu->compute_stream);
+    cudaFree(gpu->allocation);
+    delete gpu;
+    return cublas_fail(error, error_capacity, "cublasCreate", blas_status);
+  }
   std::memset(gpu->host_staging, 0, gpu->host_staging_bytes);
   *output = gpu;
   return 0;
@@ -174,6 +196,7 @@ extern "C" int vctm_gpu_create(int device, size_t total_bytes,
 extern "C" void vctm_gpu_destroy(VctmGpu *gpu) {
   if (gpu == nullptr) return;
   cudaSetDevice(gpu->device);
+  cublasDestroy(gpu->cublas);
   cudaStreamDestroy(gpu->upload_stream);
   cudaStreamDestroy(gpu->compute_stream);
   cudaFreeHost(gpu->host_staging);
@@ -183,6 +206,21 @@ extern "C" void vctm_gpu_destroy(VctmGpu *gpu) {
 
 extern "C" size_t vctm_gpu_tensor_bytes(const VctmGpu *gpu) {
   return gpu == nullptr ? 0 : gpu->tensor_bytes;
+}
+
+extern "C" int vctm_gpu_compute_capability(const VctmGpu *gpu, int *major, int *minor) {
+  if (gpu == nullptr || major == nullptr || minor == nullptr) return 1;
+  if (cudaDeviceGetAttribute(major, cudaDevAttrComputeCapabilityMajor, gpu->device) != cudaSuccess) return 1;
+  if (cudaDeviceGetAttribute(minor, cudaDevAttrComputeCapabilityMinor, gpu->device) != cudaSuccess) return 1;
+  return 0;
+}
+
+extern "C" int vctm_gpu_device_name(const VctmGpu *gpu, char *name, size_t capacity) {
+  if (gpu == nullptr || name == nullptr || capacity == 0) return 1;
+  cudaDeviceProp properties{};
+  if (cudaGetDeviceProperties(&properties, gpu->device) != cudaSuccess) return 1;
+  std::snprintf(name, capacity, "%s", properties.name);
+  return 0;
 }
 
 extern "C" int vctm_gpu_upload_batch(
@@ -512,6 +550,101 @@ extern "C" int vctm_gpu_score_batch(
   if (status == cudaSuccess) status = cudaMemcpyAsync(output, workspace + scores_offset, score_count * sizeof(float), cudaMemcpyDeviceToHost, gpu->compute_stream);
   if (status == cudaSuccess) status = cudaStreamSynchronize(gpu->compute_stream);
   if (status != cudaSuccess) return cuda_fail(error, error_capacity, "multi-query TileMaxSim CUDA execution", status);
+  return 0;
+}
+
+__global__ void tilemaxsim_gemm_reduce_kernel(
+    const float *similarities, uint32_t query_rows, uint32_t document_rows,
+    const uint32_t *query_offsets, uint32_t request_count,
+    size_t candidate, size_t candidate_count, float *scores) {
+  for (uint32_t request = blockIdx.x * blockDim.x + threadIdx.x;
+       request < request_count; request += gridDim.x * blockDim.x) {
+    float score = 0.0f;
+    for (uint32_t query = query_offsets[request]; query < query_offsets[request + 1]; ++query) {
+      float maximum = -CUDART_INF_F;
+      for (uint32_t row = 0; row < document_rows; ++row)
+        maximum = fmaxf(maximum, similarities[static_cast<size_t>(query) * document_rows + row]);
+      score += maximum;
+    }
+    scores[static_cast<size_t>(request) * candidate_count + candidate] = score;
+  }
+}
+
+extern "C" int vctm_gpu_score_batch_tensor(
+    VctmGpu *gpu, const unsigned char *queries, size_t query_bytes,
+    const uint32_t *query_offsets, uint32_t request_count,
+    uint32_t total_query_rows, uint32_t dimension,
+    const uint64_t *document_offsets, const uint32_t *document_rows,
+    size_t count, float *output, char *error, size_t error_capacity) {
+  if (gpu == nullptr || queries == nullptr || query_offsets == nullptr || request_count < 2 ||
+      total_query_rows == 0 || dimension == 0 || document_offsets == nullptr ||
+      document_rows == nullptr || count == 0 || output == nullptr || query_offsets[0] != 0 ||
+      query_offsets[request_count] != total_query_rows)
+    return fail(error, error_capacity, "invalid tensor-core TileMaxSim request");
+  if (total_query_rows > static_cast<uint32_t>(std::numeric_limits<int>::max()) ||
+      dimension > static_cast<uint32_t>(std::numeric_limits<int>::max()))
+    return fail(error, error_capacity, "tensor-core GEMM shape exceeds cuBLAS integer limits");
+  for (uint32_t index = 0; index < request_count; ++index)
+    if (query_offsets[index] >= query_offsets[index + 1])
+      return fail(error, error_capacity, "tensor-core query offsets must be strictly increasing");
+  size_t expected_values = 0, expected_bytes = 0;
+  if (!checked_mul(total_query_rows, dimension, &expected_values) ||
+      !checked_mul(expected_values, sizeof(half), &expected_bytes) || expected_bytes != query_bytes)
+    return fail(error, error_capacity, "tensor-core query byte length disagrees with shape");
+  uint32_t maximum_document_rows = 0;
+  for (size_t candidate = 0; candidate < count; ++candidate) {
+    if (document_rows[candidate] == 0 ||
+        document_rows[candidate] > static_cast<uint32_t>(std::numeric_limits<int>::max()) ||
+        document_offsets[candidate] > gpu->tensor_bytes)
+      return fail(error, error_capacity, "invalid tensor-core document descriptor");
+    size_t values = 0, bytes = 0;
+    if (!checked_mul(document_rows[candidate], dimension, &values) ||
+        !checked_mul(values, sizeof(half), &bytes) || bytes > gpu->tensor_bytes - document_offsets[candidate])
+      return fail(error, error_capacity, "tensor-core document exceeds GPU arena");
+    maximum_document_rows = std::max(maximum_document_rows, document_rows[candidate]);
+  }
+  size_t matrix_values = 0, score_values = 0;
+  if (!checked_mul(total_query_rows, maximum_document_rows, &matrix_values) ||
+      !checked_mul(request_count, count, &score_values))
+    return fail(error, error_capacity, "tensor-core workspace shape overflow");
+  unsigned char *workspace = gpu->allocation + gpu->tensor_bytes;
+  size_t cursor = 0, query_offset = 0, query_offsets_offset = 0,
+         matrix_offset = 0, scores_offset = 0;
+  if (!reserve_aligned(&cursor, query_bytes, &query_offset) ||
+      !reserve_aligned(&cursor, (request_count + 1) * sizeof(uint32_t), &query_offsets_offset) ||
+      !reserve_aligned(&cursor, matrix_values * sizeof(float), &matrix_offset) ||
+      !reserve_aligned(&cursor, score_values * sizeof(float), &scores_offset) ||
+      cursor > gpu->workspace_bytes)
+    return fail(error, error_capacity, "tensor-core request exceeds configured GPU workspace");
+  cudaError_t status = cudaSetDevice(gpu->device);
+  if (status != cudaSuccess) return cuda_fail(error, error_capacity, "cudaSetDevice", status);
+  status = cudaMemcpyAsync(workspace + query_offset, queries, query_bytes, cudaMemcpyHostToDevice, gpu->compute_stream);
+  if (status == cudaSuccess) status = cudaMemcpyAsync(workspace + query_offsets_offset, query_offsets, (request_count + 1) * sizeof(uint32_t), cudaMemcpyHostToDevice, gpu->compute_stream);
+  if (status != cudaSuccess) return cuda_fail(error, error_capacity, "tensor-core workspace initialization", status);
+  const float alpha = 1.0f, beta = 0.0f;
+  for (size_t candidate = 0; candidate < count; ++candidate) {
+    const int m = static_cast<int>(document_rows[candidate]);
+    const int n = static_cast<int>(total_query_rows);
+    const int k = static_cast<int>(dimension);
+    cublasStatus_t blas = cublasGemmEx(
+        gpu->cublas, CUBLAS_OP_T, CUBLAS_OP_N, m, n, k, &alpha,
+        gpu->allocation + document_offsets[candidate], CUDA_R_16F, k,
+        workspace + query_offset, CUDA_R_16F, k, &beta,
+        workspace + matrix_offset, CUDA_R_32F, m,
+        CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+    if (blas != CUBLAS_STATUS_SUCCESS)
+      return cublas_fail(error, error_capacity, "cublasGemmEx", blas);
+    const unsigned int threads = 128;
+    tilemaxsim_gemm_reduce_kernel<<<std::max(1U, (request_count + threads - 1) / threads), threads, 0, gpu->compute_stream>>>(
+        reinterpret_cast<const float *>(workspace + matrix_offset), total_query_rows,
+        document_rows[candidate], reinterpret_cast<const uint32_t *>(workspace + query_offsets_offset),
+        request_count, candidate, count, reinterpret_cast<float *>(workspace + scores_offset));
+    status = cudaGetLastError();
+    if (status != cudaSuccess) return cuda_fail(error, error_capacity, "tensor-core reduction", status);
+  }
+  status = cudaMemcpyAsync(output, workspace + scores_offset, score_values * sizeof(float), cudaMemcpyDeviceToHost, gpu->compute_stream);
+  if (status == cudaSuccess) status = cudaStreamSynchronize(gpu->compute_stream);
+  if (status != cudaSuccess) return cuda_fail(error, error_capacity, "tensor-core TileMaxSim execution", status);
   return 0;
 }
 

@@ -62,7 +62,9 @@ tilemaxsimd \
   --scheduler-policy fair-priority \
   --max-connections 256 \
   --max-queued-requests 128 \
-  --max-tenant-queued-requests 16
+  --max-tenant-queued-requests 16 \
+  --scheduler-max-microbatch-requests 8 \
+  --scheduler-min-shared-candidates-milli 500
 ```
 
 Multiple GPU assignments may be supplied. Device selection and the requested

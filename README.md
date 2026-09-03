@@ -202,6 +202,25 @@ at candidate/token quanta and re-enters the scheduler between CUDA launches.
 It is cooperative preemption between kernels, not interruption of an executing
 CUDA kernel.
 
+At a new normal-priority busy period the scheduler may wait up to
+`--scheduler-batch-window-ms` and continuously compose at most
+`--scheduler-max-microbatch-requests` compatible quanta. High-priority and
+already-resumed work never waits for batch formation. Compatibility includes
+tenant, priority, model/quantization contract, shape and a content-addressed
+candidate-overlap floor controlled by
+`--scheduler-min-shared-candidates-milli`. Exact FP16 batches whose candidate
+lists are identical and resident in L0 use one shared-candidate GPU submission;
+all other shapes retain the established path.
+
+Each GPU runs a bounded startup crossover calibration at 32/96/256/512 query
+rows. It compares the shared-memory tile kernel with a cuBLAS FP16 Tensor Core
+GEMM plus segmented MaxSim reduction and accepts a crossover only when scores
+agree within the configured implementation tolerance. Architecture defaults
+are used only if calibration cannot complete; unsupported hardware, workspace
+pressure, numerical disagreement, or backend failure deterministically falls
+back to the tile/warp path. Decisions and calibration outcomes are exported by
+`GET /metrics`.
+
 Admission is bounded both globally and per tenant before work enters the
 scheduler. Client disconnects and end-to-end deadlines are checked between
 quanta. GPU and host cache ownership also have per-tenant caps; optional GPU
@@ -231,6 +250,8 @@ tilemaxsimd \
   --max-queued-requests 128 \
   --max-tenant-queued-requests 16 \
   --scheduler-quantum-fmas 4000000000 \
+  --scheduler-max-microbatch-requests 8 \
+  --scheduler-min-shared-candidates-milli 500 \
   --tenant-weight foreground=2 \
   --tenant-cache-reservation foreground=4
 ```

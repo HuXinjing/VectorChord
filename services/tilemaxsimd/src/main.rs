@@ -2237,6 +2237,28 @@ fn render_metrics(metrics: &RuntimeMetrics) -> String {
     )
     .unwrap();
     writeln!(output, "# TYPE tilemaxsim_gpu_h2d_bytes_total counter").unwrap();
+    writeln!(output, "# HELP tilemaxsim_gpu_adaptive_tensor_threshold_rows Calibrated query-row crossover; 4294967295 disables Tensor Core.").unwrap();
+    writeln!(
+        output,
+        "# TYPE tilemaxsim_gpu_adaptive_tensor_threshold_rows gauge"
+    )
+    .unwrap();
+    writeln!(
+        output,
+        "# HELP tilemaxsim_gpu_adaptive_dispatch_total Executed adaptive multi-query kernels."
+    )
+    .unwrap();
+    writeln!(
+        output,
+        "# TYPE tilemaxsim_gpu_adaptive_dispatch_total counter"
+    )
+    .unwrap();
+    writeln!(
+        output,
+        "# HELP tilemaxsim_gpu_calibration_total Startup calibration outcomes."
+    )
+    .unwrap();
+    writeln!(output, "# TYPE tilemaxsim_gpu_calibration_total counter").unwrap();
     for device in &engine.devices {
         for (kind, value) in [
             ("capacity", device.capacity_bytes),
@@ -2285,6 +2307,21 @@ fn render_metrics(metrics: &RuntimeMetrics) -> String {
             output,
             "tilemaxsim_gpu_h2d_bytes_total{{slot=\"{}\",device=\"{}\"}} {}",
             device.slot, device.device, device.h2d_bytes
+        )
+        .unwrap();
+        writeln!(output, "tilemaxsim_gpu_adaptive_tensor_threshold_rows{{slot=\"{}\",device=\"{}\",complete=\"{}\"}} {}", device.slot, device.device, device.calibration_complete, device.tensor_threshold_rows).unwrap();
+        writeln!(output, "tilemaxsim_gpu_adaptive_dispatch_total{{slot=\"{}\",device=\"{}\",kernel=\"tile\"}} {}", device.slot, device.device, device.batch_warp_calls).unwrap();
+        writeln!(output, "tilemaxsim_gpu_adaptive_dispatch_total{{slot=\"{}\",device=\"{}\",kernel=\"tensor\"}} {}", device.slot, device.device, device.batch_tensor_calls).unwrap();
+        writeln!(
+            output,
+            "tilemaxsim_gpu_calibration_total{{slot=\"{}\",device=\"{}\",outcome=\"run\"}} {}",
+            device.slot, device.device, device.calibration_runs
+        )
+        .unwrap();
+        writeln!(
+            output,
+            "tilemaxsim_gpu_calibration_total{{slot=\"{}\",device=\"{}\",outcome=\"failure\"}} {}",
+            device.slot, device.device, device.calibration_failures
         )
         .unwrap();
     }

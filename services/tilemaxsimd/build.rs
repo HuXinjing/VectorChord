@@ -17,5 +17,6 @@ fn main() {
         .file("native/tilemaxsim_cuda.cu")
         .compile("tilemaxsim_cuda");
     println!("cargo:rustc-link-lib=cudart");
+    println!("cargo:rustc-link-lib=cublas");
     println!("cargo:rustc-link-search=native=/usr/local/cuda/lib64");
 }

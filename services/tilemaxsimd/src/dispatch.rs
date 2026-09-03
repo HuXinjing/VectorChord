@@ -35,6 +35,43 @@ impl Default for DispatchThresholds {
     }
 }
 
+pub fn device_thresholds(name: &str, major: i32, minor: i32) -> Option<DispatchThresholds> {
+    let tensor_ridge = if name.contains("RTX 4090") {
+        328
+    } else if name.contains("H200") {
+        206
+    } else if name.contains("A100") {
+        156
+    } else if name.contains("L40S") {
+        424
+    } else {
+        match (major, minor) {
+            (9, _) => 384,
+            (8, 0) => 256,
+            (8, _) => 512,
+            _ => return None,
+        }
+    };
+    Some(match (major, minor) {
+        (9, _) => DispatchThresholds {
+            cuda_ridge: 14,
+            tensor_ridge,
+            ..Default::default()
+        },
+        (8, 0) => DispatchThresholds {
+            cuda_ridge: 10,
+            tensor_ridge,
+            ..Default::default()
+        },
+        (8, _) => DispatchThresholds {
+            cuda_ridge: 82,
+            tensor_ridge,
+            ..Default::default()
+        },
+        _ => return None,
+    })
+}
+
 pub fn choose(input: DispatchInput, thresholds: DispatchThresholds) -> KernelKind {
     let quantization_multiplier = match input.storage_bytes_per_scalar {
         0 | 1 => 2,
@@ -105,5 +142,26 @@ mod tests {
             choose(request, DispatchThresholds::default()),
             KernelKind::Warp
         );
+    }
+
+    #[test]
+    fn architecture_table_is_a_conservative_fallback() {
+        assert_eq!(
+            device_thresholds("NVIDIA H200", 9, 0).unwrap().tensor_ridge,
+            206
+        );
+        assert_eq!(
+            device_thresholds("NVIDIA A100", 8, 0).unwrap().tensor_ridge,
+            156
+        );
+        assert_eq!(
+            device_thresholds("NVIDIA L40S", 8, 9).unwrap().tensor_ridge,
+            424
+        );
+        assert_eq!(
+            device_thresholds("unknown", 8, 9).unwrap().tensor_ridge,
+            512
+        );
+        assert!(device_thresholds("legacy", 7, 5).is_none());
     }
 }

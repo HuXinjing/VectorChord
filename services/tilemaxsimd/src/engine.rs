@@ -49,6 +49,8 @@ pub struct Engine {
     quantization_registry: Option<QuantizationRegistry>,
 }
 
+type BatchedCandidateScores = Vec<Vec<(u32, f32)>>;
+
 #[derive(Clone, Debug, Default)]
 pub struct DeviceStatus {
     pub slot: usize,
@@ -70,6 +72,12 @@ pub struct DeviceStatus {
     pub admission_rejections: u64,
     pub h2d_batches: u64,
     pub h2d_bytes: u64,
+    pub tensor_threshold_rows: u32,
+    pub calibration_complete: bool,
+    pub batch_warp_calls: u64,
+    pub batch_tensor_calls: u64,
+    pub calibration_runs: u64,
+    pub calibration_failures: u64,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -526,7 +534,7 @@ impl Engine {
     pub fn score_resident_batch(
         &mut self,
         requests: &[Request],
-    ) -> Result<Option<Vec<Vec<(u32, f32)>>>> {
+    ) -> Result<Option<BatchedCandidateScores>> {
         if requests.len() < 2 {
             return Ok(None);
         }
@@ -561,6 +569,17 @@ impl Engine {
         }) {
             return Ok(None);
         }
+        let mut query_offsets = Vec::with_capacity(requests.len() + 1);
+        let mut queries = Vec::new();
+        query_offsets.push(0_u32);
+        let mut total_rows = 0_u32;
+        for request in requests {
+            total_rows = total_rows
+                .checked_add(request.query_rows)
+                .ok_or_else(|| anyhow!("batched query row count overflow"))?;
+            query_offsets.push(total_rows);
+            queries.extend_from_slice(&request.query);
+        }
         let mut chunks = (0..self.devices.len())
             .map(|_| Vec::<ResidentTensor>::new())
             .collect::<Vec<_>>();
@@ -582,7 +601,6 @@ impl Engine {
                 .cache
                 .get(&key)
                 .expect("resident batch cache hit disappeared");
-            validate_entry(descriptor, &entry, leader.scoring_profile, None)?;
             chunks[device_index].push(ResidentTensor {
                 candidate_index,
                 device: device_index,
@@ -592,17 +610,10 @@ impl Engine {
                 transient: false,
                 newly_admitted: false,
             });
-        }
-        let mut query_offsets = Vec::with_capacity(requests.len() + 1);
-        let mut queries = Vec::new();
-        query_offsets.push(0_u32);
-        let mut total_rows = 0_u32;
-        for request in requests {
-            total_rows = total_rows
-                .checked_add(request.query_rows)
-                .ok_or_else(|| anyhow!("batched query row count overflow"))?;
-            query_offsets.push(total_rows);
-            queries.extend_from_slice(&request.query);
+            if let Err(error) = validate_entry(descriptor, &entry, leader.scoring_profile, None) {
+                self.release_chunks(&chunks)?;
+                return Err(error);
+            }
         }
         let mut scores = vec![vec![None; leader.candidates.len()]; requests.len()];
         let result = (|| -> Result<()> {
@@ -631,23 +642,7 @@ impl Engine {
         let cleanup = self.release_chunks(&chunks);
         result?;
         cleanup?;
-        Ok(Some(
-            scores
-                .into_iter()
-                .map(|request_scores| {
-                    leader
-                        .candidates
-                        .iter()
-                        .zip(request_scores)
-                        .map(|(candidate, score)| {
-                            score
-                                .map(|value| (candidate.candidate_id, value))
-                                .ok_or_else(|| anyhow!("missing batched TileMaxSim score"))
-                        })
-                        .collect::<Result<Vec<_>>>()
-                })
-                .collect::<Result<Vec<_>>>()?,
-        ))
+        Ok(Some(attach_candidate_ids(requests, scores)?))
     }
 
     fn upload_devices(
@@ -837,29 +832,38 @@ impl Engine {
             .devices
             .iter()
             .enumerate()
-            .map(|(slot, device)| DeviceStatus {
-                slot,
-                device: device.gpu.device(),
-                capacity_bytes: device.cache.capacity(),
-                block_bytes: device.cache.block_bytes(),
-                free_bytes: device.cache.free_bytes(),
-                largest_free_extent_bytes: device.cache.largest_free_extent(),
-                allocated_bytes: device.cache.allocated_bytes(),
-                payload_bytes: device.cache.payload_bytes(),
-                internal_waste_bytes: device
-                    .cache
-                    .allocated_bytes()
-                    .saturating_sub(device.cache.payload_bytes()),
-                entries: device.cache.entry_count(),
-                pinned_entries: device.cache.pinned_entries(),
-                pinned_bytes: device.cache.pinned_bytes(),
-                tenants: device.cache.tenant_count(),
-                hits: device.cache.hits,
-                misses: device.cache.misses,
-                evictions: device.cache.evictions,
-                admission_rejections: device.cache.admission_rejections,
-                h2d_batches: device.h2d_batches,
-                h2d_bytes: device.h2d_bytes,
+            .map(|(slot, device)| {
+                let adaptive = device.gpu.adaptive_status();
+                DeviceStatus {
+                    slot,
+                    device: device.gpu.device(),
+                    capacity_bytes: device.cache.capacity(),
+                    block_bytes: device.cache.block_bytes(),
+                    free_bytes: device.cache.free_bytes(),
+                    largest_free_extent_bytes: device.cache.largest_free_extent(),
+                    allocated_bytes: device.cache.allocated_bytes(),
+                    payload_bytes: device.cache.payload_bytes(),
+                    internal_waste_bytes: device
+                        .cache
+                        .allocated_bytes()
+                        .saturating_sub(device.cache.payload_bytes()),
+                    entries: device.cache.entry_count(),
+                    pinned_entries: device.cache.pinned_entries(),
+                    pinned_bytes: device.cache.pinned_bytes(),
+                    tenants: device.cache.tenant_count(),
+                    hits: device.cache.hits,
+                    misses: device.cache.misses,
+                    evictions: device.cache.evictions,
+                    admission_rejections: device.cache.admission_rejections,
+                    h2d_batches: device.h2d_batches,
+                    h2d_bytes: device.h2d_bytes,
+                    tensor_threshold_rows: adaptive.0,
+                    calibration_complete: adaptive.1,
+                    batch_warp_calls: adaptive.2,
+                    batch_tensor_calls: adaptive.3,
+                    calibration_runs: adaptive.4,
+                    calibration_failures: adaptive.5,
+                }
             })
             .collect();
         EngineStatus {
@@ -891,6 +895,12 @@ impl Engine {
                     "gpu_pinned_entries": device.pinned_entries,
                     "gpu_pinned_bytes": device.pinned_bytes,
                     "gpu_tenant_count": device.tenants,
+                    "adaptive_tensor_threshold_rows": device.tensor_threshold_rows,
+                    "adaptive_calibration_complete": device.calibration_complete,
+                    "adaptive_batch_warp_calls": device.batch_warp_calls,
+                    "adaptive_batch_tensor_calls": device.batch_tensor_calls,
+                    "adaptive_calibration_runs": device.calibration_runs,
+                    "adaptive_calibration_failures": device.calibration_failures,
                     "gpu_hits": device.hits,
                     "gpu_misses": device.misses,
                     "gpu_evictions": device.evictions,
@@ -914,6 +924,28 @@ impl Engine {
             "batch_read_bytes": status.batch_read_bytes,
         })
     }
+}
+
+fn attach_candidate_ids(
+    requests: &[Request],
+    scores: Vec<Vec<Option<f32>>>,
+) -> Result<BatchedCandidateScores> {
+    scores
+        .into_iter()
+        .zip(requests)
+        .map(|(request_scores, request)| {
+            request
+                .candidates
+                .iter()
+                .zip(request_scores)
+                .map(|(candidate, score)| {
+                    score
+                        .map(|value| (candidate.candidate_id, value))
+                        .ok_or_else(|| anyhow!("missing batched TileMaxSim score"))
+                })
+                .collect::<Result<Vec<_>>>()
+        })
+        .collect()
 }
 
 fn unique_descriptors(descriptors: &[Descriptor]) -> Vec<Descriptor> {
@@ -1144,6 +1176,28 @@ mod tests {
         assert_eq!(unique[0].candidate_id, 1);
         assert_eq!(unique[1].candidate_id, 3);
         assert_eq!(unique[2].candidate_id, 4);
+    }
+
+    #[test]
+    fn batched_scores_keep_each_requests_logical_candidate_ids() {
+        let request = |request_id, candidate_id| Request {
+            protocol_version: 5,
+            request_id,
+            tenant: "tenant".to_owned(),
+            priority: 0,
+            timeout_ms: 1000,
+            query_rows: 1,
+            dimension: 320,
+            dtype: 2,
+            scoring_profile: ScoringProfile::ExactFp16,
+            quantization_contract: None,
+            query: vec![0; 640],
+            candidates: vec![descriptor(candidate_id, "same-content", 1)],
+        };
+        let requests = [request(1, 11), request(2, 99)];
+        let attached =
+            attach_candidate_ids(&requests, vec![vec![Some(1.5)], vec![Some(2.5)]]).unwrap();
+        assert_eq!(attached, vec![vec![(11, 1.5)], vec![(99, 2.5)]]);
     }
 
     #[test]

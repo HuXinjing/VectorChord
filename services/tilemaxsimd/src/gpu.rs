@@ -12,6 +12,7 @@ use anyhow::{Result, anyhow, bail};
 use std::collections::HashMap;
 use std::ffi::{CStr, c_char, c_int, c_uchar, c_void};
 use std::ptr::NonNull;
+use std::time::Instant;
 
 #[repr(C)]
 struct NativeGpu(c_void);
@@ -29,6 +30,12 @@ unsafe extern "C" {
     ) -> c_int;
     fn vctm_gpu_destroy(gpu: *mut NativeGpu);
     fn vctm_gpu_tensor_bytes(gpu: *const NativeGpu) -> usize;
+    fn vctm_gpu_compute_capability(
+        gpu: *const NativeGpu,
+        major: *mut c_int,
+        minor: *mut c_int,
+    ) -> c_int;
+    fn vctm_gpu_device_name(gpu: *const NativeGpu, name: *mut c_char, capacity: usize) -> c_int;
     fn vctm_quantizer_create(
         device: c_int,
         payload: *const c_uchar,
@@ -83,6 +90,21 @@ unsafe extern "C" {
         error: *mut c_char,
         error_capacity: usize,
     ) -> c_int;
+    fn vctm_gpu_score_batch_tensor(
+        gpu: *mut NativeGpu,
+        queries: *const c_uchar,
+        query_bytes: usize,
+        query_offsets: *const u32,
+        request_count: u32,
+        total_query_rows: u32,
+        dimension: u32,
+        document_offsets: *const u64,
+        document_rows: *const u32,
+        count: usize,
+        output: *mut f32,
+        error: *mut c_char,
+        error_capacity: usize,
+    ) -> c_int;
     fn vctm_gpu_score_pq(
         gpu: *mut NativeGpu,
         quantizer: *const NativeQuantizer,
@@ -104,6 +126,12 @@ pub struct Gpu {
     device: i32,
     tensor_bytes: usize,
     quantizers: HashMap<String, NonNull<NativeQuantizer>>,
+    tensor_threshold_rows: u32,
+    calibration_complete: bool,
+    batch_warp_calls: u64,
+    batch_tensor_calls: u64,
+    calibration_runs: u64,
+    calibration_failures: u64,
 }
 
 // SAFETY: `Gpu` uniquely owns the native handle. It may move to a scoped
@@ -131,12 +159,39 @@ impl Gpu {
         let native = NonNull::new(native).ok_or_else(|| anyhow!("CUDA returned a null arena"))?;
         // SAFETY: `native` is live until Drop.
         let tensor_bytes = unsafe { vctm_gpu_tensor_bytes(native.as_ptr()) };
-        Ok(Self {
+        let mut major = 0;
+        let mut minor = 0;
+        let capability_status =
+            unsafe { vctm_gpu_compute_capability(native.as_ptr(), &mut major, &mut minor) };
+        let mut name = [0_i8; 256];
+        let name_status =
+            unsafe { vctm_gpu_device_name(native.as_ptr(), name.as_mut_ptr(), name.len()) };
+        let name = if name_status == 0 {
+            native_error(&name)
+        } else {
+            String::new()
+        };
+        let tensor_threshold_rows = if capability_status == 0 {
+            crate::dispatch::device_thresholds(&name, major, minor)
+                .map(|thresholds| u32::try_from(thresholds.tensor_ridge).unwrap_or(u32::MAX))
+                .unwrap_or(u32::MAX)
+        } else {
+            u32::MAX
+        };
+        let mut gpu = Self {
             native,
             device,
             tensor_bytes,
             quantizers: HashMap::new(),
-        })
+            tensor_threshold_rows,
+            calibration_complete: false,
+            batch_warp_calls: 0,
+            batch_tensor_calls: 0,
+            calibration_runs: 0,
+            calibration_failures: 0,
+        };
+        gpu.calibrate_kernel_thresholds();
+        Ok(gpu)
     }
 
     pub fn device(&self) -> i32 {
@@ -145,6 +200,17 @@ impl Gpu {
 
     pub fn tensor_bytes(&self) -> usize {
         self.tensor_bytes
+    }
+
+    pub fn adaptive_status(&self) -> (u32, bool, u64, u64, u64, u64) {
+        (
+            self.tensor_threshold_rows,
+            self.calibration_complete,
+            self.batch_warp_calls,
+            self.batch_tensor_calls,
+            self.calibration_runs,
+            self.calibration_failures,
+        )
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -319,6 +385,183 @@ impl Gpu {
         document_offsets: &[u64],
         document_rows: &[u32],
     ) -> Result<Vec<Vec<f32>>> {
+        let total_rows = *query_offsets.last().unwrap_or(&0);
+        let tensor_eligible = dtype == 2 && self.tensor_threshold_rows != u32::MAX;
+        if tensor_eligible && !self.calibration_complete {
+            self.calibration_runs += 1;
+            let warp_started = Instant::now();
+            let warp = self.score_batch_native(
+                false,
+                queries,
+                query_offsets,
+                dimension,
+                dtype,
+                document_offsets,
+                document_rows,
+            )?;
+            let warp_elapsed = warp_started.elapsed();
+            let tensor_started = Instant::now();
+            match self.score_batch_native(
+                true,
+                queries,
+                query_offsets,
+                dimension,
+                dtype,
+                document_offsets,
+                document_rows,
+            ) {
+                Ok(tensor) if batch_scores_close(&warp, &tensor) => {
+                    let tensor_elapsed = tensor_started.elapsed();
+                    self.calibration_complete = true;
+                    if tensor_elapsed < warp_elapsed {
+                        self.tensor_threshold_rows = total_rows.max(1);
+                        self.batch_tensor_calls += 1;
+                        return Ok(tensor);
+                    }
+                    self.tensor_threshold_rows =
+                        total_rows.saturating_mul(2).max(self.tensor_threshold_rows);
+                    self.batch_warp_calls += 1;
+                    return Ok(warp);
+                }
+                _ => {
+                    self.calibration_failures += 1;
+                    self.calibration_complete = true;
+                    self.tensor_threshold_rows = u32::MAX;
+                    self.batch_warp_calls += 1;
+                    return Ok(warp);
+                }
+            }
+        }
+        if tensor_eligible && total_rows >= self.tensor_threshold_rows {
+            match self.score_batch_native(
+                true,
+                queries,
+                query_offsets,
+                dimension,
+                dtype,
+                document_offsets,
+                document_rows,
+            ) {
+                Ok(scores) => {
+                    self.batch_tensor_calls += 1;
+                    return Ok(scores);
+                }
+                Err(_) => {
+                    self.calibration_failures += 1;
+                    self.tensor_threshold_rows = u32::MAX;
+                }
+            }
+        }
+        self.batch_warp_calls += 1;
+        self.score_batch_native(
+            false,
+            queries,
+            query_offsets,
+            dimension,
+            dtype,
+            document_offsets,
+            document_rows,
+        )
+    }
+
+    fn calibrate_kernel_thresholds(&mut self) {
+        if self.tensor_threshold_rows == u32::MAX {
+            return;
+        }
+        const DIMENSION: u32 = 128;
+        const DOCUMENT_ROWS: u32 = 32;
+        let one = 0x3c00_u16.to_le_bytes();
+        let zero = 0_u16.to_le_bytes();
+        let mut document = Vec::with_capacity(DIMENSION as usize * DOCUMENT_ROWS as usize * 2);
+        for row in 0..DOCUMENT_ROWS {
+            for column in 0..DIMENSION {
+                document.extend_from_slice(if column == row % DIMENSION {
+                    &one
+                } else {
+                    &zero
+                });
+            }
+        }
+        if self.upload_batch(&[(0, &document)]).is_err() {
+            self.calibration_failures += 1;
+            return;
+        }
+        let fallback = self.tensor_threshold_rows;
+        let mut successful = 0_u64;
+        let mut crossover = None;
+        for total_rows in [32_u32, 96, 256, 512] {
+            let mut queries = Vec::with_capacity(total_rows as usize * DIMENSION as usize * 2);
+            for row in 0..total_rows {
+                for column in 0..DIMENSION {
+                    queries.extend_from_slice(if column == row % DOCUMENT_ROWS {
+                        &one
+                    } else {
+                        &zero
+                    });
+                }
+            }
+            let offsets = [0, total_rows / 2, total_rows];
+            self.calibration_runs += 1;
+            let warp_started = Instant::now();
+            let Ok(warp) = self.score_batch_native(
+                false,
+                &queries,
+                &offsets,
+                DIMENSION,
+                2,
+                &[0],
+                &[DOCUMENT_ROWS],
+            ) else {
+                self.calibration_failures += 1;
+                continue;
+            };
+            let warp_elapsed = warp_started.elapsed();
+            let tensor_started = Instant::now();
+            let Ok(tensor) = self.score_batch_native(
+                true,
+                &queries,
+                &offsets,
+                DIMENSION,
+                2,
+                &[0],
+                &[DOCUMENT_ROWS],
+            ) else {
+                self.calibration_failures += 1;
+                continue;
+            };
+            let tensor_elapsed = tensor_started.elapsed();
+            if !batch_scores_close(&warp, &tensor) {
+                self.calibration_failures += 1;
+                continue;
+            }
+            successful += 1;
+            if crossover.is_none() && tensor_elapsed < warp_elapsed {
+                crossover = Some(total_rows);
+            }
+        }
+        if successful == 0 {
+            self.tensor_threshold_rows = fallback;
+            self.calibration_complete = false;
+        } else {
+            self.tensor_threshold_rows = crossover.unwrap_or(u32::MAX);
+            self.calibration_complete = true;
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn score_batch_native(
+        &mut self,
+        tensor: bool,
+        queries: &[u8],
+        query_offsets: &[u32],
+        dimension: u32,
+        dtype: u8,
+        document_offsets: &[u64],
+        document_rows: &[u32],
+    ) -> Result<Vec<Vec<f32>>> {
+        if tensor && dtype != 2 {
+            bail!("Tensor Core TileMaxSim currently requires FP16 queries");
+        }
         if query_offsets.len() < 3 || query_offsets[0] != 0 {
             bail!("a native multi-query batch requires at least two queries");
         }
@@ -327,22 +570,42 @@ impl Gpu {
         let mut output = vec![0.0_f32; request_count * document_offsets.len()];
         let mut error = [0_i8; 512];
         let status = unsafe {
-            vctm_gpu_score_batch(
-                self.native.as_ptr(),
-                queries.as_ptr(),
-                queries.len(),
-                query_offsets.as_ptr(),
-                u32::try_from(request_count).map_err(|_| anyhow!("too many batched queries"))?,
-                total_query_rows,
-                dimension,
-                dtype,
-                document_offsets.as_ptr(),
-                document_rows.as_ptr(),
-                document_offsets.len(),
-                output.as_mut_ptr(),
-                error.as_mut_ptr(),
-                error.len(),
-            )
+            if tensor {
+                vctm_gpu_score_batch_tensor(
+                    self.native.as_ptr(),
+                    queries.as_ptr(),
+                    queries.len(),
+                    query_offsets.as_ptr(),
+                    u32::try_from(request_count)
+                        .map_err(|_| anyhow!("too many batched queries"))?,
+                    total_query_rows,
+                    dimension,
+                    document_offsets.as_ptr(),
+                    document_rows.as_ptr(),
+                    document_offsets.len(),
+                    output.as_mut_ptr(),
+                    error.as_mut_ptr(),
+                    error.len(),
+                )
+            } else {
+                vctm_gpu_score_batch(
+                    self.native.as_ptr(),
+                    queries.as_ptr(),
+                    queries.len(),
+                    query_offsets.as_ptr(),
+                    u32::try_from(request_count)
+                        .map_err(|_| anyhow!("too many batched queries"))?,
+                    total_query_rows,
+                    dimension,
+                    dtype,
+                    document_offsets.as_ptr(),
+                    document_rows.as_ptr(),
+                    document_offsets.len(),
+                    output.as_mut_ptr(),
+                    error.as_mut_ptr(),
+                    error.len(),
+                )
+            }
         };
         if status != 0 {
             bail!(native_error(&error));
@@ -355,6 +618,16 @@ impl Gpu {
             .map(<[f32]>::to_vec)
             .collect())
     }
+}
+
+fn batch_scores_close(left: &[Vec<f32>], right: &[Vec<f32>]) -> bool {
+    left.len() == right.len()
+        && left.iter().zip(right).all(|(left, right)| {
+            left.len() == right.len()
+                && left.iter().zip(right).all(|(left, right)| {
+                    (left - right).abs() <= 2.0e-3 * (1.0 + left.abs().max(right.abs()))
+                })
+        })
 }
 
 impl Drop for Gpu {
@@ -397,6 +670,86 @@ mod tests {
         assert_eq!(scores.len(), 2);
         assert!((scores[0][0] - 1.0).abs() < 1e-5, "scores={scores:?}");
         assert!((scores[1][0] - 1.0).abs() < 1e-5, "scores={scores:?}");
+        let tensor = gpu
+            .score_batch_native(true, &queries, &[0, 1, 2], 2, 2, &[0], &[2])
+            .unwrap();
+        assert!(
+            batch_scores_close(&scores, &tensor),
+            "tile={scores:?} tensor={tensor:?}"
+        );
+        assert!(gpu.calibration_runs > 0);
+        assert!(
+            gpu.calibration_complete,
+            "startup calibration did not complete"
+        );
+    }
+
+    #[test]
+    #[ignore = "requires an explicitly assigned CUDA device"]
+    fn tensor_core_matches_tile_for_320d_variable_queries() {
+        let device = std::env::var("VCTM_TEST_GPU")
+            .unwrap_or_else(|_| "0".to_owned())
+            .parse::<i32>()
+            .unwrap();
+        let mut gpu = Gpu::create(device, 96 * 1024 * 1024, 48 * 1024 * 1024).unwrap();
+        const DIM: usize = 320;
+        const DOC_ROWS: usize = 11;
+        let mut document = Vec::with_capacity(DIM * DOC_ROWS * 2);
+        for row in 0..DOC_ROWS {
+            for column in 0..DIM {
+                let value = if (column + row * 7) % 31 == 0 {
+                    0x3c00_u16
+                } else {
+                    0_u16
+                };
+                document.extend_from_slice(&value.to_le_bytes());
+            }
+        }
+        gpu.upload_batch(&[(0, &document)]).unwrap();
+        let query_offsets = [0_u32, 3, 8, 15];
+        let mut queries = Vec::with_capacity(15 * DIM * 2);
+        for row in 0..15 {
+            for column in 0..DIM {
+                let value = if (column * 3 + row * 5) % 29 == 0 {
+                    0x3800_u16
+                } else {
+                    0_u16
+                };
+                queries.extend_from_slice(&value.to_le_bytes());
+            }
+        }
+        let tile = gpu
+            .score_batch_native(
+                false,
+                &queries,
+                &query_offsets,
+                DIM as u32,
+                2,
+                &[0],
+                &[DOC_ROWS as u32],
+            )
+            .unwrap();
+        let tensor = gpu
+            .score_batch_native(
+                true,
+                &queries,
+                &query_offsets,
+                DIM as u32,
+                2,
+                &[0],
+                &[DOC_ROWS as u32],
+            )
+            .unwrap();
+        assert!(
+            batch_scores_close(&tile, &tensor),
+            "tile={tile:?} tensor={tensor:?}"
+        );
+    }
+
+    #[test]
+    fn adaptive_comparison_rejects_material_score_drift() {
+        assert!(batch_scores_close(&[vec![1.0, 2.0]], &[vec![1.001, 2.001]]));
+        assert!(!batch_scores_close(&[vec![1.0]], &[vec![1.1]]));
     }
 
     #[test]
