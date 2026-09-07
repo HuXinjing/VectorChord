@@ -1552,6 +1552,113 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "microbenchmark requires an explicitly assigned CUDA device"]
+    fn benchmark_pq_continuous_batch() {
+        const DIMENSION: usize = 320;
+        const SUBSPACES: usize = 20;
+        const CENTROIDS: usize = 256;
+        const DOCUMENT_ROWS: usize = 32;
+        const QUERY_ROWS: usize = 32;
+        const REQUESTS: usize = 8;
+        const CANDIDATES: usize = 512;
+        let mut gpu = pq_gpu();
+        let subvector = DIMENSION / SUBSPACES;
+        let codebook = (0..SUBSPACES * CENTROIDS * subvector)
+            .map(|index| if index % 97 == 0 { 0.125_f32 } else { 0.0 })
+            .collect::<Vec<_>>();
+        gpu.ensure_quantizer(
+            "pq-benchmark",
+            &f32_payload(&codebook),
+            DIMENSION as u32,
+            1,
+            SUBSPACES as u16,
+            CENTROIDS as u16,
+            0,
+        )
+        .unwrap();
+        let document = (0..DOCUMENT_ROWS * SUBSPACES)
+            .map(|index| (index % CENTROIDS) as u8)
+            .collect::<Vec<_>>();
+        let offsets = (0..CANDIDATES)
+            .map(|candidate| candidate as u64 * document.len() as u64)
+            .collect::<Vec<_>>();
+        let uploads = offsets
+            .iter()
+            .copied()
+            .map(|offset| (offset, document.as_slice()))
+            .collect::<Vec<_>>();
+        gpu.upload_batch(&uploads).unwrap();
+        let rows = vec![DOCUMENT_ROWS as u32; CANDIDATES];
+        let query = (0..QUERY_ROWS * DIMENSION)
+            .map(|index| if index % 89 == 0 { 0.5_f32 } else { 0.0 })
+            .collect::<Vec<_>>();
+        let query = f32_payload(&query);
+        let queries = (0..REQUESTS)
+            .flat_map(|_| query.iter().copied())
+            .collect::<Vec<_>>();
+        let query_offsets = (0..=REQUESTS)
+            .map(|request| (request * QUERY_ROWS) as u32)
+            .collect::<Vec<_>>();
+        for _ in 0..3 {
+            gpu.score_pq_batch(
+                "pq-benchmark",
+                &queries,
+                &query_offsets,
+                DIMENSION as u32,
+                1,
+                &offsets,
+                &rows,
+            )
+            .unwrap();
+        }
+        let started = Instant::now();
+        let mut individual = Vec::new();
+        for _ in 0..10 {
+            individual.clear();
+            for _ in 0..REQUESTS {
+                individual.push(
+                    gpu.score_pq(
+                        "pq-benchmark",
+                        &query,
+                        QUERY_ROWS as u32,
+                        1,
+                        &offsets,
+                        &rows,
+                    )
+                    .unwrap(),
+                );
+            }
+        }
+        let individual_ms = started.elapsed().as_secs_f64() * 1000.0 / 10.0;
+        let started = Instant::now();
+        let mut batched = Vec::new();
+        for _ in 0..10 {
+            batched = gpu
+                .score_pq_batch(
+                    "pq-benchmark",
+                    &queries,
+                    &query_offsets,
+                    DIMENSION as u32,
+                    1,
+                    &offsets,
+                    &rows,
+                )
+                .unwrap();
+        }
+        let batched_ms = started.elapsed().as_secs_f64() * 1000.0 / 10.0;
+        assert_eq!(batched.len(), individual.len());
+        for (actual, expected) in batched.iter().zip(&individual) {
+            for (actual, expected) in actual.iter().zip(expected) {
+                assert!((actual - expected).abs() < 1e-4);
+            }
+        }
+        eprintln!(
+            "pq_continuous_batch candidates={CANDIDATES} requests={REQUESTS} query_rows={QUERY_ROWS} individual_ms={individual_ms:.4} batched_ms={batched_ms:.4} speedup={:.3}",
+            individual_ms / batched_ms
+        );
+    }
+
+    #[test]
     #[ignore = "requires an explicitly assigned CUDA device"]
     fn native_opq_rotation_is_applied_before_adc() {
         let mut gpu = pq_gpu();
