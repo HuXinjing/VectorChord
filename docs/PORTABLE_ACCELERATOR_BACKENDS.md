@@ -102,6 +102,17 @@ an explicit accuracy/storage contract rather than expecting every resident
 shape to run faster. Larger cold/cache-pressure experiments remain a separate
 acceptance gate.
 
+PQ, OPQ and residual-PQ also participate in continuous batching when requests
+share the same immutable quantization contract and candidate set. The native
+path builds rotation/LUT state for the combined query rows, performs one ADC
+MaxSim scan, then applies a segmented reduction at the original request
+boundaries. It never merges different contracts. On the available RTX 4090,
+512 resident candidates, eight requests, 32 query rows and dimension 320 took
+about 1.083 ms as eight individual PQ calls and 0.912 ms as one continuous
+batch (1.19x). This run occurred on a shared GPU and is retained as directional
+microbenchmark evidence; an exclusive-device distribution is still required
+for a release performance claim.
+
 ## Vendor acceptance gates
 
 Every native backend needs target-hardware evidence for:
