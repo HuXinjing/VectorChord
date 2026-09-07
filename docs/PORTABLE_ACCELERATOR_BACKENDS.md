@@ -135,3 +135,11 @@ Every native backend needs target-hardware evidence for:
 
 Passing a compile or exposing a device name is not sufficient to advertise a
 backend as production-supported.
+
+The manually dispatched `tilemaxsimd-hardware-validation.yml` workflow is the
+H200 release gate. Its self-hosted runner must carry the `gpu-h200` label. The
+runner script refuses a device whose name or compute capability is not H200 /
+9.0, builds native SM90/SM90a code, inspects the cubins and instructions, runs
+all ignored real-device numerical and latency tests serially, and uploads the
+device fingerprint, raw output and checksum manifest. A queued or skipped job
+is not validation evidence.

@@ -1,0 +1,39 @@
+name: TileMaxSim hardware validation
+
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: tilemaxsimd-h200-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  h200:
+    name: H200 SM90a conformance and latency evidence
+    runs-on: [self-hosted, linux, x64, gpu-h200]
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Validate physical H200 paths
+        env:
+          VCTM_TEST_GPU: "0"
+          VCTM_EXPECTED_GPU_NAME: NVIDIA H200
+          VCTM_EXPECTED_COMPUTE_CAPABILITY: "9.0"
+          VCTM_EVIDENCE_DIR: ${{ github.workspace }}/hardware-evidence/h200
+          TILEMAXSIM_CUDA_ARCHS: 90,90a,90-virtual
+          VCTM_EXPECTED_CUBINS: sm_90,sm_90a
+          VCTM_EXPECTED_PTX: sm_90
+          VCTM_VERIFY_ASYNC_IMAGES: sm_90a
+          VCTM_VERIFY_FP8_IMAGES: sm_90a
+        run: services/tilemaxsimd/scripts/validate_nvidia_hardware.sh
+
+      - name: Upload immutable test evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tilemaxsimd-h200-${{ github.sha }}
+          path: hardware-evidence/h200
+          if-no-files-found: error
+          retention-days: 30
