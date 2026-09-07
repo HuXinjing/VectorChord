@@ -22,6 +22,14 @@ The public build publishes separate images from
 uses runtime AVX2/FMA on x86-64 or NEON on AArch64. It is the deployable
 fallback for hosts whose native accelerator backend is unavailable.
 
+NVIDIA production stages use digest-pinned CUDA runtime images matching their
+builder generation (CUDA 12.6 for Ada/Hopper and CUDA 13.3 for Blackwell).
+`tilemaxsimd` dynamically links cuBLAS and cuBLASLt, so a plain Ubuntu final
+stage is not runnable even though the CUDA driver is injected by the container
+runtime. CI now builds the final stage, runs both CLI smoke checks, and rejects
+any `ldd` dependency reported as missing; testing only the compiler stage is
+not considered image validation.
+
 Vendor executors depend on the library without another runtime:
 
 ```toml
