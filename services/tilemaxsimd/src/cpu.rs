@@ -277,5 +277,8 @@ mod tests {
             cpu.score(&query, 2, 2, 1, 1, &[0], &[2]).unwrap(),
             vec![1.5]
         );
+        assert!(cpu.supports_profile(1));
+        assert!(!cpu.supports_profile(2));
+        assert!(!cpu.supports_profile(5));
     }
 }

@@ -241,6 +241,20 @@ impl Engine {
     }
 
     pub fn score(&mut self, request: &Request) -> Result<Vec<(u32, f32)>> {
+        let native_profile = request.scoring_profile.native_code();
+        if self
+            .devices
+            .iter()
+            .any(|device| !device.gpu.supports_profile(native_profile))
+        {
+            let backend = self.devices[0].gpu.info();
+            bail!(
+                "{:?} backend on {} does not support scoring profile {}",
+                backend.backend,
+                backend.name,
+                request.scoring_profile.cache_tag()
+            );
+        }
         let active_quantizer = if matches!(
             request.scoring_profile,
             ScoringProfile::Pq | ScoringProfile::OpqRpq

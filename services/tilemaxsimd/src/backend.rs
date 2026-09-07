@@ -68,6 +68,18 @@ pub trait AcceleratorBackend: Send {
     fn tensor_bytes(&self) -> usize;
     fn adaptive_status(&self) -> AdaptiveStatus;
 
+    fn supports_profile(&self, native_profile: u8) -> bool {
+        let capabilities = &self.info().capabilities;
+        match native_profile {
+            1 => capabilities.exact_fp16,
+            2 => capabilities.int8,
+            3 => capabilities.fp8_e4m3,
+            4 => capabilities.pq,
+            5 => capabilities.opq_rpq,
+            _ => false,
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn ensure_quantizer(
         &mut self,
