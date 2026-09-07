@@ -34,7 +34,14 @@ fn main() {
     let architectures = std::env::var("TILEMAXSIM_CUDA_ARCHS")
         .unwrap_or_else(|_| "80,89,90,90a,90-virtual".to_owned());
     let mut build = cc::Build::new();
-    build.cuda(true).flag("-O3").flag("-lineinfo");
+    build.cuda(true).flag("-O3");
+    // `cc` enables nvcc device debug (`-G`) for Cargo debug profiles. nvcc
+    // treats that as mutually exclusive with line-info generation, so keep
+    // line attribution in optimized/profile builds where it is useful to
+    // Nsight and avoid a misleading warning in normal check/test builds.
+    if std::env::var("DEBUG").as_deref() != Ok("true") {
+        build.flag("-lineinfo");
+    }
     for architecture in architectures
         .split(',')
         .map(str::trim)
