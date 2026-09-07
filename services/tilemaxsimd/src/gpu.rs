@@ -50,6 +50,7 @@ unsafe extern "C" {
         memory_bus_width_bits: *mut c_int,
         memory_clock_khz: *mut c_int,
         shared_memory_per_block_bytes: *mut u64,
+        compute_stream_priority: *mut c_int,
     ) -> c_int;
     fn vctm_quantizer_create(
         device: c_int,
@@ -196,6 +197,7 @@ impl Gpu {
         let mut memory_bus_width_bits = 0;
         let mut memory_clock_khz = 0;
         let mut shared_memory_per_block_bytes = 0_u64;
+        let mut compute_stream_priority = 0;
         let info_status = unsafe {
             vctm_gpu_device_info(
                 native.as_ptr(),
@@ -208,6 +210,7 @@ impl Gpu {
                 &mut memory_bus_width_bits,
                 &mut memory_clock_khz,
                 &mut shared_memory_per_block_bytes,
+                &mut compute_stream_priority,
             )
         };
         let tensor_threshold_rows = if capability_status == 0 {
@@ -247,6 +250,14 @@ impl Gpu {
                 memory_clock_khz: (info_status == 0).then_some(memory_clock_khz as u32),
                 shared_memory_per_block_bytes: (info_status == 0)
                     .then_some(shared_memory_per_block_bytes),
+                compute_queue_priority: (info_status == 0).then_some(compute_stream_priority),
+                tuning_profile: match (major, minor) {
+                    (8, 9) => "cuda-ada".to_owned(),
+                    (9, _) => "cuda-hopper".to_owned(),
+                    (10 | 12, _) => "cuda-blackwell".to_owned(),
+                    (8, _) => "cuda-ampere".to_owned(),
+                    _ => "cuda-generic".to_owned(),
+                },
                 capabilities: BackendCapabilities {
                     kind: BackendKind::Cuda,
                     exact_fp16: true,
@@ -851,6 +862,8 @@ mod tests {
         assert!(info.total_memory_bytes.unwrap_or_default() > 0);
         assert!(info.compute_units.unwrap_or_default() > 0);
         assert_eq!(info.warp_size, Some(32));
+        assert!(info.compute_queue_priority.is_some());
+        assert!(info.tuning_profile.starts_with("cuda-"));
     }
 
     #[test]

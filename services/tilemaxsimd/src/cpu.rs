@@ -41,6 +41,8 @@ impl CpuBackend {
                 memory_bus_width_bits: None,
                 memory_clock_khz: None,
                 shared_memory_per_block_bytes: None,
+                compute_queue_priority: None,
+                tuning_profile: "cpu-reference".to_owned(),
                 capabilities: BackendCapabilities {
                     kind: BackendKind::Cpu,
                     exact_fp16: true,

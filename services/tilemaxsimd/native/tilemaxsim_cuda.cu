@@ -31,6 +31,7 @@ struct VctmGpu {
   cudaStream_t upload_stream;
   cudaStream_t compute_stream;
   cublasHandle_t cublas;
+  int compute_stream_priority;
 };
 
 struct VctmQuantizer {
@@ -156,10 +157,21 @@ extern "C" int vctm_gpu_create(int device, size_t total_bytes,
     delete gpu;
     return cuda_fail(error, error_capacity, "cudaMalloc", status);
   }
-  if ((status = cudaStreamCreateWithFlags(&gpu->upload_stream,
-                                           cudaStreamNonBlocking)) != cudaSuccess ||
-      (status = cudaStreamCreateWithFlags(&gpu->compute_stream,
-                                           cudaStreamNonBlocking)) != cudaSuccess) {
+  int least_priority = 0, greatest_priority = 0;
+  status = cudaDeviceGetStreamPriorityRange(&least_priority, &greatest_priority);
+  if (status != cudaSuccess) {
+    cudaFree(gpu->allocation);
+    delete gpu;
+    return cuda_fail(error, error_capacity,
+                     "cudaDeviceGetStreamPriorityRange", status);
+  }
+  gpu->compute_stream_priority = greatest_priority;
+  if ((status = cudaStreamCreateWithPriority(&gpu->upload_stream,
+                                              cudaStreamNonBlocking,
+                                              least_priority)) != cudaSuccess ||
+      (status = cudaStreamCreateWithPriority(&gpu->compute_stream,
+                                              cudaStreamNonBlocking,
+                                              greatest_priority)) != cudaSuccess) {
     if (gpu->upload_stream != nullptr) cudaStreamDestroy(gpu->upload_stream);
     cudaFree(gpu->allocation);
     delete gpu;
@@ -227,12 +239,14 @@ extern "C" int vctm_gpu_device_info(
     const VctmGpu *gpu, int *driver_version, int *runtime_version,
     int *cublas_version, uint64_t *total_memory_bytes,
     int *multiprocessors, int *warp_size, int *memory_bus_width_bits,
-    int *memory_clock_khz, uint64_t *shared_memory_per_block_bytes) {
+    int *memory_clock_khz, uint64_t *shared_memory_per_block_bytes,
+    int *compute_stream_priority) {
   if (gpu == nullptr || driver_version == nullptr || runtime_version == nullptr ||
       cublas_version == nullptr || total_memory_bytes == nullptr ||
       multiprocessors == nullptr || warp_size == nullptr ||
       memory_bus_width_bits == nullptr || memory_clock_khz == nullptr ||
-      shared_memory_per_block_bytes == nullptr) return 1;
+      shared_memory_per_block_bytes == nullptr ||
+      compute_stream_priority == nullptr) return 1;
   cudaDeviceProp properties{};
   if (cudaDriverGetVersion(driver_version) != cudaSuccess ||
       cudaRuntimeGetVersion(runtime_version) != cudaSuccess ||
@@ -245,6 +259,7 @@ extern "C" int vctm_gpu_device_info(
   *memory_clock_khz = properties.memoryClockRate;
   *shared_memory_per_block_bytes =
       static_cast<uint64_t>(properties.sharedMemPerBlock);
+  *compute_stream_priority = gpu->compute_stream_priority;
   return 0;
 }
 

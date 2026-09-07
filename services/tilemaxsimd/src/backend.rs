@@ -45,6 +45,8 @@ pub struct DeviceInfo {
     pub memory_bus_width_bits: Option<u32>,
     pub memory_clock_khz: Option<u32>,
     pub shared_memory_per_block_bytes: Option<u64>,
+    pub compute_queue_priority: Option<i32>,
+    pub tuning_profile: String,
     pub capabilities: BackendCapabilities,
 }
 
