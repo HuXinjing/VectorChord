@@ -77,6 +77,17 @@ query and rotation stage before LUT generation instead of being recomputed for
 every centroid, reducing the rotation arithmetic by the centroid count while
 preserving the persisted quantization contract.
 
+Quantization is not advertised as an unconditional resident-kernel speedup.
+On the same RTX 4090 with 512 resident candidates, 32 query rows and dimension
+320, exact FP16 measured about 0.110 ms, INT8 0.118 ms and FP8 0.119 ms. For an
+eight-request fused batch the corresponding measurements were about 0.571 ms,
+0.605 ms and 0.604 ms. At this working-set size, native conversion still costs
+roughly 6--8% more than the bytes it saves. INT8/FP8 remain useful for fitting
+more tensors in L0 and avoiding L1/L2 misses; the caller must choose them under
+an explicit accuracy/storage contract rather than expecting every resident
+shape to run faster. Larger cold/cache-pressure experiments remain a separate
+acceptance gate.
+
 ## Vendor acceptance gates
 
 Every native backend needs target-hardware evidence for:
