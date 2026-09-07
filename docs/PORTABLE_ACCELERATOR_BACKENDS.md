@@ -123,6 +123,10 @@ selected path is exposed as `pinned_control_staging` in device status.
 The same record exposes `control_staging_speedup_milli` (direct median divided
 by packed median, in thousandths), so operators can audit a device-specific
 choice instead of inferring it from the GPU model name.
+Prometheus exports the selected tile width, PQ short-document crossover,
+pinned-control decision and measured ratio, persisting-L2 reservation and
+matrix-engine workspace under the bounded `tilemaxsim_gpu_tuning_value`
+metric. No model name or tenant identifier is used as a label.
 
 On the shared RTX 4090, three back-to-back 512-candidate, 32-query-row,
 320-dimensional A/B runs measured direct pageable control transfers at

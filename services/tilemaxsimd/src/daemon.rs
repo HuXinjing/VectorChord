@@ -2404,6 +2404,12 @@ fn render_metrics(metrics: &RuntimeMetrics) -> String {
     )
     .unwrap();
     writeln!(output, "# TYPE tilemaxsim_gpu_calibration_total counter").unwrap();
+    writeln!(
+        output,
+        "# HELP tilemaxsim_gpu_tuning_value Runtime-selected accelerator tuning values."
+    )
+    .unwrap();
+    writeln!(output, "# TYPE tilemaxsim_gpu_tuning_value gauge").unwrap();
     for device in &engine.devices {
         for (kind, value) in [
             ("capacity", device.capacity_bytes),
@@ -2469,6 +2475,40 @@ fn render_metrics(metrics: &RuntimeMetrics) -> String {
             device.slot, device.device, device.calibration_failures
         )
         .unwrap();
+        if let Some(backend) = &device.backend {
+            for (kind, value) in [
+                (
+                    "document_tile_query_rows",
+                    backend.document_tile_query_rows.map(u64::from),
+                ),
+                (
+                    "pq_warp_task_max_document_rows",
+                    backend.pq_warp_task_max_document_rows.map(u64::from),
+                ),
+                (
+                    "pinned_control_staging",
+                    backend.pinned_control_staging.map(u64::from),
+                ),
+                (
+                    "control_staging_speedup_milli",
+                    backend.control_staging_speedup_milli.map(u64::from),
+                ),
+                ("persisting_l2_bytes", backend.persisting_l2_bytes),
+                (
+                    "matrix_engine_workspace_bytes",
+                    backend.matrix_engine_workspace_bytes,
+                ),
+            ] {
+                if let Some(value) = value {
+                    writeln!(
+                        output,
+                        "tilemaxsim_gpu_tuning_value{{slot=\"{}\",device=\"{}\",kind=\"{kind}\"}} {value}",
+                        device.slot, device.device
+                    )
+                    .unwrap();
+                }
+            }
+        }
     }
     writeln!(
         output,
@@ -2895,6 +2935,7 @@ mod tests {
         ));
         assert!(output.contains("tilemaxsim_host_cache_bytes{kind=\"used\"} 128"));
         assert!(output.contains("tilemaxsim_storage_read_bytes_total 256"));
+        assert!(output.contains("# TYPE tilemaxsim_gpu_tuning_value gauge"));
         assert!(!output.contains("tenant-a"));
     }
 }
