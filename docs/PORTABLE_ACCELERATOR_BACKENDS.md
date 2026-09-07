@@ -12,7 +12,7 @@ images; vendor SDKs are never linked into one universal binary.
 | Shared backend SDK | `backend-core` | none | available |
 | CPU reference | `backend-cpu` | none | exact FP16/FP32 available |
 | NVIDIA | `backend-cuda` | CUDA Runtime, cuBLAS | available; RTX 4090 validated |
-| Apple | downstream `backend-metal` executor | Metal/MPS | implementation pending on macOS CI |
+| Apple | `backend-metal` | Metal/Foundation | exact FP16/FP32 experimental; macOS GPU gate required |
 | Ascend | downstream `backend-ascend` executor | CANN/Ascend C | implementation pending on Ascend CI |
 | MetaX | downstream `backend-metax` executor | MXMACA/mcBLAS | implementation pending on MetaX CI |
 
@@ -32,6 +32,20 @@ They must implement `AcceleratorBackend`, publish truthful `DeviceInfo` and
 `BackendCapabilities`, and pass `run_conformance_probe` on the target device.
 Unsupported profiles fail before cache mutation or execution; substituting a
 different precision is forbidden.
+
+The Apple build is produced independently and never links CUDA:
+
+```bash
+cargo build --release --manifest-path services/tilemaxsimd/Cargo.toml \
+  --no-default-features --features backend-metal --bin tilemaxsimd
+```
+
+It reserves one `MTLStorageModeShared` arena in Apple unified memory and runs
+native MSL FP16/FP32 exact MaxSim. INT8, FP8, PQ and fused multiquery are
+reported unsupported rather than silently falling back. The macOS ARM64 CI
+job compiles the Objective-C++ bridge and runs the same device-level exact
+conformance probe as CUDA. Until that external job passes, Metal remains
+experimental rather than production-supported.
 
 ## NVIDIA architecture policy
 
