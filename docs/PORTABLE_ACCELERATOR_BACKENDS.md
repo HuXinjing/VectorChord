@@ -44,7 +44,9 @@ rule.
 - Ada/RTX 4090 uses aligned `half2` loads, FP32 accumulation, scoped
   persisting-L2 query windows, 16-byte `cp.async` document loads,
   32-query-row document-tile reuse, high-priority compute streams and batched
-  cuBLAS Tensor Core GEMM.
+  cuBLAS Tensor Core GEMM. INT8 loads are vectorized and E4M3 decoding uses
+  native FP8 conversion instructions on SM89; quantized continuous batches
+  decode a document row once into shared memory for all query rows in a tile.
 - Hopper/H200 selects the `sm_90a` image. Batched cuBLAS owns Hopper matrix-core
   instruction and data-movement selection, receives an architecture-sized
   32-MiB stable workspace, and starts with 64-query-row document-tile reuse.
@@ -69,8 +71,11 @@ On the available RTX 4090, the production-shaped 64-candidate, eight-request,
 0.112--0.114 ms, so calibration correctly kept the tile path for that shape.
 This is a kernel microbenchmark, not an end-to-end retrieval latency claim.
 Generated `sm_89` SASS was inspected and contains the asynchronous copy
-instructions; compilation alone is not counted as evidence that the fast path
-exists.
+and native E4M3 conversion instructions; compilation alone is not counted as
+evidence that the fast path exists. OPQ rotations are materialized once per
+query and rotation stage before LUT generation instead of being recomputed for
+every centroid, reducing the rotation arithmetic by the centroid count while
+preserving the persisted quantization contract.
 
 ## Vendor acceptance gates
 
