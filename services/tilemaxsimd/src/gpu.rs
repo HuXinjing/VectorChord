@@ -8,6 +8,9 @@
 //
 // Copyright (c) 2026 Hu Xinjing
 
+use crate::backend::{
+    AcceleratorBackend, AdaptiveStatus, BackendCapabilities, BackendKind, DeviceInfo,
+};
 use anyhow::{Result, anyhow, bail};
 use std::collections::HashMap;
 use std::ffi::{CStr, c_char, c_int, c_uchar, c_void};
@@ -132,6 +135,7 @@ pub struct Gpu {
     batch_tensor_calls: u64,
     calibration_runs: u64,
     calibration_failures: u64,
+    info: DeviceInfo,
 }
 
 // SAFETY: `Gpu` uniquely owns the native handle. It may move to a scoped
@@ -189,13 +193,35 @@ impl Gpu {
             batch_tensor_calls: 0,
             calibration_runs: 0,
             calibration_failures: 0,
+            info: DeviceInfo {
+                backend: BackendKind::Cuda,
+                ordinal: device,
+                name,
+                architecture: if capability_status == 0 {
+                    format!("sm_{major}{minor}")
+                } else {
+                    "unknown".to_owned()
+                },
+                driver_version: None,
+                runtime_version: None,
+                library_version: None,
+                capabilities: BackendCapabilities {
+                    kind: BackendKind::Cuda,
+                    exact_fp16: true,
+                    exact_fp32: true,
+                    int8: true,
+                    fp8_e4m3: true,
+                    pq: true,
+                    opq_rpq: true,
+                    fused_multiquery: true,
+                    matrix_engine: tensor_threshold_rows != u32::MAX,
+                    asynchronous_copy: true,
+                    unified_memory: false,
+                },
+            },
         };
         gpu.calibrate_kernel_thresholds();
         Ok(gpu)
-    }
-
-    pub fn device(&self) -> i32 {
-        self.device
     }
 
     pub fn tensor_bytes(&self) -> usize {
@@ -617,6 +643,120 @@ impl Gpu {
             .chunks(document_offsets.len())
             .map(<[f32]>::to_vec)
             .collect())
+    }
+}
+
+impl AcceleratorBackend for Gpu {
+    fn info(&self) -> &DeviceInfo {
+        &self.info
+    }
+
+    fn tensor_bytes(&self) -> usize {
+        Gpu::tensor_bytes(self)
+    }
+
+    fn adaptive_status(&self) -> AdaptiveStatus {
+        let status = Gpu::adaptive_status(self);
+        AdaptiveStatus {
+            tensor_threshold_rows: status.0,
+            calibration_complete: status.1,
+            batch_vector_calls: status.2,
+            batch_matrix_calls: status.3,
+            calibration_runs: status.4,
+            calibration_failures: status.5,
+        }
+    }
+
+    fn ensure_quantizer(
+        &mut self,
+        contract_id: &str,
+        payload: &[u8],
+        dimension: u32,
+        stages: u16,
+        subspaces: u16,
+        centroids: u16,
+        rotation_mask: u16,
+    ) -> Result<()> {
+        Gpu::ensure_quantizer(
+            self,
+            contract_id,
+            payload,
+            dimension,
+            stages,
+            subspaces,
+            centroids,
+            rotation_mask,
+        )
+    }
+
+    fn retain_quantizers(&mut self, active: &std::collections::HashSet<String>) {
+        Gpu::retain_quantizers(self, active)
+    }
+
+    fn upload_batch(&mut self, items: &[(u64, &[u8])]) -> Result<()> {
+        Gpu::upload_batch(self, items)
+    }
+
+    fn score(
+        &mut self,
+        query: &[u8],
+        query_rows: u32,
+        dimension: u32,
+        dtype: u8,
+        scoring_profile: u8,
+        document_offsets: &[u64],
+        document_rows: &[u32],
+    ) -> Result<Vec<f32>> {
+        Gpu::score(
+            self,
+            query,
+            query_rows,
+            dimension,
+            dtype,
+            scoring_profile,
+            document_offsets,
+            document_rows,
+        )
+    }
+
+    fn score_pq(
+        &mut self,
+        contract_id: &str,
+        query: &[u8],
+        query_rows: u32,
+        dtype: u8,
+        document_offsets: &[u64],
+        document_rows: &[u32],
+    ) -> Result<Vec<f32>> {
+        Gpu::score_pq(
+            self,
+            contract_id,
+            query,
+            query_rows,
+            dtype,
+            document_offsets,
+            document_rows,
+        )
+    }
+
+    fn score_batch(
+        &mut self,
+        queries: &[u8],
+        query_offsets: &[u32],
+        dimension: u32,
+        dtype: u8,
+        document_offsets: &[u64],
+        document_rows: &[u32],
+    ) -> Result<Vec<Vec<f32>>> {
+        Gpu::score_batch(
+            self,
+            queries,
+            query_offsets,
+            dimension,
+            dtype,
+            document_offsets,
+            document_rows,
+        )
     }
 }
 

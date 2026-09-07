@@ -8,8 +8,8 @@
 //
 // Copyright (c) 2026 Hu Xinjing
 
+use crate::backend::{AcceleratorBackend, DeviceInfo};
 use crate::cache::{Admission, GpuCache};
-use crate::gpu::Gpu;
 use crate::protocol::{Descriptor, Request, ScoringProfile};
 use crate::quant::{ActiveQuantizer, QuantizationRegistry};
 use crate::shard::{HostCacheStatus, ShardStore, cache_key};
@@ -36,7 +36,7 @@ struct ResidentTensor {
 }
 
 struct DeviceState {
-    gpu: Gpu,
+    gpu: Box<dyn AcceleratorBackend>,
     cache: GpuCache,
     h2d_batches: u64,
     h2d_bytes: u64,
@@ -55,6 +55,7 @@ type BatchedCandidateScores = Vec<Vec<(u32, f32)>>;
 pub struct DeviceStatus {
     pub slot: usize,
     pub device: i32,
+    pub backend: Option<DeviceInfo>,
     pub capacity_bytes: usize,
     pub block_bytes: usize,
     pub free_bytes: usize,
@@ -89,8 +90,8 @@ pub struct EngineStatus {
 }
 
 impl Engine {
-    pub fn new(
-        gpus: Vec<Gpu>,
+    pub fn new<B: AcceleratorBackend + 'static>(
+        gpus: Vec<B>,
         block_bytes: usize,
         store: ShardStore,
         tenant_cache_max_percent: u8,
@@ -113,7 +114,7 @@ impl Engine {
                 )
                 .map_err(|message| anyhow!(message))?;
                 Ok(DeviceState {
-                    gpu,
+                    gpu: Box::new(gpu),
                     cache,
                     h2d_batches: 0,
                     h2d_bytes: 0,
@@ -836,7 +837,8 @@ impl Engine {
                 let adaptive = device.gpu.adaptive_status();
                 DeviceStatus {
                     slot,
-                    device: device.gpu.device(),
+                    device: device.gpu.info().ordinal,
+                    backend: Some(device.gpu.info().clone()),
                     capacity_bytes: device.cache.capacity(),
                     block_bytes: device.cache.block_bytes(),
                     free_bytes: device.cache.free_bytes(),
@@ -857,12 +859,12 @@ impl Engine {
                     admission_rejections: device.cache.admission_rejections,
                     h2d_batches: device.h2d_batches,
                     h2d_bytes: device.h2d_bytes,
-                    tensor_threshold_rows: adaptive.0,
-                    calibration_complete: adaptive.1,
-                    batch_warp_calls: adaptive.2,
-                    batch_tensor_calls: adaptive.3,
-                    calibration_runs: adaptive.4,
-                    calibration_failures: adaptive.5,
+                    tensor_threshold_rows: adaptive.tensor_threshold_rows,
+                    calibration_complete: adaptive.calibration_complete,
+                    batch_warp_calls: adaptive.batch_vector_calls,
+                    batch_tensor_calls: adaptive.batch_matrix_calls,
+                    calibration_runs: adaptive.calibration_runs,
+                    calibration_failures: adaptive.calibration_failures,
                 }
             })
             .collect();
@@ -883,6 +885,7 @@ impl Engine {
                 serde_json::json!({
                     "index": device.slot,
                     "device": device.device,
+                    "backend": device.backend,
                     "gpu_allocator": "segregated-page-runs",
                     "gpu_tensor_bytes": device.capacity_bytes,
                     "gpu_block_bytes": device.block_bytes,

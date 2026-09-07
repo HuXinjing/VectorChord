@@ -8,6 +8,7 @@
 //
 // Copyright (c) 2026 Hu Xinjing
 
+mod backend;
 mod cache;
 mod dispatch;
 mod engine;
