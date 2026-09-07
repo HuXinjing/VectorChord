@@ -99,8 +99,33 @@ impl Engine {
         tenant_reservations: &HashMap<String, usize>,
         quantization_registry: Option<QuantizationRegistry>,
     ) -> Result<Self> {
+        Self::new_boxed(
+            gpus.into_iter()
+                .map(|gpu| Box::new(gpu) as Box<dyn AcceleratorBackend>)
+                .collect(),
+            block_bytes,
+            store,
+            tenant_cache_max_percent,
+            pinned_cache_max_percent,
+            tenant_reservations,
+            quantization_registry,
+        )
+    }
+
+    /// Construct an engine from independently loaded vendor backends. Keeping
+    /// the trait object boundary here allows Metal, CANN and MXMACA executors
+    /// to link their SDK without adding those runtimes to CUDA/CPU artifacts.
+    pub fn new_boxed(
+        gpus: Vec<Box<dyn AcceleratorBackend>>,
+        block_bytes: usize,
+        store: ShardStore,
+        tenant_cache_max_percent: u8,
+        pinned_cache_max_percent: u8,
+        tenant_reservations: &HashMap<String, usize>,
+        quantization_registry: Option<QuantizationRegistry>,
+    ) -> Result<Self> {
         if gpus.is_empty() {
-            bail!("at least one GPU is required");
+            bail!("at least one accelerator device is required");
         }
         let devices = gpus
             .into_iter()
@@ -114,7 +139,7 @@ impl Engine {
                 )
                 .map_err(|message| anyhow!(message))?;
                 Ok(DeviceState {
-                    gpu: Box::new(gpu),
+                    gpu,
                     cache,
                     h2d_batches: 0,
                     h2d_bytes: 0,
