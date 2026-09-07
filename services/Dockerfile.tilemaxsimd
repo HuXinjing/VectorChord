@@ -20,7 +20,8 @@ FROM build AS test
 RUN rustup component add clippy rustfmt \
     && cargo fmt --check \
     && cargo clippy --all-targets --locked -- -D warnings \
-    && cargo test --locked
+    && cargo test --locked \
+    && scripts/verify_cuda_artifact.sh
 
 FROM ${RUNTIME_IMAGE} AS runtime-base
 
