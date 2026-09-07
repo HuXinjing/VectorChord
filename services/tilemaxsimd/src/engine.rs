@@ -657,23 +657,51 @@ impl Engine {
         }
         let mut scores = vec![vec![None; leader.candidates.len()]; requests.len()];
         let result = (|| -> Result<()> {
-            for (device, chunk) in self.devices.iter_mut().zip(&chunks) {
-                if chunk.is_empty() {
-                    continue;
+            let completed = std::thread::scope(|scope| {
+                let mut workers = Vec::new();
+                let queries = queries.as_slice();
+                let query_offsets = query_offsets.as_slice();
+                for (device, chunk) in self.devices.iter_mut().zip(&chunks) {
+                    if chunk.is_empty() {
+                        continue;
+                    }
+                    workers.push(scope.spawn(move || {
+                        let offsets = chunk.iter().map(|item| item.offset).collect::<Vec<_>>();
+                        let rows = chunk.iter().map(|item| item.rows).collect::<Vec<_>>();
+                        let values = device.gpu.score_batch(
+                            queries,
+                            query_offsets,
+                            leader.dimension,
+                            leader.dtype,
+                            &offsets,
+                            &rows,
+                        )?;
+                        let candidate_indexes = chunk
+                            .iter()
+                            .map(|tensor| tensor.candidate_index)
+                            .collect::<Vec<_>>();
+                        Ok::<_, anyhow::Error>((candidate_indexes, values))
+                    }));
                 }
-                let offsets = chunk.iter().map(|item| item.offset).collect::<Vec<_>>();
-                let rows = chunk.iter().map(|item| item.rows).collect::<Vec<_>>();
-                let computed = device.gpu.score_batch(
-                    &queries,
-                    &query_offsets,
-                    leader.dimension,
-                    leader.dtype,
-                    &offsets,
-                    &rows,
-                )?;
-                for (request_scores, values) in scores.iter_mut().zip(computed) {
-                    for (tensor, value) in chunk.iter().zip(values) {
-                        request_scores[tensor.candidate_index] = Some(value);
+                workers
+                    .into_iter()
+                    .map(|worker| {
+                        worker
+                            .join()
+                            .map_err(|_| anyhow!("GPU batch worker panicked"))?
+                    })
+                    .collect::<Result<Vec<_>>>()
+            })?;
+            for (candidate_indexes, device_scores) in completed {
+                if device_scores.len() != requests.len() {
+                    bail!("accelerator returned the wrong batch request count");
+                }
+                for (request_scores, values) in scores.iter_mut().zip(device_scores) {
+                    if values.len() != candidate_indexes.len() {
+                        bail!("accelerator returned the wrong batch candidate count");
+                    }
+                    for (candidate_index, value) in candidate_indexes.iter().copied().zip(values) {
+                        request_scores[candidate_index] = Some(value);
                     }
                 }
             }
