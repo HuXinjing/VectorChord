@@ -8,36 +8,10 @@
 //
 // Copyright (c) 2026 Hu Xinjing
 
-mod backend;
-mod cache;
-#[cfg(feature = "backend-cpu")]
-mod cpu;
-mod dispatch;
-mod engine;
-#[cfg(feature = "backend-cuda")]
-mod gpu;
-mod protocol;
-mod quant;
-mod scheduler;
-mod shard;
-
 use anyhow::{Context, Result, anyhow, bail};
 use clap::Parser;
-#[cfg(feature = "backend-cpu")]
-use cpu::CpuBackend as SelectedBackend;
-use dispatch::{DispatchInput, DispatchThresholds, KernelKind};
-use engine::{Engine, EngineStatus};
-#[cfg(feature = "backend-cuda")]
-use gpu::Gpu as SelectedBackend;
-use protocol::{
-    HEADER_BYTES, VERSION_EXTERNAL, VERSION_PROFILED_EXTERNAL, VERSION_QUANTIZED_EXTERNAL,
-    VERSION_SCHEDULED_EXTERNAL,
-};
-use quant::QuantizationRegistry;
-use scheduler::{RequestQueue, Scheduled, SchedulerPolicy};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
-use shard::ShardStore;
 use std::collections::HashMap;
 use std::fmt::Write as FmtWrite;
 use std::fs::{self, OpenOptions};
@@ -51,11 +25,19 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
-
-#[cfg(all(feature = "backend-cuda", feature = "backend-cpu"))]
-compile_error!("select exactly one accelerator backend");
-#[cfg(not(any(feature = "backend-cuda", feature = "backend-cpu")))]
-compile_error!("select one accelerator backend");
+#[cfg(feature = "backend-cpu")]
+use tilemaxsimd::cpu::CpuBackend as SelectedBackend;
+use tilemaxsimd::dispatch::{self, DispatchInput, DispatchThresholds, KernelKind};
+use tilemaxsimd::engine::{Engine, EngineStatus};
+#[cfg(feature = "backend-cuda")]
+use tilemaxsimd::gpu::Gpu as SelectedBackend;
+use tilemaxsimd::protocol::{
+    self, HEADER_BYTES, VERSION_EXTERNAL, VERSION_PROFILED_EXTERNAL, VERSION_QUANTIZED_EXTERNAL,
+    VERSION_SCHEDULED_EXTERNAL,
+};
+use tilemaxsimd::quant::QuantizationRegistry;
+use tilemaxsimd::scheduler::{RequestQueue, Scheduled, SchedulerPolicy};
+use tilemaxsimd::shard::ShardStore;
 
 const GIB: usize = 1024 * 1024 * 1024;
 static SHUTDOWN_REQUESTED: AtomicBool = AtomicBool::new(false);
@@ -2679,12 +2661,12 @@ mod tests {
         ByteAdmission, PendingAdmission, RuntimeMetrics, candidate_fmas, handle_status_connection,
         is_fatal_cuda_diagnostic, kib_to_bytes, quantum_end, render_metrics, tenant_hash,
     };
-    use crate::engine::{DeviceStatus, EngineStatus};
-    use crate::protocol::Descriptor;
-    use crate::shard::HostCacheStatus;
     use std::io::{Read, Write};
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
+    use tilemaxsimd::engine::{DeviceStatus, EngineStatus};
+    use tilemaxsimd::protocol::Descriptor;
+    use tilemaxsimd::shard::HostCacheStatus;
 
     struct StatusExchange {
         request: std::io::Cursor<Vec<u8>>,
