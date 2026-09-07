@@ -297,6 +297,10 @@ and low-memory ablation is available in the
 The report publishes aggregate measurements and reproducible tooling, not the
 private evaluation corpus, generated tensors, model weights, or internal paths.
 
+The accelerator boundary, isolated CPU/CUDA builds, NVIDIA architecture policy
+and acceptance gates for future Metal, Ascend and MetaX executors are documented
+in [Portable accelerator backends](docs/PORTABLE_ACCELERATOR_BACKENDS.md).
+
 The development corpus contains 34,054 descriptors, 34,027 unique tensors, and
 16.28 GB of logical FP16 tensor data. Absolute latency depends on storage, CPU,
 and GPU hardware; same-machine comparisons are more meaningful than isolated
