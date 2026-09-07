@@ -125,6 +125,9 @@ paths on the actual device, checks numerical equivalence and retains packing
 only after a median improvement of at least 2%. Oversized control payloads
 fall back to bounded direct copies rather than increasing pinned memory. The
 selected path is exposed as `pinned_control_staging` in device status.
+Both variants are warmed before measurement and subsequent samples alternate
+AB/BA order, preventing clock ramp or cache warmth from systematically
+favouring the second implementation.
 The same record exposes `control_staging_speedup_milli` (direct median divided
 by packed median, in thousandths), so operators can audit a device-specific
 choice instead of inferring it from the GPU model name.
@@ -137,14 +140,14 @@ SM80+ exact tile kernels also contain a two-stage shared-memory pipeline that
 can enqueue row N+1 with `cp.async` while warps score row N. It is not enabled
 merely because the instruction exists: startup compares single and double
 buffering at the production dimension, rejects score drift, requires at least
-a 2% median win and checks that two rows fit in the device's per-block shared
+a 5% median win and checks that two rows fit in the device's per-block shared
 memory. `double_buffered_tile` and `double_buffer_speedup_milli` expose the
 decision. This keeps Ada on the simpler path when synchronization dominates,
 while allowing Hopper to select overlap only when its physical H200 result
 supports it.
 With the 64-candidate startup shape, the shared RTX 4090 measured a 1.003
 single/double ratio during calibration; a separate eight-request run measured
-1.007. Both are below the 1.02 admission threshold, so Ada retained the
+1.007. Both are below the 1.05 admission threshold, so Ada retained the
 single-buffer kernel. This rejected experiment is intentionally kept behind
 the calibrated dispatch rather than being presented as an optimization win.
 

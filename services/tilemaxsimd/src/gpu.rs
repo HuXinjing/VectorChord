@@ -178,6 +178,9 @@ pub struct Gpu {
     info: DeviceInfo,
 }
 
+type TimedBatchScores = (Duration, Vec<Vec<f32>>);
+type PairedBatchCalibration = (TimedBatchScores, TimedBatchScores);
+
 // SAFETY: `Gpu` uniquely owns the native handle. It may move to a scoped
 // worker, but no method exposes the pointer and all calls require `&mut self`.
 unsafe impl Send for Gpu {}
@@ -825,35 +828,62 @@ impl Gpu {
             }
         }
         let offsets = [0, QUERY_ROWS / 2, QUERY_ROWS];
-        let measure = |gpu: &mut Self, enabled: bool| -> Result<(Duration, Vec<Vec<f32>>)> {
+        let run_once = |gpu: &mut Self, enabled: bool| -> Result<(Duration, Vec<Vec<f32>>)> {
             if unsafe {
                 vctm_gpu_set_pinned_control_staging(gpu.native.as_ptr(), i32::from(enabled))
             } != 0
             {
                 bail!("CUDA rejected control-staging calibration mode");
             }
-            let mut samples = Vec::with_capacity(REPETITIONS);
-            let mut scores = Vec::new();
-            for _ in 0..REPETITIONS {
-                let started = Instant::now();
-                scores = gpu.score_batch_native(
-                    false,
-                    &queries,
-                    &offsets,
-                    dimension,
-                    2,
-                    document_offsets,
-                    document_rows,
-                    1,
-                )?;
-                samples.push(started.elapsed());
-            }
-            samples.sort_unstable();
-            Ok((samples[REPETITIONS / 2], scores))
+            let started = Instant::now();
+            let scores = gpu.score_batch_native(
+                false,
+                &queries,
+                &offsets,
+                dimension,
+                2,
+                document_offsets,
+                document_rows,
+                1,
+            )?;
+            Ok((started.elapsed(), scores))
         };
         self.calibration_runs += 1;
-        let pageable = measure(self, false);
-        let pinned = measure(self, true);
+        // Warm both variants, then alternate AB/BA order. Measuring every A
+        // sample before every B sample mistakes clock ramp and cache warmth
+        // for a backend optimization on shared production GPUs.
+        let calibration = (|| -> Result<PairedBatchCalibration> {
+            run_once(self, false)?;
+            run_once(self, true)?;
+            let mut samples = [
+                Vec::with_capacity(REPETITIONS),
+                Vec::with_capacity(REPETITIONS),
+            ];
+            let mut scores = [Vec::new(), Vec::new()];
+            for repetition in 0..REPETITIONS {
+                let order = if repetition & 1 == 0 {
+                    [false, true]
+                } else {
+                    [true, false]
+                };
+                for enabled in order {
+                    let (elapsed, output) = run_once(self, enabled)?;
+                    let index = usize::from(enabled);
+                    samples[index].push(elapsed);
+                    scores[index] = output;
+                }
+            }
+            samples[0].sort_unstable();
+            samples[1].sort_unstable();
+            Ok((
+                (samples[0][REPETITIONS / 2], std::mem::take(&mut scores[0])),
+                (samples[1][REPETITIONS / 2], std::mem::take(&mut scores[1])),
+            ))
+        })();
+        let (pageable, pinned) = calibration.map_or_else(
+            |error| (Err(error), Err(anyhow!("paired calibration failed"))),
+            |(pageable, pinned)| (Ok(pageable), Ok(pinned)),
+        );
         let (use_pinned, speedup_milli) = match (pageable, pinned) {
             (Ok((pageable_elapsed, pageable_scores)), Ok((pinned_elapsed, pinned_scores)))
                 if batch_scores_close(&pageable_scores, &pinned_scores) =>
@@ -909,34 +939,58 @@ impl Gpu {
             }
         }
         let offsets = [0, QUERY_ROWS / 2, QUERY_ROWS];
-        let measure = |gpu: &mut Self, enabled: bool| -> Result<(Duration, Vec<Vec<f32>>)> {
+        let run_once = |gpu: &mut Self, enabled: bool| -> Result<(Duration, Vec<Vec<f32>>)> {
             if unsafe { vctm_gpu_set_double_buffered_tile(gpu.native.as_ptr(), i32::from(enabled)) }
                 != 0
             {
                 bail!("CUDA rejected tile-buffer calibration mode");
             }
-            let mut samples = Vec::with_capacity(REPETITIONS);
-            let mut scores = Vec::new();
-            for _ in 0..REPETITIONS {
-                let started = Instant::now();
-                scores = gpu.score_batch_native(
-                    false,
-                    &queries,
-                    &offsets,
-                    dimension,
-                    2,
-                    document_offsets,
-                    document_rows,
-                    1,
-                )?;
-                samples.push(started.elapsed());
-            }
-            samples.sort_unstable();
-            Ok((samples[REPETITIONS / 2], scores))
+            let started = Instant::now();
+            let scores = gpu.score_batch_native(
+                false,
+                &queries,
+                &offsets,
+                dimension,
+                2,
+                document_offsets,
+                document_rows,
+                1,
+            )?;
+            Ok((started.elapsed(), scores))
         };
         self.calibration_runs += 1;
-        let single = measure(self, false);
-        let double = measure(self, true);
+        let calibration = (|| -> Result<PairedBatchCalibration> {
+            run_once(self, false)?;
+            run_once(self, true)?;
+            let mut samples = [
+                Vec::with_capacity(REPETITIONS),
+                Vec::with_capacity(REPETITIONS),
+            ];
+            let mut scores = [Vec::new(), Vec::new()];
+            for repetition in 0..REPETITIONS {
+                let order = if repetition & 1 == 0 {
+                    [false, true]
+                } else {
+                    [true, false]
+                };
+                for enabled in order {
+                    let (elapsed, output) = run_once(self, enabled)?;
+                    let index = usize::from(enabled);
+                    samples[index].push(elapsed);
+                    scores[index] = output;
+                }
+            }
+            samples[0].sort_unstable();
+            samples[1].sort_unstable();
+            Ok((
+                (samples[0][REPETITIONS / 2], std::mem::take(&mut scores[0])),
+                (samples[1][REPETITIONS / 2], std::mem::take(&mut scores[1])),
+            ))
+        })();
+        let (single, double) = calibration.map_or_else(
+            |error| (Err(error), Err(anyhow!("paired calibration failed"))),
+            |(single, double)| (Ok(single), Ok(double)),
+        );
         let (use_double, speedup_milli) = match (single, double) {
             (Ok((single_elapsed, single_scores)), Ok((double_elapsed, double_scores)))
                 if batch_scores_close(&single_scores, &double_scores) =>
@@ -949,7 +1003,7 @@ impl Gpu {
                     .min(u32::MAX as u128) as u32;
                 (
                     double_elapsed.as_nanos().saturating_mul(100)
-                        < single_elapsed.as_nanos().saturating_mul(98),
+                        < single_elapsed.as_nanos().saturating_mul(95),
                     Some(ratio),
                 )
             }
