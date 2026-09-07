@@ -312,6 +312,38 @@ __device__ float scalar_to_float<float>(float value) {
 }
 
 template <typename Scalar>
+__device__ float lane_dot(const Scalar *left, const Scalar *right,
+                          uint32_t dimension, uint32_t lane) {
+  float dot = 0.0f;
+  for (uint32_t index = lane; index < dimension; index += 32)
+    dot = fmaf(scalar_to_float(left[index]), scalar_to_float(right[index]), dot);
+  return dot;
+}
+
+template <>
+__device__ float lane_dot<half>(const half *left, const half *right,
+                                uint32_t dimension, uint32_t lane) {
+  if ((dimension & 1U) != 0) {
+    float scalar_dot = 0.0f;
+    for (uint32_t index = lane; index < dimension; index += 32)
+      scalar_dot = fmaf(__half2float(left[index]), __half2float(right[index]),
+                        scalar_dot);
+    return scalar_dot;
+  }
+  float dot = 0.0f;
+  const uint32_t pairs = dimension / 2;
+  const auto *left2 = reinterpret_cast<const half2 *>(left);
+  const auto *right2 = reinterpret_cast<const half2 *>(right);
+  for (uint32_t index = lane; index < pairs; index += 32) {
+    const float2 a = __half22float2(left2[index]);
+    const float2 b = __half22float2(right2[index]);
+    dot = fmaf(a.x, b.x, dot);
+    dot = fmaf(a.y, b.y, dot);
+  }
+  return dot;
+}
+
+template <typename Scalar>
 __global__ void tilemaxsim_kernel(const Scalar *query, uint32_t query_rows,
                                   uint32_t dimension,
                                   const unsigned char *documents,
@@ -333,11 +365,7 @@ __global__ void tilemaxsim_kernel(const Scalar *query, uint32_t query_rows,
     for (uint32_t row = warp; row < document_rows[candidate]; row += warps) {
       const Scalar *document_vector =
           document + static_cast<size_t>(row) * dimension;
-      float dot = 0.0f;
-      for (uint32_t index = lane; index < dimension; index += 32) {
-        dot = fmaf(scalar_to_float(query_vector[index]),
-                   scalar_to_float(document_vector[index]), dot);
-      }
+      float dot = lane_dot(query_vector, document_vector, dimension, lane);
       for (int delta = 16; delta != 0; delta >>= 1) {
         dot += __shfl_down_sync(0xffffffff, dot, delta);
       }
@@ -491,9 +519,7 @@ __global__ void tilemaxsim_multiquery_kernel(
         __syncthreads();
         if (query_row < total_query_rows) {
           const Scalar *query = queries + static_cast<size_t>(query_row) * dimension;
-          float dot = 0.0f;
-          for (uint32_t column = lane; column < dimension; column += 32)
-            dot = fmaf(scalar_to_float(query[column]), scalar_to_float(document_vector[column]), dot);
+          float dot = lane_dot(query, document_vector, dimension, lane);
           for (int delta = 16; delta != 0; delta >>= 1)
             dot += __shfl_down_sync(0xffffffff, dot, delta);
           if (lane == 0) best = fmaxf(best, dot);

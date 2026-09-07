@@ -44,9 +44,13 @@ pub fn device_thresholds(name: &str, major: i32, minor: i32) -> Option<DispatchT
         156
     } else if name.contains("L40S") {
         424
+    } else if name.contains("GB10") || name.contains("DGX Spark") {
+        512
     } else {
         match (major, minor) {
             (9, _) => 384,
+            (10, _) => 384,
+            (12, _) => 512,
             (8, 0) => 256,
             (8, _) => 512,
             _ => return None,
@@ -65,6 +69,16 @@ pub fn device_thresholds(name: &str, major: i32, minor: i32) -> Option<DispatchT
         },
         (8, _) => DispatchThresholds {
             cuda_ridge: 82,
+            tensor_ridge,
+            ..Default::default()
+        },
+        (10, _) => DispatchThresholds {
+            cuda_ridge: 16,
+            tensor_ridge,
+            ..Default::default()
+        },
+        (12, _) => DispatchThresholds {
+            cuda_ridge: 64,
             tensor_ridge,
             ..Default::default()
         },
@@ -160,6 +174,12 @@ mod tests {
         );
         assert_eq!(
             device_thresholds("unknown", 8, 9).unwrap().tensor_ridge,
+            512
+        );
+        assert_eq!(
+            device_thresholds("NVIDIA GB10", 12, 1)
+                .unwrap()
+                .tensor_ridge,
             512
         );
         assert!(device_thresholds("legacy", 7, 5).is_none());
