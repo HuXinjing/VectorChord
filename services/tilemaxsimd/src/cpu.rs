@@ -281,4 +281,12 @@ mod tests {
         assert!(!cpu.supports_profile(2));
         assert!(!cpu.supports_profile(5));
     }
+
+    #[test]
+    fn passes_vendor_neutral_conformance_probe() {
+        let mut cpu = CpuBackend::create(0, 4096, 1024).unwrap();
+        let report = crate::backend::run_conformance_probe(&mut cpu).unwrap();
+        assert_eq!(report.backend, BackendKind::Cpu);
+        assert_eq!(report.exact_fp32_score, report.expected_score);
+    }
 }

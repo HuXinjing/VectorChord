@@ -874,6 +874,19 @@ mod tests {
 
     #[test]
     #[ignore = "requires an explicitly assigned CUDA device"]
+    fn passes_vendor_neutral_conformance_probe() {
+        let device = std::env::var("VCTM_TEST_GPU")
+            .unwrap_or_else(|_| "0".to_owned())
+            .parse::<i32>()
+            .unwrap();
+        let mut gpu = Gpu::create(device, 64 * 1024 * 1024, 32 * 1024 * 1024).unwrap();
+        let report = crate::backend::run_conformance_probe(&mut gpu).unwrap();
+        assert_eq!(report.backend, BackendKind::Cuda);
+        assert_eq!(report.exact_fp32_score, report.expected_score);
+    }
+
+    #[test]
+    #[ignore = "requires an explicitly assigned CUDA device"]
     fn native_multiquery_scores_shared_documents_once_per_tile() {
         let device = std::env::var("VCTM_TEST_GPU")
             .unwrap_or_else(|_| "0".to_owned())

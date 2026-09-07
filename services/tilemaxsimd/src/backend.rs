@@ -127,3 +127,42 @@ pub trait AcceleratorBackend: Send {
         document_rows: &[u32],
     ) -> Result<Vec<Vec<f32>>>;
 }
+
+#[derive(Clone, Debug, Serialize)]
+pub struct ConformanceReport {
+    pub backend: BackendKind,
+    pub architecture: String,
+    pub exact_fp32_score: f32,
+    pub expected_score: f32,
+}
+
+/// Minimal vendor-backend acceptance probe. Run on a newly-created arena
+/// before serving requests; it verifies actual upload and exact MaxSim
+/// execution rather than trusting a capability bit.
+pub fn run_conformance_probe(backend: &mut dyn AcceleratorBackend) -> Result<ConformanceReport> {
+    if !backend.info().capabilities.exact_fp32 {
+        anyhow::bail!("backend conformance requires exact FP32 support");
+    }
+    let document = [1.0_f32, 0.0, 0.0, 1.0]
+        .into_iter()
+        .flat_map(f32::to_le_bytes)
+        .collect::<Vec<_>>();
+    let query = [1.0_f32, 0.0, 0.5, 0.5]
+        .into_iter()
+        .flat_map(f32::to_le_bytes)
+        .collect::<Vec<_>>();
+    backend.upload_batch(&[(0, &document)])?;
+    let score = backend.score(&query, 2, 2, 1, 1, &[0], &[2])?[0];
+    let expected = 1.5_f32;
+    if !score.is_finite() || (score - expected).abs() > 1.0e-5 {
+        anyhow::bail!(
+            "backend exact MaxSim conformance failed: expected {expected}, received {score}"
+        );
+    }
+    Ok(ConformanceReport {
+        backend: backend.info().backend,
+        architecture: backend.info().architecture.clone(),
+        exact_fp32_score: score,
+        expected_score: expected,
+    })
+}
