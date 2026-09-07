@@ -4,6 +4,7 @@ pub mod backend;
 pub mod cache;
 #[cfg(feature = "backend-cpu")]
 pub mod cpu;
+pub mod daemon;
 pub mod dispatch;
 pub mod engine;
 #[cfg(feature = "backend-cuda")]
