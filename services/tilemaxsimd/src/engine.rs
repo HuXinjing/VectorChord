@@ -579,7 +579,12 @@ impl Engine {
             return Ok(None);
         }
         let leader = &requests[0];
-        if leader.scoring_profile != crate::protocol::ScoringProfile::ExactFp16 {
+        if !matches!(
+            leader.scoring_profile,
+            crate::protocol::ScoringProfile::ExactFp16
+                | crate::protocol::ScoringProfile::Int8
+                | crate::protocol::ScoringProfile::Fp8E4m3
+        ) {
             return Ok(None);
         }
         let scalar_bytes = if leader.dtype == 1 {
@@ -673,6 +678,7 @@ impl Engine {
                             query_offsets,
                             leader.dimension,
                             leader.dtype,
+                            leader.scoring_profile.native_code(),
                             &offsets,
                             &rows,
                         )?;

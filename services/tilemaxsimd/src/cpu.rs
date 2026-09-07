@@ -173,9 +173,13 @@ impl AcceleratorBackend for CpuBackend {
         query_offsets: &[u32],
         dimension: u32,
         dtype: u8,
+        scoring_profile: u8,
         document_offsets: &[u64],
         document_rows: &[u32],
     ) -> Result<Vec<Vec<f32>>> {
+        if scoring_profile != 1 {
+            bail!("CPU backend does not support quantized batch scoring");
+        }
         let scalar_bytes = match dtype {
             1 => 4,
             2 => 2,
@@ -191,7 +195,7 @@ impl AcceleratorBackend for CpuBackend {
                     range[1] - range[0],
                     dimension,
                     dtype,
-                    1,
+                    scoring_profile,
                     document_offsets,
                     document_rows,
                 )

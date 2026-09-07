@@ -103,6 +103,7 @@ unsafe extern "C" {
         total_query_rows: u32,
         dimension: u32,
         dtype: u8,
+        scoring_profile: u8,
         document_offsets: *const u64,
         document_rows: *const u32,
         count: usize,
@@ -479,17 +480,20 @@ impl Gpu {
         Ok(output)
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn score_batch(
         &mut self,
         queries: &[u8],
         query_offsets: &[u32],
         dimension: u32,
         dtype: u8,
+        scoring_profile: u8,
         document_offsets: &[u64],
         document_rows: &[u32],
     ) -> Result<Vec<Vec<f32>>> {
         let total_rows = *query_offsets.last().unwrap_or(&0);
-        let tensor_eligible = dtype == 2 && self.tensor_threshold_rows != u32::MAX;
+        let tensor_eligible =
+            scoring_profile == 1 && dtype == 2 && self.tensor_threshold_rows != u32::MAX;
         if tensor_eligible && !self.calibration_complete {
             self.calibration_runs += 1;
             let warp_started = Instant::now();
@@ -501,6 +505,7 @@ impl Gpu {
                 dtype,
                 document_offsets,
                 document_rows,
+                scoring_profile,
             )?;
             let warp_elapsed = warp_started.elapsed();
             let tensor_started = Instant::now();
@@ -512,6 +517,7 @@ impl Gpu {
                 dtype,
                 document_offsets,
                 document_rows,
+                scoring_profile,
             ) {
                 Ok(tensor) if batch_scores_close(&warp, &tensor) => {
                     let tensor_elapsed = tensor_started.elapsed();
@@ -544,6 +550,7 @@ impl Gpu {
                 dtype,
                 document_offsets,
                 document_rows,
+                scoring_profile,
             ) {
                 Ok(scores) => {
                     self.batch_tensor_calls += 1;
@@ -564,6 +571,7 @@ impl Gpu {
             dtype,
             document_offsets,
             document_rows,
+            scoring_profile,
         )
     }
 
@@ -636,6 +644,7 @@ impl Gpu {
                         2,
                         &document_offsets,
                         &document_rows,
+                        1,
                     )?;
                 }
                 Ok((started.elapsed() / REPETITIONS as u32, scores))
@@ -716,6 +725,7 @@ impl Gpu {
                     2,
                     document_offsets,
                     document_rows,
+                    1,
                 ) {
                     Ok(value) => scores = Some(value),
                     Err(_) => {
@@ -758,6 +768,7 @@ impl Gpu {
         dtype: u8,
         document_offsets: &[u64],
         document_rows: &[u32],
+        scoring_profile: u8,
     ) -> Result<Vec<Vec<f32>>> {
         if tensor && dtype != 2 {
             bail!("Tensor Core TileMaxSim currently requires FP16 queries");
@@ -798,6 +809,7 @@ impl Gpu {
                     total_query_rows,
                     dimension,
                     dtype,
+                    scoring_profile,
                     document_offsets.as_ptr(),
                     document_rows.as_ptr(),
                     document_offsets.len(),
@@ -919,6 +931,7 @@ impl AcceleratorBackend for Gpu {
         query_offsets: &[u32],
         dimension: u32,
         dtype: u8,
+        scoring_profile: u8,
         document_offsets: &[u64],
         document_rows: &[u32],
     ) -> Result<Vec<Vec<f32>>> {
@@ -928,6 +941,7 @@ impl AcceleratorBackend for Gpu {
             query_offsets,
             dimension,
             dtype,
+            scoring_profile,
             document_offsets,
             document_rows,
         )
@@ -1019,13 +1033,13 @@ mod tests {
         gpu.upload_batch(&[(0, &document)]).unwrap();
         let queries = [half_one, half_zero, half_zero, half_one].concat();
         let scores = gpu
-            .score_batch(&queries, &[0, 1, 2], 2, 2, &[0], &[2])
+            .score_batch(&queries, &[0, 1, 2], 2, 2, 1, &[0], &[2])
             .unwrap();
         assert_eq!(scores.len(), 2);
         assert!((scores[0][0] - 1.0).abs() < 1e-5, "scores={scores:?}");
         assert!((scores[1][0] - 1.0).abs() < 1e-5, "scores={scores:?}");
         let tensor = gpu
-            .score_batch_native(true, &queries, &[0, 1, 2], 2, 2, &[0], &[2])
+            .score_batch_native(true, &queries, &[0, 1, 2], 2, 2, &[0], &[2], 1)
             .unwrap();
         assert!(
             batch_scores_close(&scores, &tensor),
@@ -1089,6 +1103,7 @@ mod tests {
                 2,
                 &document_offsets,
                 &document_rows,
+                1,
             )
             .unwrap();
         let tensor = gpu
@@ -1100,6 +1115,7 @@ mod tests {
                 2,
                 &document_offsets,
                 &document_rows,
+                1,
             )
             .unwrap();
         assert!(
@@ -1148,6 +1164,7 @@ mod tests {
                 2,
                 &offsets,
                 &rows,
+                1,
             )
             .unwrap();
         }
@@ -1164,6 +1181,7 @@ mod tests {
                         2,
                         &offsets,
                         &rows,
+                        1,
                     )
                     .unwrap();
             }
@@ -1226,6 +1244,36 @@ mod tests {
             .collect::<Vec<_>>();
         let scores = gpu.score(&query, 2, 2, 1, 3, &[0], &[2]).unwrap();
         assert!((scores[0] - 2.0).abs() < 1e-5, "scores={scores:?}");
+    }
+
+    #[test]
+    #[ignore = "requires an explicitly assigned CUDA device"]
+    fn quantized_multiquery_decodes_each_document_tile_once() {
+        let device = std::env::var("VCTM_TEST_GPU")
+            .unwrap_or_else(|_| "0".to_owned())
+            .parse::<i32>()
+            .unwrap();
+        let mut gpu = Gpu::create(device, 64 * 1024 * 1024, 32 * 1024 * 1024).unwrap();
+        let mut int8_document = vec![127_u8, 0, 0, 127];
+        int8_document.extend_from_slice(&(1.0_f32 / 127.0).to_le_bytes());
+        int8_document.extend_from_slice(&(1.0_f32 / 127.0).to_le_bytes());
+        let mut fp8_document = vec![0x38_u8, 0, 0, 0x38];
+        fp8_document.extend_from_slice(&1.0_f32.to_le_bytes());
+        fp8_document.extend_from_slice(&1.0_f32.to_le_bytes());
+        gpu.upload_batch(&[(0, &int8_document), (256, &fp8_document)])
+            .unwrap();
+        let queries = [1.0_f32, 0.0, 0.0, 1.0]
+            .into_iter()
+            .flat_map(f32::to_le_bytes)
+            .collect::<Vec<_>>();
+        for (profile, offset) in [(2, 0), (3, 256)] {
+            let scores = gpu
+                .score_batch(&queries, &[0, 1, 2], 2, 1, profile, &[offset], &[2])
+                .unwrap();
+            assert_eq!(scores.len(), 2);
+            assert!((scores[0][0] - 1.0).abs() < 1e-5, "scores={scores:?}");
+            assert!((scores[1][0] - 1.0).abs() < 1e-5, "scores={scores:?}");
+        }
     }
 
     fn pq_gpu() -> Gpu {

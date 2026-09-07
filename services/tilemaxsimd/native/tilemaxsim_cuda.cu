@@ -436,6 +436,19 @@ __device__ float scalar_to_float<float>(float value) {
 }
 
 template <typename Scalar>
+__device__ Scalar scalar_from_float(float value);
+
+template <>
+__device__ half scalar_from_float<half>(float value) {
+  return __float2half(value);
+}
+
+template <>
+__device__ float scalar_from_float<float>(float value) {
+  return value;
+}
+
+template <typename Scalar>
 __device__ float lane_dot(const Scalar *left, const Scalar *right,
                           uint32_t dimension, uint32_t lane) {
   float dot = 0.0f;
@@ -616,6 +629,16 @@ __device__ float e4m3fn_to_float(uint8_t bits) {
          exp2f(static_cast<float>(exponent) - 7.0f);
 }
 
+__device__ float native_e4m3fn_to_float(uint8_t bits) {
+#if __CUDA_ARCH__ >= 890
+  __nv_fp8_e4m3 value;
+  value.__x = bits;
+  return static_cast<float>(value);
+#else
+  return e4m3fn_to_float(bits);
+#endif
+}
+
 template <typename QueryScalar>
 __global__ void tilemaxsim_fp8_kernel(
     const QueryScalar *query, uint32_t query_rows, uint32_t dimension,
@@ -666,7 +689,7 @@ __global__ void tilemaxsim_sum_kernel(const float *maxima, uint32_t query_rows,
   scores[candidate] = score;
 }
 
-template <typename Scalar, uint32_t QueriesPerWarp>
+template <typename Scalar, uint32_t QueriesPerWarp, uint8_t ScoringProfile>
 __global__ void tilemaxsim_multiquery_kernel(
     const Scalar *queries, uint32_t total_query_rows, uint32_t dimension,
     const unsigned char *documents, const uint64_t *document_offsets,
@@ -684,14 +707,34 @@ __global__ void tilemaxsim_multiquery_kernel(
     const size_t candidate = task / query_tiles;
     const uint32_t query_base =
         static_cast<uint32_t>(task % query_tiles) * query_tile_rows;
-    const auto *document = reinterpret_cast<const Scalar *>(documents + document_offsets[candidate]);
+    const unsigned char *encoded_document = documents + document_offsets[candidate];
+    const auto *document = reinterpret_cast<const Scalar *>(encoded_document);
+    const size_t code_bytes =
+        static_cast<size_t>(document_rows[candidate]) * dimension;
+    const size_t scale_offset = (code_bytes + 3) & ~static_cast<size_t>(3);
+    const auto *scales = reinterpret_cast<const float *>(
+        encoded_document + scale_offset);
     float best[QueriesPerWarp];
 #pragma unroll
     for (uint32_t local = 0; local < QueriesPerWarp; ++local)
       best[local] = -CUDART_INF_F;
     for (uint32_t row = 0; row < document_rows[candidate]; ++row) {
-      const Scalar *source =
-          document + static_cast<size_t>(row) * dimension;
+      const Scalar *source = document + static_cast<size_t>(row) * dimension;
+      if (ScoringProfile != 1) {
+        const float scale = scales[row];
+        for (uint32_t column = threadIdx.x; column < dimension;
+             column += blockDim.x) {
+          float value = 0.0f;
+          const size_t index = static_cast<size_t>(row) * dimension + column;
+          if (ScoringProfile == 2)
+            value = static_cast<float>(
+                reinterpret_cast<const int8_t *>(encoded_document)[index]);
+          else
+            value = native_e4m3fn_to_float(encoded_document[index]);
+          document_vector[column] = scalar_from_float<Scalar>(value * scale);
+        }
+        __syncthreads();
+      } else {
 #if __CUDA_ARCH__ >= 800
       const size_t row_bytes = static_cast<size_t>(dimension) * sizeof(Scalar);
       if ((reinterpret_cast<uintptr_t>(source) & 15U) == 0 &&
@@ -718,6 +761,7 @@ __global__ void tilemaxsim_multiquery_kernel(
         document_vector[column] = source[column];
       __syncthreads();
 #endif
+      }
 #pragma unroll
       for (uint32_t local = 0; local < QueriesPerWarp; ++local) {
         const uint32_t query_row = query_base + warp * QueriesPerWarp + local;
@@ -745,7 +789,7 @@ static void launch_multiquery_tile(
     VctmGpu *gpu, const Scalar *queries, uint32_t total_query_rows,
     uint32_t dimension, const uint64_t *document_offsets,
     const uint32_t *document_rows, size_t count, float *maxima,
-    size_t shared_bytes) {
+    size_t shared_bytes, uint8_t scoring_profile) {
   const uint32_t queries_per_warp = gpu->tile_queries_per_warp;
   const uint32_t query_tile_rows = 8 * queries_per_warp;
   const size_t tasks = count *
@@ -753,17 +797,26 @@ static void launch_multiquery_tile(
        query_tile_rows);
   const unsigned int blocks = static_cast<unsigned int>(
       std::min(tasks, static_cast<size_t>(65'535)));
-#define VCTM_LAUNCH_TILE(QPW)                                                \
-  tilemaxsim_multiquery_kernel<Scalar, QPW>                                 \
+#define VCTM_LAUNCH_TILE(PROFILE, QPW)                                       \
+  tilemaxsim_multiquery_kernel<Scalar, QPW, PROFILE>                        \
       <<<blocks, 256, shared_bytes, gpu->compute_stream>>>(                 \
           queries, total_query_rows, dimension, gpu->allocation,            \
           document_offsets, document_rows, count, maxima)
-  if (queries_per_warp == 8)
-    VCTM_LAUNCH_TILE(8);
-  else if (queries_per_warp == 4)
-    VCTM_LAUNCH_TILE(4);
-  else
-    VCTM_LAUNCH_TILE(1);
+#define VCTM_DISPATCH_TILE(PROFILE)                                          \
+  if (queries_per_warp == 8)                                                \
+    VCTM_LAUNCH_TILE(PROFILE, 8);                                           \
+  else if (queries_per_warp == 4)                                           \
+    VCTM_LAUNCH_TILE(PROFILE, 4);                                           \
+  else                                                                      \
+    VCTM_LAUNCH_TILE(PROFILE, 1)
+  if (scoring_profile == 1) {
+    VCTM_DISPATCH_TILE(1);
+  } else if (scoring_profile == 2) {
+    VCTM_DISPATCH_TILE(2);
+  } else {
+    VCTM_DISPATCH_TILE(3);
+  }
+#undef VCTM_DISPATCH_TILE
 #undef VCTM_LAUNCH_TILE
 }
 
@@ -787,11 +840,13 @@ extern "C" int vctm_gpu_score_batch(
     VctmGpu *gpu, const unsigned char *queries, size_t query_bytes,
     const uint32_t *query_offsets, uint32_t request_count,
     uint32_t total_query_rows, uint32_t dimension, uint8_t dtype,
+    uint8_t scoring_profile,
     const uint64_t *document_offsets, const uint32_t *document_rows,
     size_t count, float *output, char *error, size_t error_capacity) {
   if (gpu == nullptr || queries == nullptr || query_offsets == nullptr || request_count < 2 ||
       total_query_rows == 0 || dimension == 0 || document_offsets == nullptr ||
       document_rows == nullptr || count == 0 || output == nullptr ||
+      (scoring_profile != 1 && scoring_profile != 2 && scoring_profile != 3) ||
       query_offsets[0] != 0 || query_offsets[request_count] != total_query_rows)
     return fail(error, error_capacity, "invalid multi-query TileMaxSim request");
   const size_t scalar_bytes = dtype == 1 ? sizeof(float) : dtype == 2 ? sizeof(half) : 0;
@@ -799,6 +854,28 @@ extern "C" int vctm_gpu_score_batch(
   if (scalar_bytes == 0 || !checked_mul(total_query_rows, dimension, &expected_values) ||
       !checked_mul(expected_values, scalar_bytes, &expected_bytes) || expected_bytes != query_bytes)
     return fail(error, error_capacity, "multi-query byte length disagrees with shape");
+  for (size_t candidate = 0; candidate < count; ++candidate) {
+    size_t values = 0, payload_bytes = 0;
+    if (document_rows[candidate] == 0 ||
+        !checked_mul(document_rows[candidate], dimension, &values))
+      return fail(error, error_capacity, "invalid multi-query document shape");
+    if (scoring_profile == 1) {
+      if (!checked_mul(values, scalar_bytes, &payload_bytes))
+        return fail(error, error_capacity, "multi-query document size overflow");
+    } else {
+      if (values > std::numeric_limits<size_t>::max() - 3)
+        return fail(error, error_capacity, "quantized batch size overflow");
+      const size_t aligned_codes = (values + 3) & ~static_cast<size_t>(3);
+      size_t scale_bytes = 0;
+      if (!checked_mul(document_rows[candidate], sizeof(float), &scale_bytes) ||
+          aligned_codes > std::numeric_limits<size_t>::max() - scale_bytes)
+        return fail(error, error_capacity, "quantized batch size overflow");
+      payload_bytes = aligned_codes + scale_bytes;
+    }
+    if (document_offsets[candidate] > gpu->tensor_bytes ||
+        payload_bytes > gpu->tensor_bytes - document_offsets[candidate])
+      return fail(error, error_capacity, "multi-query document exceeds GPU arena");
+  }
   for (uint32_t index = 0; index < request_count; ++index)
     if (query_offsets[index] >= query_offsets[index + 1])
       return fail(error, error_capacity, "multi-query offsets must be strictly increasing");
@@ -830,14 +907,16 @@ extern "C" int vctm_gpu_score_batch(
         total_query_rows, dimension,
         reinterpret_cast<const uint64_t *>(workspace + offsets_offset),
         reinterpret_cast<const uint32_t *>(workspace + rows_offset), count,
-        reinterpret_cast<float *>(workspace + maxima_offset), shared_bytes);
+        reinterpret_cast<float *>(workspace + maxima_offset), shared_bytes,
+        scoring_profile);
   else if (status == cudaSuccess && dtype == 1)
     launch_multiquery_tile(gpu,
         reinterpret_cast<const float *>(workspace + query_offset),
         total_query_rows, dimension,
         reinterpret_cast<const uint64_t *>(workspace + offsets_offset),
         reinterpret_cast<const uint32_t *>(workspace + rows_offset), count,
-        reinterpret_cast<float *>(workspace + maxima_offset), shared_bytes);
+        reinterpret_cast<float *>(workspace + maxima_offset), shared_bytes,
+        scoring_profile);
   if (status == cudaSuccess) status = cudaGetLastError();
   constexpr unsigned int threads = 256;
   if (status == cudaSuccess) tilemaxsim_segmented_sum_kernel<<<static_cast<unsigned int>(std::min((score_count + threads - 1) / threads, static_cast<size_t>(65'535))), threads, 0, gpu->compute_stream>>>(reinterpret_cast<const float *>(workspace + maxima_offset), total_query_rows, reinterpret_cast<const uint32_t *>(workspace + query_offsets_offset), request_count, count, reinterpret_cast<float *>(workspace + scores_offset));

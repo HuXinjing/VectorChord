@@ -128,6 +128,7 @@ pub trait AcceleratorBackend: Send {
         query_offsets: &[u32],
         dimension: u32,
         dtype: u8,
+        scoring_profile: u8,
         document_offsets: &[u64],
         document_rows: &[u32],
     ) -> Result<Vec<Vec<f32>>>;
