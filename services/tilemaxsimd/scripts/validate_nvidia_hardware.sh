@@ -7,7 +7,7 @@ expected_cc=${VCTM_EXPECTED_COMPUTE_CAPABILITY:-9.0}
 evidence_dir=${VCTM_EVIDENCE_DIR:-}
 crate_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 
-for command in nvidia-smi nvcc cargo cuobjdump sha256sum; do
+for command in nvidia-smi nvcc cargo cuobjdump sha256sum nsys ncu; do
   command -v "$command" >/dev/null || {
     echo "required command is unavailable: $command" >&2
     exit 1
@@ -55,6 +55,33 @@ RUST_TEST_THREADS=1 VCTM_TEST_GPU="$device" \
     --no-default-features --features backend-cuda --lib -- \
     --ignored --nocapture 2>&1 | tee "$evidence_dir/tests.txt"
 
-sha256sum "$evidence_dir/device.txt" "$evidence_dir/artifact.txt" \
-  "$evidence_dir/tests.txt" | tee "$evidence_dir/SHA256SUMS"
+test_binary=$(cargo test --release --locked --manifest-path "$crate_root/Cargo.toml" \
+  --no-default-features --features backend-cuda --lib --no-run 2>&1 \
+  | sed -n 's/^  Executable unittests src\/lib.rs (\(.*\))$/\1/p' | tail -1)
+if [[ -z "$test_binary" || ! -x "$test_binary" ]]; then
+  echo "unable to locate the CUDA library test executable" >&2
+  exit 1
+fi
+
+VCTM_TEST_GPU="$device" nsys profile --trace=cuda,nvtx --sample=none \
+  --cpuctxsw=none --force-overwrite=true \
+  --output="$evidence_dir/tensor-core" "$test_binary" \
+  benchmark_batched_tensor_core_for_320d_candidates --ignored --nocapture
+nsys stats --force-export=true --report cuda_gpu_kern_sum,cuda_gpu_mem_time_sum \
+  --format csv "$evidence_dir/tensor-core.nsys-rep" \
+  >"$evidence_dir/nsys-stats.csv"
+
+VCTM_TEST_GPU="$device" ncu --target-processes all --kernel-name-base demangled \
+  --kernel-name 'regex:.*(gemm|Gemm|Mma).*' --launch-count 1 \
+  --metrics sm__pipe_tensor_cycles_active.avg.pct_of_peak_sustained_active \
+  --csv --log-file "$evidence_dir/ncu-tensor.csv" "$test_binary" \
+  benchmark_batched_tensor_core_for_320d_candidates --ignored --nocapture
+if ! grep -q 'sm__pipe_tensor_cycles_active' "$evidence_dir/ncu-tensor.csv" ||
+   grep -q 'No kernels were profiled' "$evidence_dir/ncu-tensor.csv"; then
+  echo "Nsight Compute did not prove execution on the tensor pipeline" >&2
+  exit 1
+fi
+
+find "$evidence_dir" -maxdepth 1 -type f ! -name SHA256SUMS -print0 \
+  | sort -z | xargs -0 sha256sum | tee "$evidence_dir/SHA256SUMS"
 printf 'hardware evidence written to %s\n' "$evidence_dir"

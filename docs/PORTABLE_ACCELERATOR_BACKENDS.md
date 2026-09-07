@@ -156,5 +156,9 @@ H200 release gate. Its self-hosted runner must carry the `gpu-h200` label. The
 runner script refuses a device whose name or compute capability is not H200 /
 9.0, builds native SM90/SM90a code, inspects the cubins and instructions, runs
 all ignored real-device numerical and latency tests serially, and uploads the
-device fingerprint, raw output and checksum manifest. A queued or skipped job
-is not validation evidence.
+device fingerprint, raw output and checksum manifest. It additionally records
+the runtime-selected cuBLAS kernel with Nsight Systems and fails unless Nsight
+Compute observes activity on the SM tensor pipeline. This matters because the
+cuBLAS implementation is selected from the installed library at runtime and is
+not contained in this repository's cubin. A queued or skipped job is not
+validation evidence.
