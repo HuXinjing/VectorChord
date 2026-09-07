@@ -33,6 +33,8 @@ unsafe extern "C" {
     ) -> c_int;
     fn vctm_gpu_destroy(gpu: *mut NativeGpu);
     fn vctm_gpu_tensor_bytes(gpu: *const NativeGpu) -> usize;
+    fn vctm_gpu_set_tile_queries_per_warp(gpu: *mut NativeGpu, value: u32) -> c_int;
+    fn vctm_gpu_tile_queries_per_warp(gpu: *const NativeGpu) -> u32;
     fn vctm_gpu_compute_capability(
         gpu: *const NativeGpu,
         major: *mut c_int,
@@ -292,6 +294,9 @@ impl Gpu {
             },
         };
         gpu.calibrate_kernel_thresholds();
+        // SAFETY: the native arena is still live and owns this tuning value.
+        let queries_per_warp = unsafe { vctm_gpu_tile_queries_per_warp(gpu.native.as_ptr()) };
+        gpu.info.document_tile_query_rows = queries_per_warp.checked_mul(8);
         Ok(gpu)
     }
 
@@ -388,6 +393,7 @@ impl Gpu {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn score(
         &mut self,
         query: &[u8],
@@ -593,6 +599,15 @@ impl Gpu {
             self.calibration_failures += 1;
             return;
         }
+        self.calibrate_tile_reuse(
+            DIMENSION,
+            DOCUMENT_ROWS,
+            REPETITIONS,
+            &document_offsets,
+            &document_rows,
+            &one,
+            &zero,
+        );
         let fallback = self.tensor_threshold_rows;
         let mut successful = 0_u64;
         let mut crossover = None;
@@ -648,6 +663,88 @@ impl Gpu {
         } else {
             self.tensor_threshold_rows = crossover.unwrap_or(u32::MAX);
             self.calibration_complete = true;
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn calibrate_tile_reuse(
+        &mut self,
+        dimension: u32,
+        document_rows_per_candidate: u32,
+        repetitions: usize,
+        document_offsets: &[u64],
+        document_rows: &[u32],
+        one: &[u8; 2],
+        zero: &[u8; 2],
+    ) {
+        // SM80+ has the async tiled implementation. Older devices retain the
+        // scalar-compatible single-query-per-warp path.
+        if !self.info.capabilities.asynchronous_copy {
+            return;
+        }
+        const TOTAL_ROWS: u32 = 256;
+        let mut queries = Vec::with_capacity(TOTAL_ROWS as usize * dimension as usize * 2);
+        for row in 0..TOTAL_ROWS {
+            for column in 0..dimension {
+                queries.extend_from_slice(if column == row % document_rows_per_candidate {
+                    one
+                } else {
+                    zero
+                });
+            }
+        }
+        let offsets = [0, TOTAL_ROWS / 2, TOTAL_ROWS];
+        // SAFETY: the native handle is live and accepted values are fixed by
+        // the C ABI. Restore the original value unless a numerically equivalent
+        // faster variant completes all repetitions.
+        let original = unsafe { vctm_gpu_tile_queries_per_warp(self.native.as_ptr()) };
+        let mut oracle = None::<Vec<Vec<f32>>>;
+        let mut best = None::<(Duration, u32)>;
+        for candidate in [1_u32, 4, 8] {
+            if unsafe { vctm_gpu_set_tile_queries_per_warp(self.native.as_ptr(), candidate) } != 0 {
+                continue;
+            }
+            self.calibration_runs += 1;
+            let started = Instant::now();
+            let mut scores = None;
+            for _ in 0..repetitions {
+                match self.score_batch_native(
+                    false,
+                    &queries,
+                    &offsets,
+                    dimension,
+                    2,
+                    document_offsets,
+                    document_rows,
+                ) {
+                    Ok(value) => scores = Some(value),
+                    Err(_) => {
+                        self.calibration_failures += 1;
+                        scores = None;
+                        break;
+                    }
+                }
+            }
+            let elapsed = started.elapsed() / repetitions as u32;
+            let Some(scores) = scores else { continue };
+            if let Some(reference) = oracle.as_ref() {
+                if !batch_scores_close(reference, &scores) {
+                    self.calibration_failures += 1;
+                    continue;
+                }
+            } else {
+                oracle = Some(scores);
+            }
+            if best.is_none_or(|(best_elapsed, _)| elapsed < best_elapsed) {
+                best = Some((elapsed, candidate));
+            }
+        }
+        let selected = best.map_or(original, |(_, candidate)| candidate);
+        // SAFETY: selected is either the original native value or one of the
+        // three accepted candidates above.
+        if unsafe { vctm_gpu_set_tile_queries_per_warp(self.native.as_ptr(), selected) } != 0 {
+            self.calibration_failures += 1;
+            let _ = unsafe { vctm_gpu_set_tile_queries_per_warp(self.native.as_ptr(), original) };
         }
     }
 
@@ -1076,7 +1173,8 @@ mod tests {
         let (tensor_ms, tensor) = measure(&mut gpu, true);
         assert!(batch_scores_close(&tile, &tensor));
         eprintln!(
-            "tilemaxsim_320d candidates={CANDIDATES} requests={REQUESTS} calibrated_threshold_rows={} tile_ms={tile_ms:.4} tensor_ms={tensor_ms:.4} speedup={:.3}",
+            "tilemaxsim_320d candidates={CANDIDATES} requests={REQUESTS} tile_query_rows={} calibrated_threshold_rows={} tile_ms={tile_ms:.4} tensor_ms={tensor_ms:.4} speedup={:.3}",
+            gpu.info.document_tile_query_rows.unwrap_or_default(),
             gpu.tensor_threshold_rows,
             tile_ms / tensor_ms
         );

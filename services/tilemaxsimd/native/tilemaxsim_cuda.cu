@@ -34,6 +34,7 @@ struct VctmGpu {
   cudaStream_t compute_stream;
   cublasHandle_t cublas;
   int compute_major;
+  uint32_t tile_queries_per_warp;
   size_t matrix_engine_workspace_bytes;
   int compute_stream_priority;
   size_t persisting_l2_bytes;
@@ -195,6 +196,7 @@ extern "C" int vctm_gpu_create(int device, size_t total_bytes,
   }
   auto *gpu = new VctmGpu{};
   gpu->device = device;
+  gpu->tile_queries_per_warp = 1;
   gpu->total_bytes = total_bytes;
   gpu->tensor_bytes = ((total_bytes - workspace_bytes) / 256) * 256;
   gpu->workspace_bytes = total_bytes - gpu->tensor_bytes;
@@ -251,6 +253,8 @@ extern "C" int vctm_gpu_create(int device, size_t total_bytes,
   cudaDeviceProp properties{};
   if (cudaGetDeviceProperties(&properties, device) == cudaSuccess) {
     gpu->compute_major = properties.major;
+    gpu->tile_queries_per_warp =
+        properties.major >= 9 ? 8 : properties.major >= 8 ? 4 : 1;
   }
   // Give cuBLAS stable scratch space instead of letting it allocate during a
   // latency-sensitive score call. Hopper gets a larger budget because its
@@ -306,6 +310,17 @@ extern "C" void vctm_gpu_destroy(VctmGpu *gpu) {
 
 extern "C" size_t vctm_gpu_tensor_bytes(const VctmGpu *gpu) {
   return gpu == nullptr ? 0 : gpu->tensor_bytes;
+}
+
+extern "C" int vctm_gpu_set_tile_queries_per_warp(VctmGpu *gpu,
+                                                     uint32_t value) {
+  if (gpu == nullptr || (value != 1 && value != 4 && value != 8)) return 1;
+  gpu->tile_queries_per_warp = value;
+  return 0;
+}
+
+extern "C" uint32_t vctm_gpu_tile_queries_per_warp(const VctmGpu *gpu) {
+  return gpu == nullptr ? 0 : gpu->tile_queries_per_warp;
 }
 
 extern "C" int vctm_gpu_compute_capability(const VctmGpu *gpu, int *major, int *minor) {
@@ -686,8 +701,7 @@ static void launch_multiquery_tile(
     uint32_t dimension, const uint64_t *document_offsets,
     const uint32_t *document_rows, size_t count, float *maxima,
     size_t shared_bytes) {
-  const uint32_t queries_per_warp =
-      gpu->compute_major >= 9 ? 8 : gpu->compute_major >= 8 ? 4 : 1;
+  const uint32_t queries_per_warp = gpu->tile_queries_per_warp;
   const uint32_t query_tile_rows = 8 * queries_per_warp;
   const size_t tasks = count *
       ((static_cast<size_t>(total_query_rows) + query_tile_rows - 1) /
