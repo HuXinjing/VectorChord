@@ -449,7 +449,14 @@ extern "C" int vctm_gpu_device_info(
   *multiprocessors = properties.multiProcessorCount;
   *warp_size = properties.warpSize;
   *memory_bus_width_bits = properties.memoryBusWidth;
-  *memory_clock_khz = properties.memoryClockRate;
+  // CUDA 13 removed `memoryClockRate` from cudaDeviceProp. Keep the runtime
+  // attribute query, which is available in both CUDA 12 and 13, and treat
+  // unavailable telemetry as unknown rather than rejecting a usable device.
+  if (cudaDeviceGetAttribute(memory_clock_khz, cudaDevAttrMemoryClockRate,
+                             gpu->device) != cudaSuccess) {
+    *memory_clock_khz = 0;
+    cudaGetLastError();
+  }
   *shared_memory_per_block_bytes =
       static_cast<uint64_t>(properties.sharedMemPerBlock);
   *compute_stream_priority = gpu->compute_stream_priority;

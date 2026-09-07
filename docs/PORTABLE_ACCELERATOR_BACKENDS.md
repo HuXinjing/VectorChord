@@ -35,6 +35,11 @@ read, is older than SM80, or a Blackwell-class device is paired with a pre-13.0
 runtime. The published fatbin has no pre-SM80 code, and the separately tuned
 SM120/SM121 artifact is built with CUDA 13; delaying either mismatch until the
 first online request would make the advertised capability contract false.
+Non-critical device telemetry is queried through runtime attributes shared by
+CUDA 12 and CUDA 13. In particular, CUDA 13 removed the legacy
+`cudaDeviceProp::memoryClockRate` field; an unavailable clock is now reported
+as unknown instead of preventing an otherwise compatible H200/Blackwell
+executor from compiling or starting.
 
 Vendor executors depend on the library without another runtime:
 

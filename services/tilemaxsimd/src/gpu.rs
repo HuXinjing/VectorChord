@@ -288,7 +288,8 @@ impl Gpu {
                 compute_units: (info_status == 0).then_some(multiprocessors as u32),
                 warp_size: (info_status == 0).then_some(warp_size as u32),
                 memory_bus_width_bits: (info_status == 0).then_some(memory_bus_width_bits as u32),
-                memory_clock_khz: (info_status == 0).then_some(memory_clock_khz as u32),
+                memory_clock_khz: (info_status == 0 && memory_clock_khz > 0)
+                    .then_some(memory_clock_khz as u32),
                 shared_memory_per_block_bytes: (info_status == 0)
                     .then_some(shared_memory_per_block_bytes),
                 persisting_l2_bytes: (info_status == 0 && persisting_l2_bytes != 0)
