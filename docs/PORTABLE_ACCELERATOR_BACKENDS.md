@@ -52,6 +52,10 @@ known values. If a backend advertises fused multiquery, the same probe submits
 two independent FP16 requests in one batch and validates their separate
 results. A backend therefore cannot become eligible merely by setting a
 capability flag without implementing the corresponding execution path.
+Every daemon runs this probe on every configured device before constructing
+its cache or opening a scoring listener. A mismatch aborts startup with the
+backend slot and device identity; successful reports are emitted as structured
+startup events for deployment evidence.
 
 The Apple build is produced independently and never links CUDA:
 

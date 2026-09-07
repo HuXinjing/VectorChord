@@ -26,7 +26,7 @@ use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use crate::backend::AcceleratorBackend;
+use crate::backend::{AcceleratorBackend, ConformanceReport, run_conformance_probe};
 use crate::dispatch::{self, DispatchInput, DispatchThresholds, KernelKind};
 use crate::engine::{Engine, EngineStatus};
 use crate::protocol::{
@@ -283,7 +283,7 @@ where
         .quantization_registry_root
         .map(QuantizationRegistry::open)
         .transpose()?;
-    let backends = args
+    let mut backends = args
         .device_memory_gb
         .iter()
         .map(|specification| {
@@ -294,6 +294,16 @@ where
             )
         })
         .collect::<Result<Vec<_>>>()?;
+    let conformance = verify_backends(&mut backends)?;
+    for report in &conformance {
+        println!(
+            "{}",
+            serde_json::json!({
+                "event": "tilemaxsim_backend_conformance_passed",
+                "report": report,
+            })
+        );
+    }
     let tenant_cache_reservations = args.tenant_cache_reservations.iter().cloned().collect();
     let mut engine = Engine::new_boxed(
         backends,
@@ -662,6 +672,22 @@ where
         return Err(error);
     }
     Ok(())
+}
+
+fn verify_backends(backends: &mut [Box<dyn AcceleratorBackend>]) -> Result<Vec<ConformanceReport>> {
+    backends
+        .iter_mut()
+        .enumerate()
+        .map(|(slot, backend)| {
+            run_conformance_probe(backend.as_mut()).with_context(|| {
+                format!(
+                    "accelerator backend conformance failed for slot {slot} ({:?} on {})",
+                    backend.info().backend,
+                    backend.info().name
+                )
+            })
+        })
+        .collect()
 }
 
 enum ClientStream {
@@ -2658,10 +2684,16 @@ fn load_resident_manifests(values: &[(String, PathBuf)]) -> Result<Vec<protocol:
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "backend-cpu")]
+    use super::verify_backends;
     use super::{
         ByteAdmission, PendingAdmission, RuntimeMetrics, candidate_fmas, handle_status_connection,
         is_fatal_cuda_diagnostic, kib_to_bytes, quantum_end, render_metrics, tenant_hash,
     };
+    #[cfg(feature = "backend-cpu")]
+    use crate::backend::{AcceleratorBackend, BackendKind};
+    #[cfg(feature = "backend-cpu")]
+    use crate::cpu::CpuBackend;
     use crate::engine::{DeviceStatus, EngineStatus};
     use crate::protocol::Descriptor;
     use crate::shard::HostCacheStatus;
@@ -2681,6 +2713,18 @@ mod tests {
                 response: Vec::new(),
             }
         }
+    }
+
+    #[cfg(feature = "backend-cpu")]
+    #[test]
+    fn daemon_accepts_only_a_backend_that_passes_live_conformance() {
+        let mut backends: Vec<Box<dyn AcceleratorBackend>> =
+            vec![Box::new(CpuBackend::create(0, 4096, 1024).unwrap())];
+        let reports = verify_backends(&mut backends).unwrap();
+        assert_eq!(reports.len(), 1);
+        assert_eq!(reports[0].backend, BackendKind::Cpu);
+        assert_eq!(reports[0].exact_fp32_score, reports[0].expected_score);
+        assert_eq!(reports[0].exact_fp16_score, reports[0].expected_score);
     }
 
     impl Read for StatusExchange {
