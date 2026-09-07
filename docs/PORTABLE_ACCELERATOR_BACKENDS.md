@@ -81,6 +81,15 @@ rule.
   scoring uses its most-urgent priority. This does not interrupt an executing
   kernel; scheduler quantum boundaries remain the preemption points.
 
+Repeated Tensor Core batches cache only the bounded host-side mapping from a
+candidate's row-count sequence to uniform GEMM groups and reuse the A/B/C
+pointer staging vectors. Actual arena offsets are rebuilt and uploaded on every
+call, so L0 eviction or relocation cannot leave a stale device address in the
+plan. A row-count change invalidates the grouping, and plans above 65,536
+candidates are transient to prevent an unusually large request from retaining
+unbounded host memory. This removes allocator/map work without changing the
+cuBLAS precision mode or cache lifecycle.
+
 The startup calibration uses 16 resident candidates with 32 document rows at
 dimension 320. It first selects the fastest numerically equivalent document
 reuse tile, then repeats the tile/matrix comparison and records the first

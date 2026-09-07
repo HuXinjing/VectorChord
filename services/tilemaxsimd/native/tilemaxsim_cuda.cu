@@ -41,6 +41,12 @@ struct VctmGpu {
   int compute_stream_priority;
   size_t persisting_l2_bytes;
   size_t access_policy_max_window_bytes;
+  std::vector<uint32_t> tensor_cached_document_rows;
+  std::map<uint32_t, std::vector<uint32_t>> tensor_cached_row_groups;
+  std::vector<const void *> tensor_a_pointers;
+  std::vector<const void *> tensor_b_pointers;
+  std::vector<void *> tensor_c_pointers;
+  std::vector<uint32_t> tensor_candidate_indexes;
 };
 
 struct VctmQuantizer {
@@ -983,7 +989,12 @@ extern "C" int vctm_gpu_score_batch_tensor(
   if (!checked_mul(total_query_rows, dimension, &expected_values) ||
       !checked_mul(expected_values, sizeof(half), &expected_bytes) || expected_bytes != query_bytes)
     return fail(error, error_capacity, "tensor-core query byte length disagrees with shape");
-  std::map<uint32_t, std::vector<uint32_t>> row_groups;
+  constexpr size_t max_cached_tensor_candidates = 65'536;
+  const bool cache_row_groups = count <= max_cached_tensor_candidates;
+  const bool reuse_row_groups = cache_row_groups &&
+      gpu->tensor_cached_document_rows.size() == count &&
+      std::equal(gpu->tensor_cached_document_rows.begin(),
+                 gpu->tensor_cached_document_rows.end(), document_rows);
   for (size_t candidate = 0; candidate < count; ++candidate) {
     if (document_rows[candidate] == 0 ||
         document_rows[candidate] > static_cast<uint32_t>(std::numeric_limits<int>::max()) ||
@@ -993,8 +1004,21 @@ extern "C" int vctm_gpu_score_batch_tensor(
     if (!checked_mul(document_rows[candidate], dimension, &values) ||
         !checked_mul(values, sizeof(half), &bytes) || bytes > gpu->tensor_bytes - document_offsets[candidate])
       return fail(error, error_capacity, "tensor-core document exceeds GPU arena");
-    row_groups[document_rows[candidate]].push_back(static_cast<uint32_t>(candidate));
   }
+  std::map<uint32_t, std::vector<uint32_t>> transient_row_groups;
+  if (!reuse_row_groups) {
+    auto &replacement = cache_row_groups ? gpu->tensor_cached_row_groups
+                                         : transient_row_groups;
+    replacement.clear();
+    for (size_t candidate = 0; candidate < count; ++candidate)
+      replacement[document_rows[candidate]].push_back(
+          static_cast<uint32_t>(candidate));
+    if (cache_row_groups)
+      gpu->tensor_cached_document_rows.assign(document_rows,
+                                               document_rows + count);
+  }
+  const auto &row_groups = cache_row_groups ? gpu->tensor_cached_row_groups
+                                            : transient_row_groups;
   size_t score_values = 0;
   if (!checked_mul(request_count, count, &score_values))
     return fail(error, error_capacity, "tensor-core workspace shape overflow");
@@ -1025,8 +1049,10 @@ extern "C" int vctm_gpu_score_batch_tensor(
       return fail(error, error_capacity, "batched GEMM workspace shape overflow");
     const size_t per_candidate = matrix_bytes + metadata_bytes;
     const size_t available = gpu->workspace_bytes - cursor;
-    const size_t chunk_capacity = std::max(static_cast<size_t>(1),
-        std::min(candidates.size(), available / per_candidate));
+    const size_t chunk_capacity = std::max(
+        static_cast<size_t>(1),
+        std::min({candidates.size(), available / per_candidate,
+                  max_cached_tensor_candidates}));
     if (available < per_candidate)
       return fail(error, error_capacity, "tensor-core batch exceeds configured GPU workspace");
     for (size_t begin = 0; begin < candidates.size(); begin += chunk_capacity) {
@@ -1040,20 +1066,23 @@ extern "C" int vctm_gpu_score_batch_tensor(
           !reserve_aligned(&scratch, batch * sizeof(uint32_t), &candidates_offset) ||
           scratch > gpu->workspace_bytes)
         return fail(error, error_capacity, "tensor-core batch workspace packing failed");
-      std::vector<const void *> a(batch), b(batch);
-      std::vector<void *> c(batch);
-      std::vector<uint32_t> indexes(batch);
+      gpu->tensor_a_pointers.resize(batch);
+      gpu->tensor_b_pointers.resize(batch);
+      gpu->tensor_c_pointers.resize(batch);
+      gpu->tensor_candidate_indexes.resize(batch);
       for (size_t item = 0; item < batch; ++item) {
         const uint32_t candidate = candidates[begin + item];
-        indexes[item] = candidate;
-        a[item] = gpu->allocation + document_offsets[candidate];
-        b[item] = workspace + query_offset;
-        c[item] = workspace + matrix_offset + item * matrix_bytes;
+        gpu->tensor_candidate_indexes[item] = candidate;
+        gpu->tensor_a_pointers[item] =
+            gpu->allocation + document_offsets[candidate];
+        gpu->tensor_b_pointers[item] = workspace + query_offset;
+        gpu->tensor_c_pointers[item] =
+            workspace + matrix_offset + item * matrix_bytes;
       }
-      status = cudaMemcpyAsync(workspace + a_offset, a.data(), batch * sizeof(void *), cudaMemcpyHostToDevice, gpu->compute_stream);
-      if (status == cudaSuccess) status = cudaMemcpyAsync(workspace + b_offset, b.data(), batch * sizeof(void *), cudaMemcpyHostToDevice, gpu->compute_stream);
-      if (status == cudaSuccess) status = cudaMemcpyAsync(workspace + c_offset, c.data(), batch * sizeof(void *), cudaMemcpyHostToDevice, gpu->compute_stream);
-      if (status == cudaSuccess) status = cudaMemcpyAsync(workspace + candidates_offset, indexes.data(), batch * sizeof(uint32_t), cudaMemcpyHostToDevice, gpu->compute_stream);
+      status = cudaMemcpyAsync(workspace + a_offset, gpu->tensor_a_pointers.data(), batch * sizeof(void *), cudaMemcpyHostToDevice, gpu->compute_stream);
+      if (status == cudaSuccess) status = cudaMemcpyAsync(workspace + b_offset, gpu->tensor_b_pointers.data(), batch * sizeof(void *), cudaMemcpyHostToDevice, gpu->compute_stream);
+      if (status == cudaSuccess) status = cudaMemcpyAsync(workspace + c_offset, gpu->tensor_c_pointers.data(), batch * sizeof(void *), cudaMemcpyHostToDevice, gpu->compute_stream);
+      if (status == cudaSuccess) status = cudaMemcpyAsync(workspace + candidates_offset, gpu->tensor_candidate_indexes.data(), batch * sizeof(uint32_t), cudaMemcpyHostToDevice, gpu->compute_stream);
       if (status != cudaSuccess) return cuda_fail(error, error_capacity, "batched GEMM metadata upload", status);
     const int m = static_cast<int>(rows);
     const int n = static_cast<int>(total_query_rows);

@@ -1342,6 +1342,48 @@ mod tests {
             batch_scores_close(&tile, &tensor),
             "tile={tile:?} tensor={tensor:?}"
         );
+        // Reuse the cached row plan once, then change one candidate shape and
+        // prove the plan is invalidated rather than retaining stale grouping.
+        let repeated = gpu
+            .score_batch_native(
+                true,
+                &queries,
+                &query_offsets,
+                DIM as u32,
+                2,
+                &document_offsets,
+                &document_rows,
+                1,
+            )
+            .unwrap();
+        assert!(batch_scores_close(&tensor, &repeated));
+        let mut changed_rows = document_rows.clone();
+        changed_rows[0] -= 1;
+        let changed_tile = gpu
+            .score_batch_native(
+                false,
+                &queries,
+                &query_offsets,
+                DIM as u32,
+                2,
+                &document_offsets,
+                &changed_rows,
+                1,
+            )
+            .unwrap();
+        let changed_tensor = gpu
+            .score_batch_native(
+                true,
+                &queries,
+                &query_offsets,
+                DIM as u32,
+                2,
+                &document_offsets,
+                &changed_rows,
+                1,
+            )
+            .unwrap();
+        assert!(batch_scores_close(&changed_tile, &changed_tensor));
     }
 
     #[test]
