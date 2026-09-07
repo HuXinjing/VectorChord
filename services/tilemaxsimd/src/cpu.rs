@@ -42,7 +42,7 @@ impl CpuBackend {
                 memory_clock_khz: None,
                 shared_memory_per_block_bytes: None,
                 compute_queue_priority: None,
-                tuning_profile: "cpu-reference".to_owned(),
+                tuning_profile: cpu_tuning_profile().to_owned(),
                 capabilities: BackendCapabilities {
                     kind: BackendKind::Cpu,
                     exact_fp16: true,
@@ -216,16 +216,117 @@ fn exact_maxsim(
     for q in 0..query_rows as usize {
         let mut maximum = f32::NEG_INFINITY;
         for d in 0..document_rows as usize {
-            let mut dot = 0.0_f32;
-            for k in 0..dimension as usize {
-                dot += read_scalar(query, (q * dimension as usize + k) * scalar_bytes, dtype)
-                    * read_scalar(document, (d * dimension as usize + k) * scalar_bytes, dtype);
-            }
+            let query_offset = q * dimension as usize * scalar_bytes;
+            let document_offset = d * dimension as usize * scalar_bytes;
+            let dot = if dtype == 1 {
+                dot_f32_bytes(
+                    &query[query_offset..query_offset + dimension as usize * 4],
+                    &document[document_offset..document_offset + dimension as usize * 4],
+                )
+            } else {
+                let mut dot = 0.0_f32;
+                for k in 0..dimension as usize {
+                    dot += read_scalar(query, query_offset + k * scalar_bytes, dtype)
+                        * read_scalar(document, document_offset + k * scalar_bytes, dtype);
+                }
+                dot
+            };
             maximum = maximum.max(dot);
         }
         score += maximum;
     }
     Ok(score)
+}
+
+fn cpu_tuning_profile() -> &'static str {
+    #[cfg(target_arch = "x86_64")]
+    if std::is_x86_feature_detected!("avx2") && std::is_x86_feature_detected!("fma") {
+        return "cpu-avx2-fma";
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        return "cpu-neon";
+    }
+    #[allow(unreachable_code)]
+    "cpu-scalar"
+}
+
+fn dot_f32_bytes(left: &[u8], right: &[u8]) -> f32 {
+    debug_assert_eq!(left.len(), right.len());
+    debug_assert_eq!(left.len() % 4, 0);
+    #[cfg(target_arch = "x86_64")]
+    if std::is_x86_feature_detected!("avx2") && std::is_x86_feature_detected!("fma") {
+        // SAFETY: runtime detection guards the target features and the helper
+        // uses unaligned loads within both equally-sized slices.
+        return unsafe { dot_f32_avx2(left, right) };
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        // SAFETY: NEON is mandatory for AArch64.
+        return unsafe { dot_f32_neon(left, right) };
+    }
+    #[allow(unreachable_code)]
+    dot_f32_scalar(left, right)
+}
+
+fn dot_f32_scalar(left: &[u8], right: &[u8]) -> f32 {
+    left.chunks_exact(4)
+        .zip(right.chunks_exact(4))
+        .fold(0.0, |sum, (left, right)| {
+            sum + f32::from_le_bytes(left.try_into().unwrap())
+                * f32::from_le_bytes(right.try_into().unwrap())
+        })
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn dot_f32_avx2(left: &[u8], right: &[u8]) -> f32 {
+    use std::arch::x86_64::*;
+    let values = left.len() / 4;
+    let mut index = 0;
+    let mut sums = _mm256_setzero_ps();
+    while index + 8 <= values {
+        let a = unsafe { _mm256_loadu_ps(left.as_ptr().add(index * 4).cast()) };
+        let b = unsafe { _mm256_loadu_ps(right.as_ptr().add(index * 4).cast()) };
+        sums = _mm256_fmadd_ps(a, b, sums);
+        index += 8;
+    }
+    let high = _mm256_extractf128_ps(sums, 1);
+    let low = _mm256_castps256_ps128(sums);
+    let sum128 = _mm_add_ps(low, high);
+    let pair = _mm_add_ps(sum128, _mm_movehl_ps(sum128, sum128));
+    let total = _mm_add_ss(pair, _mm_shuffle_ps(pair, pair, 0x55));
+    let mut result = _mm_cvtss_f32(total);
+    while index < values {
+        let a = f32::from_le_bytes(left[index * 4..index * 4 + 4].try_into().unwrap());
+        let b = f32::from_le_bytes(right[index * 4..index * 4 + 4].try_into().unwrap());
+        result = a.mul_add(b, result);
+        index += 1;
+    }
+    result
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn dot_f32_neon(left: &[u8], right: &[u8]) -> f32 {
+    use std::arch::aarch64::*;
+    let values = left.len() / 4;
+    let mut index = 0;
+    let mut sums = vdupq_n_f32(0.0);
+    while index + 4 <= values {
+        let a = unsafe { vld1q_f32(left.as_ptr().add(index * 4).cast()) };
+        let b = unsafe { vld1q_f32(right.as_ptr().add(index * 4).cast()) };
+        sums = vfmaq_f32(sums, a, b);
+        index += 4;
+    }
+    let mut result = vaddvq_f32(sums);
+    while index < values {
+        let a = f32::from_le_bytes(left[index * 4..index * 4 + 4].try_into().unwrap());
+        let b = f32::from_le_bytes(right[index * 4..index * 4 + 4].try_into().unwrap());
+        result = a.mul_add(b, result);
+        index += 1;
+    }
+    result
 }
 
 fn read_scalar(bytes: &[u8], offset: usize, dtype: u8) -> f32 {
@@ -288,5 +389,19 @@ mod tests {
         let report = crate::backend::run_conformance_probe(&mut cpu).unwrap();
         assert_eq!(report.backend, BackendKind::Cpu);
         assert_eq!(report.exact_fp32_score, report.expected_score);
+    }
+
+    #[test]
+    fn runtime_simd_dot_matches_scalar_with_a_tail() {
+        let left = (0..37)
+            .flat_map(|index| ((index as f32 - 11.0) / 13.0).to_le_bytes())
+            .collect::<Vec<_>>();
+        let right = (0..37)
+            .flat_map(|index| ((19.0 - index as f32) / 17.0).to_le_bytes())
+            .collect::<Vec<_>>();
+        let scalar = dot_f32_scalar(&left, &right);
+        let dispatched = dot_f32_bytes(&left, &right);
+        assert!((scalar - dispatched).abs() <= 2.0e-5 * (1.0 + scalar.abs()));
+        assert!(cpu_tuning_profile().starts_with("cpu-"));
     }
 }
