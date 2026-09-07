@@ -1526,6 +1526,21 @@ mod tests {
 
     #[test]
     #[ignore = "requires an explicitly assigned CUDA device"]
+    fn native_pq_cooperative_adc_matches_long_document_oracle() {
+        let mut gpu = pq_gpu();
+        gpu.ensure_quantizer("pq", &f32_payload(&[1.0, 0.0, 0.0, 1.0]), 2, 1, 1, 2, 0)
+            .unwrap();
+        // Eight rows force the cooperative ADC mapping; both identity
+        // centroids occur repeatedly, so each query row has a unit maximum.
+        gpu.upload_batch(&[(0, &[0_u8, 1, 0, 1, 0, 1, 0, 1])])
+            .unwrap();
+        let query = f32_payload(&[1.0, 0.0, 0.0, 1.0]);
+        let scores = gpu.score_pq("pq", &query, 2, 1, &[0], &[8]).unwrap();
+        assert!((scores[0] - 2.0).abs() < 1e-5, "scores={scores:?}");
+    }
+
+    #[test]
+    #[ignore = "requires an explicitly assigned CUDA device"]
     fn native_pq_batch_matches_individual_requests() {
         let mut gpu = pq_gpu();
         gpu.ensure_quantizer("pq", &f32_payload(&[1.0, 0.0, 0.0, 1.0]), 2, 1, 1, 2, 0)
@@ -1557,10 +1572,14 @@ mod tests {
         const DIMENSION: usize = 320;
         const SUBSPACES: usize = 20;
         const CENTROIDS: usize = 256;
-        const DOCUMENT_ROWS: usize = 32;
         const QUERY_ROWS: usize = 32;
         const REQUESTS: usize = 8;
         const CANDIDATES: usize = 512;
+        let document_rows = std::env::var("VCTM_PQ_BENCH_DOCUMENT_ROWS")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(32);
+        assert!(document_rows > 0);
         let mut gpu = pq_gpu();
         let subvector = DIMENSION / SUBSPACES;
         let codebook = (0..SUBSPACES * CENTROIDS * subvector)
@@ -1576,7 +1595,7 @@ mod tests {
             0,
         )
         .unwrap();
-        let document = (0..DOCUMENT_ROWS * SUBSPACES)
+        let document = (0..document_rows * SUBSPACES)
             .map(|index| (index % CENTROIDS) as u8)
             .collect::<Vec<_>>();
         let offsets = (0..CANDIDATES)
@@ -1588,7 +1607,7 @@ mod tests {
             .map(|offset| (offset, document.as_slice()))
             .collect::<Vec<_>>();
         gpu.upload_batch(&uploads).unwrap();
-        let rows = vec![DOCUMENT_ROWS as u32; CANDIDATES];
+        let rows = vec![document_rows as u32; CANDIDATES];
         let query = (0..QUERY_ROWS * DIMENSION)
             .map(|index| if index % 89 == 0 { 0.5_f32 } else { 0.0 })
             .collect::<Vec<_>>();
@@ -1653,7 +1672,7 @@ mod tests {
             }
         }
         eprintln!(
-            "pq_continuous_batch candidates={CANDIDATES} requests={REQUESTS} query_rows={QUERY_ROWS} individual_ms={individual_ms:.4} batched_ms={batched_ms:.4} speedup={:.3}",
+            "pq_continuous_batch candidates={CANDIDATES} requests={REQUESTS} query_rows={QUERY_ROWS} document_rows={document_rows} individual_ms={individual_ms:.4} batched_ms={batched_ms:.4} speedup={:.3}",
             individual_ms / batched_ms
         );
     }

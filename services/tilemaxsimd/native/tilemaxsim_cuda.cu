@@ -1166,6 +1166,45 @@ __global__ void pq_adc_maxsim_kernel(
   }
 }
 
+// Short and medium documents do not contain enough rows to amortize the
+// block-wide barriers in the cooperative kernel above. Assign one independent
+// candidate/query task to each warp so eight tasks share a block without
+// shared memory or cross-warp synchronization. This preserves exact ADC and
+// MaxSim semantics; only the mapping of work to warps changes.
+__global__ void pq_adc_maxsim_warp_task_kernel(
+    const float *luts, uint32_t query_rows, const VctmQuantizer quantizer,
+    const unsigned char *documents, const uint64_t *document_offsets,
+    const uint32_t *document_rows, size_t task_count, float *maxima) {
+  const uint32_t lane = threadIdx.x & 31;
+  const uint32_t warp_in_block = threadIdx.x >> 5;
+  const uint32_t warps_per_block = blockDim.x >> 5;
+  size_t task = static_cast<size_t>(blockIdx.x) * warps_per_block + warp_in_block;
+  const size_t task_stride = static_cast<size_t>(gridDim.x) * warps_per_block;
+  const uint32_t code_count =
+      static_cast<uint32_t>(quantizer.stages) * quantizer.subspaces;
+  for (; task < task_count; task += task_stride) {
+    const size_t candidate = task / query_rows;
+    const uint32_t query_row = static_cast<uint32_t>(task % query_rows);
+    const uint8_t *codes = documents + document_offsets[candidate];
+    const size_t lut_base = static_cast<size_t>(query_row) * code_count *
+                            quantizer.centroids;
+    float best = -CUDART_INF_F;
+    for (uint32_t row = 0; row < document_rows[candidate]; ++row) {
+      const size_t row_base = static_cast<size_t>(row) * code_count;
+      float similarity = 0.0f;
+      for (uint32_t flat = lane; flat < code_count; flat += 32) {
+        const uint8_t code = codes[row_base + flat];
+        similarity +=
+            luts[lut_base + static_cast<size_t>(flat) * quantizer.centroids + code];
+      }
+      for (int delta = 16; delta != 0; delta >>= 1)
+        similarity += __shfl_down_sync(0xffffffff, similarity, delta);
+      if (lane == 0) best = fmaxf(best, similarity);
+    }
+    if (lane == 0) maxima[task] = best;
+  }
+}
+
 static size_t aligned(size_t value, size_t alignment) {
   return (value + alignment - 1) / alignment * alignment;
 }
@@ -1332,12 +1371,14 @@ static int score_pq_batch_impl(
   size_t codes_per_row = 0;
   if (!checked_mul(quantizer->stages, quantizer->subspaces, &codes_per_row))
     return fail(error, error_capacity, "PQ document shape overflows address space");
+  uint32_t maximum_document_rows = 0;
   for (size_t index = 0; index < count; ++index) {
     size_t code_bytes = 0;
     if (document_rows[index] == 0 || !checked_mul(document_rows[index], codes_per_row, &code_bytes) ||
         document_offsets[index] > gpu->tensor_bytes ||
         code_bytes > gpu->tensor_bytes - static_cast<size_t>(document_offsets[index]))
       return fail(error, error_capacity, "PQ document range exceeds the GPU tensor arena");
+    maximum_document_rows = std::max(maximum_document_rows, document_rows[index]);
   }
   cudaError_t status = cudaSetDevice(gpu->device);
   if (status != cudaSuccess) return cuda_fail(error, error_capacity, "cudaSetDevice", status);
@@ -1405,12 +1446,28 @@ static int score_pq_batch_impl(
     pq_lut_kernel<float><<<lut_blocks, threads, 0, gpu->compute_stream>>>(reinterpret_cast<const float *>(workspace + query_offset), query_rows, *quantizer, reinterpret_cast<const float *>(workspace + rotated_offset), reinterpret_cast<float *>(workspace + lut_offset), lut_count);
   else if (status == cudaSuccess) return fail(error, error_capacity, "unsupported PQ query dtype");
   if (status == cudaSuccess) status = cudaGetLastError();
-  const size_t kernel_blocks = std::min(maxima_count, static_cast<size_t>(65'535));
-  if (status == cudaSuccess) pq_adc_maxsim_kernel<<<static_cast<unsigned int>(kernel_blocks), threads, 0, gpu->compute_stream>>>(
-      reinterpret_cast<const float *>(workspace + lut_offset), query_rows, *quantizer,
-      gpu->allocation, reinterpret_cast<const uint64_t *>(workspace + offsets_offset),
-      reinterpret_cast<const uint32_t *>(workspace + rows_offset), maxima_count,
-      reinterpret_cast<float *>(workspace + maxima_offset));
+  constexpr size_t warps_per_block = threads / 32;
+  const bool use_warp_tasks = maximum_document_rows <= 4;
+  const size_t kernel_blocks = std::min(
+      use_warp_tasks ? (maxima_count + warps_per_block - 1) / warps_per_block
+                     : maxima_count,
+      static_cast<size_t>(65'535));
+  if (status == cudaSuccess && use_warp_tasks)
+    pq_adc_maxsim_warp_task_kernel<<<static_cast<unsigned int>(kernel_blocks),
+        threads, 0, gpu->compute_stream>>>(
+        reinterpret_cast<const float *>(workspace + lut_offset), query_rows,
+        *quantizer, gpu->allocation,
+        reinterpret_cast<const uint64_t *>(workspace + offsets_offset),
+        reinterpret_cast<const uint32_t *>(workspace + rows_offset),
+        maxima_count, reinterpret_cast<float *>(workspace + maxima_offset));
+  else if (status == cudaSuccess)
+    pq_adc_maxsim_kernel<<<static_cast<unsigned int>(kernel_blocks), threads, 0,
+        gpu->compute_stream>>>(
+        reinterpret_cast<const float *>(workspace + lut_offset), query_rows,
+        *quantizer, gpu->allocation,
+        reinterpret_cast<const uint64_t *>(workspace + offsets_offset),
+        reinterpret_cast<const uint32_t *>(workspace + rows_offset),
+        maxima_count, reinterpret_cast<float *>(workspace + maxima_offset));
   if (status == cudaSuccess) status = cudaGetLastError();
   if (status == cudaSuccess) tilemaxsim_segmented_sum_kernel<<<static_cast<unsigned int>(std::min((score_count + threads - 1) / threads, static_cast<size_t>(65'535))), threads, 0, gpu->compute_stream>>>(
       reinterpret_cast<const float *>(workspace + maxima_offset), query_rows,

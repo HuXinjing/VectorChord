@@ -121,6 +121,17 @@ batch (1.19x). This run occurred on a shared GPU and is retained as directional
 microbenchmark evidence; an exclusive-device distribution is still required
 for a release performance claim.
 
+Nsight attribution showed ADC-MaxSim consuming about 82.5% of PQ batch kernel
+time on RTX 4090. A second exact ADC mapping therefore assigns one short
+document task to each warp and removes block-wide barriers, while the original
+eight-warp cooperative mapping remains selected for documents with more rows.
+A back-to-back 512-candidate sweep placed the crossover between four and eight
+document rows: the warp-task path reduced the two-row batch from about 0.275 ms
+to 0.176 ms (1.56x) and the four-row batch from 0.291 ms to 0.251 ms (1.16x),
+but regressed at eight rows. Runtime dispatch consequently uses it only when
+every candidate has at most four rows. This threshold must be rechecked by the
+H200 hardware gate before being described as Hopper-tuned.
+
 ## Vendor acceptance gates
 
 Every native backend needs target-hardware evidence for:
