@@ -52,6 +52,22 @@ unsafe extern "C" {
         error: *mut c_char,
         error_capacity: usize,
     ) -> c_int;
+    fn vctm_metal_score_batch(
+        backend: *mut NativeMetal,
+        queries: *const c_uchar,
+        query_bytes: usize,
+        query_offsets: *const u32,
+        request_count: u32,
+        total_query_rows: u32,
+        dimension: u32,
+        dtype: u8,
+        document_offsets: *const u64,
+        document_rows: *const u32,
+        count: usize,
+        output: *mut f32,
+        error: *mut c_char,
+        error_capacity: usize,
+    ) -> c_int;
 }
 
 pub struct MetalBackend {
@@ -130,7 +146,7 @@ impl MetalBackend {
                     fp8_e4m3: false,
                     pq: false,
                     opq_rpq: false,
-                    fused_multiquery: false,
+                    fused_multiquery: true,
                     matrix_engine: false,
                     asynchronous_copy: false,
                     unified_memory: true,
@@ -264,27 +280,47 @@ impl AcceleratorBackend for MetalBackend {
         if scoring_profile != 1 {
             bail!("Metal backend does not support quantized batch scoring");
         }
-        let scalar_bytes = match dtype {
-            1 => 4,
-            2 => 2,
-            _ => bail!("unsupported Metal query dtype"),
+        if query_offsets.len() < 3 || query_offsets[0] != 0 {
+            bail!("invalid Metal batch query offsets");
+        }
+        if document_offsets.len() != document_rows.len() || document_offsets.is_empty() {
+            bail!("invalid Metal batch document metadata");
+        }
+        let request_count = query_offsets.len() - 1;
+        let total_query_rows = *query_offsets.last().unwrap();
+        let output_count = request_count
+            .checked_mul(document_offsets.len())
+            .ok_or_else(|| anyhow!("Metal batch output shape overflows address space"))?;
+        let mut flat_output = vec![0.0_f32; output_count];
+        let mut error = [0_i8; 512];
+        let status = unsafe {
+            vctm_metal_score_batch(
+                self.native.as_ptr(),
+                queries.as_ptr(),
+                queries.len(),
+                query_offsets.as_ptr(),
+                request_count as u32,
+                total_query_rows,
+                dimension,
+                dtype,
+                document_offsets.as_ptr(),
+                document_rows.as_ptr(),
+                document_offsets.len(),
+                flat_output.as_mut_ptr(),
+                error.as_mut_ptr(),
+                error.len(),
+            )
         };
-        query_offsets
-            .windows(2)
-            .map(|range| {
-                let start = range[0] as usize * dimension as usize * scalar_bytes;
-                let end = range[1] as usize * dimension as usize * scalar_bytes;
-                self.score(
-                    &queries[start..end],
-                    range[1] - range[0],
-                    dimension,
-                    dtype,
-                    scoring_profile,
-                    document_offsets,
-                    document_rows,
-                )
-            })
-            .collect()
+        if status != 0 {
+            bail!(native_error(&error));
+        }
+        if flat_output.iter().any(|score| !score.is_finite()) {
+            bail!("Metal batch TileMaxSim returned a non-finite score");
+        }
+        Ok(flat_output
+            .chunks_exact(document_offsets.len())
+            .map(<[f32]>::to_vec)
+            .collect())
     }
 }
 
@@ -311,5 +347,26 @@ mod tests {
         let report = crate::backend::run_conformance_probe(&mut backend).unwrap();
         assert_eq!(report.backend, BackendKind::Metal);
         assert_eq!(report.exact_fp32_score, report.expected_score);
+    }
+
+    #[test]
+    #[ignore = "requires an explicitly assigned Apple Metal device"]
+    fn native_batch_matches_individual_requests() {
+        let mut backend = MetalBackend::create(0, 64 * 1024 * 1024, 32 * 1024 * 1024).unwrap();
+        let document = [1.0_f32, 0.0, 0.0, 1.0]
+            .into_iter()
+            .flat_map(f32::to_le_bytes)
+            .collect::<Vec<_>>();
+        backend.upload_batch(&[(0, &document)]).unwrap();
+        let queries = [1.0_f32, 0.0, 0.0, 1.0, 1.0, 0.0]
+            .into_iter()
+            .flat_map(f32::to_le_bytes)
+            .collect::<Vec<_>>();
+        let scores = backend
+            .score_batch(&queries, &[0, 2, 3], 2, 1, 1, &[0], &[2])
+            .unwrap();
+        assert_eq!(scores.len(), 2);
+        assert!((scores[0][0] - 2.0).abs() < 1e-5);
+        assert!((scores[1][0] - 1.0).abs() < 1e-5);
     }
 }

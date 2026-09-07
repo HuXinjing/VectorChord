@@ -41,7 +41,8 @@ cargo build --release --manifest-path services/tilemaxsimd/Cargo.toml \
 ```
 
 It reserves one `MTLStorageModeShared` arena in Apple unified memory and runs
-native MSL FP16/FP32 exact MaxSim. INT8, FP8, PQ and fused multiquery are
+native MSL FP16/FP32 exact MaxSim. Compatible resident requests share one
+command-buffer submission and segmented result reduction. INT8, FP8 and PQ are
 reported unsupported rather than silently falling back. The macOS ARM64 CI
 job compiles the Objective-C++ bridge and runs the same device-level exact
 conformance probe as CUDA. Until that external job passes, Metal remains

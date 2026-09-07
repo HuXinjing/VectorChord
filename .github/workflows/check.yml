@@ -194,14 +194,14 @@ jobs:
           cargo clippy --manifest-path services/tilemaxsimd/Cargo.toml \
             --no-default-features --features backend-metal --all-targets -- -D warnings
 
-      - name: Validate exact Metal scoring on the runner GPU
+      - name: Validate exact and batched Metal scoring on the runner GPU
         if: runner.os == 'macOS'
         env:
           RUST_TEST_THREADS: "1"
         run: >-
           cargo test --manifest-path services/tilemaxsimd/Cargo.toml
           --no-default-features --features backend-metal
-          metal::tests::passes_vendor_neutral_conformance_probe
+          metal::tests::
           -- --ignored --nocapture
 
       - name: Validate CPU-only image

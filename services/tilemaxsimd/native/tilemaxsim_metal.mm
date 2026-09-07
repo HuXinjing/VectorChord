@@ -199,24 +199,34 @@ extern "C" int vctm_metal_upload_batch(
   return 0;
 }
 
-extern "C" int vctm_metal_score(
+static int score_batch_impl(
     VctmMetal *backend, const unsigned char *query, size_t query_bytes,
     uint32_t query_rows, uint32_t dimension, uint8_t dtype,
+    const uint32_t *query_offsets, uint32_t request_count,
     const uint64_t *document_offsets, const uint32_t *document_rows,
     size_t count, float *output, char *error, size_t error_capacity) {
   @autoreleasepool {
     if (backend == nullptr || query == nullptr || query_rows == 0 ||
+        query_offsets == nullptr || request_count == 0 ||
+        query_offsets[0] != 0 || query_offsets[request_count] != query_rows ||
         dimension == 0 || document_offsets == nullptr ||
         document_rows == nullptr || count == 0 ||
         count > std::numeric_limits<uint32_t>::max() || output == nullptr)
       return fail(error, error_capacity, "invalid Metal score request");
+    for (uint32_t request = 0; request < request_count; ++request)
+      if (query_offsets[request] >= query_offsets[request + 1])
+        return fail(error, error_capacity,
+                    "Metal query offsets must be strictly increasing");
     const size_t scalar_bytes = dtype == 1 ? sizeof(float) : dtype == 2 ? 2 : 0;
-    size_t query_values = 0, expected_query_bytes = 0, maxima_count = 0;
+    size_t query_values = 0, expected_query_bytes = 0, maxima_count = 0,
+           output_count = 0;
     if (scalar_bytes == 0 || !checked_mul(query_rows, dimension, &query_values) ||
         !checked_mul(query_values, scalar_bytes, &expected_query_bytes) ||
         expected_query_bytes != query_bytes ||
-        !checked_mul(query_rows, count, &maxima_count))
+        !checked_mul(query_rows, count, &maxima_count) ||
+        !checked_mul(request_count, count, &output_count))
       return fail(error, error_capacity, "Metal query shape is invalid");
+    (void)output_count;
     for (size_t candidate = 0; candidate < count; ++candidate) {
       size_t values = 0, bytes = 0;
       if (document_rows[candidate] == 0 ||
@@ -269,12 +279,39 @@ extern "C" int vctm_metal_score(
       return ns_fail(error, error_capacity, "Metal TileMaxSim execution",
                      command.error);
     const auto *maxima = reinterpret_cast<const float *>(workspace + maxima_offset);
-    for (size_t candidate = 0; candidate < count; ++candidate) {
-      float score = 0.0f;
-      for (uint32_t row = 0; row < query_rows; ++row)
-        score += maxima[candidate * query_rows + row];
-      output[candidate] = score;
+    for (uint32_t request = 0; request < request_count; ++request) {
+      for (size_t candidate = 0; candidate < count; ++candidate) {
+        float score = 0.0f;
+        for (uint32_t row = query_offsets[request];
+             row < query_offsets[request + 1]; ++row)
+          score += maxima[candidate * query_rows + row];
+        output[static_cast<size_t>(request) * count + candidate] = score;
+      }
     }
     return 0;
   }
+}
+
+extern "C" int vctm_metal_score(
+    VctmMetal *backend, const unsigned char *query, size_t query_bytes,
+    uint32_t query_rows, uint32_t dimension, uint8_t dtype,
+    const uint64_t *document_offsets, const uint32_t *document_rows,
+    size_t count, float *output, char *error, size_t error_capacity) {
+  const uint32_t query_offsets[2] = {0, query_rows};
+  return score_batch_impl(
+      backend, query, query_bytes, query_rows, dimension, dtype, query_offsets,
+      1, document_offsets, document_rows, count, output, error,
+      error_capacity);
+}
+
+extern "C" int vctm_metal_score_batch(
+    VctmMetal *backend, const unsigned char *queries, size_t query_bytes,
+    const uint32_t *query_offsets, uint32_t request_count,
+    uint32_t total_query_rows, uint32_t dimension, uint8_t dtype,
+    const uint64_t *document_offsets, const uint32_t *document_rows,
+    size_t count, float *output, char *error, size_t error_capacity) {
+  return score_batch_impl(
+      backend, queries, query_bytes, total_query_rows, dimension, dtype,
+      query_offsets, request_count, document_offsets, document_rows, count,
+      output, error, error_capacity);
 }
