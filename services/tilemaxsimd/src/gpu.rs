@@ -970,6 +970,76 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "microbenchmark requires an explicitly assigned CUDA device"]
+    fn benchmark_batched_tensor_core_for_320d_candidates() {
+        let device = std::env::var("VCTM_TEST_GPU")
+            .unwrap_or_else(|_| "0".to_owned())
+            .parse::<i32>()
+            .unwrap();
+        let mut gpu = Gpu::create(device, 96 * 1024 * 1024, 48 * 1024 * 1024).unwrap();
+        const DIM: usize = 320;
+        const DOC_ROWS: usize = 32;
+        const CANDIDATES: usize = 64;
+        const REQUESTS: usize = 8;
+        const QUERY_ROWS: usize = 32;
+        let document = (0..DOC_ROWS * DIM)
+            .flat_map(|index| if index % 37 == 0 { 0x3c00_u16 } else { 0_u16 }.to_le_bytes())
+            .collect::<Vec<_>>();
+        let offsets = (0..CANDIDATES)
+            .map(|index| index as u64 * document.len() as u64)
+            .collect::<Vec<_>>();
+        let uploads = offsets
+            .iter()
+            .map(|offset| (*offset, document.as_slice()))
+            .collect::<Vec<_>>();
+        gpu.upload_batch(&uploads).unwrap();
+        let rows = vec![DOC_ROWS as u32; CANDIDATES];
+        let queries = (0..REQUESTS * QUERY_ROWS * DIM)
+            .flat_map(|index| if index % 41 == 0 { 0x3800_u16 } else { 0_u16 }.to_le_bytes())
+            .collect::<Vec<_>>();
+        let query_offsets = (0..=REQUESTS)
+            .map(|index| (index * QUERY_ROWS) as u32)
+            .collect::<Vec<_>>();
+        for _ in 0..3 {
+            gpu.score_batch_native(
+                true,
+                &queries,
+                &query_offsets,
+                DIM as u32,
+                2,
+                &offsets,
+                &rows,
+            )
+            .unwrap();
+        }
+        let measure = |gpu: &mut Gpu, tensor| {
+            let started = Instant::now();
+            let mut result = Vec::new();
+            for _ in 0..20 {
+                result = gpu
+                    .score_batch_native(
+                        tensor,
+                        &queries,
+                        &query_offsets,
+                        DIM as u32,
+                        2,
+                        &offsets,
+                        &rows,
+                    )
+                    .unwrap();
+            }
+            (started.elapsed().as_secs_f64() * 1000.0 / 20.0, result)
+        };
+        let (tile_ms, tile) = measure(&mut gpu, false);
+        let (tensor_ms, tensor) = measure(&mut gpu, true);
+        assert!(batch_scores_close(&tile, &tensor));
+        eprintln!(
+            "tilemaxsim_320d candidates={CANDIDATES} requests={REQUESTS} tile_ms={tile_ms:.4} tensor_ms={tensor_ms:.4} speedup={:.3}",
+            tile_ms / tensor_ms
+        );
+    }
+
+    #[test]
     fn adaptive_comparison_rejects_material_score_drift() {
         assert!(batch_scores_close(&[vec![1.0, 2.0]], &[vec![1.001, 2.001]]));
         assert!(!batch_scores_close(&[vec![1.0]], &[vec![1.1]]));
