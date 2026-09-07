@@ -1276,6 +1276,125 @@ mod tests {
         }
     }
 
+    #[test]
+    #[ignore = "microbenchmark requires an explicitly assigned CUDA device"]
+    fn benchmark_quantized_fused_scoring_for_320d_candidates() {
+        let device = std::env::var("VCTM_TEST_GPU")
+            .unwrap_or_else(|_| "0".to_owned())
+            .parse::<i32>()
+            .unwrap();
+        let mut gpu = Gpu::create(device, 96 * 1024 * 1024, 48 * 1024 * 1024).unwrap();
+        const DIM: usize = 320;
+        const ROWS: usize = 32;
+        const CANDIDATES: usize = 512;
+        const QUERY_ROWS: usize = 32;
+        let mut exact = Vec::with_capacity(ROWS * DIM * 2);
+        let mut int8 = Vec::with_capacity(ROWS * DIM + ROWS * 4);
+        let mut fp8 = Vec::with_capacity(ROWS * DIM + ROWS * 4);
+        for index in 0..ROWS * DIM {
+            let nonzero = index % 37 == 0;
+            exact.extend_from_slice(&(if nonzero { 0x3c00_u16 } else { 0 }).to_le_bytes());
+            int8.push(if nonzero { 127_u8 } else { 0 });
+            fp8.push(if nonzero { 0x38_u8 } else { 0 });
+        }
+        for _ in 0..ROWS {
+            int8.extend_from_slice(&(1.0_f32 / 127.0).to_le_bytes());
+            fp8.extend_from_slice(&1.0_f32.to_le_bytes());
+        }
+        let bases = [0_u64, 16 * 1024 * 1024, 24 * 1024 * 1024];
+        let payloads = [&exact, &int8, &fp8];
+        let mut uploads = Vec::new();
+        let mut offsets: [Vec<u64>; 3] = std::array::from_fn(|_| Vec::new());
+        for (profile, payload) in payloads.into_iter().enumerate() {
+            for candidate in 0..CANDIDATES {
+                let offset = bases[profile] + candidate as u64 * payload.len() as u64;
+                offsets[profile].push(offset);
+                uploads.push((offset, payload.as_slice()));
+            }
+        }
+        gpu.upload_batch(&uploads).unwrap();
+        let rows = vec![ROWS as u32; CANDIDATES];
+        let query = (0..QUERY_ROWS * DIM)
+            .flat_map(|index| (if index % 41 == 0 { 0x3800_u16 } else { 0 }).to_le_bytes())
+            .collect::<Vec<_>>();
+        let measure = |gpu: &mut Gpu, profile: u8, offsets: &[u64]| {
+            for _ in 0..3 {
+                gpu.score(
+                    &query,
+                    QUERY_ROWS as u32,
+                    DIM as u32,
+                    2,
+                    profile,
+                    offsets,
+                    &rows,
+                )
+                .unwrap();
+            }
+            let started = Instant::now();
+            for _ in 0..20 {
+                gpu.score(
+                    &query,
+                    QUERY_ROWS as u32,
+                    DIM as u32,
+                    2,
+                    profile,
+                    offsets,
+                    &rows,
+                )
+                .unwrap();
+            }
+            started.elapsed().as_secs_f64() * 1000.0 / 20.0
+        };
+        let exact_ms = measure(&mut gpu, 1, &offsets[0]);
+        let int8_ms = measure(&mut gpu, 2, &offsets[1]);
+        let fp8_ms = measure(&mut gpu, 3, &offsets[2]);
+        const REQUESTS: usize = 8;
+        let batched_queries = (0..REQUESTS)
+            .flat_map(|_| query.iter().copied())
+            .collect::<Vec<_>>();
+        let query_offsets = (0..=REQUESTS)
+            .map(|request| (request * QUERY_ROWS) as u32)
+            .collect::<Vec<_>>();
+        let measure_batch = |gpu: &mut Gpu, profile: u8, offsets: &[u64]| {
+            for _ in 0..3 {
+                gpu.score_batch(
+                    &batched_queries,
+                    &query_offsets,
+                    DIM as u32,
+                    2,
+                    profile,
+                    offsets,
+                    &rows,
+                )
+                .unwrap();
+            }
+            let started = Instant::now();
+            for _ in 0..10 {
+                gpu.score_batch(
+                    &batched_queries,
+                    &query_offsets,
+                    DIM as u32,
+                    2,
+                    profile,
+                    offsets,
+                    &rows,
+                )
+                .unwrap();
+            }
+            started.elapsed().as_secs_f64() * 1000.0 / 10.0
+        };
+        let exact_batch_ms = measure_batch(&mut gpu, 1, &offsets[0]);
+        let int8_batch_ms = measure_batch(&mut gpu, 2, &offsets[1]);
+        let fp8_batch_ms = measure_batch(&mut gpu, 3, &offsets[2]);
+        eprintln!(
+            "quantized_320d candidates={CANDIDATES} query_rows={QUERY_ROWS} exact_ms={exact_ms:.4} int8_ms={int8_ms:.4} fp8_ms={fp8_ms:.4} int8_vs_exact={:.3} fp8_vs_exact={:.3} requests={REQUESTS} exact_batch_ms={exact_batch_ms:.4} int8_batch_ms={int8_batch_ms:.4} fp8_batch_ms={fp8_batch_ms:.4} int8_batch_vs_exact={:.3} fp8_batch_vs_exact={:.3}",
+            exact_ms / int8_ms,
+            exact_ms / fp8_ms,
+            exact_batch_ms / int8_batch_ms,
+            exact_batch_ms / fp8_batch_ms,
+        );
+    }
+
     fn pq_gpu() -> Gpu {
         let device = std::env::var("VCTM_TEST_GPU")
             .unwrap_or_else(|_| "0".to_owned())
