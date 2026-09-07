@@ -9,11 +9,9 @@
 // Copyright (c) 2026 Hu Xinjing
 
 #include <cuda_fp16.h>
+#include <cuda_pipeline_primitives.h>
 #include <cuda_runtime.h>
-#include <cuda/barrier>
 #include <cublas_v2.h>
-#include <cooperative_groups.h>
-#include <cooperative_groups/memcpy_async.h>
 #include <math_constants.h>
 
 #include <algorithm>
@@ -638,12 +636,17 @@ __global__ void tilemaxsim_multiquery_kernel(
       const size_t row_bytes = static_cast<size_t>(dimension) * sizeof(Scalar);
       if ((reinterpret_cast<uintptr_t>(source) & 15U) == 0 &&
           (row_bytes & 15U) == 0) {
-        const auto block = cooperative_groups::this_thread_block();
-        cooperative_groups::memcpy_async(
-            block, reinterpret_cast<unsigned char *>(document_vector),
-            reinterpret_cast<const unsigned char *>(source),
-            cuda::aligned_size_t<16>(row_bytes));
-        cooperative_groups::wait(block);
+        auto *destination_bytes =
+            reinterpret_cast<unsigned char *>(document_vector);
+        const auto *source_bytes =
+            reinterpret_cast<const unsigned char *>(source);
+        for (size_t byte = static_cast<size_t>(threadIdx.x) * 16;
+             byte < row_bytes; byte += static_cast<size_t>(blockDim.x) * 16)
+          __pipeline_memcpy_async(destination_bytes + byte,
+                                  source_bytes + byte, 16);
+        __pipeline_commit();
+        __pipeline_wait_prior(0);
+        __syncthreads();
       } else {
         for (uint32_t column = threadIdx.x; column < dimension;
              column += blockDim.x)
