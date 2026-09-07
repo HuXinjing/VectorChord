@@ -15,7 +15,7 @@ use anyhow::{Result, anyhow, bail};
 use std::collections::HashMap;
 use std::ffi::{CStr, c_char, c_int, c_uchar, c_void};
 use std::ptr::NonNull;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 #[repr(C)]
 struct NativeGpu(c_void);
@@ -547,8 +547,10 @@ impl Gpu {
         if self.tensor_threshold_rows == u32::MAX {
             return;
         }
-        const DIMENSION: u32 = 128;
+        const DIMENSION: u32 = 320;
         const DOCUMENT_ROWS: u32 = 32;
+        const CANDIDATES: usize = 16;
+        const REPETITIONS: usize = 3;
         let one = 0x3c00_u16.to_le_bytes();
         let zero = 0_u16.to_le_bytes();
         let mut document = Vec::with_capacity(DIMENSION as usize * DOCUMENT_ROWS as usize * 2);
@@ -561,7 +563,15 @@ impl Gpu {
                 });
             }
         }
-        if self.upload_batch(&[(0, &document)]).is_err() {
+        let document_offsets = (0..CANDIDATES)
+            .map(|index| index as u64 * document.len() as u64)
+            .collect::<Vec<_>>();
+        let uploads = document_offsets
+            .iter()
+            .map(|offset| (*offset, document.as_slice()))
+            .collect::<Vec<_>>();
+        let document_rows = vec![DOCUMENT_ROWS; CANDIDATES];
+        if self.upload_batch(&uploads).is_err() {
             self.calibration_failures += 1;
             return;
         }
@@ -581,34 +591,30 @@ impl Gpu {
             }
             let offsets = [0, total_rows / 2, total_rows];
             self.calibration_runs += 1;
-            let warp_started = Instant::now();
-            let Ok(warp) = self.score_batch_native(
-                false,
-                &queries,
-                &offsets,
-                DIMENSION,
-                2,
-                &[0],
-                &[DOCUMENT_ROWS],
-            ) else {
+            let measure = |gpu: &mut Self, tensor| -> Result<(Duration, Vec<Vec<f32>>)> {
+                let started = Instant::now();
+                let mut scores = Vec::new();
+                for _ in 0..REPETITIONS {
+                    scores = gpu.score_batch_native(
+                        tensor,
+                        &queries,
+                        &offsets,
+                        DIMENSION,
+                        2,
+                        &document_offsets,
+                        &document_rows,
+                    )?;
+                }
+                Ok((started.elapsed() / REPETITIONS as u32, scores))
+            };
+            let Ok((warp_elapsed, warp)) = measure(self, false) else {
                 self.calibration_failures += 1;
                 continue;
             };
-            let warp_elapsed = warp_started.elapsed();
-            let tensor_started = Instant::now();
-            let Ok(tensor) = self.score_batch_native(
-                true,
-                &queries,
-                &offsets,
-                DIMENSION,
-                2,
-                &[0],
-                &[DOCUMENT_ROWS],
-            ) else {
+            let Ok((tensor_elapsed, tensor)) = measure(self, true) else {
                 self.calibration_failures += 1;
                 continue;
             };
-            let tensor_elapsed = tensor_started.elapsed();
             if !batch_scores_close(&warp, &tensor) {
                 self.calibration_failures += 1;
                 continue;
@@ -1034,7 +1040,8 @@ mod tests {
         let (tensor_ms, tensor) = measure(&mut gpu, true);
         assert!(batch_scores_close(&tile, &tensor));
         eprintln!(
-            "tilemaxsim_320d candidates={CANDIDATES} requests={REQUESTS} tile_ms={tile_ms:.4} tensor_ms={tensor_ms:.4} speedup={:.3}",
+            "tilemaxsim_320d candidates={CANDIDATES} requests={REQUESTS} calibrated_threshold_rows={} tile_ms={tile_ms:.4} tensor_ms={tensor_ms:.4} speedup={:.3}",
+            gpu.tensor_threshold_rows,
             tile_ms / tensor_ms
         );
     }
