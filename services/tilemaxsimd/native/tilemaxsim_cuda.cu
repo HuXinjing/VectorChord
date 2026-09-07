@@ -31,6 +31,7 @@ struct VctmGpu {
   size_t workspace_bytes;
   unsigned char *host_staging;
   size_t host_staging_bytes;
+  bool use_pinned_control_staging;
   cudaStream_t upload_stream;
   cudaStream_t compute_stream;
   cublasHandle_t cublas;
@@ -112,6 +113,46 @@ static int cublas_fail(char *error, size_t capacity, const char *operation,
   return 1;
 }
 static bool reserve_aligned(size_t *cursor, size_t bytes, size_t *offset);
+
+struct HostControlSegment {
+  size_t offset;
+  const void *source;
+  size_t bytes;
+};
+
+// Request control data normally originates in pageable Rust vectors. Pack the
+// small query/descriptor prefix into the arena's persistent pinned host buffer
+// and submit one H2D operation. This removes several driver staging and launch
+// costs from every score call. Very large requests retain the bounded,
+// allocation-free multi-copy path instead of growing pinned host memory.
+static cudaError_t copy_control_payload(
+    VctmGpu *gpu, unsigned char *workspace,
+    const HostControlSegment *segments, size_t segment_count) {
+  size_t packed_bytes = 0;
+  for (size_t index = 0; index < segment_count; ++index) {
+    if (segments[index].bytes >
+        std::numeric_limits<size_t>::max() - segments[index].offset)
+      return cudaErrorInvalidValue;
+    packed_bytes = std::max(
+        packed_bytes, segments[index].offset + segments[index].bytes);
+  }
+  if (gpu->use_pinned_control_staging &&
+      packed_bytes <= gpu->host_staging_bytes) {
+    std::memset(gpu->host_staging, 0, packed_bytes);
+    for (size_t index = 0; index < segment_count; ++index)
+      std::memcpy(gpu->host_staging + segments[index].offset,
+                  segments[index].source, segments[index].bytes);
+    return cudaMemcpyAsync(workspace, gpu->host_staging, packed_bytes,
+                           cudaMemcpyHostToDevice, gpu->compute_stream);
+  }
+  cudaError_t status = cudaSuccess;
+  for (size_t index = 0; index < segment_count && status == cudaSuccess;
+       ++index)
+    status = cudaMemcpyAsync(workspace + segments[index].offset,
+                             segments[index].source, segments[index].bytes,
+                             cudaMemcpyHostToDevice, gpu->compute_stream);
+  return status;
+}
 
 static bool checked_mul(size_t left, size_t right, size_t *output) {
   if (right != 0 && left > std::numeric_limits<size_t>::max() / right) return false;
@@ -210,6 +251,7 @@ extern "C" int vctm_gpu_create(int device, size_t total_bytes,
   gpu->workspace_bytes = total_bytes - gpu->tensor_bytes;
   gpu->host_staging_bytes =
       std::min(gpu->tensor_bytes, static_cast<size_t>(64) * 1024 * 1024);
+  gpu->use_pinned_control_staging = true;
   status = cudaMalloc(reinterpret_cast<void **>(&gpu->allocation), total_bytes);
   if (status != cudaSuccess) {
     delete gpu;
@@ -329,6 +371,17 @@ extern "C" int vctm_gpu_set_tile_queries_per_warp(VctmGpu *gpu,
 
 extern "C" uint32_t vctm_gpu_tile_queries_per_warp(const VctmGpu *gpu) {
   return gpu == nullptr ? 0 : gpu->tile_queries_per_warp;
+}
+
+extern "C" int vctm_gpu_set_pinned_control_staging(VctmGpu *gpu,
+                                                     int enabled) {
+  if (gpu == nullptr) return 1;
+  gpu->use_pinned_control_staging = enabled != 0;
+  return 0;
+}
+
+extern "C" int vctm_gpu_pinned_control_staging(const VctmGpu *gpu) {
+  return gpu != nullptr && gpu->use_pinned_control_staging ? 1 : 0;
 }
 
 extern "C" int vctm_gpu_set_pq_warp_task_max_document_rows(
@@ -915,10 +968,15 @@ extern "C" int vctm_gpu_score_batch(
       !reserve_aligned(&cursor, score_count * sizeof(float), &scores_offset) ||
       cursor > gpu->workspace_bytes)
     return fail(error, error_capacity, "multi-query request exceeds configured GPU workspace");
-  status = cudaMemcpyAsync(workspace + query_offset, queries, query_bytes, cudaMemcpyHostToDevice, gpu->compute_stream);
-  if (status == cudaSuccess) status = cudaMemcpyAsync(workspace + query_offsets_offset, query_offsets, (request_count + 1) * sizeof(uint32_t), cudaMemcpyHostToDevice, gpu->compute_stream);
-  if (status == cudaSuccess) status = cudaMemcpyAsync(workspace + offsets_offset, document_offsets, count * sizeof(uint64_t), cudaMemcpyHostToDevice, gpu->compute_stream);
-  if (status == cudaSuccess) status = cudaMemcpyAsync(workspace + rows_offset, document_rows, count * sizeof(uint32_t), cudaMemcpyHostToDevice, gpu->compute_stream);
+  const HostControlSegment control[] = {
+      {query_offset, queries, query_bytes},
+      {query_offsets_offset, query_offsets,
+       (request_count + 1) * sizeof(uint32_t)},
+      {offsets_offset, document_offsets, count * sizeof(uint64_t)},
+      {rows_offset, document_rows, count * sizeof(uint32_t)},
+  };
+  status = copy_control_payload(gpu, workspace, control,
+                                sizeof(control) / sizeof(control[0]));
   const size_t shared_bytes = static_cast<size_t>(dimension) * scalar_bytes;
   if (status == cudaSuccess && dtype == 2)
     launch_multiquery_tile(gpu,
@@ -1032,8 +1090,13 @@ extern "C" int vctm_gpu_score_batch_tensor(
     return fail(error, error_capacity, "tensor-core request exceeds configured GPU workspace");
   cudaError_t status = cudaSetDevice(gpu->device);
   if (status != cudaSuccess) return cuda_fail(error, error_capacity, "cudaSetDevice", status);
-  status = cudaMemcpyAsync(workspace + query_offset, queries, query_bytes, cudaMemcpyHostToDevice, gpu->compute_stream);
-  if (status == cudaSuccess) status = cudaMemcpyAsync(workspace + query_offsets_offset, query_offsets, (request_count + 1) * sizeof(uint32_t), cudaMemcpyHostToDevice, gpu->compute_stream);
+  const HostControlSegment control[] = {
+      {query_offset, queries, query_bytes},
+      {query_offsets_offset, query_offsets,
+       (request_count + 1) * sizeof(uint32_t)},
+  };
+  status = copy_control_payload(gpu, workspace, control,
+                                sizeof(control) / sizeof(control[0]));
   if (status != cudaSuccess) return cuda_fail(error, error_capacity, "tensor-core workspace initialization", status);
   ScopedPersistingQuery query_policy(gpu, workspace + query_offset, query_bytes);
   const float alpha = 1.0f, beta = 0.0f;
@@ -1304,16 +1367,13 @@ extern "C" int vctm_gpu_score(
     return fail(error, error_capacity,
                 "TileMaxSim request exceeds the configured GPU workspace");
   }
-  status = cudaMemcpyAsync(workspace + query_offset, query, query_bytes,
-                           cudaMemcpyHostToDevice, gpu->compute_stream);
-  if (status == cudaSuccess)
-    status = cudaMemcpyAsync(workspace + offsets_offset, document_offsets,
-                             count * sizeof(uint64_t), cudaMemcpyHostToDevice,
-                             gpu->compute_stream);
-  if (status == cudaSuccess)
-    status = cudaMemcpyAsync(workspace + rows_offset, document_rows,
-                             count * sizeof(uint32_t), cudaMemcpyHostToDevice,
-                             gpu->compute_stream);
+  const HostControlSegment control[] = {
+      {query_offset, query, query_bytes},
+      {offsets_offset, document_offsets, count * sizeof(uint64_t)},
+      {rows_offset, document_rows, count * sizeof(uint32_t)},
+  };
+  status = copy_control_payload(gpu, workspace, control,
+                                sizeof(control) / sizeof(control[0]));
   if (status != cudaSuccess) {
     return cuda_fail(error, error_capacity, "CUDA workspace initialization",
                      status);
@@ -1458,10 +1518,15 @@ static int score_pq_batch_impl(
       !reserve_aligned(&cursor, score_count * sizeof(float), &scores_offset) ||
       cursor > gpu->workspace_bytes)
     return fail(error, error_capacity, "PQ request exceeds configured GPU workspace");
-  status = cudaMemcpyAsync(workspace + query_offset, query, query_bytes, cudaMemcpyHostToDevice, gpu->compute_stream);
-  if (status == cudaSuccess) status = cudaMemcpyAsync(workspace + query_offsets_offset, query_offsets, (request_count + 1) * sizeof(uint32_t), cudaMemcpyHostToDevice, gpu->compute_stream);
-  if (status == cudaSuccess) status = cudaMemcpyAsync(workspace + offsets_offset, document_offsets, count * sizeof(uint64_t), cudaMemcpyHostToDevice, gpu->compute_stream);
-  if (status == cudaSuccess) status = cudaMemcpyAsync(workspace + rows_offset, document_rows, count * sizeof(uint32_t), cudaMemcpyHostToDevice, gpu->compute_stream);
+  const HostControlSegment control[] = {
+      {query_offset, query, query_bytes},
+      {query_offsets_offset, query_offsets,
+       (request_count + 1) * sizeof(uint32_t)},
+      {offsets_offset, document_offsets, count * sizeof(uint64_t)},
+      {rows_offset, document_rows, count * sizeof(uint32_t)},
+  };
+  status = copy_control_payload(gpu, workspace, control,
+                                sizeof(control) / sizeof(control[0]));
   constexpr unsigned int threads = 256;
   if (status == cudaSuccess && rotated_count != 0) {
     const unsigned int rotation_blocks = static_cast<unsigned int>(std::min(

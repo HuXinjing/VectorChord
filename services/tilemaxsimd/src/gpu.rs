@@ -35,6 +35,8 @@ unsafe extern "C" {
     fn vctm_gpu_tensor_bytes(gpu: *const NativeGpu) -> usize;
     fn vctm_gpu_set_tile_queries_per_warp(gpu: *mut NativeGpu, value: u32) -> c_int;
     fn vctm_gpu_tile_queries_per_warp(gpu: *const NativeGpu) -> u32;
+    fn vctm_gpu_set_pinned_control_staging(gpu: *mut NativeGpu, enabled: c_int) -> c_int;
+    fn vctm_gpu_pinned_control_staging(gpu: *const NativeGpu) -> c_int;
     fn vctm_gpu_set_pq_warp_task_max_document_rows(gpu: *mut NativeGpu, rows: u32) -> c_int;
     fn vctm_gpu_pq_warp_task_max_document_rows(gpu: *const NativeGpu) -> u32;
     fn vctm_gpu_compute_capability(
@@ -292,6 +294,8 @@ impl Gpu {
                 matrix_engine_workspace_bytes: (info_status == 0
                     && matrix_engine_workspace_bytes != 0)
                     .then_some(matrix_engine_workspace_bytes),
+                pinned_control_staging: Some(true),
+                control_staging_speedup_milli: None,
                 document_tile_query_rows: match major {
                     9.. => Some(64),
                     8 => Some(32),
@@ -330,6 +334,8 @@ impl Gpu {
         gpu.info.document_tile_query_rows = queries_per_warp.checked_mul(8);
         gpu.info.pq_warp_task_max_document_rows =
             Some(unsafe { vctm_gpu_pq_warp_task_max_document_rows(gpu.native.as_ptr()) });
+        gpu.info.pinned_control_staging =
+            Some(unsafe { vctm_gpu_pinned_control_staging(gpu.native.as_ptr()) != 0 });
         Ok(gpu)
     }
 
@@ -706,6 +712,14 @@ impl Gpu {
             self.calibration_failures += 1;
             return;
         }
+        self.calibrate_control_staging(
+            DIMENSION,
+            DOCUMENT_ROWS,
+            &document_offsets,
+            &document_rows,
+            &one,
+            &zero,
+        );
         self.calibrate_tile_reuse(
             DIMENSION,
             DOCUMENT_ROWS,
@@ -771,6 +785,86 @@ impl Gpu {
         } else {
             self.tensor_threshold_rows = crossover.unwrap_or(u32::MAX);
             self.calibration_complete = true;
+        }
+    }
+
+    fn calibrate_control_staging(
+        &mut self,
+        dimension: u32,
+        document_rows_per_candidate: u32,
+        document_offsets: &[u64],
+        document_rows: &[u32],
+        one: &[u8; 2],
+        zero: &[u8; 2],
+    ) {
+        const QUERY_ROWS: u32 = 32;
+        const REPETITIONS: usize = 7;
+        let mut queries = Vec::with_capacity(QUERY_ROWS as usize * dimension as usize * 2);
+        for row in 0..QUERY_ROWS {
+            for column in 0..dimension {
+                queries.extend_from_slice(if column == row % document_rows_per_candidate {
+                    one
+                } else {
+                    zero
+                });
+            }
+        }
+        let offsets = [0, QUERY_ROWS / 2, QUERY_ROWS];
+        let measure = |gpu: &mut Self, enabled: bool| -> Result<(Duration, Vec<Vec<f32>>)> {
+            if unsafe {
+                vctm_gpu_set_pinned_control_staging(gpu.native.as_ptr(), i32::from(enabled))
+            } != 0
+            {
+                bail!("CUDA rejected control-staging calibration mode");
+            }
+            let mut samples = Vec::with_capacity(REPETITIONS);
+            let mut scores = Vec::new();
+            for _ in 0..REPETITIONS {
+                let started = Instant::now();
+                scores = gpu.score_batch_native(
+                    false,
+                    &queries,
+                    &offsets,
+                    dimension,
+                    2,
+                    document_offsets,
+                    document_rows,
+                    1,
+                )?;
+                samples.push(started.elapsed());
+            }
+            samples.sort_unstable();
+            Ok((samples[REPETITIONS / 2], scores))
+        };
+        self.calibration_runs += 1;
+        let pageable = measure(self, false);
+        let pinned = measure(self, true);
+        let (use_pinned, speedup_milli) = match (pageable, pinned) {
+            (Ok((pageable_elapsed, pageable_scores)), Ok((pinned_elapsed, pinned_scores)))
+                if batch_scores_close(&pageable_scores, &pinned_scores) =>
+            {
+                let ratio = pageable_elapsed
+                    .as_nanos()
+                    .saturating_mul(1000)
+                    .checked_div(pinned_elapsed.as_nanos().max(1))
+                    .unwrap_or(0)
+                    .min(u32::MAX as u128) as u32;
+                // Require a small but material win so noise on a shared device
+                // does not force an extra host memcpy on every request.
+                (
+                    pinned_elapsed.as_nanos().saturating_mul(100)
+                        < pageable_elapsed.as_nanos().saturating_mul(98),
+                    Some(ratio),
+                )
+            }
+            _ => {
+                self.calibration_failures += 1;
+                (false, None)
+            }
+        };
+        self.info.control_staging_speedup_milli = speedup_milli;
+        unsafe {
+            vctm_gpu_set_pinned_control_staging(self.native.as_ptr(), i32::from(use_pinned));
         }
     }
 
@@ -1263,9 +1357,15 @@ mod tests {
         assert!(info.tuning_profile.starts_with("cuda-"));
         assert!(info.document_tile_query_rows.unwrap_or_default() >= 8);
         assert!(info.pq_warp_task_max_document_rows.unwrap_or(u32::MAX) <= 8);
+        assert!(info.pinned_control_staging.is_some());
+        assert!(info.control_staging_speedup_milli.is_some());
         eprintln!(
-            "cuda_tuning architecture={} document_tile_query_rows={:?} pq_warp_task_max_document_rows={:?}",
-            info.architecture, info.document_tile_query_rows, info.pq_warp_task_max_document_rows
+            "cuda_tuning architecture={} document_tile_query_rows={:?} pq_warp_task_max_document_rows={:?} pinned_control_staging={:?} control_staging_speedup_milli={:?}",
+            info.architecture,
+            info.document_tile_query_rows,
+            info.pq_warp_task_max_document_rows,
+            info.pinned_control_staging,
+            info.control_staging_speedup_milli,
         );
         assert_eq!(
             info.capabilities.persisting_l2,

@@ -48,6 +48,12 @@ pub struct DeviceInfo {
     pub shared_memory_per_block_bytes: Option<u64>,
     pub persisting_l2_bytes: Option<u64>,
     pub matrix_engine_workspace_bytes: Option<u64>,
+    /// Whether request control payloads are packed into persistent pinned host
+    /// memory before H2D submission on this device.
+    pub pinned_control_staging: Option<bool>,
+    /// Direct-pageable median time divided by pinned-packed median time,
+    /// expressed in thousandths. Values above 1000 favour pinned packing.
+    pub control_staging_speedup_milli: Option<u32>,
     /// Query rows served by one document-tile load in the native fused path.
     pub document_tile_query_rows: Option<u32>,
     /// Largest PQ document row count assigned one independent task per warp.

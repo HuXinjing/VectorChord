@@ -112,6 +112,18 @@ rule.
   scoring uses its most-urgent priority. This does not interrupt an executing
   kernel; scheduler quantum boundaries remain the preemption points.
 
+Exact, quantized and PQ requests pack their query and descriptor control data
+into the arena's persistent pinned-host staging region before one asynchronous
+H2D submission. Because the extra host copy is not profitable for every PCIe,
+NUMA and integrated topology, startup compares the packed and direct-pageable
+paths on the actual device, checks numerical equivalence and retains packing
+only after a median improvement of at least 2%. Oversized control payloads
+fall back to bounded direct copies rather than increasing pinned memory. The
+selected path is exposed as `pinned_control_staging` in device status.
+The same record exposes `control_staging_speedup_milli` (direct median divided
+by packed median, in thousandths), so operators can audit a device-specific
+choice instead of inferring it from the GPU model name.
+
 Repeated Tensor Core batches cache only the bounded host-side mapping from a
 candidate's row-count sequence to uniform GEMM groups and reuse the A/B/C
 pointer staging vectors. Actual arena offsets are rebuilt and uploaded on every

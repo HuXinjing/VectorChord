@@ -135,6 +135,8 @@ impl MetalBackend {
                 shared_memory_per_block_bytes: None,
                 persisting_l2_bytes: None,
                 matrix_engine_workspace_bytes: None,
+                pinned_control_staging: None,
+                control_staging_speedup_milli: None,
                 document_tile_query_rows: Some(8),
                 pq_warp_task_max_document_rows: None,
                 compute_queue_priority: None,

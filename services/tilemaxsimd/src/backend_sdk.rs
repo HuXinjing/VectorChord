@@ -16,7 +16,7 @@ pub struct BackendApiVersion {
     pub minor: u16,
 }
 
-pub const BACKEND_API_VERSION: BackendApiVersion = BackendApiVersion { major: 1, minor: 0 };
+pub const BACKEND_API_VERSION: BackendApiVersion = BackendApiVersion { major: 1, minor: 1 };
 
 pub trait BackendProvider {
     fn name(&self) -> &'static str;
