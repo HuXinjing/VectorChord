@@ -1806,6 +1806,83 @@ mod tests {
         );
     }
 
+    #[test]
+    #[ignore = "requires an explicitly assigned CUDA device"]
+    fn benchmark_pinned_control_staging_for_320d_candidates() {
+        const DIMENSION: u32 = 320;
+        const DOCUMENT_ROWS: u32 = 32;
+        const QUERY_ROWS: u32 = 32;
+        const CANDIDATES: usize = 512;
+        const REPETITIONS: usize = 31;
+        let device = std::env::var("VCTM_TEST_GPU")
+            .unwrap_or_else(|_| "0".to_owned())
+            .parse()
+            .unwrap();
+        let mut gpu = Gpu::create(device, 96 * 1024 * 1024, 48 * 1024 * 1024).unwrap();
+        let one = 0x3c00_u16.to_le_bytes();
+        let zero = 0_u16.to_le_bytes();
+        let mut document = Vec::with_capacity(DOCUMENT_ROWS as usize * DIMENSION as usize * 2);
+        for row in 0..DOCUMENT_ROWS {
+            for column in 0..DIMENSION {
+                document.extend_from_slice(if column == row { &one } else { &zero });
+            }
+        }
+        let document_offsets = (0..CANDIDATES)
+            .map(|candidate| candidate as u64 * document.len() as u64)
+            .collect::<Vec<_>>();
+        let uploads = document_offsets
+            .iter()
+            .copied()
+            .map(|offset| (offset, document.as_slice()))
+            .collect::<Vec<_>>();
+        gpu.upload_batch(&uploads).unwrap();
+        let document_rows = vec![DOCUMENT_ROWS; CANDIDATES];
+        let mut query = Vec::with_capacity(QUERY_ROWS as usize * DIMENSION as usize * 2);
+        for row in 0..QUERY_ROWS {
+            for column in 0..DIMENSION {
+                query.extend_from_slice(if column == row { &one } else { &zero });
+            }
+        }
+        let query_offsets = [0, QUERY_ROWS / 2, QUERY_ROWS];
+        let measure = |gpu: &mut Gpu, enabled: bool| {
+            unsafe {
+                assert_eq!(
+                    vctm_gpu_set_pinned_control_staging(gpu.native.as_ptr(), i32::from(enabled)),
+                    0
+                );
+            }
+            let mut samples = Vec::with_capacity(REPETITIONS);
+            let mut scores = Vec::new();
+            for _ in 0..REPETITIONS {
+                let started = Instant::now();
+                scores = gpu
+                    .score_batch_native(
+                        false,
+                        &query,
+                        &query_offsets,
+                        DIMENSION,
+                        2,
+                        &document_offsets,
+                        &document_rows,
+                        1,
+                    )
+                    .unwrap();
+                samples.push(started.elapsed());
+            }
+            samples.sort_unstable();
+            (samples[REPETITIONS / 2], scores)
+        };
+        let (pageable, pageable_scores) = measure(&mut gpu, false);
+        let (pinned, pinned_scores) = measure(&mut gpu, true);
+        assert!(batch_scores_close(&pageable_scores, &pinned_scores));
+        eprintln!(
+            "control_staging_320d candidates={CANDIDATES} query_rows={QUERY_ROWS} pageable_ms={:.4} pinned_ms={:.4} speedup={:.3}",
+            pageable.as_secs_f64() * 1000.0,
+            pinned.as_secs_f64() * 1000.0,
+            pageable.as_secs_f64() / pinned.as_secs_f64(),
+        );
+    }
+
     fn pq_gpu() -> Gpu {
         let device = std::env::var("VCTM_TEST_GPU")
             .unwrap_or_else(|_| "0".to_owned())

@@ -124,6 +124,14 @@ The same record exposes `control_staging_speedup_milli` (direct median divided
 by packed median, in thousandths), so operators can audit a device-specific
 choice instead of inferring it from the GPU model name.
 
+On the shared RTX 4090, three back-to-back 512-candidate, 32-query-row,
+320-dimensional A/B runs measured direct pageable control transfers at
+0.1154--0.1204 ms and pinned packed transfers at 0.1045--0.1066 ms, a
+1.10--1.13x reduction for this kernel call. The benchmark validates identical
+scores and never asserts that packing must win, because topology and driver
+behaviour differ; the H200 gate runs the same A/B benchmark and records its own
+decision.
+
 Repeated Tensor Core batches cache only the bounded host-side mapping from a
 candidate's row-count sequence to uniform GEMM groups and reuse the A/B/C
 pointer staging vectors. Actual arena offsets are rebuilt and uploaded on every
