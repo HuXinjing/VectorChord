@@ -920,7 +920,15 @@ mod tests {
                 document.extend_from_slice(&value.to_le_bytes());
             }
         }
-        gpu.upload_batch(&[(0, &document)]).unwrap();
+        let document_offsets = (0..4)
+            .map(|index| index * document.len() as u64)
+            .collect::<Vec<_>>();
+        let uploads = document_offsets
+            .iter()
+            .map(|offset| (*offset, document.as_slice()))
+            .collect::<Vec<_>>();
+        gpu.upload_batch(&uploads).unwrap();
+        let document_rows = vec![DOC_ROWS as u32; document_offsets.len()];
         let query_offsets = [0_u32, 3, 8, 15];
         let mut queries = Vec::with_capacity(15 * DIM * 2);
         for row in 0..15 {
@@ -940,8 +948,8 @@ mod tests {
                 &query_offsets,
                 DIM as u32,
                 2,
-                &[0],
-                &[DOC_ROWS as u32],
+                &document_offsets,
+                &document_rows,
             )
             .unwrap();
         let tensor = gpu
@@ -951,8 +959,8 @@ mod tests {
                 &query_offsets,
                 DIM as u32,
                 2,
-                &[0],
-                &[DOC_ROWS as u32],
+                &document_offsets,
+                &document_rows,
             )
             .unwrap();
         assert!(
