@@ -43,6 +43,7 @@ impl CpuBackend {
                 shared_memory_per_block_bytes: None,
                 persisting_l2_bytes: None,
                 matrix_engine_workspace_bytes: None,
+                document_tile_query_rows: None,
                 compute_queue_priority: None,
                 tuning_profile: cpu_tuning_profile().to_owned(),
                 capabilities: BackendCapabilities {

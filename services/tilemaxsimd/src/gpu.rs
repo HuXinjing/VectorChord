@@ -261,6 +261,12 @@ impl Gpu {
                 matrix_engine_workspace_bytes: (info_status == 0
                     && matrix_engine_workspace_bytes != 0)
                     .then_some(matrix_engine_workspace_bytes),
+                document_tile_query_rows: match major {
+                    9.. => Some(64),
+                    8 => Some(32),
+                    _ if capability_status == 0 => Some(8),
+                    _ => None,
+                },
                 compute_queue_priority: (info_status == 0).then_some(compute_stream_priority),
                 tuning_profile: match (major, minor) {
                     (8, 9) => "cuda-ada".to_owned(),
@@ -279,7 +285,7 @@ impl Gpu {
                     opq_rpq: true,
                     fused_multiquery: true,
                     matrix_engine: tensor_threshold_rows != u32::MAX,
-                    asynchronous_copy: true,
+                    asynchronous_copy: capability_status == 0 && major >= 8,
                     unified_memory: false,
                     persisting_l2: info_status == 0 && persisting_l2_bytes != 0,
                 },
@@ -882,6 +888,7 @@ mod tests {
         assert_eq!(info.warp_size, Some(32));
         assert!(info.compute_queue_priority.is_some());
         assert!(info.tuning_profile.starts_with("cuda-"));
+        assert!(info.document_tile_query_rows.unwrap_or_default() >= 8);
         assert_eq!(
             info.capabilities.persisting_l2,
             info.persisting_l2_bytes.is_some()

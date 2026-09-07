@@ -48,6 +48,8 @@ pub struct DeviceInfo {
     pub shared_memory_per_block_bytes: Option<u64>,
     pub persisting_l2_bytes: Option<u64>,
     pub matrix_engine_workspace_bytes: Option<u64>,
+    /// Query rows served by one document-tile load in the native fused path.
+    pub document_tile_query_rows: Option<u32>,
     pub compute_queue_priority: Option<i32>,
     pub tuning_profile: String,
     pub capabilities: BackendCapabilities,
