@@ -112,6 +112,21 @@ An architecture appearing in the binary means only that it can be loaded.
 Architecture-specific kernels and same-device numerical/performance regression
 remain required before that device is advertised as tuned.
 
+The daemon core is backend-neutral. CUDA remains the default build, while the
+exact CPU reference build has no CUDA or cuBLAS link dependency:
+
+```shell
+cargo build --release --manifest-path services/tilemaxsimd/Cargo.toml
+cargo build --release --manifest-path services/tilemaxsimd/Cargo.toml \
+  --no-default-features --features backend-cpu
+```
+
+Use `--device-memory-gb 0=GB` for new deployments. The historical
+`--gpu-memory-gb` spelling remains a visible compatibility alias. The CPU
+backend implements exact FP16/FP32 MaxSim and fails closed for unsupported
+quantized profiles; it is both a no-accelerator deployment path and the common
+numerical oracle for vendor backends.
+
 Use the image's dependency-free probe from systemd, Docker, or Kubernetes:
 
 ```shell

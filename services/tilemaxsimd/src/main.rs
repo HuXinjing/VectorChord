@@ -10,8 +10,11 @@
 
 mod backend;
 mod cache;
+#[cfg(feature = "backend-cpu")]
+mod cpu;
 mod dispatch;
 mod engine;
+#[cfg(feature = "backend-cuda")]
 mod gpu;
 mod protocol;
 mod quant;
@@ -20,9 +23,12 @@ mod shard;
 
 use anyhow::{Context, Result, anyhow, bail};
 use clap::Parser;
+#[cfg(feature = "backend-cpu")]
+use cpu::CpuBackend as SelectedBackend;
 use dispatch::{DispatchInput, DispatchThresholds, KernelKind};
 use engine::{Engine, EngineStatus};
-use gpu::Gpu;
+#[cfg(feature = "backend-cuda")]
+use gpu::Gpu as SelectedBackend;
 use protocol::{
     HEADER_BYTES, VERSION_EXTERNAL, VERSION_PROFILED_EXTERNAL, VERSION_QUANTIZED_EXTERNAL,
     VERSION_SCHEDULED_EXTERNAL,
@@ -45,6 +51,11 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
+
+#[cfg(all(feature = "backend-cuda", feature = "backend-cpu"))]
+compile_error!("select exactly one accelerator backend");
+#[cfg(not(any(feature = "backend-cuda", feature = "backend-cpu")))]
+compile_error!("select one accelerator backend");
 
 const GIB: usize = 1024 * 1024 * 1024;
 static SHUTDOWN_REQUESTED: AtomicBool = AtomicBool::new(false);
@@ -77,8 +88,8 @@ struct Args {
     /// Optional TCP scoring listener for a database running in another pod.
     #[arg(long)]
     listen: Option<SocketAddr>,
-    #[arg(long, required = true, value_delimiter = ',', value_parser = parse_gpu_memory)]
-    gpu_memory_gb: Vec<GpuMemory>,
+    #[arg(long = "device-memory-gb", visible_alias = "gpu-memory-gb", required = true, value_delimiter = ',', value_parser = parse_device_memory)]
+    device_memory_gb: Vec<DeviceMemory>,
     #[arg(long, default_value = "2", value_parser = parse_gb)]
     gpu_workspace_gb: usize,
     #[arg(long, default_value = "8", value_parser = parse_gb)]
@@ -153,12 +164,12 @@ struct Args {
 }
 
 #[derive(Clone)]
-struct GpuMemory {
+struct DeviceMemory {
     device: i32,
     bytes: usize,
 }
 
-fn parse_gpu_memory(value: &str) -> Result<GpuMemory, String> {
+fn parse_device_memory(value: &str) -> Result<DeviceMemory, String> {
     let (device, gb) = value
         .strip_prefix("cuda:")
         .unwrap_or(value)
@@ -171,7 +182,7 @@ fn parse_gpu_memory(value: &str) -> Result<GpuMemory, String> {
         return Err("GPU index must be nonnegative".to_owned());
     }
     let bytes = parse_gb(gb)?;
-    Ok(GpuMemory { device, bytes })
+    Ok(DeviceMemory { device, bytes })
 }
 
 fn parse_gb(value: &str) -> Result<usize, String> {
@@ -267,7 +278,7 @@ fn main() -> Result<()> {
         bail!("connection, queue, timeout, and priority-aging limits must be positive");
     }
     let mut seen_devices = std::collections::HashSet::new();
-    for specification in &args.gpu_memory_gb {
+    for specification in &args.device_memory_gb {
         if args.gpu_workspace_gb >= specification.bytes {
             bail!("every configured GPU allocation must exceed its workspace");
         }
@@ -290,10 +301,10 @@ fn main() -> Result<()> {
         .map(QuantizationRegistry::open)
         .transpose()?;
     let gpus = args
-        .gpu_memory_gb
+        .device_memory_gb
         .iter()
         .map(|specification| {
-            Gpu::create(
+            SelectedBackend::create(
                 specification.device,
                 specification.bytes,
                 args.gpu_workspace_gb,
@@ -359,7 +370,7 @@ fn main() -> Result<()> {
     ));
     let public_config = Arc::new(serde_json::json!({
         "api_version": "tilemaxsim.management.v1",
-        "gpu": args.gpu_memory_gb.iter().map(|item| serde_json::json!({
+        "devices": args.device_memory_gb.iter().map(|item| serde_json::json!({
             "device": item.device,
             "memory_gb": item.bytes as f64 / GIB as f64,
             "workspace_gb": args.gpu_workspace_gb as f64 / GIB as f64,
@@ -498,7 +509,7 @@ fn main() -> Result<()> {
             "event": "tilemaxsim_rust_ready",
             "socket": args.socket,
             "listen": args.listen,
-            "devices": args.gpu_memory_gb.iter().map(|item| serde_json::json!({
+            "devices": args.device_memory_gb.iter().map(|item| serde_json::json!({
                 "device": item.device,
                 "allocated_bytes": item.bytes,
             })).collect::<Vec<_>>(),

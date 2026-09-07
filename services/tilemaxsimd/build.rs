@@ -9,6 +9,9 @@
 // Copyright (c) 2026 Hu Xinjing
 
 fn main() {
+    if std::env::var_os("CARGO_FEATURE_BACKEND_CUDA").is_none() {
+        return;
+    }
     println!("cargo:rerun-if-changed=native/tilemaxsim_cuda.cu");
     println!("cargo:rerun-if-env-changed=TILEMAXSIM_CUDA_ARCHS");
     let architectures =
