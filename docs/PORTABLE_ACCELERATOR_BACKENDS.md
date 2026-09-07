@@ -47,8 +47,9 @@ rule.
   cuBLAS Tensor Core GEMM.
 - Hopper/H200 selects the `sm_90a` image. Batched cuBLAS owns Hopper matrix-core
   instruction and data-movement selection, receives an architecture-sized
-  32-MiB stable workspace, and the fused tile path reuses each document load
-  across 64 query rows. The custom MaxSim reduction remains
+  32-MiB stable workspace, and starts with 64-query-row document-tile reuse.
+  Startup calibration compares 8, 32 and 64 rows and may select a smaller tile
+  when it is faster on the actual device. The custom MaxSim reduction remains
   architecture-neutral. Resident batches execute concurrently across devices
   instead of serializing an eight-GPU node. H200 is not marked validated until
   same-device conformance, Nsight and latency tests pass.
@@ -57,8 +58,10 @@ rule.
   kernel; scheduler quantum boundaries remain the preemption points.
 
 The startup calibration uses 16 resident candidates with 32 document rows at
-dimension 320, repeats both paths, checks numerical agreement and records the
-first query-row crossover. A failed or divergent matrix path is disabled.
+dimension 320. It first selects the fastest numerically equivalent document
+reuse tile, then repeats the tile/matrix comparison and records the first
+query-row crossover. A failed or divergent variant is rejected; a failed or
+divergent matrix path is disabled.
 
 On the available RTX 4090, the production-shaped 64-candidate, eight-request,
 32-query-row, 320-dimensional benchmark changed from approximately 0.477 ms to
