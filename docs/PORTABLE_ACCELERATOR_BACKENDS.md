@@ -30,6 +30,12 @@ runtime. CI now builds the final stage, runs both CLI smoke checks, and rejects
 any `ldd` dependency reported as missing; testing only the compiler stage is
 not considered image validation.
 
+The CUDA executor also fails during startup when compute capability cannot be
+read, is older than SM80, or a Blackwell-class device is paired with a pre-13.0
+runtime. The published fatbin has no pre-SM80 code, and the separately tuned
+SM120/SM121 artifact is built with CUDA 13; delaying either mismatch until the
+first online request would make the advertised capability contract false.
+
 Vendor executors depend on the library without another runtime:
 
 ```toml

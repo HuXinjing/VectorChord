@@ -240,6 +240,16 @@ impl Gpu {
                 &mut matrix_engine_workspace_bytes,
             )
         };
+        if name_status != 0 {
+            unsafe { vctm_gpu_destroy(native.as_ptr()) };
+            bail!("unable to determine CUDA device identity");
+        }
+        if let Err(reason) =
+            validate_cuda_runtime(capability_status, info_status, major, runtime_version)
+        {
+            unsafe { vctm_gpu_destroy(native.as_ptr()) };
+            bail!(reason);
+        }
         let tensor_threshold_rows = if capability_status == 0 {
             crate::dispatch::device_thresholds(&name, major, minor)
                 .map(|thresholds| u32::try_from(thresholds.tensor_ridge).unwrap_or(u32::MAX))
@@ -1025,6 +1035,31 @@ impl Gpu {
     }
 }
 
+fn validate_cuda_runtime(
+    capability_status: c_int,
+    info_status: c_int,
+    major: c_int,
+    runtime_version: c_int,
+) -> Result<()> {
+    if capability_status != 0 {
+        bail!("unable to determine CUDA compute capability");
+    }
+    if info_status != 0 {
+        bail!("unable to determine CUDA driver, runtime, or device capabilities");
+    }
+    if major < 8 {
+        bail!(
+            "CUDA backend requires compute capability 8.0 or newer; use the CPU backend on this device"
+        );
+    }
+    if major >= 10 && runtime_version < 13_000 {
+        bail!(
+            "Blackwell-class CUDA devices require the CUDA 13 tilemaxsimd image; the loaded runtime reports {runtime_version}"
+        );
+    }
+    Ok(())
+}
+
 impl AcceleratorBackend for Gpu {
     fn info(&self) -> &DeviceInfo {
         &self.info
@@ -1193,6 +1228,18 @@ fn native_error(buffer: &[c_char]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn runtime_gate_matches_published_cuda_artifacts() {
+        assert!(validate_cuda_runtime(0, 0, 8, 12_060).is_ok());
+        assert!(validate_cuda_runtime(0, 0, 9, 12_060).is_ok());
+        assert!(validate_cuda_runtime(0, 0, 12, 13_030).is_ok());
+        assert!(validate_cuda_runtime(1, 0, 9, 13_030).is_err());
+        assert!(validate_cuda_runtime(0, 1, 9, 13_030).is_err());
+        assert!(validate_cuda_runtime(0, 0, 7, 12_060).is_err());
+        assert!(validate_cuda_runtime(0, 0, 10, 12_060).is_err());
+        assert!(validate_cuda_runtime(0, 0, 12, 12_060).is_err());
+    }
 
     #[test]
     #[ignore = "requires an explicitly assigned CUDA device"]
