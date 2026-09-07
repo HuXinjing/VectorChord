@@ -11,7 +11,7 @@ images; vendor SDKs are never linked into one universal binary.
 | --- | --- | --- | --- |
 | Shared backend SDK | `backend-core` | none | available |
 | CPU reference | `backend-cpu` | none | exact FP16/FP32 available |
-| NVIDIA | `backend-cuda` | CUDA Runtime, cuBLAS | available; RTX 4090 validated |
+| NVIDIA | `backend-cuda` | CUDA Runtime, cuBLAS | available; RTX 4090 validated; H200 functional gate passed, profiling gate pending |
 | Apple | `backend-metal` | Metal/Foundation | exact FP16/FP32 experimental; macOS GPU gate required |
 | Ascend | downstream `backend-ascend` executor | CANN/Ascend C | implementation pending on Ascend CI |
 | MetaX | downstream `backend-metax` executor | MXMACA/mcBLAS | implementation pending on MetaX CI |
@@ -107,8 +107,10 @@ rule.
   Startup calibration compares 8, 32 and 64 rows and may select a smaller tile
   when it is faster on the actual device. The custom MaxSim reduction remains
   architecture-neutral. Resident batches execute concurrently across devices
-  instead of serializing an eight-GPU node. H200 is not marked validated until
-  same-device conformance, Nsight and latency tests pass.
+  instead of serializing an eight-GPU node. Physical H200 compilation,
+  conformance and latency microbenchmarks have passed; the Nsight attribution
+  and full cold-cache/concurrency gates remain required before H200 is marked
+  production-validated.
 - Blackwell/GB10 uses the isolated CUDA 13 SM121 image and the same startup
   numerical calibration. It is loadable and artifact-checked, but it is not
   advertised as tuned until the exact/quantized conformance and latency gates
@@ -222,6 +224,50 @@ the selected maximum through `pq_warp_task_max_document_rows`. The available
 RTX 4090 selected four rows. Calibration failure safely selects the cooperative
 kernel. The H200 hardware gate records its independently selected value before
 the path can be described as Hopper-tuned.
+
+## Physical H200 validation (2026-09-07)
+
+Commit `2fb9dbe` was built offline with CUDA 13.0 for native `sm_90`, `sm_90a`
+and `compute_90` on one NVIDIA H200 (compute capability 9.0, driver 595.91.07).
+The GPU was shared with an existing workload; the test used only otherwise free
+memory and did not stop or reconfigure that workload. All 17 ignored CUDA
+device tests passed, covering the backend conformance probe, exact FP16/FP32,
+fused multiquery, INT8, FP8, PQ, OPQ, residual PQ, variable-query Tensor Core
+equivalence, continuous batching and cache-safe quantizer reclamation.
+
+Five independent startup-calibration runs made the same choices:
+
+- document-tile query rows: 8;
+- PQ warp-task maximum document rows: 8;
+- pinned control staging: enabled, with measured median ratios of 1.053--1.070;
+- double-buffered document tiles: disabled, with ratios of 1.028--1.042, below
+  the 1.05 admission threshold.
+
+The final complete run measured the 64-candidate, eight-request Tensor Core
+path at 0.1334 ms versus 0.1460 ms for the selected single-buffer tile path
+(1.094x). Earlier repeated isolated A/B probes measured 1.155--1.162x; the
+spread is reported because the GPU was shared, so these numbers are evidence
+for dispatch direction rather than a production latency SLO. The same complete
+run measured PQ continuous batching at 0.6803 ms versus 0.9862 ms for eight
+individual calls (1.450x). An eight-request INT8/FP8 batch measured 1.018x and
+1.019x versus exact FP16 respectively, while single-request quantized scoring
+was slower; this supports retaining quantization as an explicit capacity and
+accuracy contract rather than enabling it as an unconditional latency mode.
+
+The direct double-buffer benchmark regressed to 0.898x in the final run. The
+paired AB/BA startup calibration therefore correctly retained single buffering
+instead of applying a Hopper model-name rule. GPU memory before and after the
+validation was identical (65,837 MiB used, 77,322 MiB free), and all transferred
+source/toolchain files were removed from the remote host.
+
+This run does **not** close the complete H200 release gate. The host did not
+provide `nvdisasm`, Nsight Systems or Nsight Compute, and no packages were
+installed. Consequently the CUDA 13 cubin instruction audit and hardware
+counter proof of Tensor Pipeline activity remain pending, as do end-to-end
+L2-to-L1-to-L0 cold-cache distributions and sustained multi-tenant p50/p95/p99
+tests on an exclusive device. The mandatory hardware-validation workflow is
+intentionally unchanged and still fails closed when those tools or artifacts
+are absent.
 
 ## Vendor acceptance gates
 
