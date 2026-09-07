@@ -54,6 +54,11 @@ RUST_TEST_THREADS=1 VCTM_TEST_GPU="$device" \
   cargo test --release --locked --manifest-path "$crate_root/Cargo.toml" \
     --no-default-features --features backend-cuda --lib -- \
     --ignored --nocapture 2>&1 | tee "$evidence_dir/tests.txt"
+if ! grep -E 'cuda_tuning architecture=sm_90 .*double_buffered_tile=Some\((true|false)\).*double_buffer_speedup_milli=Some\([0-9]+\)' \
+    "$evidence_dir/tests.txt" | tee "$evidence_dir/tuning.txt"; then
+  echo "H200 test output did not contain a complete runtime tuning decision" >&2
+  exit 1
+fi
 
 test_binary=$(cargo test --release --locked --manifest-path "$crate_root/Cargo.toml" \
   --no-default-features --features backend-cuda --lib --no-run 2>&1 \

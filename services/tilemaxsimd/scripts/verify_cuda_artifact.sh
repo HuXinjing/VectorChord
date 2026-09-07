@@ -18,6 +18,7 @@ expected_ptx=${VCTM_EXPECTED_PTX:-sm_90}
 async_images=${VCTM_VERIFY_ASYNC_IMAGES-sm_89,sm_90a}
 fp8_images=${VCTM_VERIFY_FP8_IMAGES-sm_89,sm_90a}
 pq_images=${VCTM_VERIFY_PQ_IMAGES-sm_89,sm_90a}
+double_buffer_images=${VCTM_VERIFY_DOUBLE_BUFFER_IMAGES-sm_89,sm_90a}
 IFS=',' read -r -a cubins <<<"$expected_cubins"
 for image in "${cubins[@]}"; do
   if ! grep -q "tilemaxsim_cuda.${image}.cubin" <<<"$listing"; then
@@ -35,7 +36,7 @@ fi
 temporary=$(mktemp -d "${TMPDIR:-/tmp}/tilemaxsim-cuda.XXXXXX")
 trap 'rm -rf "$temporary"' EXIT
 archive=$(realpath "$archive")
-IFS=',' read -r -a inspected <<<"$async_images,$fp8_images,$pq_images"
+IFS=',' read -r -a inspected <<<"$async_images,$fp8_images,$pq_images,$double_buffer_images"
 for image in $(printf '%s\n' "${inspected[@]}" | awk 'NF && !seen[$0]++'); do
   (
     cd "$temporary"
@@ -57,7 +58,15 @@ for image in $(printf '%s\n' "${inspected[@]}" | awk 'NF && !seen[$0]++'); do
         exit 1
       fi
     fi
+    if [[ ",$double_buffer_images," == *",$image,"* ]]; then
+      resources=$(cuobjdump --dump-resource-usage "tilemaxsim_cuda.${image}.cubin")
+      if ! grep -q 'ELh1ELb0E' <<<"$resources" ||
+         ! grep -q 'ELh1ELb1E' <<<"$resources"; then
+        echo "${image} artifact is missing an exact single/double-buffer dispatch variant" >&2
+        exit 1
+      fi
+    fi
   )
 done
 
-echo "verified CUDA images: ${expected_cubins} and ${expected_ptx} PTX; async tile copy: ${async_images:-not asserted}; native E4M3: ${fp8_images:-not asserted}; PQ ADC variants: ${pq_images:-not asserted}"
+echo "verified CUDA images: ${expected_cubins} and ${expected_ptx} PTX; async tile copy: ${async_images:-not asserted}; native E4M3: ${fp8_images:-not asserted}; PQ ADC variants: ${pq_images:-not asserted}; exact row-buffer variants: ${double_buffer_images:-not asserted}"
