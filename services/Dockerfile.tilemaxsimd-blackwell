@@ -1,0 +1,57 @@
+ARG CUDA_DEVEL_IMAGE=nvidia/cuda:13.3.1-devel-ubuntu24.04@sha256:4ff859525f99de5782aa73607ce24219b07dddd48d12b97c1c301d7e1cfb0a87
+ARG RUNTIME_IMAGE=ubuntu:24.04@sha256:33ceb71981b602c1a7443a53469e4dba065f7503eab3078a2d7a57a2ab987517
+
+FROM ${CUDA_DEVEL_IMAGE} AS build
+
+RUN apt-get update \
+    && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+        build-essential ca-certificates curl \
+    && rm -rf /var/lib/apt/lists/*
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+    | sh -s -- -y --profile minimal --default-toolchain 1.96.0
+
+ENV PATH=/root/.cargo/bin:${PATH}
+# CUDA 13 is intentionally isolated from the CUDA 12 Ada/Hopper artifact.
+# sm_121 is the native GB10/DGX Spark target; compute_121 is retained for
+# forward-compatible loading on later family-compatible devices.
+ENV TILEMAXSIM_CUDA_ARCHS=120,121,121-virtual
+WORKDIR /build/tilemaxsimd
+COPY services/tilemaxsimd/ .
+RUN cargo build --release --locked
+
+FROM build AS test
+ENV VCTM_EXPECTED_CUBINS=sm_120,sm_121
+ENV VCTM_EXPECTED_PTX=sm_121
+ENV VCTM_VERIFY_ASYNC_IMAGES=""
+ENV VCTM_VERIFY_FP8_IMAGES=""
+RUN rustup component add clippy rustfmt \
+    && cargo fmt --check \
+    && cargo clippy --all-targets --locked -- -D warnings \
+    && cargo test --locked \
+    && scripts/verify_cuda_artifact.sh
+
+FROM ${RUNTIME_IMAGE} AS runtime-base
+
+RUN apt-get update \
+    && DEBIAN_FRONTEND=noninteractive apt-get upgrade -y \
+    && rm -rf /var/lib/apt/lists/*
+
+FROM runtime-base
+
+COPY --from=build /build/tilemaxsimd/target/release/tilemaxsimd /usr/local/bin/tilemaxsimd
+COPY --from=build /build/tilemaxsimd/target/release/tilemaxsimctl /usr/local/bin/tilemaxsimctl
+RUN /usr/local/bin/tilemaxsimd --help >/dev/null \
+    && /usr/local/bin/tilemaxsimctl --help >/dev/null \
+    && groupadd --system vectorchord \
+    && useradd --system --gid vectorchord --home-dir /nonexistent \
+        --shell /usr/sbin/nologin vectorchord \
+    && install -d -o vectorchord -g vectorchord -m 0750 \
+        /run/vectorchord /var/lib/vectorchord
+
+USER vectorchord:vectorchord
+
+STOPSIGNAL SIGTERM
+HEALTHCHECK --interval=10s --timeout=2s --start-period=5m --retries=3 \
+    CMD ["/usr/local/bin/tilemaxsimctl", "--socket", "/run/vectorchord/tilemaxsim-status.sock"]
+
+ENTRYPOINT ["/usr/local/bin/tilemaxsimd"]

@@ -109,6 +109,11 @@ TILEMAXSIM_CUDA_ARCHS=89,90,120,121,121-virtual cargo build \
   --release --manifest-path services/tilemaxsimd/Cargo.toml
 ```
 
+The repository also provides `services/Dockerfile.tilemaxsimd-blackwell`, a
+pinned multi-architecture CUDA 13.3 build that emits native SM120/SM121 code
+and compute_121 PTX. It is separate from the CUDA 12 Ada/Hopper image so an
+older production toolchain cannot silently drop the DGX Spark target.
+
 An architecture appearing in the binary means only that it can be loaded.
 Architecture-specific kernels and same-device numerical/performance regression
 remain required before that device is advertised as tuned.

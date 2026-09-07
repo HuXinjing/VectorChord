@@ -208,6 +208,26 @@ jobs:
         if: runner.os == 'Linux'
         run: docker build --check -f services/Dockerfile.tilemaxsimd-cpu .
 
+  tilemaxsimd_blackwell_artifact:
+    name: TileMaxSim CUDA 13 Blackwell artifact
+    if: |
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'pull_request' && contains(github.event.pull_request.body, 'job: +tilemaxsimd_blackwell'))
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Free space for the CUDA 13 build image
+        run: |
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup
+          docker builder prune --all --force
+
+      - name: Build and inspect native SM120/SM121 code
+        run: >-
+          docker build --target test
+          -f services/Dockerfile.tilemaxsimd-blackwell .
+
   miri:
     if: |
       (github.event_name == 'push' && contains(github.event.head_commit.message, 'job: +miri')) ||

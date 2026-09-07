@@ -51,8 +51,11 @@ experimental rather than production-supported.
 ## NVIDIA architecture policy
 
 The CUDA 12 artifact contains native `sm_80`, `sm_89`, `sm_90`, `sm_90a` and
-forward-compatible `compute_90` PTX. CUDA 13 Blackwell builders produce native
-targets independently. Runtime dispatch uses the device architecture and a
+forward-compatible `compute_90` PTX. The independent CUDA 13.3 Blackwell image
+(`services/Dockerfile.tilemaxsimd-blackwell`) contains native `sm_120` and
+`sm_121` plus `compute_121` PTX; SM121 is the GB10/DGX Spark target. Its opt-in
+CI job inspects the resulting cubins instead of treating a build flag as proof.
+Runtime dispatch uses the device architecture and a
 production-shaped 320-dimensional microbenchmark rather than a model-name-only
 rule.
 
@@ -70,6 +73,10 @@ rule.
   architecture-neutral. Resident batches execute concurrently across devices
   instead of serializing an eight-GPU node. H200 is not marked validated until
   same-device conformance, Nsight and latency tests pass.
+- Blackwell/GB10 uses the isolated CUDA 13 SM121 image and the same startup
+  numerical calibration. It is loadable and artifact-checked, but it is not
+  advertised as tuned until the exact/quantized conformance and latency gates
+  run on a physical DGX Spark.
 - Cache uploads use the device's least-urgent stream priority and foreground
   scoring uses its most-urgent priority. This does not interrupt an executing
   kernel; scheduler quantum boundaries remain the preemption points.
