@@ -994,9 +994,34 @@ extern "C" int vctm_gpu_score_batch_tensor(
 }
 
 template <typename QueryScalar>
+__global__ void rotate_queries_kernel(
+    const QueryScalar *query, uint32_t query_rows,
+    const VctmQuantizer quantizer, float *rotated, size_t count) {
+  for (size_t task = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+       task < count; task += static_cast<size_t>(gridDim.x) * blockDim.x) {
+    size_t cursor = task;
+    const uint32_t destination = cursor % quantizer.dimension;
+    cursor /= quantizer.dimension;
+    const uint32_t query_row = cursor % query_rows;
+    const size_t rotation_rank = cursor / query_rows;
+    const float *rotation = quantizer.payload +
+        rotation_rank * quantizer.dimension * quantizer.dimension;
+    const QueryScalar *query_vector =
+        query + static_cast<size_t>(query_row) * quantizer.dimension;
+    float value = 0.0f;
+    for (uint32_t source = 0; source < quantizer.dimension; ++source)
+      value = fmaf(scalar_to_float(query_vector[source]),
+                   rotation[static_cast<size_t>(source) * quantizer.dimension +
+                            destination],
+                   value);
+    rotated[task] = value;
+  }
+}
+
+template <typename QueryScalar>
 __global__ void pq_lut_kernel(
     const QueryScalar *query, uint32_t query_rows, const VctmQuantizer quantizer,
-    float *luts, size_t count) {
+    const float *rotated_queries, float *luts, size_t count) {
   const size_t index = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
   if (index >= count) return;
   size_t cursor = index;
@@ -1015,11 +1040,9 @@ __global__ void pq_lut_kernel(
     const uint32_t dimension = static_cast<uint32_t>(subspace) * subdimension + local;
     float query_value = scalar_to_float(query[static_cast<size_t>(query_row) * quantizer.dimension + dimension]);
     if ((quantizer.rotation_mask >> stage) & 1) {
-      query_value = 0.0f;
-      const float *rotation = quantizer.payload + rotation_rank * quantizer.dimension * quantizer.dimension;
-      for (uint32_t source = 0; source < quantizer.dimension; ++source)
-        query_value = fmaf(scalar_to_float(query[static_cast<size_t>(query_row) * quantizer.dimension + source]),
-                           rotation[static_cast<size_t>(source) * quantizer.dimension + dimension], query_value);
+      query_value = rotated_queries[
+          (rotation_rank * query_rows + query_row) * quantizer.dimension +
+          dimension];
     }
     const size_t center = (((static_cast<size_t>(stage) * quantizer.subspaces + subspace)
         * quantizer.centroids + centroid) * subdimension + local);
@@ -1236,20 +1259,31 @@ extern "C" int vctm_gpu_score_pq(
   }
   cudaError_t status = cudaSetDevice(gpu->device);
   if (status != cudaSuccess) return cuda_fail(error, error_capacity, "cudaSetDevice", status);
-  size_t maxima_count = 0, lut_count = 0;
+  size_t maxima_count = 0, lut_count = 0, rotated_count = 0;
+  const size_t rotations =
+      __builtin_popcount(static_cast<unsigned int>(quantizer->rotation_mask));
   if (!checked_mul(count, query_rows, &maxima_count) ||
       !checked_mul(query_rows, quantizer->stages, &lut_count) ||
       !checked_mul(lut_count, quantizer->subspaces, &lut_count) ||
-      !checked_mul(lut_count, quantizer->centroids, &lut_count))
+      !checked_mul(lut_count, quantizer->centroids, &lut_count) ||
+      !checked_mul(rotations, query_rows, &rotated_count) ||
+      !checked_mul(rotated_count, quantizer->dimension, &rotated_count))
     return fail(error, error_capacity, "PQ request shape overflows address space");
+  size_t rotated_bytes = 0, lut_bytes = 0, maxima_bytes = 0;
+  if (!checked_mul(rotated_count, sizeof(float), &rotated_bytes) ||
+      !checked_mul(lut_count, sizeof(float), &lut_bytes) ||
+      !checked_mul(maxima_count, sizeof(float), &maxima_bytes))
+    return fail(error, error_capacity, "PQ workspace size overflows address space");
   unsigned char *workspace = gpu->allocation + gpu->tensor_bytes;
   size_t cursor = 0, query_offset = 0, offsets_offset = 0, rows_offset = 0,
-         lut_offset = 0, maxima_offset = 0, scores_offset = 0;
+         rotated_offset = 0, lut_offset = 0, maxima_offset = 0,
+         scores_offset = 0;
   if (!reserve_aligned(&cursor, query_bytes, &query_offset) ||
       !reserve_aligned(&cursor, count * sizeof(uint64_t), &offsets_offset) ||
       !reserve_aligned(&cursor, count * sizeof(uint32_t), &rows_offset) ||
-      !reserve_aligned(&cursor, lut_count * sizeof(float), &lut_offset) ||
-      !reserve_aligned(&cursor, maxima_count * sizeof(float), &maxima_offset) ||
+      !reserve_aligned(&cursor, rotated_bytes, &rotated_offset) ||
+      !reserve_aligned(&cursor, lut_bytes, &lut_offset) ||
+      !reserve_aligned(&cursor, maxima_bytes, &maxima_offset) ||
       !reserve_aligned(&cursor, count * sizeof(float), &scores_offset) ||
       cursor > gpu->workspace_bytes)
     return fail(error, error_capacity, "PQ request exceeds configured GPU workspace");
@@ -1257,11 +1291,29 @@ extern "C" int vctm_gpu_score_pq(
   if (status == cudaSuccess) status = cudaMemcpyAsync(workspace + offsets_offset, document_offsets, count * sizeof(uint64_t), cudaMemcpyHostToDevice, gpu->compute_stream);
   if (status == cudaSuccess) status = cudaMemcpyAsync(workspace + rows_offset, document_rows, count * sizeof(uint32_t), cudaMemcpyHostToDevice, gpu->compute_stream);
   constexpr unsigned int threads = 256;
+  if (status == cudaSuccess && rotated_count != 0) {
+    const unsigned int rotation_blocks = static_cast<unsigned int>(std::min(
+        (rotated_count + threads - 1) / threads,
+        static_cast<size_t>(65'535)));
+    if (dtype == 2)
+      rotate_queries_kernel<half><<<rotation_blocks, threads, 0,
+          gpu->compute_stream>>>(
+          reinterpret_cast<const half *>(workspace + query_offset), query_rows,
+          *quantizer, reinterpret_cast<float *>(workspace + rotated_offset),
+          rotated_count);
+    else if (dtype == 1)
+      rotate_queries_kernel<float><<<rotation_blocks, threads, 0,
+          gpu->compute_stream>>>(
+          reinterpret_cast<const float *>(workspace + query_offset), query_rows,
+          *quantizer, reinterpret_cast<float *>(workspace + rotated_offset),
+          rotated_count);
+    status = cudaGetLastError();
+  }
   const unsigned int lut_blocks = static_cast<unsigned int>((lut_count + threads - 1) / threads);
   if (status == cudaSuccess && dtype == 2)
-    pq_lut_kernel<half><<<lut_blocks, threads, 0, gpu->compute_stream>>>(reinterpret_cast<const half *>(workspace + query_offset), query_rows, *quantizer, reinterpret_cast<float *>(workspace + lut_offset), lut_count);
+    pq_lut_kernel<half><<<lut_blocks, threads, 0, gpu->compute_stream>>>(reinterpret_cast<const half *>(workspace + query_offset), query_rows, *quantizer, reinterpret_cast<const float *>(workspace + rotated_offset), reinterpret_cast<float *>(workspace + lut_offset), lut_count);
   else if (status == cudaSuccess && dtype == 1)
-    pq_lut_kernel<float><<<lut_blocks, threads, 0, gpu->compute_stream>>>(reinterpret_cast<const float *>(workspace + query_offset), query_rows, *quantizer, reinterpret_cast<float *>(workspace + lut_offset), lut_count);
+    pq_lut_kernel<float><<<lut_blocks, threads, 0, gpu->compute_stream>>>(reinterpret_cast<const float *>(workspace + query_offset), query_rows, *quantizer, reinterpret_cast<const float *>(workspace + rotated_offset), reinterpret_cast<float *>(workspace + lut_offset), lut_count);
   else if (status == cudaSuccess) return fail(error, error_capacity, "unsupported PQ query dtype");
   if (status == cudaSuccess) status = cudaGetLastError();
   const size_t kernel_blocks = std::min(maxima_count, static_cast<size_t>(65'535));
