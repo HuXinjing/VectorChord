@@ -154,6 +154,42 @@ jobs:
       - name: Validate VectorChord PostgreSQL Dockerfile
         run: docker build --check -f services/Dockerfile.postgres .
 
+  tilemaxsimd_portable_cpu:
+    name: TileMaxSim CPU (${{ matrix.name }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Linux x86_64
+            runner: ubuntu-24.04
+          - name: macOS arm64
+            runner: macos-15
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Install stable Rust
+        uses: dtolnay/rust-toolchain@5d458579430fc14a04a08a1e7d3694f545e91ce6 # stable
+        with:
+          toolchain: stable
+          components: clippy
+
+      - name: Test exact portable backend
+        run: >-
+          cargo test --manifest-path services/tilemaxsimd/Cargo.toml
+          --no-default-features --features backend-cpu --all-targets
+
+      - name: Lint exact portable backend
+        run: >-
+          cargo clippy --manifest-path services/tilemaxsimd/Cargo.toml
+          --no-default-features --features backend-cpu --all-targets
+          -- -D warnings
+
+      - name: Validate CPU-only image
+        if: runner.os == 'Linux'
+        run: docker build --check -f services/Dockerfile.tilemaxsimd-cpu .
+
   miri:
     if: |
       (github.event_name == 'push' && contains(github.event.head_commit.message, 'job: +miri')) ||

@@ -169,6 +169,18 @@ jobs:
             --exit-code 1 "${IMAGE}:${SEMVER}"
           docker push "${IMAGE}:${SEMVER}"
 
+      - name: Build and publish CPU-only TileMaxSim image
+        env:
+          SEMVER: ${{ needs.semver.outputs.SEMVER }}
+        run: |
+          IMAGE=$(echo "ghcr.io/${GITHUB_REPOSITORY_OWNER}/vectorchord-tilemaxsimd" | tr '[:upper:]' '[:lower:]')
+          docker build -f services/Dockerfile.tilemaxsimd-cpu -t "${IMAGE}:${SEMVER}-cpu" .
+          docker run --rm -v /var/run/docker.sock:/var/run/docker.sock \
+            aquasec/trivy:0.72.0@sha256:cffe3f5161a47a6823fbd23d985795b3ed72a4c806da4c4df16266c02accdd6f \
+            image --scanners vuln --severity HIGH,CRITICAL --ignore-unfixed \
+            --exit-code 1 "${IMAGE}:${SEMVER}-cpu"
+          docker push "${IMAGE}:${SEMVER}-cpu"
+
   postgres-image:
     runs-on: ubuntu-24.04
     needs: ["semver", "build"]
