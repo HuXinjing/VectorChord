@@ -28,6 +28,7 @@ pub struct BackendCapabilities {
     pub matrix_engine: bool,
     pub asynchronous_copy: bool,
     pub unified_memory: bool,
+    pub persisting_l2: bool,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -45,6 +46,7 @@ pub struct DeviceInfo {
     pub memory_bus_width_bits: Option<u32>,
     pub memory_clock_khz: Option<u32>,
     pub shared_memory_per_block_bytes: Option<u64>,
+    pub persisting_l2_bytes: Option<u64>,
     pub compute_queue_priority: Option<i32>,
     pub tuning_profile: String,
     pub capabilities: BackendCapabilities,

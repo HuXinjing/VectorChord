@@ -41,6 +41,7 @@ impl CpuBackend {
                 memory_bus_width_bits: None,
                 memory_clock_khz: None,
                 shared_memory_per_block_bytes: None,
+                persisting_l2_bytes: None,
                 compute_queue_priority: None,
                 tuning_profile: cpu_tuning_profile().to_owned(),
                 capabilities: BackendCapabilities {
@@ -55,6 +56,7 @@ impl CpuBackend {
                     matrix_engine: false,
                     asynchronous_copy: false,
                     unified_memory: true,
+                    persisting_l2: false,
                 },
             },
         })

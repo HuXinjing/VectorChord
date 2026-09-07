@@ -33,6 +33,8 @@ struct VctmGpu {
   cudaStream_t compute_stream;
   cublasHandle_t cublas;
   int compute_stream_priority;
+  size_t persisting_l2_bytes;
+  size_t access_policy_max_window_bytes;
 };
 
 struct VctmQuantizer {
@@ -44,6 +46,48 @@ struct VctmQuantizer {
   uint16_t subspaces;
   uint16_t centroids;
   uint16_t rotation_mask;
+};
+
+// CUDA access-policy windows are stream state. Keep the policy scoped to one
+// score operation so an error path cannot accidentally pin unrelated request
+// metadata or result buffers in L2. Failure is deliberately non-fatal: MIG and
+// some driver/device combinations expose the property but reject the limit.
+class ScopedPersistingQuery {
+ public:
+  ScopedPersistingQuery(VctmGpu *gpu, void *base, size_t bytes)
+      : gpu_(gpu), enabled_(false) {
+    if (gpu == nullptr || gpu->persisting_l2_bytes == 0 ||
+        gpu->access_policy_max_window_bytes == 0 || bytes == 0) return;
+    cudaStreamAttrValue value{};
+    value.accessPolicyWindow.base_ptr = base;
+    value.accessPolicyWindow.num_bytes = std::min(
+        bytes, std::min(gpu->persisting_l2_bytes,
+                        gpu->access_policy_max_window_bytes));
+    value.accessPolicyWindow.hitRatio = 1.0f;
+    value.accessPolicyWindow.hitProp = cudaAccessPropertyPersisting;
+    value.accessPolicyWindow.missProp = cudaAccessPropertyNormal;
+    enabled_ = cudaStreamSetAttribute(
+                   gpu->compute_stream, cudaStreamAttributeAccessPolicyWindow,
+                   &value) == cudaSuccess;
+    if (!enabled_) cudaGetLastError();
+  }
+
+  ~ScopedPersistingQuery() {
+    if (!enabled_) return;
+    cudaStreamAttrValue value{};
+    value.accessPolicyWindow.num_bytes = 0;
+    if (cudaStreamSetAttribute(gpu_->compute_stream,
+                               cudaStreamAttributeAccessPolicyWindow,
+                               &value) != cudaSuccess)
+      cudaGetLastError();
+  }
+
+  ScopedPersistingQuery(const ScopedPersistingQuery &) = delete;
+  ScopedPersistingQuery &operator=(const ScopedPersistingQuery &) = delete;
+
+ private:
+  VctmGpu *gpu_;
+  bool enabled_;
 };
 
 static int fail(char *error, size_t capacity, const char *message);
@@ -201,6 +245,23 @@ extern "C" int vctm_gpu_create(int device, size_t total_bytes,
     delete gpu;
     return cublas_fail(error, error_capacity, "cublasCreate", blas_status);
   }
+  cudaDeviceProp properties{};
+  if (cudaGetDeviceProperties(&properties, device) == cudaSuccess &&
+      properties.persistingL2CacheMaxSize > 0 &&
+      properties.accessPolicyMaxWindowSize > 0) {
+    gpu->persisting_l2_bytes = std::min(
+        static_cast<size_t>(properties.persistingL2CacheMaxSize),
+        static_cast<size_t>(4) * 1024 * 1024);
+    if (cudaDeviceSetLimit(cudaLimitPersistingL2CacheSize,
+                           gpu->persisting_l2_bytes) == cudaSuccess) {
+      gpu->access_policy_max_window_bytes =
+          static_cast<size_t>(properties.accessPolicyMaxWindowSize);
+    } else {
+      gpu->persisting_l2_bytes = 0;
+      gpu->access_policy_max_window_bytes = 0;
+      cudaGetLastError();
+    }
+  }
   std::memset(gpu->host_staging, 0, gpu->host_staging_bytes);
   *output = gpu;
   return 0;
@@ -241,13 +302,13 @@ extern "C" int vctm_gpu_device_info(
     int *cublas_version, uint64_t *total_memory_bytes,
     int *multiprocessors, int *warp_size, int *memory_bus_width_bits,
     int *memory_clock_khz, uint64_t *shared_memory_per_block_bytes,
-    int *compute_stream_priority) {
+    int *compute_stream_priority, uint64_t *persisting_l2_bytes) {
   if (gpu == nullptr || driver_version == nullptr || runtime_version == nullptr ||
       cublas_version == nullptr || total_memory_bytes == nullptr ||
       multiprocessors == nullptr || warp_size == nullptr ||
       memory_bus_width_bits == nullptr || memory_clock_khz == nullptr ||
       shared_memory_per_block_bytes == nullptr ||
-      compute_stream_priority == nullptr) return 1;
+      compute_stream_priority == nullptr || persisting_l2_bytes == nullptr) return 1;
   cudaDeviceProp properties{};
   if (cudaDriverGetVersion(driver_version) != cudaSuccess ||
       cudaRuntimeGetVersion(runtime_version) != cudaSuccess ||
@@ -261,6 +322,7 @@ extern "C" int vctm_gpu_device_info(
   *shared_memory_per_block_bytes =
       static_cast<uint64_t>(properties.sharedMemPerBlock);
   *compute_stream_priority = gpu->compute_stream_priority;
+  *persisting_l2_bytes = static_cast<uint64_t>(gpu->persisting_l2_bytes);
   return 0;
 }
 
@@ -691,6 +753,7 @@ extern "C" int vctm_gpu_score_batch_tensor(
   status = cudaMemcpyAsync(workspace + query_offset, queries, query_bytes, cudaMemcpyHostToDevice, gpu->compute_stream);
   if (status == cudaSuccess) status = cudaMemcpyAsync(workspace + query_offsets_offset, query_offsets, (request_count + 1) * sizeof(uint32_t), cudaMemcpyHostToDevice, gpu->compute_stream);
   if (status != cudaSuccess) return cuda_fail(error, error_capacity, "tensor-core workspace initialization", status);
+  ScopedPersistingQuery query_policy(gpu, workspace + query_offset, query_bytes);
   const float alpha = 1.0f, beta = 0.0f;
   for (const auto &[rows, candidates] : row_groups) {
     size_t matrix_values = 0;

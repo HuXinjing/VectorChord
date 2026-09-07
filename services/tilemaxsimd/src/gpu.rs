@@ -51,6 +51,7 @@ unsafe extern "C" {
         memory_clock_khz: *mut c_int,
         shared_memory_per_block_bytes: *mut u64,
         compute_stream_priority: *mut c_int,
+        persisting_l2_bytes: *mut u64,
     ) -> c_int;
     fn vctm_quantizer_create(
         device: c_int,
@@ -198,6 +199,7 @@ impl Gpu {
         let mut memory_clock_khz = 0;
         let mut shared_memory_per_block_bytes = 0_u64;
         let mut compute_stream_priority = 0;
+        let mut persisting_l2_bytes = 0_u64;
         let info_status = unsafe {
             vctm_gpu_device_info(
                 native.as_ptr(),
@@ -211,6 +213,7 @@ impl Gpu {
                 &mut memory_clock_khz,
                 &mut shared_memory_per_block_bytes,
                 &mut compute_stream_priority,
+                &mut persisting_l2_bytes,
             )
         };
         let tensor_threshold_rows = if capability_status == 0 {
@@ -250,6 +253,8 @@ impl Gpu {
                 memory_clock_khz: (info_status == 0).then_some(memory_clock_khz as u32),
                 shared_memory_per_block_bytes: (info_status == 0)
                     .then_some(shared_memory_per_block_bytes),
+                persisting_l2_bytes: (info_status == 0 && persisting_l2_bytes != 0)
+                    .then_some(persisting_l2_bytes),
                 compute_queue_priority: (info_status == 0).then_some(compute_stream_priority),
                 tuning_profile: match (major, minor) {
                     (8, 9) => "cuda-ada".to_owned(),
@@ -270,6 +275,7 @@ impl Gpu {
                     matrix_engine: tensor_threshold_rows != u32::MAX,
                     asynchronous_copy: true,
                     unified_memory: false,
+                    persisting_l2: info_status == 0 && persisting_l2_bytes != 0,
                 },
             },
         };
@@ -870,6 +876,10 @@ mod tests {
         assert_eq!(info.warp_size, Some(32));
         assert!(info.compute_queue_priority.is_some());
         assert!(info.tuning_profile.starts_with("cuda-"));
+        assert_eq!(
+            info.capabilities.persisting_l2,
+            info.persisting_l2_bytes.is_some()
+        );
     }
 
     #[test]
