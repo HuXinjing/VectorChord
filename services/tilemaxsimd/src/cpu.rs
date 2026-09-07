@@ -398,6 +398,8 @@ mod tests {
         let report = crate::backend::run_conformance_probe(&mut cpu).unwrap();
         assert_eq!(report.backend, BackendKind::Cpu);
         assert_eq!(report.exact_fp32_score, report.expected_score);
+        assert_eq!(report.exact_fp16_score, report.expected_score);
+        assert!(report.batched_fp16_scores.is_none());
     }
 
     #[test]

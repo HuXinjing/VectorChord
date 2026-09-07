@@ -176,6 +176,8 @@ pub struct ConformanceReport {
     pub backend: BackendKind,
     pub architecture: String,
     pub exact_fp32_score: f32,
+    pub exact_fp16_score: f32,
+    pub batched_fp16_scores: Option<Vec<f32>>,
     pub expected_score: f32,
 }
 
@@ -183,8 +185,8 @@ pub struct ConformanceReport {
 /// before serving requests; it verifies actual upload and exact MaxSim
 /// execution rather than trusting a capability bit.
 pub fn run_conformance_probe(backend: &mut dyn AcceleratorBackend) -> Result<ConformanceReport> {
-    if !backend.info().capabilities.exact_fp32 {
-        anyhow::bail!("backend conformance requires exact FP32 support");
+    if !backend.info().capabilities.exact_fp32 || !backend.info().capabilities.exact_fp16 {
+        anyhow::bail!("backend conformance requires exact FP32 and FP16 support");
     }
     let document = [1.0_f32, 0.0, 0.0, 1.0]
         .into_iter()
@@ -202,10 +204,53 @@ pub fn run_conformance_probe(backend: &mut dyn AcceleratorBackend) -> Result<Con
             "backend exact MaxSim conformance failed: expected {expected}, received {score}"
         );
     }
+    let document_fp16 = [0x3c00_u16, 0, 0, 0x3c00]
+        .into_iter()
+        .flat_map(u16::to_le_bytes)
+        .collect::<Vec<_>>();
+    let query_fp16 = [0x3c00_u16, 0, 0x3800, 0x3800]
+        .into_iter()
+        .flat_map(u16::to_le_bytes)
+        .collect::<Vec<_>>();
+    backend.upload_batch(&[(256, &document_fp16)])?;
+    let fp16_score = backend.score(&query_fp16, 2, 2, 2, 1, &[256], &[2])?[0];
+    if !fp16_score.is_finite() || (fp16_score - expected).abs() > 1.0e-3 {
+        anyhow::bail!(
+            "backend FP16 MaxSim conformance failed: expected {expected}, received {fp16_score}"
+        );
+    }
+    let batched_fp16_scores = if backend.info().capabilities.fused_multiquery {
+        let values = backend.score_batch(&query_fp16, &[0, 1, 2], 2, 2, 1, &[256], &[2])?;
+        let values = values
+            .into_iter()
+            .map(|request| {
+                request
+                    .into_iter()
+                    .next()
+                    .ok_or_else(|| anyhow::anyhow!("backend batch conformance returned no score"))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let expected_batch = [1.0_f32, 0.5];
+        if values.len() != expected_batch.len()
+            || values
+                .iter()
+                .zip(expected_batch)
+                .any(|(actual, expected)| (actual - expected).abs() > 1.0e-3)
+        {
+            anyhow::bail!(
+                "backend fused FP16 batch conformance failed: expected {expected_batch:?}, received {values:?}"
+            );
+        }
+        Some(values)
+    } else {
+        None
+    };
     Ok(ConformanceReport {
         backend: backend.info().backend,
         architecture: backend.info().architecture.clone(),
         exact_fp32_score: score,
+        exact_fp16_score: fp16_score,
+        batched_fp16_scores,
         expected_score: expected,
     })
 }

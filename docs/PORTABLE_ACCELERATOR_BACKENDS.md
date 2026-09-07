@@ -47,6 +47,12 @@ They must implement `AcceleratorBackend`, publish truthful `DeviceInfo` and
 Unsupported profiles fail before cache mutation or execution; substituting a
 different precision is forbidden.
 
+The shared conformance probe executes both FP32 and FP16 exact MaxSim against
+known values. If a backend advertises fused multiquery, the same probe submits
+two independent FP16 requests in one batch and validates their separate
+results. A backend therefore cannot become eligible merely by setting a
+capability flag without implementing the corresponding execution path.
+
 The Apple build is produced independently and never links CUDA:
 
 ```bash

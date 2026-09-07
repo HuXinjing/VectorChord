@@ -348,6 +348,8 @@ mod tests {
         let report = crate::backend::run_conformance_probe(&mut backend).unwrap();
         assert_eq!(report.backend, BackendKind::Metal);
         assert_eq!(report.exact_fp32_score, report.expected_score);
+        assert_eq!(report.exact_fp16_score, report.expected_score);
+        assert_eq!(report.batched_fp16_scores, Some(vec![1.0, 0.5]));
     }
 
     #[test]
