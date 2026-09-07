@@ -36,6 +36,7 @@ struct VctmGpu {
   cudaStream_t compute_stream;
   cublasHandle_t cublas;
   int compute_major;
+  size_t matrix_engine_workspace_bytes;
   int compute_stream_priority;
   size_t persisting_l2_bytes;
   size_t access_policy_max_window_bytes;
@@ -253,6 +254,26 @@ extern "C" int vctm_gpu_create(int device, size_t total_bytes,
   if (cudaGetDeviceProperties(&properties, device) == cudaSuccess) {
     gpu->compute_major = properties.major;
   }
+  // Give cuBLAS stable scratch space instead of letting it allocate during a
+  // latency-sensitive score call. Hopper gets a larger budget because its
+  // grouped Tensor Core algorithms can profit from more staging workspace.
+  const size_t desired_blas_workspace =
+      gpu->compute_major >= 9 ? static_cast<size_t>(32) * 1024 * 1024
+                              : static_cast<size_t>(4) * 1024 * 1024;
+  gpu->matrix_engine_workspace_bytes =
+      std::min(desired_blas_workspace, gpu->workspace_bytes / 4) &
+      ~static_cast<size_t>(255);
+  if (gpu->matrix_engine_workspace_bytes != 0) {
+    void *blas_workspace = gpu->allocation + gpu->total_bytes -
+                           gpu->matrix_engine_workspace_bytes;
+    if (cublasSetWorkspace(gpu->cublas, blas_workspace,
+                           gpu->matrix_engine_workspace_bytes) ==
+        CUBLAS_STATUS_SUCCESS) {
+      gpu->workspace_bytes -= gpu->matrix_engine_workspace_bytes;
+    } else {
+      gpu->matrix_engine_workspace_bytes = 0;
+    }
+  }
   if (gpu->compute_major != 0 &&
       properties.persistingL2CacheMaxSize > 0 &&
       properties.accessPolicyMaxWindowSize > 0) {
@@ -309,13 +330,15 @@ extern "C" int vctm_gpu_device_info(
     int *cublas_version, uint64_t *total_memory_bytes,
     int *multiprocessors, int *warp_size, int *memory_bus_width_bits,
     int *memory_clock_khz, uint64_t *shared_memory_per_block_bytes,
-    int *compute_stream_priority, uint64_t *persisting_l2_bytes) {
+    int *compute_stream_priority, uint64_t *persisting_l2_bytes,
+    uint64_t *matrix_engine_workspace_bytes) {
   if (gpu == nullptr || driver_version == nullptr || runtime_version == nullptr ||
       cublas_version == nullptr || total_memory_bytes == nullptr ||
       multiprocessors == nullptr || warp_size == nullptr ||
       memory_bus_width_bits == nullptr || memory_clock_khz == nullptr ||
       shared_memory_per_block_bytes == nullptr ||
-      compute_stream_priority == nullptr || persisting_l2_bytes == nullptr) return 1;
+      compute_stream_priority == nullptr || persisting_l2_bytes == nullptr ||
+      matrix_engine_workspace_bytes == nullptr) return 1;
   cudaDeviceProp properties{};
   if (cudaDriverGetVersion(driver_version) != cudaSuccess ||
       cudaRuntimeGetVersion(runtime_version) != cudaSuccess ||
@@ -330,6 +353,8 @@ extern "C" int vctm_gpu_device_info(
       static_cast<uint64_t>(properties.sharedMemPerBlock);
   *compute_stream_priority = gpu->compute_stream_priority;
   *persisting_l2_bytes = static_cast<uint64_t>(gpu->persisting_l2_bytes);
+  *matrix_engine_workspace_bytes =
+      static_cast<uint64_t>(gpu->matrix_engine_workspace_bytes);
   return 0;
 }
 

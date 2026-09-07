@@ -52,6 +52,7 @@ unsafe extern "C" {
         shared_memory_per_block_bytes: *mut u64,
         compute_stream_priority: *mut c_int,
         persisting_l2_bytes: *mut u64,
+        matrix_engine_workspace_bytes: *mut u64,
     ) -> c_int;
     fn vctm_quantizer_create(
         device: c_int,
@@ -200,6 +201,7 @@ impl Gpu {
         let mut shared_memory_per_block_bytes = 0_u64;
         let mut compute_stream_priority = 0;
         let mut persisting_l2_bytes = 0_u64;
+        let mut matrix_engine_workspace_bytes = 0_u64;
         let info_status = unsafe {
             vctm_gpu_device_info(
                 native.as_ptr(),
@@ -214,6 +216,7 @@ impl Gpu {
                 &mut shared_memory_per_block_bytes,
                 &mut compute_stream_priority,
                 &mut persisting_l2_bytes,
+                &mut matrix_engine_workspace_bytes,
             )
         };
         let tensor_threshold_rows = if capability_status == 0 {
@@ -255,6 +258,9 @@ impl Gpu {
                     .then_some(shared_memory_per_block_bytes),
                 persisting_l2_bytes: (info_status == 0 && persisting_l2_bytes != 0)
                     .then_some(persisting_l2_bytes),
+                matrix_engine_workspace_bytes: (info_status == 0
+                    && matrix_engine_workspace_bytes != 0)
+                    .then_some(matrix_engine_workspace_bytes),
                 compute_queue_priority: (info_status == 0).then_some(compute_stream_priority),
                 tuning_profile: match (major, minor) {
                     (8, 9) => "cuda-ada".to_owned(),
