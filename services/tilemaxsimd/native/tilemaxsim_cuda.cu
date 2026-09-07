@@ -10,7 +10,10 @@
 
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
+#include <cuda/barrier>
 #include <cublas_v2.h>
+#include <cooperative_groups.h>
+#include <cooperative_groups/memcpy_async.h>
 #include <math_constants.h>
 
 #include <algorithm>
@@ -32,6 +35,7 @@ struct VctmGpu {
   cudaStream_t upload_stream;
   cudaStream_t compute_stream;
   cublasHandle_t cublas;
+  int compute_major;
   int compute_stream_priority;
   size_t persisting_l2_bytes;
   size_t access_policy_max_window_bytes;
@@ -246,7 +250,10 @@ extern "C" int vctm_gpu_create(int device, size_t total_bytes,
     return cublas_fail(error, error_capacity, "cublasCreate", blas_status);
   }
   cudaDeviceProp properties{};
-  if (cudaGetDeviceProperties(&properties, device) == cudaSuccess &&
+  if (cudaGetDeviceProperties(&properties, device) == cudaSuccess) {
+    gpu->compute_major = properties.major;
+  }
+  if (gpu->compute_major != 0 &&
       properties.persistingL2CacheMaxSize > 0 &&
       properties.accessPolicyMaxWindowSize > 0) {
     gpu->persisting_l2_bytes = std::min(
@@ -576,7 +583,7 @@ __global__ void tilemaxsim_sum_kernel(const float *maxima, uint32_t query_rows,
   scores[candidate] = score;
 }
 
-template <typename Scalar>
+template <typename Scalar, uint32_t QueriesPerWarp>
 __global__ void tilemaxsim_multiquery_kernel(
     const Scalar *queries, uint32_t total_query_rows, uint32_t dimension,
     const unsigned char *documents, const uint64_t *document_offsets,
@@ -586,28 +593,91 @@ __global__ void tilemaxsim_multiquery_kernel(
   const uint32_t lane = threadIdx.x & 31;
   const uint32_t warp = threadIdx.x >> 5;
   constexpr uint32_t warps = 8;
-  for (size_t candidate = blockIdx.x; candidate < candidate_count; candidate += gridDim.x) {
+  constexpr uint32_t query_tile_rows = warps * QueriesPerWarp;
+  const uint32_t query_tiles =
+      (total_query_rows + query_tile_rows - 1) / query_tile_rows;
+  const size_t task_count = candidate_count * query_tiles;
+  for (size_t task = blockIdx.x; task < task_count; task += gridDim.x) {
+    const size_t candidate = task / query_tiles;
+    const uint32_t query_base =
+        static_cast<uint32_t>(task % query_tiles) * query_tile_rows;
     const auto *document = reinterpret_cast<const Scalar *>(documents + document_offsets[candidate]);
-    for (uint32_t query_base = 0; query_base < total_query_rows; query_base += warps) {
-      const uint32_t query_row = query_base + warp;
-      float best = -CUDART_INF_F;
-      for (uint32_t row = 0; row < document_rows[candidate]; ++row) {
-        for (uint32_t column = threadIdx.x; column < dimension; column += blockDim.x)
-          document_vector[column] = document[static_cast<size_t>(row) * dimension + column];
+    float best[QueriesPerWarp];
+#pragma unroll
+    for (uint32_t local = 0; local < QueriesPerWarp; ++local)
+      best[local] = -CUDART_INF_F;
+    for (uint32_t row = 0; row < document_rows[candidate]; ++row) {
+      const Scalar *source =
+          document + static_cast<size_t>(row) * dimension;
+#if __CUDA_ARCH__ >= 800
+      const size_t row_bytes = static_cast<size_t>(dimension) * sizeof(Scalar);
+      if ((reinterpret_cast<uintptr_t>(source) & 15U) == 0 &&
+          (row_bytes & 15U) == 0) {
+        const auto block = cooperative_groups::this_thread_block();
+        cooperative_groups::memcpy_async(
+            block, reinterpret_cast<unsigned char *>(document_vector),
+            reinterpret_cast<const unsigned char *>(source),
+            cuda::aligned_size_t<16>(row_bytes));
+        cooperative_groups::wait(block);
+      } else {
+        for (uint32_t column = threadIdx.x; column < dimension;
+             column += blockDim.x)
+          document_vector[column] = source[column];
         __syncthreads();
+      }
+#else
+        for (uint32_t column = threadIdx.x; column < dimension; column += blockDim.x)
+        document_vector[column] = source[column];
+      __syncthreads();
+#endif
+#pragma unroll
+      for (uint32_t local = 0; local < QueriesPerWarp; ++local) {
+        const uint32_t query_row = query_base + warp * QueriesPerWarp + local;
         if (query_row < total_query_rows) {
           const Scalar *query = queries + static_cast<size_t>(query_row) * dimension;
           float dot = lane_dot(query, document_vector, dimension, lane);
           for (int delta = 16; delta != 0; delta >>= 1)
             dot += __shfl_down_sync(0xffffffff, dot, delta);
-          if (lane == 0) best = fmaxf(best, dot);
+          if (lane == 0) best[local] = fmaxf(best[local], dot);
         }
-        __syncthreads();
       }
+      __syncthreads();
+    }
+#pragma unroll
+    for (uint32_t local = 0; local < QueriesPerWarp; ++local) {
+      const uint32_t query_row = query_base + warp * QueriesPerWarp + local;
       if (lane == 0 && query_row < total_query_rows)
-        maxima[candidate * total_query_rows + query_row] = best;
+        maxima[candidate * total_query_rows + query_row] = best[local];
     }
   }
+}
+
+template <typename Scalar>
+static void launch_multiquery_tile(
+    VctmGpu *gpu, const Scalar *queries, uint32_t total_query_rows,
+    uint32_t dimension, const uint64_t *document_offsets,
+    const uint32_t *document_rows, size_t count, float *maxima,
+    size_t shared_bytes) {
+  const uint32_t queries_per_warp =
+      gpu->compute_major >= 9 ? 8 : gpu->compute_major >= 8 ? 4 : 1;
+  const uint32_t query_tile_rows = 8 * queries_per_warp;
+  const size_t tasks = count *
+      ((static_cast<size_t>(total_query_rows) + query_tile_rows - 1) /
+       query_tile_rows);
+  const unsigned int blocks = static_cast<unsigned int>(
+      std::min(tasks, static_cast<size_t>(65'535)));
+#define VCTM_LAUNCH_TILE(QPW)                                                \
+  tilemaxsim_multiquery_kernel<Scalar, QPW>                                 \
+      <<<blocks, 256, shared_bytes, gpu->compute_stream>>>(                 \
+          queries, total_query_rows, dimension, gpu->allocation,            \
+          document_offsets, document_rows, count, maxima)
+  if (queries_per_warp == 8)
+    VCTM_LAUNCH_TILE(8);
+  else if (queries_per_warp == 4)
+    VCTM_LAUNCH_TILE(4);
+  else
+    VCTM_LAUNCH_TILE(1);
+#undef VCTM_LAUNCH_TILE
 }
 
 __global__ void tilemaxsim_segmented_sum_kernel(
@@ -666,12 +736,21 @@ extern "C" int vctm_gpu_score_batch(
   if (status == cudaSuccess) status = cudaMemcpyAsync(workspace + query_offsets_offset, query_offsets, (request_count + 1) * sizeof(uint32_t), cudaMemcpyHostToDevice, gpu->compute_stream);
   if (status == cudaSuccess) status = cudaMemcpyAsync(workspace + offsets_offset, document_offsets, count * sizeof(uint64_t), cudaMemcpyHostToDevice, gpu->compute_stream);
   if (status == cudaSuccess) status = cudaMemcpyAsync(workspace + rows_offset, document_rows, count * sizeof(uint32_t), cudaMemcpyHostToDevice, gpu->compute_stream);
-  const unsigned int blocks = static_cast<unsigned int>(std::min(count, static_cast<size_t>(65'535)));
   const size_t shared_bytes = static_cast<size_t>(dimension) * scalar_bytes;
   if (status == cudaSuccess && dtype == 2)
-    tilemaxsim_multiquery_kernel<half><<<blocks, 256, shared_bytes, gpu->compute_stream>>>(reinterpret_cast<const half *>(workspace + query_offset), total_query_rows, dimension, gpu->allocation, reinterpret_cast<const uint64_t *>(workspace + offsets_offset), reinterpret_cast<const uint32_t *>(workspace + rows_offset), count, reinterpret_cast<float *>(workspace + maxima_offset));
+    launch_multiquery_tile(gpu,
+        reinterpret_cast<const half *>(workspace + query_offset),
+        total_query_rows, dimension,
+        reinterpret_cast<const uint64_t *>(workspace + offsets_offset),
+        reinterpret_cast<const uint32_t *>(workspace + rows_offset), count,
+        reinterpret_cast<float *>(workspace + maxima_offset), shared_bytes);
   else if (status == cudaSuccess && dtype == 1)
-    tilemaxsim_multiquery_kernel<float><<<blocks, 256, shared_bytes, gpu->compute_stream>>>(reinterpret_cast<const float *>(workspace + query_offset), total_query_rows, dimension, gpu->allocation, reinterpret_cast<const uint64_t *>(workspace + offsets_offset), reinterpret_cast<const uint32_t *>(workspace + rows_offset), count, reinterpret_cast<float *>(workspace + maxima_offset));
+    launch_multiquery_tile(gpu,
+        reinterpret_cast<const float *>(workspace + query_offset),
+        total_query_rows, dimension,
+        reinterpret_cast<const uint64_t *>(workspace + offsets_offset),
+        reinterpret_cast<const uint32_t *>(workspace + rows_offset), count,
+        reinterpret_cast<float *>(workspace + maxima_offset), shared_bytes);
   if (status == cudaSuccess) status = cudaGetLastError();
   constexpr unsigned int threads = 256;
   if (status == cudaSuccess) tilemaxsim_segmented_sum_kernel<<<static_cast<unsigned int>(std::min((score_count + threads - 1) / threads, static_cast<size_t>(65'535))), threads, 0, gpu->compute_stream>>>(reinterpret_cast<const float *>(workspace + maxima_offset), total_query_rows, reinterpret_cast<const uint32_t *>(workspace + query_offsets_offset), request_count, count, reinterpret_cast<float *>(workspace + scores_offset));
