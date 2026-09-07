@@ -41,12 +41,17 @@ targets independently. Runtime dispatch uses the device architecture and a
 production-shaped 320-dimensional microbenchmark rather than a model-name-only
 rule.
 
-- Ada/RTX 4090 uses aligned `half2` loads, FP32 accumulation, high-priority
-  compute streams and batched cuBLAS Tensor Core GEMM.
+- Ada/RTX 4090 uses aligned `half2` loads, FP32 accumulation, scoped
+  persisting-L2 query windows, 16-byte `cp.async` document loads,
+  32-query-row document-tile reuse, high-priority compute streams and batched
+  cuBLAS Tensor Core GEMM.
 - Hopper/H200 selects the `sm_90a` image. Batched cuBLAS owns Hopper matrix-core
-  instruction and data-movement selection; the custom MaxSim reduction remains
-  architecture-neutral. H200 is not marked validated until same-device
-  conformance, Nsight and latency tests pass.
+  instruction and data-movement selection, receives an architecture-sized
+  32-MiB stable workspace, and the fused tile path reuses each document load
+  across 64 query rows. The custom MaxSim reduction remains
+  architecture-neutral. Resident batches execute concurrently across devices
+  instead of serializing an eight-GPU node. H200 is not marked validated until
+  same-device conformance, Nsight and latency tests pass.
 - Cache uploads use the device's least-urgent stream priority and foreground
   scoring uses its most-urgent priority. This does not interrupt an executing
   kernel; scheduler quantum boundaries remain the preemption points.
@@ -54,6 +59,15 @@ rule.
 The startup calibration uses 16 resident candidates with 32 document rows at
 dimension 320, repeats both paths, checks numerical agreement and records the
 first query-row crossover. A failed or divergent matrix path is disabled.
+
+On the available RTX 4090, the production-shaped 64-candidate, eight-request,
+32-query-row, 320-dimensional benchmark changed from approximately 0.477 ms to
+0.112 ms for the fused tile path (about 4.26x). The cuBLAS path measured about
+0.112--0.114 ms, so calibration correctly kept the tile path for that shape.
+This is a kernel microbenchmark, not an end-to-end retrieval latency claim.
+Generated `sm_89` SASS was inspected and contains the asynchronous copy
+instructions; compilation alone is not counted as evidence that the fast path
+exists.
 
 ## Vendor acceptance gates
 
