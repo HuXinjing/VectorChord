@@ -27,6 +27,7 @@ jobs:
           VCTM_EXPECTED_PTX: sm_90
           VCTM_VERIFY_ASYNC_IMAGES: sm_90a
           VCTM_VERIFY_FP8_IMAGES: sm_90a
+          VCTM_VERIFY_PQ_IMAGES: sm_90a
         run: services/tilemaxsimd/scripts/validate_nvidia_hardware.sh
 
       - name: Upload immutable test evidence
