@@ -27,6 +27,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::backend::{AcceleratorBackend, ConformanceReport, run_conformance_probe};
+use crate::backend_sdk::{BackendProvider, validate_provider};
 use crate::dispatch::{self, DispatchInput, DispatchThresholds, KernelKind};
 use crate::engine::{Engine, EngineStatus};
 use crate::protocol::{
@@ -672,6 +673,18 @@ where
         return Err(error);
     }
     Ok(())
+}
+
+/// Stable source-level entry point for an independently built vendor
+/// executor. Provider compatibility is checked before any device or service
+/// resource is acquired; device-level arithmetic is then checked by the
+/// shared live conformance probe in `run_with_backend_factory`.
+pub fn run_with_backend_provider<P>(provider: P) -> Result<()>
+where
+    P: BackendProvider,
+{
+    validate_provider(&provider)?;
+    run_with_backend_factory(|device, total, workspace| provider.create(device, total, workspace))
 }
 
 fn verify_backends(backends: &mut [Box<dyn AcceleratorBackend>]) -> Result<Vec<ConformanceReport>> {

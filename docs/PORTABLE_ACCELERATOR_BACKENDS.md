@@ -42,8 +42,15 @@ Vendor executors depend on the library without another runtime:
 tilemaxsimd = { path = "../tilemaxsimd", default-features = false, features = ["backend-core"] }
 ```
 
-They must implement `AcceleratorBackend`, publish truthful `DeviceInfo` and
-`BackendCapabilities`, and pass `run_conformance_probe` on the target device.
+They implement the versioned `backend_sdk::BackendProvider` and
+`AcceleratorBackend`, then call `daemon::run_with_backend_provider` from their
+own executable. The provider API major is checked before resources are
+acquired. This is a source-level SDK, not a promise that Rust trait objects are
+a stable binary ABI: every vendor executor is compiled against the matching
+core crate and links only its own runtime.
+
+Providers must publish truthful `DeviceInfo` and `BackendCapabilities`, and
+pass `run_conformance_probe` on the target device.
 Unsupported profiles fail before cache mutation or execution; substituting a
 different precision is forbidden.
 

@@ -1,6 +1,7 @@
 // This software is licensed under the repository's dual license model.
 
 pub mod backend;
+pub mod backend_sdk;
 pub mod cache;
 #[cfg(feature = "backend-cpu")]
 pub mod cpu;
