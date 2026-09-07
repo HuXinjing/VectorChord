@@ -25,6 +25,9 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
+
+#[cfg(not(any(feature = "backend-cuda", feature = "backend-cpu")))]
+compile_error!("the tilemaxsimd executable requires one accelerator backend");
 #[cfg(feature = "backend-cpu")]
 use tilemaxsimd::cpu::CpuBackend as SelectedBackend;
 use tilemaxsimd::dispatch::{self, DispatchInput, DispatchThresholds, KernelKind};

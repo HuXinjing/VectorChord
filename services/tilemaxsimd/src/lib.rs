@@ -15,5 +15,3 @@ pub mod shard;
 
 #[cfg(all(feature = "backend-cuda", feature = "backend-cpu"))]
 compile_error!("select exactly one accelerator backend");
-#[cfg(not(any(feature = "backend-cuda", feature = "backend-cpu")))]
-compile_error!("select one accelerator backend");

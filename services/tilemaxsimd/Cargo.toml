@@ -6,8 +6,9 @@ publish = false
 
 [features]
 default = ["backend-cuda"]
-backend-cuda = []
-backend-cpu = []
+backend-core = []
+backend-cuda = ["backend-core"]
+backend-cpu = ["backend-core"]
 
 [dependencies]
 anyhow = "1.0"
