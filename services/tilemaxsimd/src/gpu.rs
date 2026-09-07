@@ -37,6 +37,8 @@ unsafe extern "C" {
     fn vctm_gpu_tile_queries_per_warp(gpu: *const NativeGpu) -> u32;
     fn vctm_gpu_set_pinned_control_staging(gpu: *mut NativeGpu, enabled: c_int) -> c_int;
     fn vctm_gpu_pinned_control_staging(gpu: *const NativeGpu) -> c_int;
+    fn vctm_gpu_set_double_buffered_tile(gpu: *mut NativeGpu, enabled: c_int) -> c_int;
+    fn vctm_gpu_double_buffered_tile(gpu: *const NativeGpu) -> c_int;
     fn vctm_gpu_set_pq_warp_task_max_document_rows(gpu: *mut NativeGpu, rows: u32) -> c_int;
     fn vctm_gpu_pq_warp_task_max_document_rows(gpu: *const NativeGpu) -> u32;
     fn vctm_gpu_compute_capability(
@@ -296,6 +298,8 @@ impl Gpu {
                     .then_some(matrix_engine_workspace_bytes),
                 pinned_control_staging: Some(true),
                 control_staging_speedup_milli: None,
+                double_buffered_tile: Some(false),
+                double_buffer_speedup_milli: None,
                 document_tile_query_rows: match major {
                     9.. => Some(64),
                     8 => Some(32),
@@ -336,6 +340,8 @@ impl Gpu {
             Some(unsafe { vctm_gpu_pq_warp_task_max_document_rows(gpu.native.as_ptr()) });
         gpu.info.pinned_control_staging =
             Some(unsafe { vctm_gpu_pinned_control_staging(gpu.native.as_ptr()) != 0 });
+        gpu.info.double_buffered_tile =
+            Some(unsafe { vctm_gpu_double_buffered_tile(gpu.native.as_ptr()) != 0 });
         Ok(gpu)
     }
 
@@ -686,7 +692,7 @@ impl Gpu {
         }
         const DIMENSION: u32 = 320;
         const DOCUMENT_ROWS: u32 = 32;
-        const CANDIDATES: usize = 16;
+        const CANDIDATES: usize = 64;
         const REPETITIONS: usize = 3;
         let one = 0x3c00_u16.to_le_bytes();
         let zero = 0_u16.to_le_bytes();
@@ -713,6 +719,14 @@ impl Gpu {
             return;
         }
         self.calibrate_control_staging(
+            DIMENSION,
+            DOCUMENT_ROWS,
+            &document_offsets,
+            &document_rows,
+            &one,
+            &zero,
+        );
+        self.calibrate_double_buffered_tile(
             DIMENSION,
             DOCUMENT_ROWS,
             &document_offsets,
@@ -865,6 +879,87 @@ impl Gpu {
         self.info.control_staging_speedup_milli = speedup_milli;
         unsafe {
             vctm_gpu_set_pinned_control_staging(self.native.as_ptr(), i32::from(use_pinned));
+        }
+    }
+
+    fn calibrate_double_buffered_tile(
+        &mut self,
+        dimension: u32,
+        document_rows_per_candidate: u32,
+        document_offsets: &[u64],
+        document_rows: &[u32],
+        one: &[u8; 2],
+        zero: &[u8; 2],
+    ) {
+        const QUERY_ROWS: u32 = 256;
+        const REPETITIONS: usize = 7;
+        let row_bytes = dimension as usize * size_of::<u16>();
+        if row_bytes > self.info.shared_memory_per_block_bytes.unwrap_or(0) as usize / 2 {
+            return;
+        }
+        let mut queries = Vec::with_capacity(QUERY_ROWS as usize * dimension as usize * 2);
+        for row in 0..QUERY_ROWS {
+            for column in 0..dimension {
+                queries.extend_from_slice(if column == row % document_rows_per_candidate {
+                    one
+                } else {
+                    zero
+                });
+            }
+        }
+        let offsets = [0, QUERY_ROWS / 2, QUERY_ROWS];
+        let measure = |gpu: &mut Self, enabled: bool| -> Result<(Duration, Vec<Vec<f32>>)> {
+            if unsafe { vctm_gpu_set_double_buffered_tile(gpu.native.as_ptr(), i32::from(enabled)) }
+                != 0
+            {
+                bail!("CUDA rejected tile-buffer calibration mode");
+            }
+            let mut samples = Vec::with_capacity(REPETITIONS);
+            let mut scores = Vec::new();
+            for _ in 0..REPETITIONS {
+                let started = Instant::now();
+                scores = gpu.score_batch_native(
+                    false,
+                    &queries,
+                    &offsets,
+                    dimension,
+                    2,
+                    document_offsets,
+                    document_rows,
+                    1,
+                )?;
+                samples.push(started.elapsed());
+            }
+            samples.sort_unstable();
+            Ok((samples[REPETITIONS / 2], scores))
+        };
+        self.calibration_runs += 1;
+        let single = measure(self, false);
+        let double = measure(self, true);
+        let (use_double, speedup_milli) = match (single, double) {
+            (Ok((single_elapsed, single_scores)), Ok((double_elapsed, double_scores)))
+                if batch_scores_close(&single_scores, &double_scores) =>
+            {
+                let ratio = single_elapsed
+                    .as_nanos()
+                    .saturating_mul(1000)
+                    .checked_div(double_elapsed.as_nanos().max(1))
+                    .unwrap_or(0)
+                    .min(u32::MAX as u128) as u32;
+                (
+                    double_elapsed.as_nanos().saturating_mul(100)
+                        < single_elapsed.as_nanos().saturating_mul(98),
+                    Some(ratio),
+                )
+            }
+            _ => {
+                self.calibration_failures += 1;
+                (false, None)
+            }
+        };
+        self.info.double_buffer_speedup_milli = speedup_milli;
+        unsafe {
+            vctm_gpu_set_double_buffered_tile(self.native.as_ptr(), i32::from(use_double));
         }
     }
 
@@ -1359,13 +1454,17 @@ mod tests {
         assert!(info.pq_warp_task_max_document_rows.unwrap_or(u32::MAX) <= 8);
         assert!(info.pinned_control_staging.is_some());
         assert!(info.control_staging_speedup_milli.is_some());
+        assert!(info.double_buffered_tile.is_some());
+        assert!(info.double_buffer_speedup_milli.is_some());
         eprintln!(
-            "cuda_tuning architecture={} document_tile_query_rows={:?} pq_warp_task_max_document_rows={:?} pinned_control_staging={:?} control_staging_speedup_milli={:?}",
+            "cuda_tuning architecture={} document_tile_query_rows={:?} pq_warp_task_max_document_rows={:?} pinned_control_staging={:?} control_staging_speedup_milli={:?} double_buffered_tile={:?} double_buffer_speedup_milli={:?}",
             info.architecture,
             info.document_tile_query_rows,
             info.pq_warp_task_max_document_rows,
             info.pinned_control_staging,
             info.control_staging_speedup_milli,
+            info.double_buffered_tile,
+            info.double_buffer_speedup_milli,
         );
         assert_eq!(
             info.capabilities.persisting_l2,
@@ -1598,13 +1697,25 @@ mod tests {
             }
             (started.elapsed().as_secs_f64() * 1000.0 / 20.0, result)
         };
+        unsafe {
+            assert_eq!(vctm_gpu_set_double_buffered_tile(gpu.native.as_ptr(), 0), 0);
+        }
         let (tile_ms, tile) = measure(&mut gpu, false);
+        unsafe {
+            assert_eq!(vctm_gpu_set_double_buffered_tile(gpu.native.as_ptr(), 1), 0);
+        }
+        let (double_buffer_ms, double_buffer) = measure(&mut gpu, false);
+        unsafe {
+            assert_eq!(vctm_gpu_set_double_buffered_tile(gpu.native.as_ptr(), 0), 0);
+        }
         let (tensor_ms, tensor) = measure(&mut gpu, true);
+        assert!(batch_scores_close(&tile, &double_buffer));
         assert!(batch_scores_close(&tile, &tensor));
         eprintln!(
-            "tilemaxsim_320d candidates={CANDIDATES} requests={REQUESTS} tile_query_rows={} calibrated_threshold_rows={} tile_ms={tile_ms:.4} tensor_ms={tensor_ms:.4} speedup={:.3}",
+            "tilemaxsim_320d candidates={CANDIDATES} requests={REQUESTS} tile_query_rows={} calibrated_threshold_rows={} single_buffer_ms={tile_ms:.4} double_buffer_ms={double_buffer_ms:.4} double_buffer_speedup={:.3} tensor_ms={tensor_ms:.4} tensor_speedup={:.3}",
             gpu.info.document_tile_query_rows.unwrap_or_default(),
             gpu.tensor_threshold_rows,
+            tile_ms / double_buffer_ms,
             tile_ms / tensor_ms
         );
     }

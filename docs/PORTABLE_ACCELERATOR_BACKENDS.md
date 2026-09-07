@@ -128,6 +128,21 @@ pinned-control decision and measured ratio, persisting-L2 reservation and
 matrix-engine workspace under the bounded `tilemaxsim_gpu_tuning_value`
 metric. No model name or tenant identifier is used as a label.
 
+SM80+ exact tile kernels also contain a two-stage shared-memory pipeline that
+can enqueue row N+1 with `cp.async` while warps score row N. It is not enabled
+merely because the instruction exists: startup compares single and double
+buffering at the production dimension, rejects score drift, requires at least
+a 2% median win and checks that two rows fit in the device's per-block shared
+memory. `double_buffered_tile` and `double_buffer_speedup_milli` expose the
+decision. This keeps Ada on the simpler path when synchronization dominates,
+while allowing Hopper to select overlap only when its physical H200 result
+supports it.
+With the 64-candidate startup shape, the shared RTX 4090 measured a 1.003
+single/double ratio during calibration; a separate eight-request run measured
+1.007. Both are below the 1.02 admission threshold, so Ada retained the
+single-buffer kernel. This rejected experiment is intentionally kept behind
+the calibrated dispatch rather than being presented as an optimization win.
+
 On the shared RTX 4090, three back-to-back 512-candidate, 32-query-row,
 320-dimensional A/B runs measured direct pageable control transfers at
 0.1154--0.1204 ms and pinned packed transfers at 0.1045--0.1066 ms, a
@@ -145,7 +160,7 @@ candidates are transient to prevent an unusually large request from retaining
 unbounded host memory. This removes allocator/map work without changing the
 cuBLAS precision mode or cache lifecycle.
 
-The startup calibration uses 16 resident candidates with 32 document rows at
+The startup calibration uses 64 resident candidates with 32 document rows at
 dimension 320. It first selects the fastest numerically equivalent document
 reuse tile, then repeats the tile/matrix comparison and records the first
 query-row crossover. A failed or divergent variant is rejected; a failed or

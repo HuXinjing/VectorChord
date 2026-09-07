@@ -45,6 +45,8 @@ impl CpuBackend {
                 matrix_engine_workspace_bytes: None,
                 pinned_control_staging: None,
                 control_staging_speedup_milli: None,
+                double_buffered_tile: None,
+                double_buffer_speedup_milli: None,
                 document_tile_query_rows: None,
                 pq_warp_task_max_document_rows: None,
                 compute_queue_priority: None,

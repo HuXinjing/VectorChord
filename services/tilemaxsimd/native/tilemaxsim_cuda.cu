@@ -32,10 +32,12 @@ struct VctmGpu {
   unsigned char *host_staging;
   size_t host_staging_bytes;
   bool use_pinned_control_staging;
+  bool use_double_buffered_tile;
   cudaStream_t upload_stream;
   cudaStream_t compute_stream;
   cublasHandle_t cublas;
   int compute_major;
+  size_t shared_memory_per_block_bytes;
   uint32_t tile_queries_per_warp;
   uint32_t pq_warp_task_max_document_rows;
   size_t matrix_engine_workspace_bytes;
@@ -252,6 +254,7 @@ extern "C" int vctm_gpu_create(int device, size_t total_bytes,
   gpu->host_staging_bytes =
       std::min(gpu->tensor_bytes, static_cast<size_t>(64) * 1024 * 1024);
   gpu->use_pinned_control_staging = true;
+  gpu->use_double_buffered_tile = false;
   status = cudaMalloc(reinterpret_cast<void **>(&gpu->allocation), total_bytes);
   if (status != cudaSuccess) {
     delete gpu;
@@ -303,6 +306,7 @@ extern "C" int vctm_gpu_create(int device, size_t total_bytes,
   cudaDeviceProp properties{};
   if (cudaGetDeviceProperties(&properties, device) == cudaSuccess) {
     gpu->compute_major = properties.major;
+    gpu->shared_memory_per_block_bytes = properties.sharedMemPerBlock;
     gpu->tile_queries_per_warp =
         properties.major >= 9 ? 8 : properties.major >= 8 ? 4 : 1;
   }
@@ -382,6 +386,17 @@ extern "C" int vctm_gpu_set_pinned_control_staging(VctmGpu *gpu,
 
 extern "C" int vctm_gpu_pinned_control_staging(const VctmGpu *gpu) {
   return gpu != nullptr && gpu->use_pinned_control_staging ? 1 : 0;
+}
+
+extern "C" int vctm_gpu_set_double_buffered_tile(VctmGpu *gpu,
+                                                   int enabled) {
+  if (gpu == nullptr) return 1;
+  gpu->use_double_buffered_tile = enabled != 0;
+  return 0;
+}
+
+extern "C" int vctm_gpu_double_buffered_tile(const VctmGpu *gpu) {
+  return gpu != nullptr && gpu->use_double_buffered_tile ? 1 : 0;
 }
 
 extern "C" int vctm_gpu_set_pq_warp_task_max_document_rows(
@@ -761,13 +776,26 @@ __global__ void tilemaxsim_sum_kernel(const float *maxima, uint32_t query_rows,
   scores[candidate] = score;
 }
 
-template <typename Scalar, uint32_t QueriesPerWarp, uint8_t ScoringProfile>
+template <typename Scalar>
+__device__ void enqueue_async_row_copy(Scalar *destination,
+                                       const Scalar *source,
+                                       size_t row_bytes) {
+  auto *destination_bytes = reinterpret_cast<unsigned char *>(destination);
+  const auto *source_bytes = reinterpret_cast<const unsigned char *>(source);
+  for (size_t byte = static_cast<size_t>(threadIdx.x) * 16;
+       byte < row_bytes; byte += static_cast<size_t>(blockDim.x) * 16)
+    __pipeline_memcpy_async(destination_bytes + byte, source_bytes + byte, 16);
+  __pipeline_commit();
+}
+
+template <typename Scalar, uint32_t QueriesPerWarp, uint8_t ScoringProfile,
+          bool DoubleBuffer>
 __global__ void tilemaxsim_multiquery_kernel(
     const Scalar *queries, uint32_t total_query_rows, uint32_t dimension,
     const unsigned char *documents, const uint64_t *document_offsets,
     const uint32_t *document_rows, size_t candidate_count, float *maxima) {
   extern __shared__ unsigned char shared_bytes[];
-  auto *document_vector = reinterpret_cast<Scalar *>(shared_bytes);
+  auto *document_vectors = reinterpret_cast<Scalar *>(shared_bytes);
   const uint32_t lane = threadIdx.x & 31;
   const uint32_t warp = threadIdx.x >> 5;
   constexpr uint32_t warps = 8;
@@ -786,11 +814,24 @@ __global__ void tilemaxsim_multiquery_kernel(
     const size_t scale_offset = (code_bytes + 3) & ~static_cast<size_t>(3);
     const auto *scales = reinterpret_cast<const float *>(
         encoded_document + scale_offset);
+    const size_t row_bytes = static_cast<size_t>(dimension) * sizeof(Scalar);
+    const bool asynchronous_rows =
+        DoubleBuffer && (reinterpret_cast<uintptr_t>(document) & 15U) == 0 &&
+        (row_bytes & 15U) == 0;
     float best[QueriesPerWarp];
 #pragma unroll
     for (uint32_t local = 0; local < QueriesPerWarp; ++local)
       best[local] = -CUDART_INF_F;
+    if (asynchronous_rows) {
+#if __CUDA_ARCH__ >= 800
+      enqueue_async_row_copy(document_vectors, document, row_bytes);
+      __pipeline_wait_prior(0);
+      __syncthreads();
+#endif
+    }
     for (uint32_t row = 0; row < document_rows[candidate]; ++row) {
+      Scalar *document_vector = document_vectors +
+          (asynchronous_rows ? static_cast<size_t>(row & 1U) * dimension : 0);
       const Scalar *source = document + static_cast<size_t>(row) * dimension;
       if (ScoringProfile != 1) {
         const float scale = scales[row];
@@ -808,18 +849,14 @@ __global__ void tilemaxsim_multiquery_kernel(
         __syncthreads();
       } else {
 #if __CUDA_ARCH__ >= 800
-      const size_t row_bytes = static_cast<size_t>(dimension) * sizeof(Scalar);
-      if ((reinterpret_cast<uintptr_t>(source) & 15U) == 0 &&
+      if (asynchronous_rows) {
+        if (row + 1 < document_rows[candidate])
+          enqueue_async_row_copy(
+              document_vectors + static_cast<size_t>((row + 1) & 1U) * dimension,
+              source + dimension, row_bytes);
+      } else if ((reinterpret_cast<uintptr_t>(source) & 15U) == 0 &&
           (row_bytes & 15U) == 0) {
-        auto *destination_bytes =
-            reinterpret_cast<unsigned char *>(document_vector);
-        const auto *source_bytes =
-            reinterpret_cast<const unsigned char *>(source);
-        for (size_t byte = static_cast<size_t>(threadIdx.x) * 16;
-             byte < row_bytes; byte += static_cast<size_t>(blockDim.x) * 16)
-          __pipeline_memcpy_async(destination_bytes + byte,
-                                  source_bytes + byte, 16);
-        __pipeline_commit();
+        enqueue_async_row_copy(document_vector, source, row_bytes);
         __pipeline_wait_prior(0);
         __syncthreads();
       } else {
@@ -845,6 +882,11 @@ __global__ void tilemaxsim_multiquery_kernel(
           if (lane == 0) best[local] = fmaxf(best[local], dot);
         }
       }
+      if (asynchronous_rows && row + 1 < document_rows[candidate]) {
+#if __CUDA_ARCH__ >= 800
+        __pipeline_wait_prior(0);
+#endif
+      }
       __syncthreads();
     }
 #pragma unroll
@@ -869,24 +911,29 @@ static void launch_multiquery_tile(
        query_tile_rows);
   const unsigned int blocks = static_cast<unsigned int>(
       std::min(tasks, static_cast<size_t>(65'535)));
-#define VCTM_LAUNCH_TILE(PROFILE, QPW)                                       \
-  tilemaxsim_multiquery_kernel<Scalar, QPW, PROFILE>                        \
-      <<<blocks, 256, shared_bytes, gpu->compute_stream>>>(                 \
+#define VCTM_LAUNCH_TILE(PROFILE, QPW, DOUBLE_BUFFER)                        \
+  tilemaxsim_multiquery_kernel<Scalar, QPW, PROFILE, DOUBLE_BUFFER>         \
+      <<<blocks, 256,                                                       \
+         shared_bytes * ((DOUBLE_BUFFER) ? 2 : 1), gpu->compute_stream>>>(  \
           queries, total_query_rows, dimension, gpu->allocation,            \
           document_offsets, document_rows, count, maxima)
-#define VCTM_DISPATCH_TILE(PROFILE)                                          \
+#define VCTM_DISPATCH_TILE(PROFILE, DOUBLE_BUFFER)                           \
   if (queries_per_warp == 8)                                                \
-    VCTM_LAUNCH_TILE(PROFILE, 8);                                           \
+    VCTM_LAUNCH_TILE(PROFILE, 8, DOUBLE_BUFFER);                            \
   else if (queries_per_warp == 4)                                           \
-    VCTM_LAUNCH_TILE(PROFILE, 4);                                           \
+    VCTM_LAUNCH_TILE(PROFILE, 4, DOUBLE_BUFFER);                            \
   else                                                                      \
-    VCTM_LAUNCH_TILE(PROFILE, 1)
+    VCTM_LAUNCH_TILE(PROFILE, 1, DOUBLE_BUFFER)
   if (scoring_profile == 1) {
-    VCTM_DISPATCH_TILE(1);
+    if (gpu->use_double_buffered_tile &&
+        shared_bytes <= gpu->shared_memory_per_block_bytes / 2)
+      VCTM_DISPATCH_TILE(1, true);
+    else
+      VCTM_DISPATCH_TILE(1, false);
   } else if (scoring_profile == 2) {
-    VCTM_DISPATCH_TILE(2);
+    VCTM_DISPATCH_TILE(2, false);
   } else {
-    VCTM_DISPATCH_TILE(3);
+    VCTM_DISPATCH_TILE(3, false);
   }
 #undef VCTM_DISPATCH_TILE
 #undef VCTM_LAUNCH_TILE

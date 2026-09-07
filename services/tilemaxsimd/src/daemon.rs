@@ -2493,6 +2493,14 @@ fn render_metrics(metrics: &RuntimeMetrics) -> String {
                     "control_staging_speedup_milli",
                     backend.control_staging_speedup_milli.map(u64::from),
                 ),
+                (
+                    "double_buffered_tile",
+                    backend.double_buffered_tile.map(u64::from),
+                ),
+                (
+                    "double_buffer_speedup_milli",
+                    backend.double_buffer_speedup_milli.map(u64::from),
+                ),
                 ("persisting_l2_bytes", backend.persisting_l2_bytes),
                 (
                     "matrix_engine_workspace_bytes",

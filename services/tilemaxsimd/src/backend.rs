@@ -54,6 +54,11 @@ pub struct DeviceInfo {
     /// Direct-pageable median time divided by pinned-packed median time,
     /// expressed in thousandths. Values above 1000 favour pinned packing.
     pub control_staging_speedup_milli: Option<u32>,
+    /// Whether exact document rows use two shared-memory buffers so the next
+    /// asynchronous copy can overlap current-row dot products.
+    pub double_buffered_tile: Option<bool>,
+    /// Single-buffer median divided by double-buffer median, in thousandths.
+    pub double_buffer_speedup_milli: Option<u32>,
     /// Query rows served by one document-tile load in the native fused path.
     pub document_tile_query_rows: Option<u32>,
     /// Largest PQ document row count assigned one independent task per warp.
