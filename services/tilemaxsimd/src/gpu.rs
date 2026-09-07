@@ -39,6 +39,18 @@ unsafe extern "C" {
         minor: *mut c_int,
     ) -> c_int;
     fn vctm_gpu_device_name(gpu: *const NativeGpu, name: *mut c_char, capacity: usize) -> c_int;
+    fn vctm_gpu_device_info(
+        gpu: *const NativeGpu,
+        driver_version: *mut c_int,
+        runtime_version: *mut c_int,
+        cublas_version: *mut c_int,
+        total_memory_bytes: *mut u64,
+        multiprocessors: *mut c_int,
+        warp_size: *mut c_int,
+        memory_bus_width_bits: *mut c_int,
+        memory_clock_khz: *mut c_int,
+        shared_memory_per_block_bytes: *mut u64,
+    ) -> c_int;
     fn vctm_quantizer_create(
         device: c_int,
         payload: *const c_uchar,
@@ -175,6 +187,29 @@ impl Gpu {
         } else {
             String::new()
         };
+        let mut driver_version = 0;
+        let mut runtime_version = 0;
+        let mut cublas_version = 0;
+        let mut total_memory_bytes = 0_u64;
+        let mut multiprocessors = 0;
+        let mut warp_size = 0;
+        let mut memory_bus_width_bits = 0;
+        let mut memory_clock_khz = 0;
+        let mut shared_memory_per_block_bytes = 0_u64;
+        let info_status = unsafe {
+            vctm_gpu_device_info(
+                native.as_ptr(),
+                &mut driver_version,
+                &mut runtime_version,
+                &mut cublas_version,
+                &mut total_memory_bytes,
+                &mut multiprocessors,
+                &mut warp_size,
+                &mut memory_bus_width_bits,
+                &mut memory_clock_khz,
+                &mut shared_memory_per_block_bytes,
+            )
+        };
         let tensor_threshold_rows = if capability_status == 0 {
             crate::dispatch::device_thresholds(&name, major, minor)
                 .map(|thresholds| u32::try_from(thresholds.tensor_ridge).unwrap_or(u32::MAX))
@@ -202,9 +237,16 @@ impl Gpu {
                 } else {
                     "unknown".to_owned()
                 },
-                driver_version: None,
-                runtime_version: None,
-                library_version: None,
+                driver_version: (info_status == 0).then_some(driver_version as u32),
+                runtime_version: (info_status == 0).then_some(runtime_version as u32),
+                library_version: (info_status == 0).then_some(cublas_version as u32),
+                total_memory_bytes: (info_status == 0).then_some(total_memory_bytes),
+                compute_units: (info_status == 0).then_some(multiprocessors as u32),
+                warp_size: (info_status == 0).then_some(warp_size as u32),
+                memory_bus_width_bits: (info_status == 0).then_some(memory_bus_width_bits as u32),
+                memory_clock_khz: (info_status == 0).then_some(memory_clock_khz as u32),
+                shared_memory_per_block_bytes: (info_status == 0)
+                    .then_some(shared_memory_per_block_bytes),
                 capabilities: BackendCapabilities {
                     kind: BackendKind::Cuda,
                     exact_fp16: true,
@@ -790,6 +832,26 @@ fn native_error(buffer: &[c_char]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[ignore = "requires an explicitly assigned CUDA device"]
+    fn device_info_reports_runtime_fingerprint() {
+        let device = std::env::var("VCTM_TEST_GPU")
+            .unwrap_or_else(|_| "0".to_owned())
+            .parse::<i32>()
+            .unwrap();
+        let gpu = Gpu::create(device, 64 * 1024 * 1024, 32 * 1024 * 1024).unwrap();
+        let info = AcceleratorBackend::info(&gpu);
+        assert_eq!(info.backend, BackendKind::Cuda);
+        assert!(info.name.contains("NVIDIA"));
+        assert!(info.architecture.starts_with("sm_"));
+        assert!(info.driver_version.unwrap_or_default() > 0);
+        assert!(info.runtime_version.unwrap_or_default() > 0);
+        assert!(info.library_version.unwrap_or_default() > 0);
+        assert!(info.total_memory_bytes.unwrap_or_default() > 0);
+        assert!(info.compute_units.unwrap_or_default() > 0);
+        assert_eq!(info.warp_size, Some(32));
+    }
 
     #[test]
     #[ignore = "requires an explicitly assigned CUDA device"]

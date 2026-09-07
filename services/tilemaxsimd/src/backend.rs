@@ -39,6 +39,12 @@ pub struct DeviceInfo {
     pub driver_version: Option<u32>,
     pub runtime_version: Option<u32>,
     pub library_version: Option<u32>,
+    pub total_memory_bytes: Option<u64>,
+    pub compute_units: Option<u32>,
+    pub warp_size: Option<u32>,
+    pub memory_bus_width_bits: Option<u32>,
+    pub memory_clock_khz: Option<u32>,
+    pub shared_memory_per_block_bytes: Option<u64>,
     pub capabilities: BackendCapabilities,
 }
 

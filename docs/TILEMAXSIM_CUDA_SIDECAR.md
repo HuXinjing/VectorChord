@@ -92,6 +92,26 @@ The status Unix socket serves:
 - `POST /v1/reload`: atomically reload shard and quantizer registries. It is
   accepted only over the Unix status socket; TCP status is read-only.
 
+`GET /v1/cache` also reports the accelerator backend, device name and
+architecture, CUDA driver/runtime/cuBLAS versions, SM count, warp size, memory
+bus and clock, shared-memory limit, and calibrated dispatch state. This runtime
+fingerprint is part of performance diagnosis; a model name alone is not a safe
+kernel-selection contract.
+
+CUDA builds produce an explicit fat binary. The default CUDA 12 build targets
+native `sm_80`, `sm_89`, and `sm_90` code plus `compute_90` PTX. Override it
+with a validated toolchain-specific list, for example a CUDA 13 Blackwell
+builder:
+
+```shell
+TILEMAXSIM_CUDA_ARCHS=89,90,120,121,121-virtual cargo build \
+  --release --manifest-path services/tilemaxsimd/Cargo.toml
+```
+
+An architecture appearing in the binary means only that it can be loaded.
+Architecture-specific kernels and same-device numerical/performance regression
+remain required before that device is advertised as tuned.
+
 Use the image's dependency-free probe from systemd, Docker, or Kubernetes:
 
 ```shell

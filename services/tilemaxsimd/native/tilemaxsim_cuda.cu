@@ -223,6 +223,31 @@ extern "C" int vctm_gpu_device_name(const VctmGpu *gpu, char *name, size_t capac
   return 0;
 }
 
+extern "C" int vctm_gpu_device_info(
+    const VctmGpu *gpu, int *driver_version, int *runtime_version,
+    int *cublas_version, uint64_t *total_memory_bytes,
+    int *multiprocessors, int *warp_size, int *memory_bus_width_bits,
+    int *memory_clock_khz, uint64_t *shared_memory_per_block_bytes) {
+  if (gpu == nullptr || driver_version == nullptr || runtime_version == nullptr ||
+      cublas_version == nullptr || total_memory_bytes == nullptr ||
+      multiprocessors == nullptr || warp_size == nullptr ||
+      memory_bus_width_bits == nullptr || memory_clock_khz == nullptr ||
+      shared_memory_per_block_bytes == nullptr) return 1;
+  cudaDeviceProp properties{};
+  if (cudaDriverGetVersion(driver_version) != cudaSuccess ||
+      cudaRuntimeGetVersion(runtime_version) != cudaSuccess ||
+      cublasGetVersion(gpu->cublas, cublas_version) != CUBLAS_STATUS_SUCCESS ||
+      cudaGetDeviceProperties(&properties, gpu->device) != cudaSuccess) return 1;
+  *total_memory_bytes = static_cast<uint64_t>(properties.totalGlobalMem);
+  *multiprocessors = properties.multiProcessorCount;
+  *warp_size = properties.warpSize;
+  *memory_bus_width_bits = properties.memoryBusWidth;
+  *memory_clock_khz = properties.memoryClockRate;
+  *shared_memory_per_block_bytes =
+      static_cast<uint64_t>(properties.sharedMemPerBlock);
+  return 0;
+}
+
 extern "C" int vctm_gpu_upload_batch(
     VctmGpu *gpu, const uint64_t *offsets,
     const unsigned char *const *payloads, const size_t *lengths, size_t count,
