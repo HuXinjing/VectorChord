@@ -16,6 +16,12 @@ images; vendor SDKs are never linked into one universal binary.
 | Ascend | downstream `backend-ascend` executor | CANN/Ascend C | implementation pending on Ascend CI |
 | MetaX | downstream `backend-metax` executor | MXMACA/mcBLAS | implementation pending on MetaX CI |
 
+The public build publishes separate images from
+`services/Dockerfile.tilemaxsimd` and
+`services/Dockerfile.tilemaxsimd-cpu`. The latter links no CUDA library and
+uses runtime AVX2/FMA on x86-64 or NEON on AArch64. It is the deployable
+fallback for hosts whose native accelerator backend is unavailable.
+
 Vendor executors depend on the library without another runtime:
 
 ```toml

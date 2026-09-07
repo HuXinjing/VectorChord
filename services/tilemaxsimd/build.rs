@@ -37,7 +37,7 @@ fn main() {
                     .is_some_and(|suffix| matches!(suffix, "" | "a" | "f")),
             "TILEMAXSIM_CUDA_ARCHS contains an invalid architecture"
         );
-        build.flag(&format!("-gencode=arch=compute_{target},code={code}"));
+        build.flag(format!("-gencode=arch=compute_{target},code={code}"));
     }
     build
         .file("native/tilemaxsim_cuda.cu")

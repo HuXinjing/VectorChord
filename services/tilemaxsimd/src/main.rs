@@ -1193,7 +1193,7 @@ fn run_scheduler(
         config.tenant_weights.clone(),
     );
     let mut channel_open = true;
-    while channel_open || queue.len() > 0 {
+    while channel_open || !queue.is_empty() {
         if reload.swap(false, Ordering::AcqRel) {
             match engine.reload_shards() {
                 Ok(()) => {
@@ -1211,7 +1211,7 @@ fn run_scheduler(
             }
         }
 
-        if queue.len() == 0 && channel_open {
+        if queue.is_empty() && channel_open {
             match receiver.recv_timeout(Duration::from_millis(50)) {
                 Ok(work) => enqueue_work(&mut queue, work, &config, &metrics),
                 Err(mpsc::RecvTimeoutError::Timeout) => continue,

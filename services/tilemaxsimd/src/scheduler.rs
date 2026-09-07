@@ -98,6 +98,10 @@ impl<T> RequestQueue<T> {
         self.pending.len()
     }
 
+    pub fn is_empty(&self) -> bool {
+        self.pending.is_empty()
+    }
+
     pub fn iter(&self) -> impl Iterator<Item = &Scheduled<T>> {
         self.pending.iter()
     }

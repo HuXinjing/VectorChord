@@ -289,7 +289,7 @@ pub fn parse_quantizer(bytes: &[u8]) -> Result<QuantizerArtifact> {
         || stages == 0
         || subspaces == 0
         || !(2..=256).contains(&centroids)
-        || dimension % u32::from(subspaces) != 0
+        || !dimension.is_multiple_of(u32::from(subspaces))
         || stages > 16
         || rotation_mask >> stages != 0
     {
