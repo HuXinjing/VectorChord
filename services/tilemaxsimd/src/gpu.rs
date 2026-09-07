@@ -140,6 +140,22 @@ unsafe extern "C" {
         error: *mut c_char,
         error_capacity: usize,
     ) -> c_int;
+    fn vctm_gpu_score_pq_batch(
+        gpu: *mut NativeGpu,
+        quantizer: *const NativeQuantizer,
+        queries: *const c_uchar,
+        query_bytes: usize,
+        query_offsets: *const u32,
+        request_count: u32,
+        total_query_rows: u32,
+        dtype: u8,
+        document_offsets: *const u64,
+        document_rows: *const u32,
+        count: usize,
+        output: *mut f32,
+        error: *mut c_char,
+        error_capacity: usize,
+    ) -> c_int;
 }
 
 pub struct Gpu {
@@ -478,6 +494,73 @@ impl Gpu {
             bail!("native PQ TileMaxSim returned a non-finite score");
         }
         Ok(output)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn score_pq_batch(
+        &mut self,
+        contract_id: &str,
+        queries: &[u8],
+        query_offsets: &[u32],
+        dimension: u32,
+        dtype: u8,
+        document_offsets: &[u64],
+        document_rows: &[u32],
+    ) -> Result<Vec<Vec<f32>>> {
+        let quantizer = self
+            .quantizers
+            .get(contract_id)
+            .ok_or_else(|| anyhow!("PQ quantizer is not resident on this GPU"))?;
+        if query_offsets.len() < 3 || query_offsets[0] != 0 {
+            bail!("invalid PQ batch query offsets");
+        }
+        let total_query_rows = *query_offsets.last().unwrap();
+        let scalar_bytes = match dtype {
+            1 => 4_usize,
+            2 => 2_usize,
+            _ => bail!("unsupported PQ batch query dtype"),
+        };
+        let expected_bytes = (total_query_rows as usize)
+            .checked_mul(dimension as usize)
+            .and_then(|values| values.checked_mul(scalar_bytes))
+            .ok_or_else(|| anyhow!("PQ batch query shape overflows address space"))?;
+        if expected_bytes != queries.len() {
+            bail!("PQ batch query byte length disagrees with its shape");
+        }
+        if document_offsets.len() != document_rows.len() || document_offsets.is_empty() {
+            bail!("invalid PQ batch document metadata");
+        }
+        let request_count = query_offsets.len() - 1;
+        let mut flat_output = vec![0.0_f32; request_count * document_offsets.len()];
+        let mut error = [0_i8; 512];
+        let status = unsafe {
+            vctm_gpu_score_pq_batch(
+                self.native.as_ptr(),
+                quantizer.as_ptr(),
+                queries.as_ptr(),
+                queries.len(),
+                query_offsets.as_ptr(),
+                request_count as u32,
+                total_query_rows,
+                dtype,
+                document_offsets.as_ptr(),
+                document_rows.as_ptr(),
+                document_offsets.len(),
+                flat_output.as_mut_ptr(),
+                error.as_mut_ptr(),
+                error.len(),
+            )
+        };
+        if status != 0 {
+            bail!(native_error(&error));
+        }
+        if flat_output.iter().any(|score| !score.is_finite()) {
+            bail!("native PQ batch TileMaxSim returned a non-finite score");
+        }
+        Ok(flat_output
+            .chunks_exact(document_offsets.len())
+            .map(<[f32]>::to_vec)
+            .collect())
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -919,6 +1002,28 @@ impl AcceleratorBackend for Gpu {
             contract_id,
             query,
             query_rows,
+            dtype,
+            document_offsets,
+            document_rows,
+        )
+    }
+
+    fn score_pq_batch(
+        &mut self,
+        contract_id: &str,
+        queries: &[u8],
+        query_offsets: &[u32],
+        dimension: u32,
+        dtype: u8,
+        document_offsets: &[u64],
+        document_rows: &[u32],
+    ) -> Result<Vec<Vec<f32>>> {
+        Gpu::score_pq_batch(
+            self,
+            contract_id,
+            queries,
+            query_offsets,
+            dimension,
             dtype,
             document_offsets,
             document_rows,
@@ -1417,6 +1522,33 @@ mod tests {
         let query = f32_payload(&[1.0, 0.0, 0.0, 1.0]);
         let scores = gpu.score_pq("pq", &query, 2, 1, &[0], &[2]).unwrap();
         assert!((scores[0] - 2.0).abs() < 1e-5, "scores={scores:?}");
+    }
+
+    #[test]
+    #[ignore = "requires an explicitly assigned CUDA device"]
+    fn native_pq_batch_matches_individual_requests() {
+        let mut gpu = pq_gpu();
+        gpu.ensure_quantizer("pq", &f32_payload(&[1.0, 0.0, 0.0, 1.0]), 2, 1, 1, 2, 0)
+            .unwrap();
+        gpu.upload_batch(&[(0, &[0_u8, 1])]).unwrap();
+        let first = f32_payload(&[1.0, 0.0, 0.0, 1.0]);
+        let second = f32_payload(&[1.0, 0.0]);
+        let mut queries = first.clone();
+        queries.extend_from_slice(&second);
+        let batched = gpu
+            .score_pq_batch("pq", &queries, &[0, 2, 3], 2, 1, &[0], &[2])
+            .unwrap();
+        let individual = [
+            gpu.score_pq("pq", &first, 2, 1, &[0], &[2]).unwrap(),
+            gpu.score_pq("pq", &second, 1, 1, &[0], &[2]).unwrap(),
+        ];
+        assert_eq!(batched.len(), individual.len());
+        for (actual, expected) in batched.iter().zip(individual) {
+            assert!(
+                (actual[0] - expected[0]).abs() < 1e-5,
+                "batched={batched:?}"
+            );
+        }
     }
 
     #[test]

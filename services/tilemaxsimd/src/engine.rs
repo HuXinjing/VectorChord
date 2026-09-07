@@ -584,7 +584,17 @@ impl Engine {
             crate::protocol::ScoringProfile::ExactFp16
                 | crate::protocol::ScoringProfile::Int8
                 | crate::protocol::ScoringProfile::Fp8E4m3
+                | crate::protocol::ScoringProfile::Pq
+                | crate::protocol::ScoringProfile::OpqRpq
         ) {
+            return Ok(None);
+        }
+        if self.devices.iter().any(|device| {
+            !device.gpu.info().capabilities.fused_multiquery
+                || !device
+                    .gpu
+                    .supports_profile(leader.scoring_profile.native_code())
+        }) {
             return Ok(None);
         }
         let scalar_bytes = if leader.dtype == 1 {
@@ -605,6 +615,7 @@ impl Engine {
             request.dimension != leader.dimension
                 || request.dtype != leader.dtype
                 || request.scoring_profile != leader.scoring_profile
+                || request.quantization_contract != leader.quantization_contract
                 || request.candidates.len() != leader.candidates.len()
                 || request
                     .candidates
@@ -614,6 +625,31 @@ impl Engine {
         }) {
             return Ok(None);
         }
+        let active_quantizer = if matches!(
+            leader.scoring_profile,
+            ScoringProfile::Pq | ScoringProfile::OpqRpq
+        ) {
+            let contract_id = leader
+                .quantization_contract
+                .as_deref()
+                .ok_or_else(|| anyhow!("PQ-family request has no quantization contract"))?;
+            let model_contract = leader
+                .candidates
+                .first()
+                .ok_or_else(|| anyhow!("PQ-family request has no candidates"))?
+                .contract
+                .as_str();
+            Some(
+                self.quantization_registry
+                    .as_ref()
+                    .ok_or_else(|| {
+                        anyhow!("PQ-family scoring requires --quantization-registry-root")
+                    })?
+                    .resolve_active(contract_id, model_contract, leader.scoring_profile)?,
+            )
+        } else {
+            None
+        };
         let mut query_offsets = Vec::with_capacity(requests.len() + 1);
         let mut queries = Vec::new();
         query_offsets.push(0_u32);
@@ -655,7 +691,12 @@ impl Engine {
                 transient: false,
                 newly_admitted: false,
             });
-            if let Err(error) = validate_entry(descriptor, &entry, leader.scoring_profile, None) {
+            if let Err(error) = validate_entry(
+                descriptor,
+                &entry,
+                leader.scoring_profile,
+                active_quantizer.as_ref(),
+            ) {
                 self.release_chunks(&chunks)?;
                 return Err(error);
             }
@@ -670,18 +711,40 @@ impl Engine {
                     if chunk.is_empty() {
                         continue;
                     }
+                    let active_quantizer = active_quantizer.as_ref();
                     workers.push(scope.spawn(move || {
                         let offsets = chunk.iter().map(|item| item.offset).collect::<Vec<_>>();
                         let rows = chunk.iter().map(|item| item.rows).collect::<Vec<_>>();
-                        let values = device.gpu.score_batch(
-                            queries,
-                            query_offsets,
-                            leader.dimension,
-                            leader.dtype,
-                            leader.scoring_profile.native_code(),
-                            &offsets,
-                            &rows,
-                        )?;
+                        let values = if let Some(active) = active_quantizer {
+                            device.gpu.ensure_quantizer(
+                                &active.contract_id,
+                                &active.quantizer.payload,
+                                active.quantizer.dimension,
+                                active.quantizer.stages,
+                                active.quantizer.subspaces,
+                                active.quantizer.centroids,
+                                active.quantizer.rotation_mask,
+                            )?;
+                            device.gpu.score_pq_batch(
+                                &active.contract_id,
+                                queries,
+                                query_offsets,
+                                leader.dimension,
+                                leader.dtype,
+                                &offsets,
+                                &rows,
+                            )?
+                        } else {
+                            device.gpu.score_batch(
+                                queries,
+                                query_offsets,
+                                leader.dimension,
+                                leader.dtype,
+                                leader.scoring_profile.native_code(),
+                                &offsets,
+                                &rows,
+                            )?
+                        };
                         let candidate_indexes = chunk
                             .iter()
                             .map(|tensor| tensor.candidate_index)

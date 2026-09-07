@@ -122,6 +122,41 @@ pub trait AcceleratorBackend: Send {
     ) -> Result<Vec<f32>>;
 
     #[allow(clippy::too_many_arguments)]
+    fn score_pq_batch(
+        &mut self,
+        contract_id: &str,
+        queries: &[u8],
+        query_offsets: &[u32],
+        dimension: u32,
+        dtype: u8,
+        document_offsets: &[u64],
+        document_rows: &[u32],
+    ) -> Result<Vec<Vec<f32>>> {
+        let scalar_bytes = match dtype {
+            1 => 4,
+            2 => 2,
+            _ => anyhow::bail!("unsupported PQ query dtype"),
+        };
+        query_offsets
+            .windows(2)
+            .map(|range| {
+                let start = range[0] as usize * dimension as usize * scalar_bytes;
+                let end = range[1] as usize * dimension as usize * scalar_bytes;
+                self.score_pq(
+                    contract_id,
+                    queries
+                        .get(start..end)
+                        .ok_or_else(|| anyhow::anyhow!("PQ batch offsets exceed query payload"))?,
+                    range[1] - range[0],
+                    dtype,
+                    document_offsets,
+                    document_rows,
+                )
+            })
+            .collect()
+    }
+
+    #[allow(clippy::too_many_arguments)]
     fn score_batch(
         &mut self,
         queries: &[u8],

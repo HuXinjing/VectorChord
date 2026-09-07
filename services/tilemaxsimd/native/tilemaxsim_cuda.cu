@@ -1311,13 +1311,16 @@ extern "C" int vctm_gpu_score(
   return 0;
 }
 
-extern "C" int vctm_gpu_score_pq(
+static int score_pq_batch_impl(
     VctmGpu *gpu, const VctmQuantizer *quantizer,
     const unsigned char *query, size_t query_bytes, uint32_t query_rows,
-    uint8_t dtype, const uint64_t *document_offsets,
+    const uint32_t *query_offsets, uint32_t request_count, uint8_t dtype,
+    const uint64_t *document_offsets,
     const uint32_t *document_rows, size_t count, float *output,
     char *error, size_t error_capacity) {
   if (gpu == nullptr || quantizer == nullptr || query == nullptr || query_rows == 0 ||
+      query_offsets == nullptr || request_count == 0 || query_offsets[0] != 0 ||
+      query_offsets[request_count] != query_rows ||
       count == 0 || document_offsets == nullptr || document_rows == nullptr || output == nullptr ||
       quantizer->device != gpu->device) return fail(error, error_capacity, "invalid PQ score request");
   const size_t scalar_bytes = dtype == 1 ? sizeof(float) : dtype == 2 ? sizeof(half) : 0;
@@ -1338,10 +1341,14 @@ extern "C" int vctm_gpu_score_pq(
   }
   cudaError_t status = cudaSetDevice(gpu->device);
   if (status != cudaSuccess) return cuda_fail(error, error_capacity, "cudaSetDevice", status);
-  size_t maxima_count = 0, lut_count = 0, rotated_count = 0;
+  for (uint32_t index = 0; index < request_count; ++index)
+    if (query_offsets[index] >= query_offsets[index + 1])
+      return fail(error, error_capacity, "PQ query offsets must be strictly increasing");
+  size_t maxima_count = 0, score_count = 0, lut_count = 0, rotated_count = 0;
   const size_t rotations =
       __builtin_popcount(static_cast<unsigned int>(quantizer->rotation_mask));
   if (!checked_mul(count, query_rows, &maxima_count) ||
+      !checked_mul(count, request_count, &score_count) ||
       !checked_mul(query_rows, quantizer->stages, &lut_count) ||
       !checked_mul(lut_count, quantizer->subspaces, &lut_count) ||
       !checked_mul(lut_count, quantizer->centroids, &lut_count) ||
@@ -1354,19 +1361,22 @@ extern "C" int vctm_gpu_score_pq(
       !checked_mul(maxima_count, sizeof(float), &maxima_bytes))
     return fail(error, error_capacity, "PQ workspace size overflows address space");
   unsigned char *workspace = gpu->allocation + gpu->tensor_bytes;
-  size_t cursor = 0, query_offset = 0, offsets_offset = 0, rows_offset = 0,
+  size_t cursor = 0, query_offset = 0, query_offsets_offset = 0,
+         offsets_offset = 0, rows_offset = 0,
          rotated_offset = 0, lut_offset = 0, maxima_offset = 0,
          scores_offset = 0;
   if (!reserve_aligned(&cursor, query_bytes, &query_offset) ||
+      !reserve_aligned(&cursor, (request_count + 1) * sizeof(uint32_t), &query_offsets_offset) ||
       !reserve_aligned(&cursor, count * sizeof(uint64_t), &offsets_offset) ||
       !reserve_aligned(&cursor, count * sizeof(uint32_t), &rows_offset) ||
       !reserve_aligned(&cursor, rotated_bytes, &rotated_offset) ||
       !reserve_aligned(&cursor, lut_bytes, &lut_offset) ||
       !reserve_aligned(&cursor, maxima_bytes, &maxima_offset) ||
-      !reserve_aligned(&cursor, count * sizeof(float), &scores_offset) ||
+      !reserve_aligned(&cursor, score_count * sizeof(float), &scores_offset) ||
       cursor > gpu->workspace_bytes)
     return fail(error, error_capacity, "PQ request exceeds configured GPU workspace");
   status = cudaMemcpyAsync(workspace + query_offset, query, query_bytes, cudaMemcpyHostToDevice, gpu->compute_stream);
+  if (status == cudaSuccess) status = cudaMemcpyAsync(workspace + query_offsets_offset, query_offsets, (request_count + 1) * sizeof(uint32_t), cudaMemcpyHostToDevice, gpu->compute_stream);
   if (status == cudaSuccess) status = cudaMemcpyAsync(workspace + offsets_offset, document_offsets, count * sizeof(uint64_t), cudaMemcpyHostToDevice, gpu->compute_stream);
   if (status == cudaSuccess) status = cudaMemcpyAsync(workspace + rows_offset, document_rows, count * sizeof(uint32_t), cudaMemcpyHostToDevice, gpu->compute_stream);
   constexpr unsigned int threads = 256;
@@ -1402,12 +1412,38 @@ extern "C" int vctm_gpu_score_pq(
       reinterpret_cast<const uint32_t *>(workspace + rows_offset), maxima_count,
       reinterpret_cast<float *>(workspace + maxima_offset));
   if (status == cudaSuccess) status = cudaGetLastError();
-  if (status == cudaSuccess) tilemaxsim_sum_kernel<<<static_cast<unsigned int>((count + threads - 1) / threads), threads, 0, gpu->compute_stream>>>(
-      reinterpret_cast<const float *>(workspace + maxima_offset), query_rows, count,
-      reinterpret_cast<float *>(workspace + scores_offset));
+  if (status == cudaSuccess) tilemaxsim_segmented_sum_kernel<<<static_cast<unsigned int>(std::min((score_count + threads - 1) / threads, static_cast<size_t>(65'535))), threads, 0, gpu->compute_stream>>>(
+      reinterpret_cast<const float *>(workspace + maxima_offset), query_rows,
+      reinterpret_cast<const uint32_t *>(workspace + query_offsets_offset),
+      request_count, count, reinterpret_cast<float *>(workspace + scores_offset));
   if (status == cudaSuccess) status = cudaGetLastError();
-  if (status == cudaSuccess) status = cudaMemcpyAsync(output, workspace + scores_offset, count * sizeof(float), cudaMemcpyDeviceToHost, gpu->compute_stream);
+  if (status == cudaSuccess) status = cudaMemcpyAsync(output, workspace + scores_offset, score_count * sizeof(float), cudaMemcpyDeviceToHost, gpu->compute_stream);
   if (status == cudaSuccess) status = cudaStreamSynchronize(gpu->compute_stream);
   if (status != cudaSuccess) return cuda_fail(error, error_capacity, "PQ ADC-MaxSim CUDA execution", status);
   return 0;
+}
+
+extern "C" int vctm_gpu_score_pq(
+    VctmGpu *gpu, const VctmQuantizer *quantizer,
+    const unsigned char *query, size_t query_bytes, uint32_t query_rows,
+    uint8_t dtype, const uint64_t *document_offsets,
+    const uint32_t *document_rows, size_t count, float *output,
+    char *error, size_t error_capacity) {
+  const uint32_t query_offsets[2] = {0, query_rows};
+  return score_pq_batch_impl(
+      gpu, quantizer, query, query_bytes, query_rows, query_offsets, 1, dtype,
+      document_offsets, document_rows, count, output, error, error_capacity);
+}
+
+extern "C" int vctm_gpu_score_pq_batch(
+    VctmGpu *gpu, const VctmQuantizer *quantizer,
+    const unsigned char *queries, size_t query_bytes,
+    const uint32_t *query_offsets, uint32_t request_count,
+    uint32_t total_query_rows, uint8_t dtype,
+    const uint64_t *document_offsets, const uint32_t *document_rows,
+    size_t count, float *output, char *error, size_t error_capacity) {
+  return score_pq_batch_impl(
+      gpu, quantizer, queries, query_bytes, total_query_rows, query_offsets,
+      request_count, dtype, document_offsets, document_rows, count, output,
+      error, error_capacity);
 }
