@@ -2,7 +2,11 @@
 
 use anyhow::Result;
 
-#[cfg(not(any(feature = "backend-cuda", feature = "backend-cpu")))]
+#[cfg(not(any(
+    feature = "backend-cuda",
+    feature = "backend-cpu",
+    feature = "backend-metal"
+)))]
 compile_error!("the tilemaxsimd executable requires one accelerator backend");
 
 fn main() -> Result<()> {
@@ -16,6 +20,13 @@ fn main() -> Result<()> {
     #[cfg(feature = "backend-cuda")]
     return tilemaxsimd::daemon::run_with_backend_factory(|device, total, workspace| {
         Ok(Box::new(tilemaxsimd::gpu::Gpu::create(
+            device, total, workspace,
+        )?))
+    });
+
+    #[cfg(feature = "backend-metal")]
+    return tilemaxsimd::daemon::run_with_backend_factory(|device, total, workspace| {
+        Ok(Box::new(tilemaxsimd::metal::MetalBackend::create(
             device, total, workspace,
         )?))
     });

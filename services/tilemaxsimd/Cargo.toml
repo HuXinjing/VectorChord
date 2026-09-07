@@ -9,6 +9,7 @@ default = ["backend-cuda"]
 backend-core = []
 backend-cuda = ["backend-core"]
 backend-cpu = ["backend-core"]
+backend-metal = ["backend-core"]
 
 [dependencies]
 anyhow = "1.0"

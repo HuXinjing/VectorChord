@@ -9,6 +9,23 @@
 // Copyright (c) 2026 Hu Xinjing
 
 fn main() {
+    if std::env::var_os("CARGO_FEATURE_BACKEND_METAL").is_some() {
+        assert_eq!(
+            std::env::var("CARGO_CFG_TARGET_OS").as_deref(),
+            Ok("macos"),
+            "backend-metal can only be built for macOS"
+        );
+        println!("cargo:rerun-if-changed=native/tilemaxsim_metal.mm");
+        cc::Build::new()
+            .cpp(true)
+            .flag("-std=c++17")
+            .flag("-fobjc-arc")
+            .file("native/tilemaxsim_metal.mm")
+            .compile("tilemaxsim_metal");
+        println!("cargo:rustc-link-lib=framework=Metal");
+        println!("cargo:rustc-link-lib=framework=Foundation");
+        return;
+    }
     if std::env::var_os("CARGO_FEATURE_BACKEND_CUDA").is_none() {
         return;
     }

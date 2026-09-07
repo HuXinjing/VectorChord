@@ -186,6 +186,24 @@ jobs:
           --no-default-features --features backend-cpu --all-targets
           -- -D warnings
 
+      - name: Build and lint native Metal backend
+        if: runner.os == 'macOS'
+        run: |
+          cargo test --manifest-path services/tilemaxsimd/Cargo.toml \
+            --no-default-features --features backend-metal --all-targets --no-run
+          cargo clippy --manifest-path services/tilemaxsimd/Cargo.toml \
+            --no-default-features --features backend-metal --all-targets -- -D warnings
+
+      - name: Validate exact Metal scoring on the runner GPU
+        if: runner.os == 'macOS'
+        env:
+          RUST_TEST_THREADS: "1"
+        run: >-
+          cargo test --manifest-path services/tilemaxsimd/Cargo.toml
+          --no-default-features --features backend-metal
+          metal::tests::passes_vendor_neutral_conformance_probe
+          -- --ignored --nocapture
+
       - name: Validate CPU-only image
         if: runner.os == 'Linux'
         run: docker build --check -f services/Dockerfile.tilemaxsimd-cpu .
