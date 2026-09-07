@@ -99,7 +99,8 @@ fingerprint is part of performance diagnosis; a model name alone is not a safe
 kernel-selection contract.
 
 CUDA builds produce an explicit fat binary. The default CUDA 12 build targets
-native `sm_80`, `sm_89`, and `sm_90` code plus `compute_90` PTX. Override it
+native `sm_80`, `sm_89`, `sm_90`, and Hopper-specific `sm_90a` code plus
+`compute_90` PTX. Override it
 with a validated toolchain-specific list, for example a CUDA 13 Blackwell
 builder:
 

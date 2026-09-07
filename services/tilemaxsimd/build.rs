@@ -14,8 +14,8 @@ fn main() {
     }
     println!("cargo:rerun-if-changed=native/tilemaxsim_cuda.cu");
     println!("cargo:rerun-if-env-changed=TILEMAXSIM_CUDA_ARCHS");
-    let architectures =
-        std::env::var("TILEMAXSIM_CUDA_ARCHS").unwrap_or_else(|_| "80,89,90,90-virtual".to_owned());
+    let architectures = std::env::var("TILEMAXSIM_CUDA_ARCHS")
+        .unwrap_or_else(|_| "80,89,90,90a,90-virtual".to_owned());
     let mut build = cc::Build::new();
     build.cuda(true).flag("-O3").flag("-lineinfo");
     for architecture in architectures
@@ -23,16 +23,21 @@ fn main() {
         .map(str::trim)
         .filter(|v| !v.is_empty())
     {
-        let (number, code) = architecture
+        let (target, code) = architecture
             .strip_suffix("-virtual")
-            .map_or((architecture, format!("sm_{architecture}")), |number| {
-                (number, format!("compute_{number}"))
+            .map_or((architecture, format!("sm_{architecture}")), |target| {
+                (target, format!("compute_{target}"))
             });
+        let number = target.trim_end_matches(['a', 'f']);
         assert!(
-            number.bytes().all(|byte| byte.is_ascii_digit()),
+            !number.is_empty()
+                && number.bytes().all(|byte| byte.is_ascii_digit())
+                && target
+                    .strip_prefix(number)
+                    .is_some_and(|suffix| matches!(suffix, "" | "a" | "f")),
             "TILEMAXSIM_CUDA_ARCHS contains an invalid architecture"
         );
-        build.flag(&format!("-gencode=arch=compute_{number},code={code}"));
+        build.flag(&format!("-gencode=arch=compute_{target},code={code}"));
     }
     build
         .file("native/tilemaxsim_cuda.cu")
