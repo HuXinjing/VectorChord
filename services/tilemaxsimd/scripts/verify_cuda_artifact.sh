@@ -38,7 +38,11 @@ for image in sm_89 sm_90a; do
       echo "${image} fused tile kernel has no asynchronous global-to-shared copy" >&2
       exit 1
     fi
+    if ! grep -qE 'F2FP[^[:space:]]*\.E4M3' <<<"$sass"; then
+      echo "${image} quantized kernel has no native E4M3 conversion" >&2
+      exit 1
+    fi
   )
 done
 
-echo "verified CUDA images: sm_80 sm_89 sm_90 sm_90a compute_90; async tile copy: sm_89 sm_90a"
+echo "verified CUDA images: sm_80 sm_89 sm_90 sm_90a compute_90; async tile copy and native E4M3: sm_89 sm_90a"

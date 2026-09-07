@@ -9,6 +9,7 @@
 // Copyright (c) 2026 Hu Xinjing
 
 #include <cuda_fp16.h>
+#include <cuda_fp8.h>
 #include <cuda_pipeline_primitives.h>
 #include <cuda_runtime.h>
 #include <cublas_v2.h>
@@ -443,6 +444,58 @@ __device__ float lane_dot(const Scalar *left, const Scalar *right,
   return dot;
 }
 
+__device__ float e4m3fn_to_float(uint8_t bits);
+
+template <typename QueryScalar>
+__device__ float lane_dot_int8(const QueryScalar *query, const int8_t *document,
+                               uint32_t dimension, uint32_t lane) {
+  float dot = 0.0f;
+  if ((dimension & 3U) == 0 &&
+      (reinterpret_cast<uintptr_t>(document) & 3U) == 0) {
+    const auto *packed_document = reinterpret_cast<const char4 *>(document);
+    const uint32_t vectors = dimension / 4;
+    for (uint32_t index = lane; index < vectors; index += 32) {
+      const char4 values = packed_document[index];
+      const size_t base = static_cast<size_t>(index) * 4;
+      dot = fmaf(scalar_to_float(query[base]), static_cast<float>(values.x), dot);
+      dot = fmaf(scalar_to_float(query[base + 1]), static_cast<float>(values.y), dot);
+      dot = fmaf(scalar_to_float(query[base + 2]), static_cast<float>(values.z), dot);
+      dot = fmaf(scalar_to_float(query[base + 3]), static_cast<float>(values.w), dot);
+    }
+    return dot;
+  }
+  for (uint32_t index = lane; index < dimension; index += 32)
+    dot = fmaf(scalar_to_float(query[index]),
+               static_cast<float>(document[index]), dot);
+  return dot;
+}
+
+template <typename QueryScalar>
+__device__ float lane_dot_fp8(const QueryScalar *query, const uint8_t *document,
+                              uint32_t dimension, uint32_t lane) {
+  float dot = 0.0f;
+  if ((dimension & 3U) == 0 &&
+      (reinterpret_cast<uintptr_t>(document) & 3U) == 0) {
+    const auto *packed_document = reinterpret_cast<const uint32_t *>(document);
+    const uint32_t vectors = dimension / 4;
+    for (uint32_t index = lane; index < vectors; index += 32) {
+      __nv_fp8x4_e4m3 packed;
+      packed.__x = packed_document[index];
+      const float4 values = static_cast<float4>(packed);
+      const size_t base = static_cast<size_t>(index) * 4;
+      dot = fmaf(scalar_to_float(query[base]), values.x, dot);
+      dot = fmaf(scalar_to_float(query[base + 1]), values.y, dot);
+      dot = fmaf(scalar_to_float(query[base + 2]), values.z, dot);
+      dot = fmaf(scalar_to_float(query[base + 3]), values.w, dot);
+    }
+    return dot;
+  }
+  for (uint32_t index = lane; index < dimension; index += 32)
+    dot = fmaf(scalar_to_float(query[index]),
+               e4m3fn_to_float(document[index]), dot);
+  return dot;
+}
+
 template <>
 __device__ float lane_dot<half>(const half *left, const half *right,
                                 uint32_t dimension, uint32_t lane) {
@@ -534,11 +587,7 @@ __global__ void tilemaxsim_int8_kernel(
     for (uint32_t row = warp; row < document_rows[candidate]; row += warps) {
       const int8_t *document_vector =
           document + static_cast<size_t>(row) * dimension;
-      float dot = 0.0f;
-      for (uint32_t index = lane; index < dimension; index += 32) {
-        dot = fmaf(scalar_to_float(query_vector[index]),
-                   static_cast<float>(document_vector[index]), dot);
-      }
+      float dot = lane_dot_int8(query_vector, document_vector, dimension, lane);
       dot *= scales[row];
       for (int delta = 16; delta != 0; delta >>= 1) {
         dot += __shfl_down_sync(0xffffffff, dot, delta);
@@ -587,11 +636,7 @@ __global__ void tilemaxsim_fp8_kernel(
     float best = -CUDART_INF_F;
     for (uint32_t row = warp; row < document_rows[candidate]; row += warps) {
       const uint8_t *document_vector = document + static_cast<size_t>(row) * dimension;
-      float dot = 0.0f;
-      for (uint32_t index = lane; index < dimension; index += 32) {
-        dot = fmaf(scalar_to_float(query_vector[index]),
-                   e4m3fn_to_float(document_vector[index]), dot);
-      }
+      float dot = lane_dot_fp8(query_vector, document_vector, dimension, lane);
       dot *= scales[row];
       for (int delta = 16; delta != 0; delta >>= 1) {
         dot += __shfl_down_sync(0xffffffff, dot, delta);
