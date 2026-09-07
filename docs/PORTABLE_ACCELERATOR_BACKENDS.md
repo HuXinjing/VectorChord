@@ -128,9 +128,13 @@ eight-warp cooperative mapping remains selected for documents with more rows.
 A back-to-back 512-candidate sweep placed the crossover between four and eight
 document rows: the warp-task path reduced the two-row batch from about 0.275 ms
 to 0.176 ms (1.56x) and the four-row batch from 0.291 ms to 0.251 ms (1.16x),
-but regressed at eight rows. Runtime dispatch consequently uses it only when
-every candidate has at most four rows. This threshold must be rechecked by the
-H200 hardware gate before being described as Hopper-tuned.
+but regressed at eight rows. The value is not hard-coded across architectures:
+startup repeats both kernels at two, four and eight rows with 512 candidates,
+checks their scores, requires a median improvement greater than 5%, and exposes
+the selected maximum through `pq_warp_task_max_document_rows`. The available
+RTX 4090 selected four rows. Calibration failure safely selects the cooperative
+kernel. The H200 hardware gate records its independently selected value before
+the path can be described as Hopper-tuned.
 
 ## Vendor acceptance gates
 

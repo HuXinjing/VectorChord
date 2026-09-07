@@ -36,6 +36,7 @@ struct VctmGpu {
   cublasHandle_t cublas;
   int compute_major;
   uint32_t tile_queries_per_warp;
+  uint32_t pq_warp_task_max_document_rows;
   size_t matrix_engine_workspace_bytes;
   int compute_stream_priority;
   size_t persisting_l2_bytes;
@@ -322,6 +323,18 @@ extern "C" int vctm_gpu_set_tile_queries_per_warp(VctmGpu *gpu,
 
 extern "C" uint32_t vctm_gpu_tile_queries_per_warp(const VctmGpu *gpu) {
   return gpu == nullptr ? 0 : gpu->tile_queries_per_warp;
+}
+
+extern "C" int vctm_gpu_set_pq_warp_task_max_document_rows(
+    VctmGpu *gpu, uint32_t rows) {
+  if (gpu == nullptr) return 1;
+  gpu->pq_warp_task_max_document_rows = rows;
+  return 0;
+}
+
+extern "C" uint32_t vctm_gpu_pq_warp_task_max_document_rows(
+    const VctmGpu *gpu) {
+  return gpu == nullptr ? 0 : gpu->pq_warp_task_max_document_rows;
 }
 
 extern "C" int vctm_gpu_compute_capability(const VctmGpu *gpu, int *major, int *minor) {
@@ -1447,7 +1460,9 @@ static int score_pq_batch_impl(
   else if (status == cudaSuccess) return fail(error, error_capacity, "unsupported PQ query dtype");
   if (status == cudaSuccess) status = cudaGetLastError();
   constexpr size_t warps_per_block = threads / 32;
-  const bool use_warp_tasks = maximum_document_rows <= 4;
+  const bool use_warp_tasks = gpu->pq_warp_task_max_document_rows != 0 &&
+                              maximum_document_rows <=
+                                  gpu->pq_warp_task_max_document_rows;
   const size_t kernel_blocks = std::min(
       use_warp_tasks ? (maxima_count + warps_per_block - 1) / warps_per_block
                      : maxima_count,

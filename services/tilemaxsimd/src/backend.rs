@@ -50,6 +50,8 @@ pub struct DeviceInfo {
     pub matrix_engine_workspace_bytes: Option<u64>,
     /// Query rows served by one document-tile load in the native fused path.
     pub document_tile_query_rows: Option<u32>,
+    /// Largest PQ document row count assigned one independent task per warp.
+    pub pq_warp_task_max_document_rows: Option<u32>,
     pub compute_queue_priority: Option<i32>,
     pub tuning_profile: String,
     pub capabilities: BackendCapabilities,

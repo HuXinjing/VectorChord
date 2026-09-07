@@ -12,7 +12,7 @@ use crate::backend::{
     AcceleratorBackend, AdaptiveStatus, BackendCapabilities, BackendKind, DeviceInfo,
 };
 use anyhow::{Result, anyhow, bail};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ffi::{CStr, c_char, c_int, c_uchar, c_void};
 use std::ptr::NonNull;
 use std::time::{Duration, Instant};
@@ -35,6 +35,8 @@ unsafe extern "C" {
     fn vctm_gpu_tensor_bytes(gpu: *const NativeGpu) -> usize;
     fn vctm_gpu_set_tile_queries_per_warp(gpu: *mut NativeGpu, value: u32) -> c_int;
     fn vctm_gpu_tile_queries_per_warp(gpu: *const NativeGpu) -> u32;
+    fn vctm_gpu_set_pq_warp_task_max_document_rows(gpu: *mut NativeGpu, rows: u32) -> c_int;
+    fn vctm_gpu_pq_warp_task_max_document_rows(gpu: *const NativeGpu) -> u32;
     fn vctm_gpu_compute_capability(
         gpu: *const NativeGpu,
         major: *mut c_int,
@@ -286,6 +288,7 @@ impl Gpu {
                     _ if capability_status == 0 => Some(8),
                     _ => None,
                 },
+                pq_warp_task_max_document_rows: Some(0),
                 compute_queue_priority: (info_status == 0).then_some(compute_stream_priority),
                 tuning_profile: match (major, minor) {
                     (8, 9) => "cuda-ada".to_owned(),
@@ -311,9 +314,12 @@ impl Gpu {
             },
         };
         gpu.calibrate_kernel_thresholds();
+        gpu.calibrate_pq_adc_dispatch();
         // SAFETY: the native arena is still live and owns this tuning value.
         let queries_per_warp = unsafe { vctm_gpu_tile_queries_per_warp(gpu.native.as_ptr()) };
         gpu.info.document_tile_query_rows = queries_per_warp.checked_mul(8);
+        gpu.info.pq_warp_task_max_document_rows =
+            Some(unsafe { vctm_gpu_pq_warp_task_max_document_rows(gpu.native.as_ptr()) });
         Ok(gpu)
     }
 
@@ -758,6 +764,110 @@ impl Gpu {
         }
     }
 
+    fn calibrate_pq_adc_dispatch(&mut self) {
+        const DIMENSION: u32 = 320;
+        const SUBSPACES: u16 = 20;
+        const CENTROIDS: u16 = 256;
+        const QUERY_ROWS: u32 = 32;
+        const REQUESTS: u32 = 8;
+        // Match the resident rerank scale used by the production benchmark.
+        // A small candidate set can hide occupancy losses and choose an
+        // over-aggressive crossover for the common larger batch.
+        const CANDIDATES: usize = 512;
+        const REPETITIONS: usize = 5;
+        const CONTRACT: &str = "__startup_pq_adc_calibration__";
+        let subdimension = DIMENSION as usize / SUBSPACES as usize;
+        let codebook_values = SUBSPACES as usize * CENTROIDS as usize * subdimension;
+        let mut codebook = Vec::with_capacity(codebook_values * size_of::<f32>());
+        for index in 0..codebook_values {
+            codebook
+                .extend_from_slice(&(if index % 97 == 0 { 0.125_f32 } else { 0.0 }).to_le_bytes());
+        }
+        if self
+            .ensure_quantizer(CONTRACT, &codebook, DIMENSION, 1, SUBSPACES, CENTROIDS, 0)
+            .is_err()
+        {
+            self.calibration_failures += 1;
+            return;
+        }
+        let query = (0..QUERY_ROWS as usize * DIMENSION as usize)
+            .flat_map(|index| (if index % 89 == 0 { 0.5_f32 } else { 0.0 }).to_le_bytes())
+            .collect::<Vec<_>>();
+        let queries = (0..REQUESTS)
+            .flat_map(|_| query.iter().copied())
+            .collect::<Vec<_>>();
+        let query_offsets = (0..=REQUESTS)
+            .map(|request| request * QUERY_ROWS)
+            .collect::<Vec<_>>();
+        let mut selected = 0_u32;
+        for candidate_rows in [2_u32, 4, 8] {
+            let document = (0..candidate_rows as usize * SUBSPACES as usize)
+                .map(|index| (index % CENTROIDS as usize) as u8)
+                .collect::<Vec<_>>();
+            let document_offsets = (0..CANDIDATES)
+                .map(|candidate| candidate as u64 * document.len() as u64)
+                .collect::<Vec<_>>();
+            let uploads = document_offsets
+                .iter()
+                .copied()
+                .map(|offset| (offset, document.as_slice()))
+                .collect::<Vec<_>>();
+            let document_rows = vec![candidate_rows; CANDIDATES];
+            if self.upload_batch(&uploads).is_err() {
+                self.calibration_failures += 1;
+                break;
+            }
+            let measure = |gpu: &mut Self, warp_task_rows| {
+                unsafe {
+                    vctm_gpu_set_pq_warp_task_max_document_rows(gpu.native.as_ptr(), warp_task_rows)
+                };
+                let mut samples = Vec::with_capacity(REPETITIONS);
+                let mut scores = Vec::new();
+                for _ in 0..REPETITIONS {
+                    let started = Instant::now();
+                    scores = gpu.score_pq_batch(
+                        CONTRACT,
+                        &queries,
+                        &query_offsets,
+                        DIMENSION,
+                        1,
+                        &document_offsets,
+                        &document_rows,
+                    )?;
+                    samples.push(started.elapsed());
+                }
+                samples.sort_unstable();
+                Ok::<_, anyhow::Error>((samples[REPETITIONS / 2], scores))
+            };
+            self.calibration_runs += 1;
+            let Ok((cooperative_elapsed, cooperative)) = measure(self, 0) else {
+                self.calibration_failures += 1;
+                break;
+            };
+            let Ok((warp_elapsed, warp)) = measure(self, candidate_rows) else {
+                self.calibration_failures += 1;
+                break;
+            };
+            if !batch_scores_close(&cooperative, &warp) {
+                self.calibration_failures += 1;
+                break;
+            }
+            // Demand a material win so startup noise cannot select a fragile
+            // architecture threshold that regresses production traffic.
+            if warp_elapsed.as_nanos().saturating_mul(100)
+                < cooperative_elapsed.as_nanos().saturating_mul(95)
+            {
+                selected = candidate_rows;
+            } else {
+                break;
+            }
+        }
+        unsafe {
+            vctm_gpu_set_pq_warp_task_max_document_rows(self.native.as_ptr(), selected);
+        }
+        self.retain_quantizers(&HashSet::new());
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn calibrate_tile_reuse(
         &mut self,
@@ -1105,6 +1215,11 @@ mod tests {
         assert!(info.compute_queue_priority.is_some());
         assert!(info.tuning_profile.starts_with("cuda-"));
         assert!(info.document_tile_query_rows.unwrap_or_default() >= 8);
+        assert!(info.pq_warp_task_max_document_rows.unwrap_or(u32::MAX) <= 8);
+        eprintln!(
+            "cuda_tuning architecture={} document_tile_query_rows={:?} pq_warp_task_max_document_rows={:?}",
+            info.architecture, info.document_tile_query_rows, info.pq_warp_task_max_document_rows
+        );
         assert_eq!(
             info.capabilities.persisting_l2,
             info.persisting_l2_bytes.is_some()
