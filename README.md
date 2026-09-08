@@ -212,14 +212,19 @@ candidate-overlap floor controlled by
 lists are identical and resident in L0 use one shared-candidate GPU submission;
 all other shapes retain the established path.
 
-Each GPU runs a bounded startup crossover calibration at 32/96/256/512 query
-rows. It compares the shared-memory tile kernel with a cuBLAS FP16 Tensor Core
-GEMM plus segmented MaxSim reduction and accepts a crossover only when scores
-agree within the configured implementation tolerance. Architecture defaults
+Each GPU runs a bounded startup crossover calibration across 64/512/4096
+candidate buckets, uniform/moderately grouped/fragmented document-row profiles,
+and 64--2048 aggregate query rows. It compares the shared-memory tile kernel
+with a cuBLAS FP16 Tensor Core GEMM plus segmented MaxSim reduction and accepts
+a crossover only after numerically equivalent AB/BA measurements show a
+material win. The grouped-GEMM candidate chunk is independently selected from
+the sizes that fit the configured workspace; calibration never borrows
+unreserved free VRAM. Runtime dispatch uses candidate count, total document
+rows, row-group count, batch query rows and dimension. Architecture defaults
 are used only if calibration cannot complete; unsupported hardware, workspace
 pressure, numerical disagreement, or backend failure deterministically falls
-back to the tile/warp path. Decisions and calibration outcomes are exported by
-`GET /metrics`.
+back to the tile/warp path. Per-bucket thresholds, measured times and selected
+chunk sizes are exported by the status and metrics endpoints.
 
 Admission is bounded both globally and per tenant before work enters the
 scheduler. Client disconnects and end-to-end deadlines are checked between

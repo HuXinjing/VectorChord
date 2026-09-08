@@ -170,11 +170,20 @@ candidates are transient to prevent an unusually large request from retaining
 unbounded host memory. This removes allocator/map work without changing the
 cuBLAS precision mode or cache lifecycle.
 
-The startup calibration uses 64 resident candidates with 32 document rows at
-dimension 320. It first selects the fastest numerically equivalent document
-reuse tile, then repeats the tile/matrix comparison and records the first
-query-row crossover. A failed or divergent variant is rejected; a failed or
-divergent matrix path is disabled.
+The startup calibration first selects the fastest numerically equivalent
+document-reuse tile, then measures matrix crossover points at 64, 512 and 4,096
+resident candidates. Each candidate bucket covers one, eight and 32 distinct
+document-row groups and 64--2,048 aggregate query rows at dimension 320. Buckets
+that do not fit the configured tensor arena or workspace are skipped rather
+than borrowing unreserved VRAM. Within each viable bucket the grouped-GEMM
+candidate chunk is selected at that bucket's measured query-row crossover from
+64/256/1,024/4,096 and the bucket size, bounded by the native workspace.
+Selecting it at a fixed unrelated query shape is specifically avoided because
+matrix scratch per candidate changes with batch rows. Runtime normalizes
+candidate work by total document rows, selects the nearest calibrated grouping profile, scales for dimension and
+uses the measured query-row crossover. A failed or divergent bucket is rejected;
+a runtime matrix failure disables the matrix path for that device and retries
+through the established tile path.
 
 On the available RTX 4090, the production-shaped 64-candidate, eight-request,
 32-query-row, 320-dimensional benchmark changed from approximately 0.477 ms to
@@ -295,16 +304,24 @@ batches were 41.5824/3.8990 ms at eight requests, 83.1257/5.9925 ms at 16,
 165.1969/10.6387 ms at 32 and 329.3798/20.4426 ms at 64. The 64-request speedup
 was tightly grouped at 15.989--16.130x despite the shared device.
 
-This result exposes a dispatch-model gap rather than proving that every large
-online request should use Tensor Core. The startup probe used 64 candidates and
-left `tensor_threshold_rows` disabled (`u32::MAX`), even though explicit matrix
-dispatch won strongly once either candidate count or concurrency grew. Query
-rows alone are therefore not a sufficient crossover variable. Production auto
-dispatch must incorporate candidate count, document rows and their resulting
-work estimate (plus launch/grouping cost), then calibrate more than one candidate
-bucket. Until that change is validated, these numbers demonstrate available
-kernel capability but not automatic end-to-end acceleration. The sweep excludes
-scheduler queueing, H2D cache misses, PostgreSQL candidate generation and network
+This result exposed a dispatch-model gap: the former startup probe used 64
+candidates and left `tensor_threshold_rows` disabled (`u32::MAX`) even though
+explicit matrix dispatch won strongly once candidate count or concurrency grew.
+The current implementation addresses that gap with the multi-bucket work and
+grouping model described above. On RTX 4090 it retained tile for 64 candidates
+and two requests, selected Tensor Core for 64 candidates and 16 requests, and
+selected Tensor Core for 512 candidates at both two and eight requests; each
+choice agreed with the directly measured faster path. On the physical H200 the
+same automatic policy retained tile at 64 candidates/two requests (Tensor Core
+was only 0.59x), then selected Tensor Core at 512/two (1.62x), 4,096/two
+(5.92x), 34,054/eight (11.12x) and 34,054/64 (15.82x). The last two shapes
+selected a 4,096-candidate grouped-GEMM chunk within their configured workspace.
+A deliberately tested fixed-512-query-row chunk calibration had selected 1,024
+candidates and regressed the 34,054/eight Tensor path to 12.75 ms; calibrating
+the chunk at the bucket crossover restored it to 3.72 ms. This rejected design
+is recorded to prevent reintroducing a global tile-size assumption. The sweep
+was followed by the complete H200 CUDA suite, with all 17 real-device tests
+passing. It excludes scheduler queueing, H2D cache misses, PostgreSQL candidate generation and network
 latency, and its repeated synthetic document shape is more GEMM-friendly than a
 variable-length production corpus.
 

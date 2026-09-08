@@ -124,10 +124,14 @@ priority、模型/量化 contract、shape，以及由
 采用精确 FP16 且全部命中 L0 的批次会进入共享候选 GPU 路径；其他情况确定性保持
 原执行路径。
 
-每张 GPU 启动时用 32/96/256/512 个 query rows 做有界交叉点校准，对比共享内存
-tile kernel 与 cuBLAS FP16 Tensor Core GEMM + 分段 MaxSim 归约。只有数值结果在
-容差内一致时才采纳实测交叉点；校准失败时使用架构保守表，硬件不支持、workspace
-不足、数值不一致或后端失败时回退 tile/warp。分派和校准结果均由 `/metrics` 暴露。
+每张 GPU 启动时会覆盖 64/512/4096 候选桶、统一/中度分组/高度碎片化的文档行数
+分布，以及 64--2048 个批内 query rows，对共享内存 tile kernel 与 cuBLAS FP16
+Tensor Core GEMM + 分段 MaxSim 归约做有界 AB/BA 校准。只有数值一致且收益达到门槛
+才采纳交叉点。grouped GEMM 的 candidate chunk 也只在用户配置的 workspace 内从
+可用档位实测选择，不借用系统中未预留的空闲显存。运行时同时使用候选数、文档总
+rows、row-group 数、批内 query rows 和维度选路；校准失败、workspace 不足、数值
+不一致或后端失败时确定性回退 tile/warp。状态与 `/metrics` 会暴露每个桶的阈值、
+实测时间和 chunk 大小。
 
 GPU 和 host cache 都有调度域最大占用限制。可选的
 `--tenant-cache-reservation TENANT=GB` 会保护已经预热的 GPU 页面，使其他调度域
