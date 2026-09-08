@@ -41,6 +41,7 @@ use crate::shard::ShardStore;
 const GIB: usize = 1024 * 1024 * 1024;
 const MAX_MANAGEMENT_REQUEST_BYTES: usize = 1024 * 1024;
 const MAX_MANAGEMENT_OPERATIONS: usize = 1024;
+const MAX_QUEUED_MANAGEMENT_OPERATIONS: usize = 64;
 static SHUTDOWN_REQUESTED: AtomicBool = AtomicBool::new(false);
 static RELOAD_REQUESTED: AtomicBool = AtomicBool::new(false);
 
@@ -516,12 +517,23 @@ where
             "priority", "deadline", "candidate_scope", "candidate_limit"
         ],
         "management": {
-            "reload": "POST /v1/reload on the Unix status socket only",
-            "runtime_cache_warm": true,
-            "runtime_cache_pin": true,
-            "operation_tracking": true,
-            "graceful_drain": true,
-            "tensor_circuit_probe": true,
+            "api_version": "tilemaxsim.management.v1",
+            "write_transport": "unix-status-socket-only",
+            "max_request_bytes": MAX_MANAGEMENT_REQUEST_BYTES,
+            "max_queued_operations": MAX_QUEUED_MANAGEMENT_OPERATIONS,
+            "max_operation_records": MAX_MANAGEMENT_OPERATIONS,
+            "runtime_cache_profiles": ["exact-fp16"],
+            "endpoints": {
+                "cache": "GET /v1/cache",
+                "config": "GET /v1/config",
+                "operation": "GET /v1/operations/{id}",
+                "reload": "POST /v1/reload",
+                "prewarm": "POST /v1/cache/prewarm",
+                "pin": "POST /v1/cache/pin",
+                "unpin": "POST /v1/cache/unpin",
+                "drain": "POST /v1/drain",
+                "tensor_circuit_probe": "POST /v1/devices/{ordinal}/tensor-circuit/probe"
+            },
             "forced_kernel_selection": false,
         }
     }));
@@ -530,7 +542,8 @@ where
     let ready_cache = engine.status_json();
 
     let (sender, receiver) = mpsc::sync_channel::<Work>(args.max_queued_requests);
-    let (admin_sender, admin_receiver) = mpsc::sync_channel::<AdminCommand>(64);
+    let (admin_sender, admin_receiver) =
+        mpsc::sync_channel::<AdminCommand>(MAX_QUEUED_MANAGEMENT_OPERATIONS);
     let operations = Arc::new(Mutex::new(OperationRegistry::default()));
     let frame_admission = Arc::new(ByteAdmission::new(
         args.max_inflight_request_gb,

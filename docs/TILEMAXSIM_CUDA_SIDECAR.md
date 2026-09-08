@@ -89,8 +89,11 @@ The status Unix socket serves:
 - `GET /v1/config`: effective non-secret instance settings and the stable
   application request-control contract;
 - `GET /v1/cache`: JSON L0/L1 cache and adaptive GPU state;
-- `POST /v1/reload`: atomically reload shard and quantizer registries. It is
-  accepted only over the Unix status socket; TCP status is read-only.
+- `POST /v1/reload`: atomically reload the shard index. Quantizer activation is
+  resolved atomically per request and needs no reload. The endpoint is accepted
+  only over the Unix status socket; TCP status is read-only. See
+  [`TILEMAXSIM_MANAGEMENT_API.md`](TILEMAXSIM_MANAGEMENT_API.md) for all runtime
+  operations and schemas.
 
 `GET /v1/cache` also reports the accelerator backend, device name and
 architecture, CUDA driver/runtime/cuBLAS versions, SM count, warp size, memory

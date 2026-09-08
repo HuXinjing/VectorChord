@@ -59,7 +59,7 @@ L2 shard 是正确性来源，L1 host cache 降低磁盘读取，L0 accelerator 
 运行时管理写只接受 Unix status socket：
 
 - `/v1/cache/prewarm`、`pin`、`unpin`：异步缓存操作；普通运行时预热不能绕过准入。
-- `/v1/reload`：重载 shard/量化 registry。
+- `/v1/reload`：重载 shard 索引；量化 registry 激活状态由请求路径原子读取。
 - `/v1/devices/{ordinal}/tensor-circuit/probe`：人工请求熔断 half-open 探测。
 - `/v1/operations/{id}`：查询有界操作账本。
 - `/v1/drain`：撤销 readiness，拒绝新工作，排空已接收请求并退出。

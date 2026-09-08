@@ -300,7 +300,7 @@ controls. `GET /v1/cache` returns a timestamped and versioned L0/L1 occupancy,
 fragmentation, hit/miss, transfer, eviction, and adaptive-kernel snapshot.
 Runtime `POST /v1/cache/prewarm`, `/v1/cache/pin`, and `/v1/cache/unpin`
 operations accept content-addressed descriptors. `POST /v1/reload` reloads the
-shard and quantization registries, while
+shard index (quantization activation is read atomically per request), while
 `POST /v1/devices/{ordinal}/tensor-circuit/probe` requests an immediate
 half-open probe. These bounded asynchronous operations return an ID whose
 state is available from `GET /v1/operations/{id}`. `POST /v1/drain` withdraws
@@ -342,6 +342,8 @@ and acceptance gates for future Metal, Ascend and MetaX executors are documented
 in [Portable accelerator backends](docs/PORTABLE_ACCELERATOR_BACKENDS.md).
 New contributors can follow the end-to-end module and request-path guide in
 [Codebase map (Chinese)](docs/CODEBASE_GUIDE.zh-CN.md).
+The control-plane contract and request schemas are specified in the
+[TileMaxSim management API](docs/TILEMAXSIM_MANAGEMENT_API.md).
 
 The development corpus contains 34,054 descriptors, 34,027 unique tensors, and
 16.28 GB of logical FP16 tensor data. Absolute latency depends on storage, CPU,

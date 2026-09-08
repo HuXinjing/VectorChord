@@ -180,7 +180,8 @@ PostgreSQL 可以通过本地 Unix socket 或 `tcp://HOST:PORT` 连接 daemon。
 管理面还提供版本化视图：`GET /v1/config` 返回实际生效的 GPU、缓存、准入和调度
 配置，`GET /v1/cache` 返回带版本与生成时间的 L0/L1 占用、碎片、命中、换入换出及
 每张卡的 kernel 校准状态。运行时可通过 `POST /v1/cache/prewarm`、`/v1/cache/pin`
-和 `/v1/cache/unpin` 管理内容寻址张量；`POST /v1/reload` 重载 shard 与量化 registry；
+和 `/v1/cache/unpin` 管理内容寻址张量；`POST /v1/reload` 重载 shard 索引（量化激活状态
+由每个请求原子读取）；
 `POST /v1/devices/{ordinal}/tensor-circuit/probe` 主动触发 half-open 探测。异步操作
 返回 operation ID，可通过 `GET /v1/operations/{id}` 查询状态。`POST /v1/drain`
 会撤销 readiness、拒绝新请求和管理写、排空已接收工作后退出。所有写操作只允许通过
@@ -211,6 +212,8 @@ IMAGE@sha256:DIGEST` 校验镜像签名。
 [《Portable accelerator backends》](docs/PORTABLE_ACCELERATOR_BACKENDS.md)。
 首次参与开发可先阅读[《代码地图》](docs/CODEBASE_GUIDE.zh-CN.md)，其中按请求链路说明
 PostgreSQL 扩展、daemon、三级缓存、调度、后端和测试的修改落点。
+控制面 endpoint、请求格式、状态与错误语义见
+[《TileMaxSim management API》](docs/TILEMAXSIM_MANAGEMENT_API.md)。
 报告只公开聚合指标和可复现程序，不公开私有评测语料、生成张量、模型权重或内部路径。
 
 开发机语料包含 34,054 个张量描述符、34,027 个唯一张量，逻辑 FP16 数据量为
