@@ -79,6 +79,11 @@ pub struct AdaptiveStatus {
     pub calibration_failures: u64,
     pub tensor_calibration_buckets: Vec<TensorCalibrationBucket>,
     pub tensor_chunk_candidates: u32,
+    pub tensor_circuit_open: bool,
+    pub tensor_suppressed_bucket_count: u32,
+    pub tensor_request_fallbacks: u64,
+    pub tensor_capacity_fallbacks: u64,
+    pub tensor_device_fallbacks: u64,
 }
 
 /// Vendor-neutral execution contract. Scheduling, caching, storage and wire

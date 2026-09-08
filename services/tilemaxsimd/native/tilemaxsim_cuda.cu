@@ -107,6 +107,10 @@ class ScopedPersistingQuery {
 };
 
 static int fail(char *error, size_t capacity, const char *message);
+static int capacity_fail(char *error, size_t capacity, const char *message) {
+  fail(error, capacity, message);
+  return 2;
+}
 static int cuda_fail(char *error, size_t capacity, const char *operation,
                      cudaError_t status);
 static int cublas_fail(char *error, size_t capacity, const char *operation,
@@ -1146,7 +1150,7 @@ extern "C" int vctm_gpu_score_batch_tensor(
                                             : transient_row_groups;
   size_t score_values = 0;
   if (!checked_mul(request_count, count, &score_values))
-    return fail(error, error_capacity, "tensor-core workspace shape overflow");
+    return capacity_fail(error, error_capacity, "tensor-core workspace shape overflow");
   unsigned char *workspace = gpu->allocation + gpu->tensor_bytes;
   size_t cursor = 0, query_offset = 0, query_offsets_offset = 0,
          scores_offset = 0;
@@ -1154,9 +1158,12 @@ extern "C" int vctm_gpu_score_batch_tensor(
       !reserve_aligned(&cursor, (request_count + 1) * sizeof(uint32_t), &query_offsets_offset) ||
       !reserve_aligned(&cursor, score_values * sizeof(float), &scores_offset) ||
       cursor > gpu->workspace_bytes)
-    return fail(error, error_capacity, "tensor-core request exceeds configured GPU workspace");
+    return capacity_fail(error, error_capacity, "tensor-core request exceeds configured GPU workspace");
   cudaError_t status = cudaSetDevice(gpu->device);
-  if (status != cudaSuccess) return cuda_fail(error, error_capacity, "cudaSetDevice", status);
+  if (status != cudaSuccess) {
+    cuda_fail(error, error_capacity, "cudaSetDevice", status);
+    return 3;
+  }
   const HostControlSegment control[] = {
       {query_offset, queries, query_bytes},
       {query_offsets_offset, query_offsets,
@@ -1164,7 +1171,10 @@ extern "C" int vctm_gpu_score_batch_tensor(
   };
   status = copy_control_payload(gpu, workspace, control,
                                 sizeof(control) / sizeof(control[0]));
-  if (status != cudaSuccess) return cuda_fail(error, error_capacity, "tensor-core workspace initialization", status);
+  if (status != cudaSuccess) {
+    cuda_fail(error, error_capacity, "tensor-core workspace initialization", status);
+    return 3;
+  }
   ScopedPersistingQuery query_policy(gpu, workspace + query_offset, query_bytes);
   const float alpha = 1.0f, beta = 0.0f;
   for (const auto &[rows, candidates] : row_groups) {
@@ -1172,11 +1182,11 @@ extern "C" int vctm_gpu_score_batch_tensor(
     size_t matrix_bytes = 0;
     if (!checked_mul(total_query_rows, rows, &matrix_values) ||
         !checked_mul(matrix_values, sizeof(float), &matrix_bytes))
-      return fail(error, error_capacity, "batched GEMM matrix shape overflow");
+      return capacity_fail(error, error_capacity, "batched GEMM matrix shape overflow");
     constexpr size_t metadata_bytes =
         3 * sizeof(void *) + sizeof(uint32_t) + 4 * 256;
     if (matrix_bytes > std::numeric_limits<size_t>::max() - metadata_bytes)
-      return fail(error, error_capacity, "batched GEMM workspace shape overflow");
+      return capacity_fail(error, error_capacity, "batched GEMM workspace shape overflow");
     const size_t per_candidate = matrix_bytes + metadata_bytes;
     const size_t available = gpu->workspace_bytes - cursor;
     const size_t chunk_capacity = std::max(
@@ -1184,7 +1194,7 @@ extern "C" int vctm_gpu_score_batch_tensor(
         std::min({candidates.size(), available / per_candidate,
                   max_cached_tensor_candidates, gpu->tensor_chunk_candidates}));
     if (available < per_candidate)
-      return fail(error, error_capacity, "tensor-core batch exceeds configured GPU workspace");
+      return capacity_fail(error, error_capacity, "tensor-core batch exceeds configured GPU workspace");
     for (size_t begin = 0; begin < candidates.size(); begin += chunk_capacity) {
       const size_t batch = std::min(chunk_capacity, candidates.size() - begin);
       size_t scratch = cursor, matrix_offset = 0, a_offset = 0, b_offset = 0,
@@ -1195,7 +1205,7 @@ extern "C" int vctm_gpu_score_batch_tensor(
           !reserve_aligned(&scratch, batch * sizeof(void *), &c_offset) ||
           !reserve_aligned(&scratch, batch * sizeof(uint32_t), &candidates_offset) ||
           scratch > gpu->workspace_bytes)
-        return fail(error, error_capacity, "tensor-core batch workspace packing failed");
+        return capacity_fail(error, error_capacity, "tensor-core batch workspace packing failed");
       gpu->tensor_a_pointers.resize(batch);
       gpu->tensor_b_pointers.resize(batch);
       gpu->tensor_c_pointers.resize(batch);
@@ -1213,7 +1223,10 @@ extern "C" int vctm_gpu_score_batch_tensor(
       if (status == cudaSuccess) status = cudaMemcpyAsync(workspace + b_offset, gpu->tensor_b_pointers.data(), batch * sizeof(void *), cudaMemcpyHostToDevice, gpu->compute_stream);
       if (status == cudaSuccess) status = cudaMemcpyAsync(workspace + c_offset, gpu->tensor_c_pointers.data(), batch * sizeof(void *), cudaMemcpyHostToDevice, gpu->compute_stream);
       if (status == cudaSuccess) status = cudaMemcpyAsync(workspace + candidates_offset, gpu->tensor_candidate_indexes.data(), batch * sizeof(uint32_t), cudaMemcpyHostToDevice, gpu->compute_stream);
-      if (status != cudaSuccess) return cuda_fail(error, error_capacity, "batched GEMM metadata upload", status);
+      if (status != cudaSuccess) {
+        cuda_fail(error, error_capacity, "batched GEMM metadata upload", status);
+        return 3;
+      }
     const int m = static_cast<int>(rows);
     const int n = static_cast<int>(total_query_rows);
     const int k = static_cast<int>(dimension);
@@ -1225,7 +1238,8 @@ extern "C" int vctm_gpu_score_batch_tensor(
         static_cast<int>(batch), CUBLAS_COMPUTE_32F,
         CUBLAS_GEMM_DEFAULT_TENSOR_OP);
     if (blas != CUBLAS_STATUS_SUCCESS)
-      return cublas_fail(error, error_capacity, "cublasGemmBatchedEx", blas);
+      cublas_fail(error, error_capacity, "cublasGemmBatchedEx", blas);
+      return 3;
     const unsigned int threads = 128;
     const size_t reduction_tasks = batch * request_count;
     tilemaxsim_batched_gemm_reduce_kernel<<<static_cast<unsigned int>(std::min((reduction_tasks + threads - 1) / threads, static_cast<size_t>(65'535))), threads, 0, gpu->compute_stream>>>(
@@ -1235,12 +1249,18 @@ extern "C" int vctm_gpu_score_batch_tensor(
         static_cast<uint32_t>(batch), matrix_values, count,
         reinterpret_cast<float *>(workspace + scores_offset));
     status = cudaGetLastError();
-    if (status != cudaSuccess) return cuda_fail(error, error_capacity, "tensor-core reduction", status);
+    if (status != cudaSuccess) {
+      cuda_fail(error, error_capacity, "tensor-core reduction", status);
+      return 3;
+    }
     }
   }
   status = cudaMemcpyAsync(output, workspace + scores_offset, score_values * sizeof(float), cudaMemcpyDeviceToHost, gpu->compute_stream);
   if (status == cudaSuccess) status = cudaStreamSynchronize(gpu->compute_stream);
-  if (status != cudaSuccess) return cuda_fail(error, error_capacity, "tensor-core TileMaxSim execution", status);
+  if (status != cudaSuccess) {
+    cuda_fail(error, error_capacity, "tensor-core TileMaxSim execution", status);
+    return 3;
+  }
   return 0;
 }
 

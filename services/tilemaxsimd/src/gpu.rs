@@ -18,6 +18,47 @@ use std::ffi::{CStr, c_char, c_int, c_uchar, c_void};
 use std::ptr::NonNull;
 use std::time::{Duration, Instant};
 
+const TENSOR_BUCKET_COOLDOWN: Duration = Duration::from_secs(60);
+const TENSOR_DEVICE_COOLDOWN: Duration = Duration::from_secs(30);
+const TENSOR_DEVICE_FAILURE_LIMIT: u32 = 3;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum NativeBatchErrorKind {
+    Request,
+    Capacity,
+    Device,
+}
+
+fn classify_native_batch_status(status: i32) -> NativeBatchErrorKind {
+    match status {
+        2 => NativeBatchErrorKind::Capacity,
+        3 => NativeBatchErrorKind::Device,
+        _ => NativeBatchErrorKind::Request,
+    }
+}
+
+fn next_tensor_device_failure_streak(current: u32, kind: NativeBatchErrorKind) -> (u32, bool) {
+    if kind != NativeBatchErrorKind::Device {
+        return (0, false);
+    }
+    let next = current.saturating_add(1);
+    (next, next >= TENSOR_DEVICE_FAILURE_LIMIT)
+}
+
+#[derive(Debug)]
+struct NativeBatchError {
+    kind: NativeBatchErrorKind,
+    message: String,
+}
+
+impl std::fmt::Display for NativeBatchError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for NativeBatchError {}
+
 #[repr(C)]
 struct NativeGpu(c_void);
 #[repr(C)]
@@ -174,7 +215,12 @@ pub struct Gpu {
     quantizers: HashMap<String, NonNull<NativeQuantizer>>,
     tensor_threshold_rows: u32,
     tensor_calibration_buckets: Vec<TensorCalibrationBucket>,
-    tensor_runtime_disabled: bool,
+    tensor_suppressed_buckets: HashMap<(u32, u32, u32), Instant>,
+    tensor_circuit_open_until: Option<Instant>,
+    tensor_device_failure_streak: u32,
+    tensor_request_fallbacks: u64,
+    tensor_capacity_fallbacks: u64,
+    tensor_device_fallbacks: u64,
     calibration_complete: bool,
     batch_warp_calls: u64,
     batch_tensor_calls: u64,
@@ -276,7 +322,12 @@ impl Gpu {
             quantizers: HashMap::new(),
             tensor_threshold_rows,
             tensor_calibration_buckets: Vec::new(),
-            tensor_runtime_disabled: false,
+            tensor_suppressed_buckets: HashMap::new(),
+            tensor_circuit_open_until: None,
+            tensor_device_failure_streak: 0,
+            tensor_request_fallbacks: 0,
+            tensor_capacity_fallbacks: 0,
+            tensor_device_fallbacks: 0,
             calibration_complete: false,
             batch_warp_calls: 0,
             batch_tensor_calls: 0,
@@ -373,6 +424,19 @@ impl Gpu {
                 vctm_gpu_tensor_chunk_candidates(self.native.as_ptr())
             })
             .unwrap_or(u32::MAX),
+            tensor_circuit_open: self
+                .tensor_circuit_open_until
+                .is_some_and(|until| until > Instant::now()),
+            tensor_suppressed_bucket_count: u32::try_from(
+                self.tensor_suppressed_buckets
+                    .values()
+                    .filter(|until| **until > Instant::now())
+                    .count(),
+            )
+            .unwrap_or(u32::MAX),
+            tensor_request_fallbacks: self.tensor_request_fallbacks,
+            tensor_capacity_fallbacks: self.tensor_capacity_fallbacks,
+            tensor_device_fallbacks: self.tensor_device_fallbacks,
         }
     }
 
@@ -619,10 +683,20 @@ impl Gpu {
         document_rows: &[u32],
     ) -> Result<Vec<Vec<f32>>> {
         let total_rows = *query_offsets.last().unwrap_or(&0);
+        let now = Instant::now();
+        if self
+            .tensor_circuit_open_until
+            .is_some_and(|until| until <= now)
+        {
+            self.tensor_circuit_open_until = None;
+            self.tensor_device_failure_streak = 0;
+        }
+        self.tensor_suppressed_buckets
+            .retain(|_, until| *until > now);
         let tensor_eligible = scoring_profile == 1
             && dtype == 2
             && self.info.capabilities.matrix_engine
-            && !self.tensor_runtime_disabled;
+            && self.tensor_circuit_open_until.is_none();
         let fallback_bucket = TensorCalibrationBucket {
             candidate_count: 64,
             reference_document_rows: 32,
@@ -656,7 +730,14 @@ impl Gpu {
                 )
             })
             .flatten();
-        if let Some(decision) = tensor_decision.filter(|decision| decision.use_tensor) {
+        if let Some(decision) = tensor_decision.filter(|decision| {
+            decision.use_tensor
+                && !self.tensor_suppressed_buckets.contains_key(&(
+                    decision.selected_candidate_bucket,
+                    decision.selected_document_rows,
+                    decision.selected_row_groups,
+                ))
+        }) {
             if let Some(bucket) = buckets.iter().find(|bucket| {
                 bucket.candidate_count == decision.selected_candidate_bucket
                     && bucket.reference_document_rows == decision.selected_document_rows
@@ -680,18 +761,44 @@ impl Gpu {
                 scoring_profile,
             ) {
                 Ok(scores) => {
+                    self.tensor_device_failure_streak = 0;
                     self.batch_tensor_calls += 1;
                     return Ok(scores);
                 }
-                Err(_) => {
+                Err(error) => {
                     self.calibration_failures += 1;
-                    self.tensor_runtime_disabled = true;
-                    self.tensor_threshold_rows = u32::MAX;
+                    let (failure_streak, open_circuit) = next_tensor_device_failure_streak(
+                        self.tensor_device_failure_streak,
+                        error.kind,
+                    );
+                    self.tensor_device_failure_streak = failure_streak;
+                    match error.kind {
+                        NativeBatchErrorKind::Request => {
+                            self.tensor_request_fallbacks += 1;
+                        }
+                        NativeBatchErrorKind::Capacity => {
+                            self.tensor_capacity_fallbacks += 1;
+                            self.tensor_suppressed_buckets.insert(
+                                (
+                                    decision.selected_candidate_bucket,
+                                    decision.selected_document_rows,
+                                    decision.selected_row_groups,
+                                ),
+                                now + TENSOR_BUCKET_COOLDOWN,
+                            );
+                        }
+                        NativeBatchErrorKind::Device => {
+                            self.tensor_device_fallbacks += 1;
+                            if open_circuit {
+                                self.tensor_circuit_open_until = Some(now + TENSOR_DEVICE_COOLDOWN);
+                            }
+                        }
+                    }
                 }
             }
         }
         self.batch_warp_calls += 1;
-        self.score_batch_native(
+        Ok(self.score_batch_native(
             false,
             queries,
             query_offsets,
@@ -700,7 +807,7 @@ impl Gpu {
             document_offsets,
             document_rows,
             scoring_profile,
-        )
+        )?)
     }
 
     fn calibrate_kernel_thresholds(&mut self) {
@@ -1410,12 +1517,18 @@ impl Gpu {
         document_offsets: &[u64],
         document_rows: &[u32],
         scoring_profile: u8,
-    ) -> Result<Vec<Vec<f32>>> {
+    ) -> std::result::Result<Vec<Vec<f32>>, NativeBatchError> {
         if tensor && dtype != 2 {
-            bail!("Tensor Core TileMaxSim currently requires FP16 queries");
+            return Err(NativeBatchError {
+                kind: NativeBatchErrorKind::Request,
+                message: "Tensor Core TileMaxSim currently requires FP16 queries".to_owned(),
+            });
         }
         if query_offsets.len() < 3 || query_offsets[0] != 0 {
-            bail!("a native multi-query batch requires at least two queries");
+            return Err(NativeBatchError {
+                kind: NativeBatchErrorKind::Request,
+                message: "a native multi-query batch requires at least two queries".to_owned(),
+            });
         }
         let request_count = query_offsets.len() - 1;
         let total_query_rows = *query_offsets.last().unwrap();
@@ -1428,8 +1541,10 @@ impl Gpu {
                     queries.as_ptr(),
                     queries.len(),
                     query_offsets.as_ptr(),
-                    u32::try_from(request_count)
-                        .map_err(|_| anyhow!("too many batched queries"))?,
+                    u32::try_from(request_count).map_err(|_| NativeBatchError {
+                        kind: NativeBatchErrorKind::Request,
+                        message: "too many batched queries".to_owned(),
+                    })?,
                     total_query_rows,
                     dimension,
                     document_offsets.as_ptr(),
@@ -1445,8 +1560,10 @@ impl Gpu {
                     queries.as_ptr(),
                     queries.len(),
                     query_offsets.as_ptr(),
-                    u32::try_from(request_count)
-                        .map_err(|_| anyhow!("too many batched queries"))?,
+                    u32::try_from(request_count).map_err(|_| NativeBatchError {
+                        kind: NativeBatchErrorKind::Request,
+                        message: "too many batched queries".to_owned(),
+                    })?,
                     total_query_rows,
                     dimension,
                     dtype,
@@ -1461,10 +1578,16 @@ impl Gpu {
             }
         };
         if status != 0 {
-            bail!(native_error(&error));
+            return Err(NativeBatchError {
+                kind: classify_native_batch_status(status),
+                message: native_error(&error),
+            });
         }
         if output.iter().any(|score| !score.is_finite()) {
-            bail!("native multi-query TileMaxSim returned a non-finite score");
+            return Err(NativeBatchError {
+                kind: NativeBatchErrorKind::Device,
+                message: "native multi-query TileMaxSim returned a non-finite score".to_owned(),
+            });
         }
         Ok(output
             .chunks(document_offsets.len())
@@ -1738,6 +1861,34 @@ fn native_error(buffer: &[c_char]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn native_tensor_failures_have_stable_recovery_classes() {
+        assert_eq!(
+            classify_native_batch_status(1),
+            NativeBatchErrorKind::Request
+        );
+        assert_eq!(
+            classify_native_batch_status(2),
+            NativeBatchErrorKind::Capacity
+        );
+        assert_eq!(
+            classify_native_batch_status(3),
+            NativeBatchErrorKind::Device
+        );
+        assert_eq!(
+            next_tensor_device_failure_streak(0, NativeBatchErrorKind::Device),
+            (1, false)
+        );
+        assert_eq!(
+            next_tensor_device_failure_streak(2, NativeBatchErrorKind::Device),
+            (3, true)
+        );
+        assert_eq!(
+            next_tensor_device_failure_streak(2, NativeBatchErrorKind::Capacity),
+            (0, false)
+        );
+    }
 
     #[test]
     fn runtime_gate_matches_published_cuda_artifacts() {
