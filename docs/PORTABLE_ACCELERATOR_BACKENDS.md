@@ -308,7 +308,11 @@ This result exposed a dispatch-model gap: the former startup probe used 64
 candidates and left `tensor_threshold_rows` disabled (`u32::MAX`) even though
 explicit matrix dispatch won strongly once candidate count or concurrency grew.
 The current implementation addresses that gap with the multi-bucket work and
-grouping model described above. On RTX 4090 it retained tile for 64 candidates
+grouping model described above. Dispatch compares measured crossover
+dot-product work with the actual query rows, total document rows and dimension,
+while exact row-count cardinality selects the grouping profile. The daemon's
+default candidate quantum is derived from the largest useful bucket common to
+every active device; a non-zero operator setting overrides it. On RTX 4090 it retained tile for 64 candidates
 and two requests, selected Tensor Core for 64 candidates and 16 requests, and
 selected Tensor Core for 512 candidates at both two and eight requests; each
 choice agreed with the directly measured faster path. On the physical H200 the
@@ -324,6 +328,15 @@ was followed by the complete H200 CUDA suite, with all 17 real-device tests
 passing. It excludes scheduler queueing, H2D cache misses, PostgreSQL candidate generation and network
 latency, and its repeated synthetic document shape is more GEMM-friendly than a
 variable-length production corpus.
+
+Native Tensor failures are classified at the ABI boundary. Request and
+workspace-capacity failures fall back without disabling unrelated shapes, with
+the affected calibration bucket retried after a bounded cooldown. Only three
+consecutive CUDA/cuBLAS/device failures open a device-wide circuit, and that
+circuit automatically permits a probe after 30 seconds. Management JSON and
+Prometheus expose each class separately. The retained
+`adaptive_tensor_threshold_rows` metric is a deprecated minimum-over-buckets
+summary, not a global dispatch threshold.
 
 ## Vendor acceptance gates
 

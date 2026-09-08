@@ -202,6 +202,12 @@ at candidate/token quanta and re-enters the scheduler between CUDA launches.
 It is cooperative preemption between kernels, not interruption of an executing
 CUDA kernel.
 
+The candidate quantum defaults to automatic mode: the daemon takes the largest
+useful calibrated candidate bucket supported by every configured accelerator.
+An explicit non-zero `--scheduler-quantum-candidates` remains a hard operator
+override; when calibration is unavailable, automatic mode conservatively uses
+1,024 candidates.
+
 At a new normal-priority busy period the scheduler may wait up to
 `--scheduler-batch-window-ms` and continuously compose at most
 `--scheduler-max-microbatch-requests` compatible quanta. High-priority and
@@ -219,12 +225,19 @@ with a cuBLAS FP16 Tensor Core GEMM plus segmented MaxSim reduction and accepts
 a crossover only after numerically equivalent AB/BA measurements show a
 material win. The grouped-GEMM candidate chunk is independently selected from
 the sizes that fit the configured workspace; calibration never borrows
-unreserved free VRAM. Runtime dispatch uses candidate count, total document
-rows, row-group count, batch query rows and dimension. Architecture defaults
+unreserved free VRAM. Runtime dispatch compares actual
+`query rows * document rows * dimension` work with the crossover work of the
+matching candidate-count and row-group bucket. This keeps continuous batching
+and highly uneven document lengths as separate inputs. Architecture defaults
 are used only if calibration cannot complete; unsupported hardware, workspace
 pressure, numerical disagreement, or backend failure deterministically falls
-back to the tile/warp path. Per-bucket thresholds, measured times and selected
-chunk sizes are exported by the status and metrics endpoints.
+back to the tile/warp path. Request/capacity failures suppress only the affected
+workload bucket for 60 seconds. Three consecutive device failures open a
+device-wide 30-second circuit breaker, after which Tensor Core is probed again.
+Per-bucket thresholds, measured times, selected chunk sizes, fallback classes,
+suppressed buckets and circuit state are exported by the status and metrics
+endpoints. The legacy `adaptive_tensor_threshold_rows` field is only the minimum
+calibrated threshold across buckets and must not be used as the dispatch rule.
 
 Admission is bounded both globally and per tenant before work enters the
 scheduler. Client disconnects and end-to-end deadlines are checked between

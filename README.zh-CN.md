@@ -116,6 +116,10 @@ token 数和实际 `query rows × document rows × dimension` 计算量切分。
 launch 结束后，请求重新进入调度器，因此其他调度域可以插入执行。已经开始的
 CUDA kernel 不能被中断，FMA quantum 用来限制这段协作式不可抢占时间。
 
+候选 quantum 默认为自动模式：daemon 选择所有已配置加速器都支持的最大有效校准
+候选桶。用户传入非零 `--scheduler-quantum-candidates` 时仍作为硬覆盖；无法完成校准
+时自动模式保守回退到 1024 个候选。
+
 普通优先级的新一轮 busy period 最多等待 `--scheduler-batch-window-ms`，并在每个
 quantum 边界连续吸收不超过 `--scheduler-max-microbatch-requests` 个兼容请求。
 高优先级请求和已经恢复执行的长请求不会为了凑批额外等待。兼容条件包含租户、
@@ -128,10 +132,15 @@ priority、模型/量化 contract、shape，以及由
 分布，以及 64--2048 个批内 query rows，对共享内存 tile kernel 与 cuBLAS FP16
 Tensor Core GEMM + 分段 MaxSim 归约做有界 AB/BA 校准。只有数值一致且收益达到门槛
 才采纳交叉点。grouped GEMM 的 candidate chunk 也只在用户配置的 workspace 内从
-可用档位实测选择，不借用系统中未预留的空闲显存。运行时同时使用候选数、文档总
-rows、row-group 数、批内 query rows 和维度选路；校准失败、workspace 不足、数值
-不一致或后端失败时确定性回退 tile/warp。状态与 `/metrics` 会暴露每个桶的阈值、
-实测时间和 chunk 大小。
+可用档位实测选择，不借用系统中未预留的空闲显存。执行层以匹配候选数和 row-group
+桶的交叉点积工作量为基准，直接比较实际
+`query rows × document rows × dimension`；连续批处理带来的 query 复用和长尾文档
+形状是两个独立输入。校准失败、workspace 不足、数值不一致或后端失败时确定性回退
+tile/warp。请求/容量类失败只抑制对应 workload 桶 60 秒；连续三次设备类失败才打开
+全设备 30 秒熔断，冷却后自动探测恢复。状态与 `/metrics` 会暴露每个桶的阈值、实测
+时间、chunk 大小、分类回退计数、抑制桶和熔断状态。兼容字段
+`adaptive_tensor_threshold_rows` 只是所有桶中的最小阈值，不能再被当作运行时全局
+分派阈值。
 
 GPU 和 host cache 都有调度域最大占用限制。可选的
 `--tenant-cache-reservation TENANT=GB` 会保护已经预热的 GPU 页面，使其他调度域
