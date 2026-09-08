@@ -1,5 +1,6 @@
 // This software is licensed under the repository's dual license model.
 
+use crate::dispatch::TensorCalibrationBucket;
 use anyhow::Result;
 use serde::Serialize;
 use std::collections::HashSet;
@@ -68,7 +69,7 @@ pub struct DeviceInfo {
     pub capabilities: BackendCapabilities,
 }
 
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Debug, Default)]
 pub struct AdaptiveStatus {
     pub tensor_threshold_rows: u32,
     pub calibration_complete: bool,
@@ -76,6 +77,8 @@ pub struct AdaptiveStatus {
     pub batch_matrix_calls: u64,
     pub calibration_runs: u64,
     pub calibration_failures: u64,
+    pub tensor_calibration_buckets: Vec<TensorCalibrationBucket>,
+    pub tensor_chunk_candidates: u32,
 }
 
 /// Vendor-neutral execution contract. Scheduling, caching, storage and wire

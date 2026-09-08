@@ -2404,6 +2404,12 @@ fn render_metrics(metrics: &RuntimeMetrics) -> String {
     )
     .unwrap();
     writeln!(output, "# TYPE tilemaxsim_gpu_calibration_total counter").unwrap();
+    writeln!(output, "# HELP tilemaxsim_gpu_tensor_calibration_value Candidate/document-shape calibration values for Tensor Core dispatch.").unwrap();
+    writeln!(
+        output,
+        "# TYPE tilemaxsim_gpu_tensor_calibration_value gauge"
+    )
+    .unwrap();
     writeln!(
         output,
         "# HELP tilemaxsim_gpu_tuning_value Runtime-selected accelerator tuning values."
@@ -2463,6 +2469,22 @@ fn render_metrics(metrics: &RuntimeMetrics) -> String {
         writeln!(output, "tilemaxsim_gpu_adaptive_tensor_threshold_rows{{slot=\"{}\",device=\"{}\",complete=\"{}\"}} {}", device.slot, device.device, device.calibration_complete, device.tensor_threshold_rows).unwrap();
         writeln!(output, "tilemaxsim_gpu_adaptive_dispatch_total{{slot=\"{}\",device=\"{}\",kernel=\"tile\"}} {}", device.slot, device.device, device.batch_warp_calls).unwrap();
         writeln!(output, "tilemaxsim_gpu_adaptive_dispatch_total{{slot=\"{}\",device=\"{}\",kernel=\"tensor\"}} {}", device.slot, device.device, device.batch_tensor_calls).unwrap();
+        for bucket in &device.tensor_calibration_buckets {
+            for (kind, value) in [
+                (
+                    "threshold_query_rows",
+                    u64::from(bucket.threshold_query_rows),
+                ),
+                ("tile_time_ns", bucket.tile_time_ns),
+                ("tensor_time_ns", bucket.tensor_time_ns),
+                (
+                    "tensor_chunk_candidates",
+                    u64::from(bucket.tensor_chunk_candidates),
+                ),
+            ] {
+                writeln!(output, "tilemaxsim_gpu_tensor_calibration_value{{slot=\"{}\",device=\"{}\",candidates=\"{}\",document_rows=\"{}\",row_groups=\"{}\",kind=\"{kind}\"}} {value}", device.slot, device.device, bucket.candidate_count, bucket.reference_document_rows, bucket.reference_row_groups).unwrap();
+            }
+        }
         writeln!(
             output,
             "tilemaxsim_gpu_calibration_total{{slot=\"{}\",device=\"{}\",outcome=\"run\"}} {}",

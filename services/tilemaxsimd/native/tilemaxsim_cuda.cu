@@ -50,6 +50,7 @@ struct VctmGpu {
   std::vector<const void *> tensor_b_pointers;
   std::vector<void *> tensor_c_pointers;
   std::vector<uint32_t> tensor_candidate_indexes;
+  size_t tensor_chunk_candidates;
 };
 
 struct VctmQuantizer {
@@ -255,6 +256,7 @@ extern "C" int vctm_gpu_create(int device, size_t total_bytes,
       std::min(gpu->tensor_bytes, static_cast<size_t>(64) * 1024 * 1024);
   gpu->use_pinned_control_staging = true;
   gpu->use_double_buffered_tile = false;
+  gpu->tensor_chunk_candidates = 65'536;
   status = cudaMalloc(reinterpret_cast<void **>(&gpu->allocation), total_bytes);
   if (status != cudaSuccess) {
     delete gpu;
@@ -409,6 +411,17 @@ extern "C" int vctm_gpu_set_pq_warp_task_max_document_rows(
 extern "C" uint32_t vctm_gpu_pq_warp_task_max_document_rows(
     const VctmGpu *gpu) {
   return gpu == nullptr ? 0 : gpu->pq_warp_task_max_document_rows;
+}
+
+extern "C" int vctm_gpu_set_tensor_chunk_candidates(VctmGpu *gpu,
+                                                       size_t candidates) {
+  if (gpu == nullptr || candidates == 0 || candidates > 65'536) return 1;
+  gpu->tensor_chunk_candidates = candidates;
+  return 0;
+}
+
+extern "C" size_t vctm_gpu_tensor_chunk_candidates(const VctmGpu *gpu) {
+  return gpu == nullptr ? 0 : gpu->tensor_chunk_candidates;
 }
 
 extern "C" int vctm_gpu_compute_capability(const VctmGpu *gpu, int *major, int *minor) {
@@ -1169,7 +1182,7 @@ extern "C" int vctm_gpu_score_batch_tensor(
     const size_t chunk_capacity = std::max(
         static_cast<size_t>(1),
         std::min({candidates.size(), available / per_candidate,
-                  max_cached_tensor_candidates}));
+                  max_cached_tensor_candidates, gpu->tensor_chunk_candidates}));
     if (available < per_candidate)
       return fail(error, error_capacity, "tensor-core batch exceeds configured GPU workspace");
     for (size_t begin = 0; begin < candidates.size(); begin += chunk_capacity) {

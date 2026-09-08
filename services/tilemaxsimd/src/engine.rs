@@ -79,6 +79,8 @@ pub struct DeviceStatus {
     pub batch_tensor_calls: u64,
     pub calibration_runs: u64,
     pub calibration_failures: u64,
+    pub tensor_calibration_buckets: Vec<crate::dispatch::TensorCalibrationBucket>,
+    pub tensor_chunk_candidates: u32,
 }
 
 #[derive(Clone, Debug, Default, serde::Serialize)]
@@ -1001,6 +1003,8 @@ impl Engine {
                     batch_tensor_calls: adaptive.batch_matrix_calls,
                     calibration_runs: adaptive.calibration_runs,
                     calibration_failures: adaptive.calibration_failures,
+                    tensor_calibration_buckets: adaptive.tensor_calibration_buckets,
+                    tensor_chunk_candidates: adaptive.tensor_chunk_candidates,
                 }
             })
             .collect();
@@ -1040,6 +1044,8 @@ impl Engine {
                     "adaptive_batch_tensor_calls": device.batch_tensor_calls,
                     "adaptive_calibration_runs": device.calibration_runs,
                     "adaptive_calibration_failures": device.calibration_failures,
+                    "adaptive_tensor_calibration_buckets": device.tensor_calibration_buckets,
+                    "adaptive_tensor_chunk_candidates": device.tensor_chunk_candidates,
                     "gpu_hits": device.hits,
                     "gpu_misses": device.misses,
                     "gpu_evictions": device.evictions,

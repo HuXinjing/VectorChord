@@ -11,6 +11,7 @@
 use crate::backend::{
     AcceleratorBackend, AdaptiveStatus, BackendCapabilities, BackendKind, DeviceInfo,
 };
+use crate::dispatch::{TensorCalibrationBucket, TensorDispatchInput, choose_tensor};
 use anyhow::{Result, anyhow, bail};
 use std::collections::{HashMap, HashSet};
 use std::ffi::{CStr, c_char, c_int, c_uchar, c_void};
@@ -41,6 +42,8 @@ unsafe extern "C" {
     fn vctm_gpu_double_buffered_tile(gpu: *const NativeGpu) -> c_int;
     fn vctm_gpu_set_pq_warp_task_max_document_rows(gpu: *mut NativeGpu, rows: u32) -> c_int;
     fn vctm_gpu_pq_warp_task_max_document_rows(gpu: *const NativeGpu) -> u32;
+    fn vctm_gpu_set_tensor_chunk_candidates(gpu: *mut NativeGpu, candidates: usize) -> c_int;
+    fn vctm_gpu_tensor_chunk_candidates(gpu: *const NativeGpu) -> usize;
     fn vctm_gpu_compute_capability(
         gpu: *const NativeGpu,
         major: *mut c_int,
@@ -170,6 +173,8 @@ pub struct Gpu {
     tensor_bytes: usize,
     quantizers: HashMap<String, NonNull<NativeQuantizer>>,
     tensor_threshold_rows: u32,
+    tensor_calibration_buckets: Vec<TensorCalibrationBucket>,
+    tensor_runtime_disabled: bool,
     calibration_complete: bool,
     batch_warp_calls: u64,
     batch_tensor_calls: u64,
@@ -270,6 +275,8 @@ impl Gpu {
             tensor_bytes,
             quantizers: HashMap::new(),
             tensor_threshold_rows,
+            tensor_calibration_buckets: Vec::new(),
+            tensor_runtime_disabled: false,
             calibration_complete: false,
             batch_warp_calls: 0,
             batch_tensor_calls: 0,
@@ -353,15 +360,20 @@ impl Gpu {
         self.tensor_bytes
     }
 
-    pub fn adaptive_status(&self) -> (u32, bool, u64, u64, u64, u64) {
-        (
-            self.tensor_threshold_rows,
-            self.calibration_complete,
-            self.batch_warp_calls,
-            self.batch_tensor_calls,
-            self.calibration_runs,
-            self.calibration_failures,
-        )
+    pub fn adaptive_status(&self) -> AdaptiveStatus {
+        AdaptiveStatus {
+            tensor_threshold_rows: self.tensor_threshold_rows,
+            calibration_complete: self.calibration_complete,
+            batch_vector_calls: self.batch_warp_calls,
+            batch_matrix_calls: self.batch_tensor_calls,
+            calibration_runs: self.calibration_runs,
+            calibration_failures: self.calibration_failures,
+            tensor_calibration_buckets: self.tensor_calibration_buckets.clone(),
+            tensor_chunk_candidates: u32::try_from(unsafe {
+                vctm_gpu_tensor_chunk_candidates(self.native.as_ptr())
+            })
+            .unwrap_or(u32::MAX),
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -607,56 +619,56 @@ impl Gpu {
         document_rows: &[u32],
     ) -> Result<Vec<Vec<f32>>> {
         let total_rows = *query_offsets.last().unwrap_or(&0);
-        let tensor_eligible =
-            scoring_profile == 1 && dtype == 2 && self.tensor_threshold_rows != u32::MAX;
-        if tensor_eligible && !self.calibration_complete {
-            self.calibration_runs += 1;
-            let warp_started = Instant::now();
-            let warp = self.score_batch_native(
-                false,
-                queries,
-                query_offsets,
-                dimension,
-                dtype,
-                document_offsets,
-                document_rows,
-                scoring_profile,
-            )?;
-            let warp_elapsed = warp_started.elapsed();
-            let tensor_started = Instant::now();
-            match self.score_batch_native(
-                true,
-                queries,
-                query_offsets,
-                dimension,
-                dtype,
-                document_offsets,
-                document_rows,
-                scoring_profile,
-            ) {
-                Ok(tensor) if batch_scores_close(&warp, &tensor) => {
-                    let tensor_elapsed = tensor_started.elapsed();
-                    self.calibration_complete = true;
-                    if tensor_elapsed < warp_elapsed {
-                        self.tensor_threshold_rows = total_rows.max(1);
-                        self.batch_tensor_calls += 1;
-                        return Ok(tensor);
-                    }
-                    self.tensor_threshold_rows =
-                        total_rows.saturating_mul(2).max(self.tensor_threshold_rows);
-                    self.batch_warp_calls += 1;
-                    return Ok(warp);
-                }
-                _ => {
-                    self.calibration_failures += 1;
-                    self.calibration_complete = true;
-                    self.tensor_threshold_rows = u32::MAX;
-                    self.batch_warp_calls += 1;
-                    return Ok(warp);
-                }
+        let tensor_eligible = scoring_profile == 1
+            && dtype == 2
+            && self.info.capabilities.matrix_engine
+            && !self.tensor_runtime_disabled;
+        let fallback_bucket = TensorCalibrationBucket {
+            candidate_count: 64,
+            reference_document_rows: 32,
+            reference_row_groups: 1,
+            threshold_query_rows: self.tensor_threshold_rows,
+            tensor_chunk_candidates: 64,
+            ..TensorCalibrationBucket::default()
+        };
+        let buckets = if self.tensor_calibration_buckets.is_empty() {
+            std::slice::from_ref(&fallback_bucket)
+        } else {
+            &self.tensor_calibration_buckets
+        };
+        let total_document_rows = document_rows
+            .iter()
+            .fold(0_u64, |total, rows| total.saturating_add(u64::from(*rows)));
+        let document_row_groups =
+            u32::try_from(document_rows.iter().copied().collect::<HashSet<_>>().len())
+                .unwrap_or(u32::MAX);
+        let tensor_decision = tensor_eligible
+            .then(|| {
+                choose_tensor(
+                    TensorDispatchInput {
+                        candidate_count: document_offsets.len(),
+                        total_query_rows: total_rows,
+                        total_document_rows,
+                        document_row_groups,
+                        dimension,
+                    },
+                    buckets,
+                )
+            })
+            .flatten();
+        if let Some(decision) = tensor_decision.filter(|decision| decision.use_tensor) {
+            if let Some(bucket) = buckets.iter().find(|bucket| {
+                bucket.candidate_count == decision.selected_candidate_bucket
+                    && bucket.reference_document_rows == decision.selected_document_rows
+                    && bucket.reference_row_groups == decision.selected_row_groups
+            }) {
+                let _ = unsafe {
+                    vctm_gpu_set_tensor_chunk_candidates(
+                        self.native.as_ptr(),
+                        bucket.tensor_chunk_candidates.max(1) as usize,
+                    )
+                };
             }
-        }
-        if tensor_eligible && total_rows >= self.tensor_threshold_rows {
             match self.score_batch_native(
                 true,
                 queries,
@@ -673,6 +685,7 @@ impl Gpu {
                 }
                 Err(_) => {
                     self.calibration_failures += 1;
+                    self.tensor_runtime_disabled = true;
                     self.tensor_threshold_rows = u32::MAX;
                 }
             }
@@ -747,63 +760,239 @@ impl Gpu {
             &one,
             &zero,
         );
+        self.calibrate_tensor_dispatch_buckets(DIMENSION, &one, &zero);
+    }
+
+    fn calibrate_tensor_dispatch_buckets(&mut self, dimension: u32, one: &[u8; 2], zero: &[u8; 2]) {
+        const UNIFORM_ROWS: [u32; 1] = [32];
+        const MODERATE_ROW_GROUPS: [u32; 8] = [8, 16, 24, 32, 40, 48, 56, 64];
+        const FRAGMENTED_ROW_GROUPS: [u32; 32] = [
+            1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24,
+            25, 26, 27, 28, 29, 30, 31, 32,
+        ];
         let fallback = self.tensor_threshold_rows;
-        let mut successful = 0_u64;
-        let mut crossover = None;
-        for total_rows in [32_u32, 96, 256, 512] {
-            let mut queries = Vec::with_capacity(total_rows as usize * DIMENSION as usize * 2);
-            for row in 0..total_rows {
-                for column in 0..DIMENSION {
-                    queries.extend_from_slice(if column == row % DOCUMENT_ROWS {
-                        &one
-                    } else {
-                        &zero
-                    });
+        let mut buckets = Vec::new();
+        for candidates in [64_usize, 512, 4096] {
+            for row_pattern in [
+                UNIFORM_ROWS.as_slice(),
+                MODERATE_ROW_GROUPS.as_slice(),
+                FRAGMENTED_ROW_GROUPS.as_slice(),
+            ] {
+                if let Some(bucket) =
+                    self.calibrate_tensor_bucket(dimension, candidates, row_pattern, one, zero)
+                {
+                    buckets.push(bucket);
                 }
-            }
-            let offsets = [0, total_rows / 2, total_rows];
-            self.calibration_runs += 1;
-            let measure = |gpu: &mut Self, tensor| -> Result<(Duration, Vec<Vec<f32>>)> {
-                let started = Instant::now();
-                let mut scores = Vec::new();
-                for _ in 0..REPETITIONS {
-                    scores = gpu.score_batch_native(
-                        tensor,
-                        &queries,
-                        &offsets,
-                        DIMENSION,
-                        2,
-                        &document_offsets,
-                        &document_rows,
-                        1,
-                    )?;
-                }
-                Ok((started.elapsed() / REPETITIONS as u32, scores))
-            };
-            let Ok((warp_elapsed, warp)) = measure(self, false) else {
-                self.calibration_failures += 1;
-                continue;
-            };
-            let Ok((tensor_elapsed, tensor)) = measure(self, true) else {
-                self.calibration_failures += 1;
-                continue;
-            };
-            if !batch_scores_close(&warp, &tensor) {
-                self.calibration_failures += 1;
-                continue;
-            }
-            successful += 1;
-            if crossover.is_none() && tensor_elapsed < warp_elapsed {
-                crossover = Some(total_rows);
             }
         }
-        if successful == 0 {
+        if buckets.is_empty() {
             self.tensor_threshold_rows = fallback;
             self.calibration_complete = false;
-        } else {
-            self.tensor_threshold_rows = crossover.unwrap_or(u32::MAX);
-            self.calibration_complete = true;
+            return;
         }
+        self.tensor_threshold_rows = buckets
+            .iter()
+            .map(|bucket| bucket.threshold_query_rows)
+            .min()
+            .unwrap_or(fallback);
+        self.tensor_calibration_buckets = buckets;
+        self.calibration_complete = true;
+    }
+
+    fn calibrate_tensor_bucket(
+        &mut self,
+        dimension: u32,
+        candidates: usize,
+        row_pattern: &[u32],
+        one: &[u8; 2],
+        zero: &[u8; 2],
+    ) -> Option<TensorCalibrationBucket> {
+        const REPETITIONS: usize = 3;
+        let templates = row_pattern
+            .iter()
+            .map(|rows| {
+                let mut document = Vec::with_capacity(*rows as usize * dimension as usize * 2);
+                for row in 0..*rows {
+                    for column in 0..dimension {
+                        document.extend_from_slice(if column == row % dimension {
+                            one
+                        } else {
+                            zero
+                        });
+                    }
+                }
+                document
+            })
+            .collect::<Vec<_>>();
+        let mut cursor = 0_u64;
+        let mut document_offsets = Vec::with_capacity(candidates);
+        let mut document_rows = Vec::with_capacity(candidates);
+        for candidate in 0..candidates {
+            let template = candidate % templates.len();
+            document_offsets.push(cursor);
+            document_rows.push(row_pattern[template]);
+            cursor = cursor.checked_add(templates[template].len() as u64)?;
+        }
+        if cursor > self.tensor_bytes as u64 {
+            return None;
+        }
+        let uploads = document_offsets
+            .iter()
+            .enumerate()
+            .map(|(candidate, offset)| (*offset, templates[candidate % templates.len()].as_slice()))
+            .collect::<Vec<_>>();
+        if self.upload_batch(&uploads).is_err() {
+            self.calibration_failures += 1;
+            return None;
+        }
+        let chunk_candidates = self.calibrate_tensor_chunk_candidates(
+            dimension,
+            candidates,
+            &document_offsets,
+            &document_rows,
+            one,
+            zero,
+        )?;
+        if unsafe { vctm_gpu_set_tensor_chunk_candidates(self.native.as_ptr(), chunk_candidates) }
+            != 0
+        {
+            self.calibration_failures += 1;
+            return None;
+        }
+
+        let mut threshold = u32::MAX;
+        let mut threshold_times = (0_u64, 0_u64);
+        let mut successful = false;
+        for total_rows in [64_u32, 256, 512, 1024, 2048] {
+            let (queries, offsets) = calibration_queries(total_rows, dimension, 32, one, zero);
+            self.calibration_runs += 1;
+            let paired = paired_kernel_measurement(
+                self,
+                &queries,
+                &offsets,
+                dimension,
+                &document_offsets,
+                &document_rows,
+                REPETITIONS,
+            );
+            let Ok(((tile_elapsed, tile), (tensor_elapsed, tensor))) = paired else {
+                self.calibration_failures += 1;
+                continue;
+            };
+            if !batch_scores_close(&tile, &tensor) {
+                self.calibration_failures += 1;
+                continue;
+            }
+            successful = true;
+            threshold_times = (
+                duration_ns_u64(tile_elapsed),
+                duration_ns_u64(tensor_elapsed),
+            );
+            if tensor_elapsed.as_nanos().saturating_mul(100)
+                < tile_elapsed.as_nanos().saturating_mul(95)
+            {
+                threshold = total_rows;
+                break;
+            }
+        }
+        successful.then(|| TensorCalibrationBucket {
+            candidate_count: u32::try_from(candidates).unwrap_or(u32::MAX),
+            reference_document_rows: u32::try_from(
+                document_rows
+                    .iter()
+                    .map(|rows| u64::from(*rows))
+                    .sum::<u64>()
+                    / candidates as u64,
+            )
+            .unwrap_or(u32::MAX),
+            reference_row_groups: u32::try_from(row_pattern.len()).unwrap_or(u32::MAX),
+            threshold_query_rows: threshold,
+            tile_time_ns: threshold_times.0,
+            tensor_time_ns: threshold_times.1,
+            tensor_chunk_candidates: u32::try_from(chunk_candidates).unwrap_or(u32::MAX),
+        })
+    }
+
+    fn calibrate_tensor_chunk_candidates(
+        &mut self,
+        dimension: u32,
+        candidates: usize,
+        document_offsets: &[u64],
+        document_rows: &[u32],
+        one: &[u8; 2],
+        zero: &[u8; 2],
+    ) -> Option<usize> {
+        const REPETITIONS: usize = 3;
+        let (queries, offsets) = calibration_queries(512, dimension, 32, one, zero);
+        let mut choices = [64_usize, 256, 1024, 4096, candidates]
+            .into_iter()
+            .filter(|choice| *choice <= candidates)
+            .collect::<Vec<_>>();
+        choices.sort_unstable();
+        choices.dedup();
+        let mut best: Option<(usize, Duration)> = None;
+        let mut oracle: Option<Vec<Vec<f32>>> = None;
+        for chunk in choices {
+            if unsafe { vctm_gpu_set_tensor_chunk_candidates(self.native.as_ptr(), chunk) } != 0 {
+                continue;
+            }
+            let mut samples = Vec::with_capacity(REPETITIONS);
+            let mut scores = None;
+            if self
+                .score_batch_native(
+                    true,
+                    &queries,
+                    &offsets,
+                    dimension,
+                    2,
+                    document_offsets,
+                    document_rows,
+                    1,
+                )
+                .is_err()
+            {
+                continue;
+            }
+            for _ in 0..REPETITIONS {
+                let started = Instant::now();
+                let Ok(output) = self.score_batch_native(
+                    true,
+                    &queries,
+                    &offsets,
+                    dimension,
+                    2,
+                    document_offsets,
+                    document_rows,
+                    1,
+                ) else {
+                    samples.clear();
+                    break;
+                };
+                samples.push(started.elapsed());
+                scores = Some(output);
+            }
+            if samples.len() != REPETITIONS {
+                continue;
+            }
+            samples.sort_unstable();
+            let scores = scores?;
+            if let Some(expected) = &oracle {
+                if !batch_scores_close(expected, &scores) {
+                    self.calibration_failures += 1;
+                    continue;
+                }
+            } else {
+                oracle = Some(scores);
+            }
+            let elapsed = samples[REPETITIONS / 2];
+            if best.is_none_or(|(_, current)| {
+                elapsed.as_nanos().saturating_mul(100) < current.as_nanos().saturating_mul(98)
+            }) {
+                best = Some((chunk, elapsed));
+            }
+        }
+        self.calibration_runs += 1;
+        best.map(|(chunk, _)| chunk)
     }
 
     fn calibrate_control_staging(
@@ -1279,6 +1468,86 @@ impl Gpu {
     }
 }
 
+fn calibration_queries(
+    total_rows: u32,
+    dimension: u32,
+    document_rows: u32,
+    one: &[u8; 2],
+    zero: &[u8; 2],
+) -> (Vec<u8>, Vec<u32>) {
+    let mut queries = Vec::with_capacity(total_rows as usize * dimension as usize * 2);
+    for row in 0..total_rows {
+        for column in 0..dimension {
+            queries.extend_from_slice(if column == row % document_rows {
+                one
+            } else {
+                zero
+            });
+        }
+    }
+    let request_rows = 32;
+    let offsets = (0..=total_rows / request_rows)
+        .map(|request| request * request_rows)
+        .collect();
+    (queries, offsets)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn paired_kernel_measurement(
+    gpu: &mut Gpu,
+    queries: &[u8],
+    query_offsets: &[u32],
+    dimension: u32,
+    document_offsets: &[u64],
+    document_rows: &[u32],
+    repetitions: usize,
+) -> Result<PairedBatchCalibration> {
+    let run_once = |gpu: &mut Gpu, tensor| -> Result<TimedBatchScores> {
+        let started = Instant::now();
+        let scores = gpu.score_batch_native(
+            tensor,
+            queries,
+            query_offsets,
+            dimension,
+            2,
+            document_offsets,
+            document_rows,
+            1,
+        )?;
+        Ok((started.elapsed(), scores))
+    };
+    run_once(gpu, false)?;
+    run_once(gpu, true)?;
+    let mut samples = [
+        Vec::with_capacity(repetitions),
+        Vec::with_capacity(repetitions),
+    ];
+    let mut scores = [Vec::new(), Vec::new()];
+    for repetition in 0..repetitions {
+        let order = if repetition & 1 == 0 {
+            [false, true]
+        } else {
+            [true, false]
+        };
+        for tensor in order {
+            let (elapsed, output) = run_once(gpu, tensor)?;
+            let index = usize::from(tensor);
+            samples[index].push(elapsed);
+            scores[index] = output;
+        }
+    }
+    samples[0].sort_unstable();
+    samples[1].sort_unstable();
+    Ok((
+        (samples[0][repetitions / 2], std::mem::take(&mut scores[0])),
+        (samples[1][repetitions / 2], std::mem::take(&mut scores[1])),
+    ))
+}
+
+fn duration_ns_u64(duration: Duration) -> u64 {
+    u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX)
+}
+
 fn validate_cuda_runtime(
     capability_status: c_int,
     info_status: c_int,
@@ -1314,15 +1583,7 @@ impl AcceleratorBackend for Gpu {
     }
 
     fn adaptive_status(&self) -> AdaptiveStatus {
-        let status = Gpu::adaptive_status(self);
-        AdaptiveStatus {
-            tensor_threshold_rows: status.0,
-            calibration_complete: status.1,
-            batch_vector_calls: status.2,
-            batch_matrix_calls: status.3,
-            calibration_runs: status.4,
-            calibration_failures: status.5,
-        }
+        Gpu::adaptive_status(self)
     }
 
     fn ensure_quantizer(
@@ -1511,8 +1772,10 @@ mod tests {
         assert!(info.control_staging_speedup_milli.is_some());
         assert!(info.double_buffered_tile.is_some());
         assert!(info.double_buffer_speedup_milli.is_some());
+        let adaptive = gpu.adaptive_status();
+        assert!(!adaptive.tensor_calibration_buckets.is_empty());
         eprintln!(
-            "cuda_tuning architecture={} document_tile_query_rows={:?} pq_warp_task_max_document_rows={:?} pinned_control_staging={:?} control_staging_speedup_milli={:?} double_buffered_tile={:?} double_buffer_speedup_milli={:?}",
+            "cuda_tuning architecture={} document_tile_query_rows={:?} pq_warp_task_max_document_rows={:?} pinned_control_staging={:?} control_staging_speedup_milli={:?} double_buffered_tile={:?} double_buffer_speedup_milli={:?} tensor_chunk_candidates={} tensor_calibration_buckets={:?}",
             info.architecture,
             info.document_tile_query_rows,
             info.pq_warp_task_max_document_rows,
@@ -1520,6 +1783,8 @@ mod tests {
             info.control_staging_speedup_milli,
             info.double_buffered_tile,
             info.double_buffer_speedup_milli,
+            adaptive.tensor_chunk_candidates,
+            adaptive.tensor_calibration_buckets,
         );
         assert_eq!(
             info.capabilities.persisting_l2,
@@ -1794,10 +2059,21 @@ mod tests {
         let (tensor_ms, tensor) = measure(&mut gpu, true);
         assert!(batch_scores_close(&tile, &double_buffer));
         assert!(batch_scores_close(&tile, &tensor));
+        let tensor_calls_before = gpu.batch_tensor_calls;
+        let auto = gpu
+            .score_batch(&queries, &query_offsets, DIM as u32, 2, 1, &offsets, &rows)
+            .unwrap();
+        assert!(batch_scores_close(&tile, &auto));
+        let automatic_kernel = if gpu.batch_tensor_calls > tensor_calls_before {
+            "tensor"
+        } else {
+            "tile"
+        };
         eprintln!(
-            "tilemaxsim_320d candidates={candidates} requests={requests} query_rows={query_rows} document_rows={document_rows} warmups={warmups} iterations={iterations} tile_query_rows={} calibrated_threshold_rows={} single_buffer_ms={tile_ms:.4} double_buffer_ms={double_buffer_ms:.4} double_buffer_speedup={:.3} tensor_ms={tensor_ms:.4} tensor_speedup={:.3}",
+            "tilemaxsim_320d candidates={candidates} requests={requests} query_rows={query_rows} document_rows={document_rows} warmups={warmups} iterations={iterations} tile_query_rows={} calibrated_threshold_rows={} automatic_kernel={automatic_kernel} tensor_chunk_candidates={} single_buffer_ms={tile_ms:.4} double_buffer_ms={double_buffer_ms:.4} double_buffer_speedup={:.3} tensor_ms={tensor_ms:.4} tensor_speedup={:.3}",
             gpu.info.document_tile_query_rows.unwrap_or_default(),
             gpu.tensor_threshold_rows,
+            unsafe { vctm_gpu_tensor_chunk_candidates(gpu.native.as_ptr()) },
             tile_ms / double_buffer_ms,
             tile_ms / tensor_ms
         );
