@@ -98,19 +98,12 @@ pub struct EngineStatus {
 
 impl Engine {
     pub fn recommended_quantum_candidates(&self) -> Option<usize> {
-        self.devices
+        let buckets_by_device = self
+            .devices
             .iter()
-            .filter_map(|device| {
-                device
-                    .gpu
-                    .adaptive_status()
-                    .tensor_calibration_buckets
-                    .iter()
-                    .filter(|bucket| bucket.threshold_query_rows != u32::MAX)
-                    .map(|bucket| bucket.candidate_count as usize)
-                    .max()
-            })
-            .min()
+            .map(|device| device.gpu.adaptive_status().tensor_calibration_buckets)
+            .collect::<Vec<_>>();
+        common_recommended_quantum(&buckets_by_device)
     }
 
     pub fn new<B: AcceleratorBackend + 'static>(
@@ -1103,6 +1096,23 @@ impl Engine {
     }
 }
 
+fn common_recommended_quantum(
+    buckets_by_device: &[Vec<crate::dispatch::TensorCalibrationBucket>],
+) -> Option<usize> {
+    buckets_by_device
+        .iter()
+        .map(|buckets| {
+            buckets
+                .iter()
+                .filter(|bucket| bucket.threshold_query_rows != u32::MAX)
+                .map(|bucket| bucket.candidate_count as usize)
+                .max()
+        })
+        .collect::<Option<Vec<_>>>()?
+        .into_iter()
+        .min()
+}
+
 fn attach_candidate_ids(
     requests: &[Request],
     scores: Vec<Vec<Option<f32>>>,
@@ -1326,6 +1336,32 @@ fn half_to_f32(bits: u16) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn calibration_bucket(
+        candidates: u32,
+        useful: bool,
+    ) -> crate::dispatch::TensorCalibrationBucket {
+        crate::dispatch::TensorCalibrationBucket {
+            candidate_count: candidates,
+            threshold_query_rows: if useful { 64 } else { u32::MAX },
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn automatic_quantum_requires_a_useful_bucket_on_every_device() {
+        let devices = vec![
+            vec![calibration_bucket(4096, true)],
+            vec![calibration_bucket(512, true)],
+        ];
+        assert_eq!(common_recommended_quantum(&devices), Some(512));
+
+        let unavailable = vec![
+            vec![calibration_bucket(4096, true)],
+            vec![calibration_bucket(4096, false)],
+        ];
+        assert_eq!(common_recommended_quantum(&unavailable), None);
+    }
 
     fn descriptor(candidate_id: u32, digest: &str, rows: u32) -> Descriptor {
         Descriptor {
