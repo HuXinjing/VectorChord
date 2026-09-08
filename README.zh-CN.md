@@ -177,16 +177,27 @@ tilemaxsimd \
 
 PostgreSQL 可以通过本地 Unix socket 或 `tcp://HOST:PORT` 连接 daemon。
 `GET /livez`、`GET /healthz` 和 `GET /metrics` 分别提供存活、就绪和有界运行指标。
-管理面还提供版本化的只读视图：`GET /v1/config` 返回实际生效的 GPU、缓存、准入和
-调度配置，`GET /v1/cache` 返回 L0/L1 占用、碎片、命中、换入换出及每张卡的 kernel
-校准状态。`POST /v1/reload` 可原子重载 shard 与量化 registry，但只允许通过受文件
-权限保护的 Unix status socket 调用；TCP status 端口始终只读。
+管理面还提供版本化视图：`GET /v1/config` 返回实际生效的 GPU、缓存、准入和调度
+配置，`GET /v1/cache` 返回带版本与生成时间的 L0/L1 占用、碎片、命中、换入换出及
+每张卡的 kernel 校准状态。运行时可通过 `POST /v1/cache/prewarm`、`/v1/cache/pin`
+和 `/v1/cache/unpin` 管理内容寻址张量；`POST /v1/reload` 重载 shard 与量化 registry；
+`POST /v1/devices/{ordinal}/tensor-circuit/probe` 主动触发 half-open 探测。异步操作
+返回 operation ID，可通过 `GET /v1/operations/{id}` 查询状态。`POST /v1/drain`
+会撤销 readiness、拒绝新请求和管理写、排空已接收工作后退出。所有写操作只允许通过
+受文件权限保护的 Unix status socket；TCP status 端口始终只读。
 
 上层应用应控制候选范围、backend、scoring profile、量化 contract、调度域、priority
 和 deadline。显存预算、租户 reservation、准入上限、攒批阈值和 quantum 大小仍由
 运维在实例启动时配置。系统不会暴露任意 eviction 或强制 kernel 接口，以免绕过缓存
-隔离与校准回退。运行时社区 cache warm 仍是后续管理接口；当前 pinned 预热使用启动期
-resident manifest。
+隔离与校准回退。运行时 prewarm 遵守正常准入限制；只有启动期 resident manifest
+是运维人员显式配置的强制 pinned 预热。
+
+发布工作流会为每个容器镜像附加 SPDX SBOM、max 模式 SLSA provenance、GitHub
+构建来源证明，并用 Cosign OIDC 对不可变 digest 做无密钥签名。可使用
+`gh attestation verify oci://IMAGE:TAG -R HuXinjing/VectorChord` 校验来源证明，使用
+`cosign verify --certificate-oidc-issuer https://token.actions.githubusercontent.com
+--certificate-identity-regexp '^https://github.com/HuXinjing/VectorChord/'
+IMAGE@sha256:DIGEST` 校验镜像签名。
 部署和协议细节见
 [`docs/TILEMAXSIM_CUDA_SIDECAR.md`](docs/TILEMAXSIM_CUDA_SIDECAR.md) 与
 [`docs/TILEMAXSIM_IPC_V2.md`](docs/TILEMAXSIM_IPC_V2.md)。

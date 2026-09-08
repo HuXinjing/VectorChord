@@ -296,18 +296,34 @@ rejections without exporting tenant identifiers.
 
 The management view is versioned and bounded. `GET /v1/config` returns the
 effective GPU/cache/admission/scheduler settings and stable application
-controls. `GET /v1/cache` returns L0/L1 occupancy, fragmentation, hit/miss,
-transfer, eviction, and adaptive-kernel calibration state. `POST /v1/reload`
-atomically reloads shard and quantization registries, but is accepted only on
-the permission-controlled Unix status socket; TCP status is always read-only.
+controls. `GET /v1/cache` returns a timestamped and versioned L0/L1 occupancy,
+fragmentation, hit/miss, transfer, eviction, and adaptive-kernel snapshot.
+Runtime `POST /v1/cache/prewarm`, `/v1/cache/pin`, and `/v1/cache/unpin`
+operations accept content-addressed descriptors. `POST /v1/reload` reloads the
+shard and quantization registries, while
+`POST /v1/devices/{ordinal}/tensor-circuit/probe` requests an immediate
+half-open probe. These bounded asynchronous operations return an ID whose
+state is available from `GET /v1/operations/{id}`. `POST /v1/drain` withdraws
+readiness, rejects new work and management writes, drains accepted work, and
+exits. All writes are accepted only on the permission-controlled Unix status
+socket; TCP status is always read-only.
 
 Applications should select candidate scope, backend, scoring profile,
 quantization contract, scheduling domain, priority, and deadline. GPU memory,
 tenant reservations, admission limits, batching thresholds, and quantum sizes
 remain operator-owned instance settings. Raw eviction and forced-kernel APIs
 are deliberately not exposed because they could bypass cache isolation or
-calibrated fallback. Runtime community-cache warming remains a future API;
-startup resident manifests are the current pinned-prewarm mechanism.
+calibrated fallback. Runtime prewarm obeys normal admission limits; startup
+resident manifests remain the explicit operator-owned forced pinned preload.
+
+Release workflows attach SPDX SBOM and maximum-mode SLSA provenance OCI
+attestations to every container image, add a GitHub build-provenance
+attestation, and keylessly sign each immutable digest with Cosign. Consumers
+can verify provenance with `gh attestation verify oci://IMAGE:TAG -R
+HuXinjing/VectorChord` and verify the image signature with `cosign verify
+--certificate-oidc-issuer https://token.actions.githubusercontent.com
+--certificate-identity-regexp '^https://github.com/HuXinjing/VectorChord/'
+IMAGE@sha256:DIGEST`.
 
 `GET /livez` reports process liveness separately from readiness. The packaged
 `tilemaxsimctl --probe live|ready` probe can wait on the status socket without

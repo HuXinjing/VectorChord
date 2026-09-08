@@ -17,6 +17,8 @@ concurrency:
 permissions:
   contents: write
   packages: write
+  id-token: write
+  attestations: write
 
 jobs:
   semver:
@@ -156,7 +158,13 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: echo "$GH_TOKEN" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
 
-      - name: Build and publish native TileMaxSim image
+      - name: Set up Buildx for OCI attestations
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+
+      - name: Install Cosign
+        uses: sigstore/cosign-installer@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4
+
+      - name: Build and scan native TileMaxSim image
         env:
           SEMVER: ${{ needs.semver.outputs.SEMVER }}
         run: |
@@ -167,9 +175,34 @@ jobs:
             aquasec/trivy:0.72.0@sha256:cffe3f5161a47a6823fbd23d985795b3ed72a4c806da4c4df16266c02accdd6f \
             image --scanners vuln --severity HIGH,CRITICAL --ignore-unfixed \
             --exit-code 1 "${IMAGE}:${SEMVER}"
-          docker push "${IMAGE}:${SEMVER}"
+      - name: Publish native TileMaxSim image with SBOM and provenance
+        id: tilemaxsim_cuda
+        env:
+          SEMVER: ${{ needs.semver.outputs.SEMVER }}
+        run: |
+          IMAGE=$(echo "ghcr.io/${GITHUB_REPOSITORY_OWNER}/vectorchord-tilemaxsimd" | tr '[:upper:]' '[:lower:]')
+          docker buildx build -f services/Dockerfile.tilemaxsimd \
+            --tag "${IMAGE}:${SEMVER}" --sbom=true --provenance=mode=max \
+            --metadata-file tilemaxsim-cuda-metadata.json --push .
+          DIGEST=$(jq -r '."containerimage.digest"' tilemaxsim-cuda-metadata.json)
+          test "$DIGEST" != null
+          echo "image=${IMAGE}" >> "$GITHUB_OUTPUT"
+          echo "digest=${DIGEST}" >> "$GITHUB_OUTPUT"
 
-      - name: Build and publish CPU-only TileMaxSim image
+      - name: Attest native TileMaxSim provenance
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4
+        with:
+          subject-name: ${{ steps.tilemaxsim_cuda.outputs.image }}
+          subject-digest: ${{ steps.tilemaxsim_cuda.outputs.digest }}
+          push-to-registry: true
+
+      - name: Sign native TileMaxSim image
+        env:
+          IMAGE: ${{ steps.tilemaxsim_cuda.outputs.image }}
+          DIGEST: ${{ steps.tilemaxsim_cuda.outputs.digest }}
+        run: cosign sign --yes "${IMAGE}@${DIGEST}"
+
+      - name: Build and scan CPU-only TileMaxSim image
         env:
           SEMVER: ${{ needs.semver.outputs.SEMVER }}
         run: |
@@ -179,7 +212,32 @@ jobs:
             aquasec/trivy:0.72.0@sha256:cffe3f5161a47a6823fbd23d985795b3ed72a4c806da4c4df16266c02accdd6f \
             image --scanners vuln --severity HIGH,CRITICAL --ignore-unfixed \
             --exit-code 1 "${IMAGE}:${SEMVER}-cpu"
-          docker push "${IMAGE}:${SEMVER}-cpu"
+      - name: Publish CPU-only TileMaxSim image with SBOM and provenance
+        id: tilemaxsim_cpu
+        env:
+          SEMVER: ${{ needs.semver.outputs.SEMVER }}
+        run: |
+          IMAGE=$(echo "ghcr.io/${GITHUB_REPOSITORY_OWNER}/vectorchord-tilemaxsimd" | tr '[:upper:]' '[:lower:]')
+          docker buildx build -f services/Dockerfile.tilemaxsimd-cpu \
+            --tag "${IMAGE}:${SEMVER}-cpu" --sbom=true --provenance=mode=max \
+            --metadata-file tilemaxsim-cpu-metadata.json --push .
+          DIGEST=$(jq -r '."containerimage.digest"' tilemaxsim-cpu-metadata.json)
+          test "$DIGEST" != null
+          echo "image=${IMAGE}" >> "$GITHUB_OUTPUT"
+          echo "digest=${DIGEST}" >> "$GITHUB_OUTPUT"
+
+      - name: Attest CPU-only TileMaxSim provenance
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4
+        with:
+          subject-name: ${{ steps.tilemaxsim_cpu.outputs.image }}
+          subject-digest: ${{ steps.tilemaxsim_cpu.outputs.digest }}
+          push-to-registry: true
+
+      - name: Sign CPU-only TileMaxSim image
+        env:
+          IMAGE: ${{ steps.tilemaxsim_cpu.outputs.image }}
+          DIGEST: ${{ steps.tilemaxsim_cpu.outputs.digest }}
+        run: cosign sign --yes "${IMAGE}@${DIGEST}"
 
   postgres-image:
     runs-on: ubuntu-24.04
@@ -196,7 +254,13 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: echo "$GH_TOKEN" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
 
-      - name: Build and publish VectorChord PostgreSQL image
+      - name: Set up Buildx for OCI attestations
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+
+      - name: Install Cosign
+        uses: sigstore/cosign-installer@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4
+
+      - name: Build and scan VectorChord PostgreSQL image
         env:
           SEMVER: ${{ needs.semver.outputs.SEMVER }}
         run: |
@@ -222,8 +286,35 @@ jobs:
             aquasec/trivy:0.72.0@sha256:cffe3f5161a47a6823fbd23d985795b3ed72a4c806da4c4df16266c02accdd6f \
             image --scanners vuln --severity HIGH,CRITICAL --ignore-unfixed \
             --exit-code 1 "${IMAGE}:pg${{ matrix.version }}-${SEMVER}"
-          docker push "${IMAGE}:pg${{ matrix.version }}-${SEMVER}"
-          docker push "${IMAGE}:${{ matrix.version }}-${SEMVER}"
+      - name: Publish VectorChord PostgreSQL image with SBOM and provenance
+        id: postgres
+        env:
+          SEMVER: ${{ needs.semver.outputs.SEMVER }}
+        run: |
+          IMAGE=$(echo "ghcr.io/${GITHUB_REPOSITORY_OWNER}/vectorchord-postgres" | tr '[:upper:]' '[:lower:]')
+          docker buildx build --build-arg POSTGRES_VERSION=${{ matrix.version }} \
+            -f services/Dockerfile.postgres \
+            --tag "${IMAGE}:pg${{ matrix.version }}-${SEMVER}" \
+            --tag "${IMAGE}:${{ matrix.version }}-${SEMVER}" \
+            --sbom=true --provenance=mode=max \
+            --metadata-file postgres-metadata.json --push .
+          DIGEST=$(jq -r '."containerimage.digest"' postgres-metadata.json)
+          test "$DIGEST" != null
+          echo "image=${IMAGE}" >> "$GITHUB_OUTPUT"
+          echo "digest=${DIGEST}" >> "$GITHUB_OUTPUT"
+
+      - name: Attest VectorChord PostgreSQL provenance
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4
+        with:
+          subject-name: ${{ steps.postgres.outputs.image }}
+          subject-digest: ${{ steps.postgres.outputs.digest }}
+          push-to-registry: true
+
+      - name: Sign VectorChord PostgreSQL image
+        env:
+          IMAGE: ${{ steps.postgres.outputs.image }}
+          DIGEST: ${{ steps.postgres.outputs.digest }}
+        run: cosign sign --yes "${IMAGE}@${DIGEST}"
 
   pgxn:
     if: ${{ vars.PUBLISH_PGXN == 'true' }}
