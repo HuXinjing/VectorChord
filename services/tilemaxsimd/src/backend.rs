@@ -84,6 +84,10 @@ pub struct AdaptiveStatus {
     pub tensor_request_fallbacks: u64,
     pub tensor_capacity_fallbacks: u64,
     pub tensor_device_fallbacks: u64,
+    pub tensor_circuit_state: String,
+    pub tensor_device_backoff_level: u32,
+    pub tensor_bucket_max_backoff_level: u32,
+    pub tensor_transition_logs_suppressed: u64,
 }
 
 /// Vendor-neutral execution contract. Scheduling, caching, storage and wire

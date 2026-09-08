@@ -18,9 +18,109 @@ use std::ffi::{CStr, c_char, c_int, c_uchar, c_void};
 use std::ptr::NonNull;
 use std::time::{Duration, Instant};
 
-const TENSOR_BUCKET_COOLDOWN: Duration = Duration::from_secs(60);
-const TENSOR_DEVICE_COOLDOWN: Duration = Duration::from_secs(30);
+const TENSOR_BUCKET_BASE_COOLDOWN: Duration = Duration::from_secs(60);
+const TENSOR_BUCKET_MAX_COOLDOWN: Duration = Duration::from_secs(30 * 60);
+const TENSOR_DEVICE_BASE_COOLDOWN: Duration = Duration::from_secs(30);
+const TENSOR_DEVICE_MAX_COOLDOWN: Duration = Duration::from_secs(10 * 60);
 const TENSOR_DEVICE_FAILURE_LIMIT: u32 = 3;
+const TENSOR_TRANSITION_LOG_INTERVAL: Duration = Duration::from_secs(5);
+
+type TensorBucketKey = (u32, u32, u32, u32, u32);
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum CircuitPhase {
+    #[default]
+    Closed,
+    Open,
+    HalfOpen,
+}
+
+impl CircuitPhase {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Closed => "closed",
+            Self::Open => "open",
+            Self::HalfOpen => "half-open",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+struct ExponentialBackoff {
+    phase: CircuitPhase,
+    level: u32,
+    retry_at: Option<Instant>,
+}
+
+impl ExponentialBackoff {
+    fn permit(&mut self, now: Instant) -> (bool, Option<CircuitPhase>) {
+        if self.phase == CircuitPhase::Open && self.retry_at.is_some_and(|retry_at| retry_at <= now)
+        {
+            self.phase = CircuitPhase::HalfOpen;
+            self.retry_at = None;
+            return (true, Some(CircuitPhase::HalfOpen));
+        }
+        (self.phase != CircuitPhase::Open, None)
+    }
+
+    fn open(&mut self, now: Instant, base: Duration, maximum: Duration) -> Duration {
+        self.level = self.level.saturating_add(1);
+        let shift = self.level.saturating_sub(1).min(31);
+        let multiplier = 1_u32 << shift;
+        let cooldown = base.saturating_mul(multiplier).min(maximum);
+        self.phase = CircuitPhase::Open;
+        self.retry_at = Some(now + cooldown);
+        cooldown
+    }
+
+    fn close(&mut self) -> bool {
+        let changed = self.phase != CircuitPhase::Closed || self.level != 0;
+        *self = Self::default();
+        changed
+    }
+}
+
+#[derive(Debug, Default)]
+struct TransitionLogLimiter {
+    last_emitted: Option<Instant>,
+    pending_suppressed: u64,
+    total_suppressed: u64,
+}
+
+impl TransitionLogLimiter {
+    fn record(
+        &mut self,
+        now: Instant,
+        device: i32,
+        scope: &str,
+        phase: CircuitPhase,
+        level: u32,
+        cooldown: Option<Duration>,
+    ) {
+        if self
+            .last_emitted
+            .is_some_and(|last| now.duration_since(last) < TENSOR_TRANSITION_LOG_INTERVAL)
+        {
+            self.pending_suppressed = self.pending_suppressed.saturating_add(1);
+            self.total_suppressed = self.total_suppressed.saturating_add(1);
+            return;
+        }
+        eprintln!(
+            "{}",
+            serde_json::json!({
+                "event": "tilemaxsim_tensor_circuit_transition",
+                "device": device,
+                "scope": scope,
+                "state": phase.name(),
+                "backoff_level": level,
+                "cooldown_ms": cooldown.map(|value| value.as_millis()),
+                "suppressed_transitions": self.pending_suppressed,
+            })
+        );
+        self.last_emitted = Some(now);
+        self.pending_suppressed = 0;
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum NativeBatchErrorKind {
@@ -37,11 +137,19 @@ fn classify_native_batch_status(status: i32) -> NativeBatchErrorKind {
     }
 }
 
-fn next_tensor_device_failure_streak(current: u32, kind: NativeBatchErrorKind) -> (u32, bool) {
+fn next_tensor_device_failure_streak(
+    current: u32,
+    kind: NativeBatchErrorKind,
+    half_open_probe: bool,
+) -> (u32, bool) {
     if kind != NativeBatchErrorKind::Device {
         return (0, false);
     }
-    let next = current.saturating_add(1);
+    let next = if half_open_probe {
+        TENSOR_DEVICE_FAILURE_LIMIT
+    } else {
+        current.saturating_add(1)
+    };
     (next, next >= TENSOR_DEVICE_FAILURE_LIMIT)
 }
 
@@ -215,9 +323,10 @@ pub struct Gpu {
     quantizers: HashMap<String, NonNull<NativeQuantizer>>,
     tensor_threshold_rows: u32,
     tensor_calibration_buckets: Vec<TensorCalibrationBucket>,
-    tensor_suppressed_buckets: HashMap<(u32, u32, u32, u32, u32), Instant>,
-    tensor_circuit_open_until: Option<Instant>,
+    tensor_bucket_backoffs: HashMap<TensorBucketKey, ExponentialBackoff>,
+    tensor_device_backoff: ExponentialBackoff,
     tensor_device_failure_streak: u32,
+    tensor_transition_logs: TransitionLogLimiter,
     tensor_request_fallbacks: u64,
     tensor_capacity_fallbacks: u64,
     tensor_device_fallbacks: u64,
@@ -322,9 +431,10 @@ impl Gpu {
             quantizers: HashMap::new(),
             tensor_threshold_rows,
             tensor_calibration_buckets: Vec::new(),
-            tensor_suppressed_buckets: HashMap::new(),
-            tensor_circuit_open_until: None,
+            tensor_bucket_backoffs: HashMap::new(),
+            tensor_device_backoff: ExponentialBackoff::default(),
             tensor_device_failure_streak: 0,
+            tensor_transition_logs: TransitionLogLimiter::default(),
             tensor_request_fallbacks: 0,
             tensor_capacity_fallbacks: 0,
             tensor_device_fallbacks: 0,
@@ -424,19 +534,26 @@ impl Gpu {
                 vctm_gpu_tensor_chunk_candidates(self.native.as_ptr())
             })
             .unwrap_or(u32::MAX),
-            tensor_circuit_open: self
-                .tensor_circuit_open_until
-                .is_some_and(|until| until > Instant::now()),
+            tensor_circuit_open: self.tensor_device_backoff.phase == CircuitPhase::Open,
             tensor_suppressed_bucket_count: u32::try_from(
-                self.tensor_suppressed_buckets
+                self.tensor_bucket_backoffs
                     .values()
-                    .filter(|until| **until > Instant::now())
+                    .filter(|state| state.phase == CircuitPhase::Open)
                     .count(),
             )
             .unwrap_or(u32::MAX),
             tensor_request_fallbacks: self.tensor_request_fallbacks,
             tensor_capacity_fallbacks: self.tensor_capacity_fallbacks,
             tensor_device_fallbacks: self.tensor_device_fallbacks,
+            tensor_circuit_state: self.tensor_device_backoff.phase.name().to_owned(),
+            tensor_device_backoff_level: self.tensor_device_backoff.level,
+            tensor_bucket_max_backoff_level: self
+                .tensor_bucket_backoffs
+                .values()
+                .map(|state| state.level)
+                .max()
+                .unwrap_or(0),
+            tensor_transition_logs_suppressed: self.tensor_transition_logs.total_suppressed,
         }
     }
 
@@ -684,19 +801,21 @@ impl Gpu {
     ) -> Result<Vec<Vec<f32>>> {
         let total_rows = *query_offsets.last().unwrap_or(&0);
         let now = Instant::now();
-        if self
-            .tensor_circuit_open_until
-            .is_some_and(|until| until <= now)
-        {
-            self.tensor_circuit_open_until = None;
-            self.tensor_device_failure_streak = 0;
+        let (device_permitted, device_transition) = self.tensor_device_backoff.permit(now);
+        if let Some(phase) = device_transition {
+            self.tensor_transition_logs.record(
+                now,
+                self.device,
+                "device",
+                phase,
+                self.tensor_device_backoff.level,
+                None,
+            );
         }
-        self.tensor_suppressed_buckets
-            .retain(|_, until| *until > now);
         let tensor_eligible = scoring_profile == 1
             && dtype == 2
             && self.info.capabilities.matrix_engine
-            && self.tensor_circuit_open_until.is_none();
+            && device_permitted;
         let fallback_bucket = TensorCalibrationBucket {
             candidate_count: 64,
             reference_document_rows: 32,
@@ -733,16 +852,42 @@ impl Gpu {
                 )
             })
             .flatten();
-        if let Some(decision) = tensor_decision.filter(|decision| {
-            decision.use_tensor
-                && !self.tensor_suppressed_buckets.contains_key(&(
-                    decision.selected_candidate_bucket,
-                    decision.selected_document_rows,
-                    decision.selected_row_groups,
-                    decision.selected_max_document_rows,
-                    decision.selected_row_imbalance_milli,
-                ))
-        }) {
+        if let Some(decision) = tensor_decision.filter(|decision| decision.use_tensor) {
+            let bucket_key = (
+                decision.selected_candidate_bucket,
+                decision.selected_document_rows,
+                decision.selected_row_groups,
+                decision.selected_max_document_rows,
+                decision.selected_row_imbalance_milli,
+            );
+            let (bucket_permitted, bucket_transition, bucket_level) = {
+                let state = self.tensor_bucket_backoffs.entry(bucket_key).or_default();
+                let (permitted, transition) = state.permit(now);
+                (permitted, transition, state.level)
+            };
+            if let Some(phase) = bucket_transition {
+                self.tensor_transition_logs.record(
+                    now,
+                    self.device,
+                    "workload_bucket",
+                    phase,
+                    bucket_level,
+                    None,
+                );
+            }
+            if !bucket_permitted {
+                self.batch_warp_calls += 1;
+                return Ok(self.score_batch_native(
+                    false,
+                    queries,
+                    query_offsets,
+                    dimension,
+                    dtype,
+                    document_offsets,
+                    document_rows,
+                    scoring_profile,
+                )?);
+            }
             if let Some(bucket) = buckets.iter().find(|bucket| {
                 bucket.candidate_count == decision.selected_candidate_bucket
                     && bucket.reference_document_rows == decision.selected_document_rows
@@ -769,37 +914,102 @@ impl Gpu {
             ) {
                 Ok(scores) => {
                     self.tensor_device_failure_streak = 0;
+                    if self.tensor_device_backoff.close() {
+                        self.tensor_transition_logs.record(
+                            now,
+                            self.device,
+                            "device",
+                            CircuitPhase::Closed,
+                            0,
+                            None,
+                        );
+                    }
+                    let bucket_closed = self
+                        .tensor_bucket_backoffs
+                        .get_mut(&bucket_key)
+                        .is_some_and(ExponentialBackoff::close);
+                    if bucket_closed {
+                        self.tensor_transition_logs.record(
+                            now,
+                            self.device,
+                            "workload_bucket",
+                            CircuitPhase::Closed,
+                            0,
+                            None,
+                        );
+                    }
                     self.batch_tensor_calls += 1;
                     return Ok(scores);
                 }
                 Err(error) => {
                     self.calibration_failures += 1;
+                    let device_half_open =
+                        self.tensor_device_backoff.phase == CircuitPhase::HalfOpen;
                     let (failure_streak, open_circuit) = next_tensor_device_failure_streak(
                         self.tensor_device_failure_streak,
                         error.kind,
+                        device_half_open,
                     );
                     self.tensor_device_failure_streak = failure_streak;
                     match error.kind {
                         NativeBatchErrorKind::Request => {
                             self.tensor_request_fallbacks += 1;
+                            let (cooldown, level) = {
+                                let state =
+                                    self.tensor_bucket_backoffs.entry(bucket_key).or_default();
+                                let cooldown = state.open(
+                                    now,
+                                    TENSOR_BUCKET_BASE_COOLDOWN,
+                                    TENSOR_BUCKET_MAX_COOLDOWN,
+                                );
+                                (cooldown, state.level)
+                            };
+                            self.tensor_transition_logs.record(
+                                now,
+                                self.device,
+                                "workload_bucket",
+                                CircuitPhase::Open,
+                                level,
+                                Some(cooldown),
+                            );
                         }
                         NativeBatchErrorKind::Capacity => {
                             self.tensor_capacity_fallbacks += 1;
-                            self.tensor_suppressed_buckets.insert(
-                                (
-                                    decision.selected_candidate_bucket,
-                                    decision.selected_document_rows,
-                                    decision.selected_row_groups,
-                                    decision.selected_max_document_rows,
-                                    decision.selected_row_imbalance_milli,
-                                ),
-                                now + TENSOR_BUCKET_COOLDOWN,
+                            let (cooldown, level) = {
+                                let state =
+                                    self.tensor_bucket_backoffs.entry(bucket_key).or_default();
+                                let cooldown = state.open(
+                                    now,
+                                    TENSOR_BUCKET_BASE_COOLDOWN,
+                                    TENSOR_BUCKET_MAX_COOLDOWN,
+                                );
+                                (cooldown, state.level)
+                            };
+                            self.tensor_transition_logs.record(
+                                now,
+                                self.device,
+                                "workload_bucket",
+                                CircuitPhase::Open,
+                                level,
+                                Some(cooldown),
                             );
                         }
                         NativeBatchErrorKind::Device => {
                             self.tensor_device_fallbacks += 1;
                             if open_circuit {
-                                self.tensor_circuit_open_until = Some(now + TENSOR_DEVICE_COOLDOWN);
+                                let cooldown = self.tensor_device_backoff.open(
+                                    now,
+                                    TENSOR_DEVICE_BASE_COOLDOWN,
+                                    TENSOR_DEVICE_MAX_COOLDOWN,
+                                );
+                                self.tensor_transition_logs.record(
+                                    now,
+                                    self.device,
+                                    "device",
+                                    CircuitPhase::Open,
+                                    self.tensor_device_backoff.level,
+                                    Some(cooldown),
+                                );
                             }
                         }
                     }
@@ -1894,17 +2104,74 @@ mod tests {
             NativeBatchErrorKind::Device
         );
         assert_eq!(
-            next_tensor_device_failure_streak(0, NativeBatchErrorKind::Device),
+            next_tensor_device_failure_streak(0, NativeBatchErrorKind::Device, false),
             (1, false)
         );
         assert_eq!(
-            next_tensor_device_failure_streak(2, NativeBatchErrorKind::Device),
+            next_tensor_device_failure_streak(2, NativeBatchErrorKind::Device, false),
             (3, true)
         );
         assert_eq!(
-            next_tensor_device_failure_streak(2, NativeBatchErrorKind::Capacity),
+            next_tensor_device_failure_streak(2, NativeBatchErrorKind::Capacity, false),
             (0, false)
         );
+        assert_eq!(
+            next_tensor_device_failure_streak(0, NativeBatchErrorKind::Device, true),
+            (3, true)
+        );
+    }
+
+    #[test]
+    fn tensor_backoff_doubles_caps_and_resets_after_success() {
+        let now = Instant::now();
+        let mut state = ExponentialBackoff::default();
+        assert_eq!(
+            state.open(now, Duration::from_secs(60), Duration::from_secs(1800)),
+            Duration::from_secs(60)
+        );
+        assert_eq!(
+            state.open(now, Duration::from_secs(60), Duration::from_secs(1800)),
+            Duration::from_secs(120)
+        );
+        for _ in 0..10 {
+            state.open(now, Duration::from_secs(60), Duration::from_secs(1800));
+        }
+        assert_eq!(state.retry_at, Some(now + Duration::from_secs(1800)));
+        assert!(!state.permit(now + Duration::from_secs(1799)).0);
+        assert_eq!(
+            state.permit(now + Duration::from_secs(1800)),
+            (true, Some(CircuitPhase::HalfOpen))
+        );
+        assert!(state.close());
+        assert_eq!(state.phase, CircuitPhase::Closed);
+        assert_eq!(state.level, 0);
+    }
+
+    #[test]
+    fn tensor_transition_logging_is_rate_limited_and_counted() {
+        let now = Instant::now();
+        let mut limiter = TransitionLogLimiter::default();
+        limiter.record(now, 0, "device", CircuitPhase::Open, 1, None);
+        limiter.record(
+            now + Duration::from_secs(1),
+            0,
+            "device",
+            CircuitPhase::HalfOpen,
+            1,
+            None,
+        );
+        assert_eq!(limiter.pending_suppressed, 1);
+        assert_eq!(limiter.total_suppressed, 1);
+        limiter.record(
+            now + TENSOR_TRANSITION_LOG_INTERVAL,
+            0,
+            "device",
+            CircuitPhase::Closed,
+            0,
+            None,
+        );
+        assert_eq!(limiter.pending_suppressed, 0);
+        assert_eq!(limiter.total_suppressed, 1);
     }
 
     #[test]
@@ -2169,8 +2436,9 @@ mod tests {
         )
         .unwrap();
         assert_eq!(gpu.tensor_capacity_fallbacks, 1);
-        assert_eq!(gpu.tensor_suppressed_buckets.len(), 1);
-        assert!(gpu.tensor_circuit_open_until.is_none());
+        assert_eq!(gpu.tensor_bucket_backoffs.len(), 1);
+        assert_eq!(gpu.tensor_bucket_backoffs.values().next().unwrap().level, 1);
+        assert_eq!(gpu.tensor_device_backoff.phase, CircuitPhase::Closed);
 
         let short_offset = long_document.len() as u64;
         let short_document = vec![0_u8; 32 * DIM * 2];

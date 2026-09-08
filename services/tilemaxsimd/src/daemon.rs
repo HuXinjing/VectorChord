@@ -2412,6 +2412,12 @@ fn render_metrics(metrics: &RuntimeMetrics) -> String {
         "# TYPE tilemaxsim_gpu_tensor_fallback_total counter"
     )
     .unwrap();
+    writeln!(output, "# HELP tilemaxsim_gpu_tensor_transition_logs_suppressed_total Tensor circuit state-transition logs suppressed by rate limiting.").unwrap();
+    writeln!(
+        output,
+        "# TYPE tilemaxsim_gpu_tensor_transition_logs_suppressed_total counter"
+    )
+    .unwrap();
     writeln!(
         output,
         "# HELP tilemaxsim_gpu_adaptive_dispatch_total Executed adaptive multi-query kernels."
@@ -2493,6 +2499,12 @@ fn render_metrics(metrics: &RuntimeMetrics) -> String {
         writeln!(output, "tilemaxsim_gpu_adaptive_tensor_threshold_rows{{slot=\"{}\",device=\"{}\",complete=\"{}\"}} {}", device.slot, device.device, device.calibration_complete, device.tensor_threshold_rows).unwrap();
         writeln!(output, "tilemaxsim_gpu_tensor_runtime_state{{slot=\"{}\",device=\"{}\",kind=\"circuit_open\"}} {}", device.slot, device.device, u8::from(device.tensor_circuit_open)).unwrap();
         writeln!(output, "tilemaxsim_gpu_tensor_runtime_state{{slot=\"{}\",device=\"{}\",kind=\"suppressed_buckets\"}} {}", device.slot, device.device, device.tensor_suppressed_bucket_count).unwrap();
+        writeln!(output, "tilemaxsim_gpu_tensor_runtime_state{{slot=\"{}\",device=\"{}\",kind=\"device_backoff_level\"}} {}", device.slot, device.device, device.tensor_device_backoff_level).unwrap();
+        writeln!(output, "tilemaxsim_gpu_tensor_runtime_state{{slot=\"{}\",device=\"{}\",kind=\"bucket_max_backoff_level\"}} {}", device.slot, device.device, device.tensor_bucket_max_backoff_level).unwrap();
+        for phase in ["closed", "open", "half-open"] {
+            writeln!(output, "tilemaxsim_gpu_tensor_runtime_state{{slot=\"{}\",device=\"{}\",kind=\"circuit_phase\",phase=\"{phase}\"}} {}", device.slot, device.device, u8::from(device.tensor_circuit_state == phase)).unwrap();
+        }
+        writeln!(output, "tilemaxsim_gpu_tensor_transition_logs_suppressed_total{{slot=\"{}\",device=\"{}\"}} {}", device.slot, device.device, device.tensor_transition_logs_suppressed).unwrap();
         for (kind, value) in [
             ("request", device.tensor_request_fallbacks),
             ("capacity", device.tensor_capacity_fallbacks),

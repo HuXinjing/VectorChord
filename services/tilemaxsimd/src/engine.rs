@@ -86,6 +86,10 @@ pub struct DeviceStatus {
     pub tensor_request_fallbacks: u64,
     pub tensor_capacity_fallbacks: u64,
     pub tensor_device_fallbacks: u64,
+    pub tensor_circuit_state: String,
+    pub tensor_device_backoff_level: u32,
+    pub tensor_bucket_max_backoff_level: u32,
+    pub tensor_transition_logs_suppressed: u64,
 }
 
 #[derive(Clone, Debug, Default, serde::Serialize)]
@@ -1024,6 +1028,10 @@ impl Engine {
                     tensor_request_fallbacks: adaptive.tensor_request_fallbacks,
                     tensor_capacity_fallbacks: adaptive.tensor_capacity_fallbacks,
                     tensor_device_fallbacks: adaptive.tensor_device_fallbacks,
+                    tensor_circuit_state: adaptive.tensor_circuit_state,
+                    tensor_device_backoff_level: adaptive.tensor_device_backoff_level,
+                    tensor_bucket_max_backoff_level: adaptive.tensor_bucket_max_backoff_level,
+                    tensor_transition_logs_suppressed: adaptive.tensor_transition_logs_suppressed,
                 }
             })
             .collect();
@@ -1071,6 +1079,10 @@ impl Engine {
                     "adaptive_tensor_request_fallbacks": device.tensor_request_fallbacks,
                     "adaptive_tensor_capacity_fallbacks": device.tensor_capacity_fallbacks,
                     "adaptive_tensor_device_fallbacks": device.tensor_device_fallbacks,
+                    "adaptive_tensor_circuit_state": device.tensor_circuit_state,
+                    "adaptive_tensor_device_backoff_level": device.tensor_device_backoff_level,
+                    "adaptive_tensor_bucket_max_backoff_level": device.tensor_bucket_max_backoff_level,
+                    "adaptive_tensor_transition_logs_suppressed": device.tensor_transition_logs_suppressed,
                     "gpu_hits": device.hits,
                     "gpu_misses": device.misses,
                     "gpu_evictions": device.evictions,
