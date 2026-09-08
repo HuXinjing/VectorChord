@@ -205,6 +205,19 @@ jobs:
           DIGEST: ${{ steps.tilemaxsim_cuda.outputs.digest }}
         run: cosign sign --yes "${IMAGE}@${DIGEST}"
 
+      - name: Verify native TileMaxSim supply-chain evidence
+        env:
+          GH_TOKEN: ${{ github.token }}
+          IMAGE: ${{ steps.tilemaxsim_cuda.outputs.image }}
+          DIGEST: ${{ steps.tilemaxsim_cuda.outputs.digest }}
+        run: |
+          test "$(docker buildx imagetools inspect "${IMAGE}@${DIGEST}" --format '{{json .SBOM}}')" != null
+          test "$(docker buildx imagetools inspect "${IMAGE}@${DIGEST}" --format '{{json .Provenance}}')" != null
+          gh attestation verify "oci://${IMAGE}@${DIGEST}" --repo "$GITHUB_REPOSITORY"
+          cosign verify --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+            --certificate-identity-regexp "^https://github.com/${GITHUB_REPOSITORY}/.github/workflows/release.yml@" \
+            "${IMAGE}@${DIGEST}"
+
       - name: Build and scan CPU-only TileMaxSim image
         env:
           SEMVER: ${{ needs.semver.outputs.SEMVER }}
@@ -241,6 +254,19 @@ jobs:
           IMAGE: ${{ steps.tilemaxsim_cpu.outputs.image }}
           DIGEST: ${{ steps.tilemaxsim_cpu.outputs.digest }}
         run: cosign sign --yes "${IMAGE}@${DIGEST}"
+
+      - name: Verify CPU-only TileMaxSim supply-chain evidence
+        env:
+          GH_TOKEN: ${{ github.token }}
+          IMAGE: ${{ steps.tilemaxsim_cpu.outputs.image }}
+          DIGEST: ${{ steps.tilemaxsim_cpu.outputs.digest }}
+        run: |
+          test "$(docker buildx imagetools inspect "${IMAGE}@${DIGEST}" --format '{{json .SBOM}}')" != null
+          test "$(docker buildx imagetools inspect "${IMAGE}@${DIGEST}" --format '{{json .Provenance}}')" != null
+          gh attestation verify "oci://${IMAGE}@${DIGEST}" --repo "$GITHUB_REPOSITORY"
+          cosign verify --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+            --certificate-identity-regexp "^https://github.com/${GITHUB_REPOSITORY}/.github/workflows/release.yml@" \
+            "${IMAGE}@${DIGEST}"
 
   postgres-image:
     runs-on: ubuntu-24.04
@@ -323,6 +349,19 @@ jobs:
           IMAGE: ${{ steps.postgres.outputs.image }}
           DIGEST: ${{ steps.postgres.outputs.digest }}
         run: cosign sign --yes "${IMAGE}@${DIGEST}"
+
+      - name: Verify VectorChord PostgreSQL supply-chain evidence
+        env:
+          GH_TOKEN: ${{ github.token }}
+          IMAGE: ${{ steps.postgres.outputs.image }}
+          DIGEST: ${{ steps.postgres.outputs.digest }}
+        run: |
+          test "$(docker buildx imagetools inspect "${IMAGE}@${DIGEST}" --format '{{json .SBOM}}')" != null
+          test "$(docker buildx imagetools inspect "${IMAGE}@${DIGEST}" --format '{{json .Provenance}}')" != null
+          gh attestation verify "oci://${IMAGE}@${DIGEST}" --repo "$GITHUB_REPOSITORY"
+          cosign verify --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+            --certificate-identity-regexp "^https://github.com/${GITHUB_REPOSITORY}/.github/workflows/release.yml@" \
+            "${IMAGE}@${DIGEST}"
 
   pgxn:
     if: ${{ vars.PUBLISH_PGXN == 'true' }}
