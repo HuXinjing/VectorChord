@@ -1237,9 +1237,10 @@ extern "C" int vctm_gpu_score_batch_tensor(
         reinterpret_cast<void *const *>(workspace + c_offset), CUDA_R_32F, m,
         static_cast<int>(batch), CUBLAS_COMPUTE_32F,
         CUBLAS_GEMM_DEFAULT_TENSOR_OP);
-    if (blas != CUBLAS_STATUS_SUCCESS)
+    if (blas != CUBLAS_STATUS_SUCCESS) {
       cublas_fail(error, error_capacity, "cublasGemmBatchedEx", blas);
       return 3;
+    }
     const unsigned int threads = 128;
     const size_t reduction_tasks = batch * request_count;
     tilemaxsim_batched_gemm_reduce_kernel<<<static_cast<unsigned int>(std::min((reduction_tasks + threads - 1) / threads, static_cast<size_t>(65'535))), threads, 0, gpu->compute_stream>>>(
