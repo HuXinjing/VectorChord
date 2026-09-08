@@ -2111,6 +2111,69 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires an explicitly assigned CUDA device"]
+    fn tensor_capacity_failure_only_cools_the_matching_workload_bucket() {
+        let device = std::env::var("VCTM_TEST_GPU")
+            .unwrap_or_else(|_| "0".to_owned())
+            .parse::<i32>()
+            .unwrap();
+        const DIM: usize = 320;
+        let mut gpu = Gpu::create(device, 64 * 1024 * 1024, 32 * 1024 * 1024).unwrap();
+        gpu.tensor_calibration_buckets = vec![
+            TensorCalibrationBucket {
+                candidate_count: 2,
+                reference_document_rows: 8192,
+                reference_row_groups: 1,
+                threshold_query_rows: 1,
+                tensor_chunk_candidates: 2,
+                ..Default::default()
+            },
+            TensorCalibrationBucket {
+                candidate_count: 64,
+                reference_document_rows: 32,
+                reference_row_groups: 1,
+                threshold_query_rows: 1,
+                tensor_chunk_candidates: 64,
+                ..Default::default()
+            },
+        ];
+
+        let long_document = vec![0_u8; 8192 * DIM * 2];
+        gpu.upload_batch(&[(0, long_document.as_slice())]).unwrap();
+        let large_queries = vec![0_u8; 2 * 1024 * DIM * 2];
+        gpu.score_batch(
+            &large_queries,
+            &[0, 1024, 2048],
+            DIM as u32,
+            2,
+            1,
+            &[0, 0],
+            &[8192, 8192],
+        )
+        .unwrap();
+        assert_eq!(gpu.tensor_capacity_fallbacks, 1);
+        assert_eq!(gpu.tensor_suppressed_buckets.len(), 1);
+        assert!(gpu.tensor_circuit_open_until.is_none());
+
+        let short_offset = long_document.len() as u64;
+        let short_document = vec![0_u8; 32 * DIM * 2];
+        gpu.upload_batch(&[(short_offset, short_document.as_slice())])
+            .unwrap();
+        let small_queries = vec![0_u8; 2 * 32 * DIM * 2];
+        gpu.score_batch(
+            &small_queries,
+            &[0, 32, 64],
+            DIM as u32,
+            2,
+            1,
+            &vec![short_offset; 64],
+            &vec![32; 64],
+        )
+        .unwrap();
+        assert_eq!(gpu.batch_tensor_calls, 1);
+    }
+
+    #[test]
     #[ignore = "microbenchmark requires an explicitly assigned CUDA device"]
     fn benchmark_batched_tensor_core_for_320d_candidates() {
         let bench_size = |name: &str, default: usize, maximum: usize| {
