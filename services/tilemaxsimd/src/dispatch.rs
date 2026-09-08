@@ -28,6 +28,8 @@ pub struct TensorCalibrationBucket {
     pub candidate_count: u32,
     pub reference_document_rows: u32,
     pub reference_row_groups: u32,
+    pub reference_max_document_rows: u32,
+    pub reference_row_imbalance_milli: u32,
     pub threshold_query_rows: u32,
     pub tile_time_ns: u64,
     pub tensor_time_ns: u64,
@@ -40,6 +42,7 @@ pub struct TensorDispatchInput {
     pub total_query_rows: u32,
     pub total_document_rows: u64,
     pub document_row_groups: u32,
+    pub max_document_rows: u32,
     pub dimension: u32,
 }
 
@@ -49,10 +52,18 @@ pub struct TensorDispatchDecision {
     pub selected_candidate_bucket: u32,
     pub selected_document_rows: u32,
     pub selected_row_groups: u32,
+    pub selected_max_document_rows: u32,
+    pub selected_row_imbalance_milli: u32,
     pub adjusted_threshold_rows: u64,
     pub effective_query_rows: u64,
     pub estimated_dot_products: u128,
     pub crossover_dot_products: u128,
+}
+
+fn ratio_distance_milli(left: u32, right: u32) -> u64 {
+    let low = u64::from(left.min(right).max(1));
+    let high = u64::from(left.max(right).max(1));
+    high.saturating_mul(1000) / low - 1000
 }
 
 pub fn choose_tensor(
@@ -62,24 +73,39 @@ pub fn choose_tensor(
     if input.candidate_count == 0
         || input.total_query_rows == 0
         || input.total_document_rows == 0
+        || input.max_document_rows == 0
         || input.dimension == 0
     {
         return None;
     }
-    let selected_group_profile = buckets
-        .iter()
-        .map(|bucket| bucket.reference_row_groups)
-        .filter(|groups| *groups >= input.document_row_groups.max(1))
-        .min()
-        .or_else(|| {
-            buckets
-                .iter()
-                .map(|bucket| bucket.reference_row_groups)
-                .max()
-        })?;
+    let actual_imbalance_milli = u128::from(input.max_document_rows)
+        .saturating_mul(u128::try_from(input.candidate_count).unwrap_or(u128::MAX))
+        .saturating_mul(1000)
+        / u128::from(input.total_document_rows);
+    let actual_imbalance_milli = u32::try_from(actual_imbalance_milli).unwrap_or(u32::MAX);
+    let selected_profile = buckets.iter().min_by_key(|bucket| {
+        ratio_distance_milli(
+            bucket.reference_row_groups,
+            input.document_row_groups.max(1),
+        )
+        .saturating_add(ratio_distance_milli(
+            bucket.reference_max_document_rows,
+            input.max_document_rows,
+        ))
+        .saturating_add(ratio_distance_milli(
+            bucket.reference_row_imbalance_milli,
+            actual_imbalance_milli,
+        ))
+    })?;
     let mut matching = buckets
         .iter()
-        .filter(|bucket| bucket.reference_row_groups == selected_group_profile)
+        .filter(|bucket| {
+            bucket.reference_row_groups == selected_profile.reference_row_groups
+                && bucket.reference_max_document_rows
+                    == selected_profile.reference_max_document_rows
+                && bucket.reference_row_imbalance_milli
+                    == selected_profile.reference_row_imbalance_milli
+        })
         .collect::<Vec<_>>();
     matching.sort_unstable_by_key(|bucket| bucket.candidate_count);
     let actual_candidates = u64::try_from(input.candidate_count).unwrap_or(u64::MAX);
@@ -122,6 +148,8 @@ pub fn choose_tensor(
         selected_candidate_bucket: selected.candidate_count,
         selected_document_rows: selected.reference_document_rows,
         selected_row_groups: selected.reference_row_groups,
+        selected_max_document_rows: selected.reference_max_document_rows,
+        selected_row_imbalance_milli: selected.reference_row_imbalance_milli,
         adjusted_threshold_rows,
         effective_query_rows,
         estimated_dot_products,
@@ -296,6 +324,8 @@ mod tests {
             candidate_count: candidates,
             reference_document_rows: 32,
             reference_row_groups: groups,
+            reference_max_document_rows: 32,
+            reference_row_imbalance_milli: 1000,
             threshold_query_rows: threshold,
             tile_time_ns: 200,
             tensor_time_ns: 100,
@@ -312,6 +342,7 @@ mod tests {
                 total_query_rows: 64,
                 total_document_rows: 64 * 32,
                 document_row_groups: 1,
+                max_document_rows: 32,
                 dimension: 320,
             },
             &buckets,
@@ -324,6 +355,7 @@ mod tests {
                 total_query_rows: 64,
                 total_document_rows: 512 * 32,
                 document_row_groups: 1,
+                max_document_rows: 32,
                 dimension: 320,
             },
             &buckets,
@@ -342,6 +374,7 @@ mod tests {
                 total_query_rows: 128,
                 total_document_rows: 512 * 32,
                 document_row_groups: 6,
+                max_document_rows: 32,
                 dimension: 320,
             },
             &buckets,
@@ -360,6 +393,7 @@ mod tests {
                 total_query_rows: 64,
                 total_document_rows: 256 * 64,
                 document_row_groups: 1,
+                max_document_rows: 64,
                 dimension: 320,
             },
             &buckets,
@@ -372,13 +406,18 @@ mod tests {
 
     #[test]
     fn sparse_long_tail_keeps_the_fragmented_shape_profile() {
-        let buckets = [bucket(512, 1, 64), bucket(512, 8, 512)];
+        let uniform = bucket(512, 1, 64);
+        let mut long_tail = bucket(512, 8, 512);
+        long_tail.reference_max_document_rows = 4096;
+        long_tail.reference_row_imbalance_milli = 455_000;
+        let buckets = [uniform, long_tail];
         let decision = choose_tensor(
             TensorDispatchInput {
                 candidate_count: 512,
                 total_query_rows: 128,
                 total_document_rows: 511 + 4096,
                 document_row_groups: 2,
+                max_document_rows: 4096,
                 dimension: 320,
             },
             &buckets,

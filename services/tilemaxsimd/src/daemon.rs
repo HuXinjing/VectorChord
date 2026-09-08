@@ -2515,7 +2515,7 @@ fn render_metrics(metrics: &RuntimeMetrics) -> String {
                     u64::from(bucket.tensor_chunk_candidates),
                 ),
             ] {
-                writeln!(output, "tilemaxsim_gpu_tensor_calibration_value{{slot=\"{}\",device=\"{}\",candidates=\"{}\",document_rows=\"{}\",row_groups=\"{}\",kind=\"{kind}\"}} {value}", device.slot, device.device, bucket.candidate_count, bucket.reference_document_rows, bucket.reference_row_groups).unwrap();
+                writeln!(output, "tilemaxsim_gpu_tensor_calibration_value{{slot=\"{}\",device=\"{}\",candidates=\"{}\",document_rows=\"{}\",row_groups=\"{}\",max_document_rows=\"{}\",row_imbalance_milli=\"{}\",kind=\"{kind}\"}} {value}", device.slot, device.device, bucket.candidate_count, bucket.reference_document_rows, bucket.reference_row_groups, bucket.reference_max_document_rows, bucket.reference_row_imbalance_milli).unwrap();
             }
         }
         writeln!(

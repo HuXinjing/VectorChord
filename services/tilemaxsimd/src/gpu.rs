@@ -215,7 +215,7 @@ pub struct Gpu {
     quantizers: HashMap<String, NonNull<NativeQuantizer>>,
     tensor_threshold_rows: u32,
     tensor_calibration_buckets: Vec<TensorCalibrationBucket>,
-    tensor_suppressed_buckets: HashMap<(u32, u32, u32), Instant>,
+    tensor_suppressed_buckets: HashMap<(u32, u32, u32, u32, u32), Instant>,
     tensor_circuit_open_until: Option<Instant>,
     tensor_device_failure_streak: u32,
     tensor_request_fallbacks: u64,
@@ -701,6 +701,8 @@ impl Gpu {
             candidate_count: 64,
             reference_document_rows: 32,
             reference_row_groups: 1,
+            reference_max_document_rows: 32,
+            reference_row_imbalance_milli: 1000,
             threshold_query_rows: self.tensor_threshold_rows,
             tensor_chunk_candidates: 64,
             ..TensorCalibrationBucket::default()
@@ -724,6 +726,7 @@ impl Gpu {
                         total_query_rows: total_rows,
                         total_document_rows,
                         document_row_groups,
+                        max_document_rows: document_rows.iter().copied().max().unwrap_or(0),
                         dimension,
                     },
                     buckets,
@@ -736,12 +739,16 @@ impl Gpu {
                     decision.selected_candidate_bucket,
                     decision.selected_document_rows,
                     decision.selected_row_groups,
+                    decision.selected_max_document_rows,
+                    decision.selected_row_imbalance_milli,
                 ))
         }) {
             if let Some(bucket) = buckets.iter().find(|bucket| {
                 bucket.candidate_count == decision.selected_candidate_bucket
                     && bucket.reference_document_rows == decision.selected_document_rows
                     && bucket.reference_row_groups == decision.selected_row_groups
+                    && bucket.reference_max_document_rows == decision.selected_max_document_rows
+                    && bucket.reference_row_imbalance_milli == decision.selected_row_imbalance_milli
             }) {
                 let _ = unsafe {
                     vctm_gpu_set_tensor_chunk_candidates(
@@ -783,6 +790,8 @@ impl Gpu {
                                     decision.selected_candidate_bucket,
                                     decision.selected_document_rows,
                                     decision.selected_row_groups,
+                                    decision.selected_max_document_rows,
+                                    decision.selected_row_imbalance_milli,
                                 ),
                                 now + TENSOR_BUCKET_COOLDOWN,
                             );
@@ -1016,6 +1025,14 @@ impl Gpu {
             )
             .unwrap_or(u32::MAX),
             reference_row_groups: u32::try_from(row_pattern.len()).unwrap_or(u32::MAX),
+            reference_max_document_rows: row_pattern.iter().copied().max().unwrap_or(0),
+            reference_row_imbalance_milli: u32::try_from(
+                u128::from(row_pattern.iter().copied().max().unwrap_or(0))
+                    .saturating_mul(u128::try_from(candidates).unwrap_or(u128::MAX))
+                    .saturating_mul(1000)
+                    / u128::from(document_rows.iter().copied().map(u64::from).sum::<u64>()),
+            )
+            .unwrap_or(u32::MAX),
             threshold_query_rows: threshold,
             tile_time_ns: threshold_times.0,
             tensor_time_ns: threshold_times.1,
