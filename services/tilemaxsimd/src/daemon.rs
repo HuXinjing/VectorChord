@@ -2188,7 +2188,10 @@ fn handle_status_connection(
                 // TCP status is intentionally readable by an orchestrator, but
                 // backend errors may contain local paths or vendor diagnostics.
                 if !local_admin && record.error.is_some() {
-                    record.error = Some("operation failed; inspect the Unix management socket or daemon logs".to_owned());
+                    record.error = Some(
+                        "operation failed; inspect the Unix management socket or daemon logs"
+                            .to_owned(),
+                    );
                 }
                 (
                     "200 OK",
