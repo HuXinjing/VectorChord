@@ -233,12 +233,17 @@ and highly uneven document lengths as separate inputs. Architecture defaults
 are used only if calibration cannot complete; unsupported hardware, workspace
 pressure, numerical disagreement, or backend failure deterministically falls
 back to the tile/warp path. Request/capacity failures suppress only the affected
-workload bucket for 60 seconds. Three consecutive device failures open a
-device-wide 30-second circuit breaker, after which Tensor Core is probed again.
+workload bucket with exponential cooldowns of 60, 120, 240 seconds and so on,
+capped at 30 minutes. Three consecutive device failures open a device-wide
+circuit breaker starting at 30 seconds and doubling up to 10 minutes. Expiry
+enters half-open state for a probe; a successful Tensor execution closes and
+resets the relevant backoff.
 Per-bucket thresholds, measured times, selected chunk sizes, fallback classes,
 suppressed buckets and circuit state are exported by the status and metrics
 endpoints. The legacy `adaptive_tensor_threshold_rows` field is only the minimum
 calibrated threshold across buckets and must not be used as the dispatch rule.
+Only rate-limited state transitions are logged; suppressed transition-log events
+remain observable through a cumulative Prometheus counter.
 
 Admission is bounded both globally and per tenant before work enters the
 scheduler. Client disconnects and end-to-end deadlines are checked between

@@ -331,11 +331,14 @@ latency, and its repeated synthetic document shape is more GEMM-friendly than a
 variable-length production corpus.
 
 Native Tensor failures are classified at the ABI boundary. Request and
-workspace-capacity failures fall back without disabling unrelated shapes, with
-the affected calibration bucket retried after a bounded cooldown. Only three
-consecutive CUDA/cuBLAS/device failures open a device-wide circuit, and that
-circuit automatically permits a probe after 30 seconds. Management JSON and
-Prometheus expose each class separately. The retained
+workspace-capacity failures fall back without disabling unrelated shapes. A
+bucket retries after 60 seconds and doubles its cooldown up to 30 minutes after
+each failed half-open probe. Only three consecutive CUDA/cuBLAS/device failures
+open a device-wide circuit; its cooldown starts at 30 seconds and doubles up to
+10 minutes. Successful Tensor work closes and resets the relevant backoff.
+Only rate-limited closed/open/half-open transitions are logged, while suppressed
+log events and every failure remain visible through cumulative Prometheus
+counters. Management JSON and Prometheus expose each class separately. The retained
 `adaptive_tensor_threshold_rows` metric is a deprecated minimum-over-buckets
 summary, not a global dispatch threshold.
 

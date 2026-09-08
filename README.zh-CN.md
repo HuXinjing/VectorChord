@@ -136,11 +136,15 @@ Tensor Core GEMM + 分段 MaxSim 归约做有界 AB/BA 校准。只有数值一�
 的 row-group 数、最大文档 rows 和 rows 不均衡度校准桶的交叉点积工作量为基准，直接比较实际
 `query rows × document rows × dimension`；连续批处理带来的 query 复用和长尾文档
 形状是两个独立输入。校准失败、workspace 不足、数值不一致或后端失败时确定性回退
-tile/warp。请求/容量类失败只抑制对应 workload 桶 60 秒；连续三次设备类失败才打开
-全设备 30 秒熔断，冷却后自动探测恢复。状态与 `/metrics` 会暴露每个桶的阈值、实测
+tile/warp。请求/容量类失败只抑制对应 workload 桶，按 60、120、240 秒指数退避，
+上限 30 分钟；连续三次设备类失败才打开全设备熔断，初始 30 秒、指数增长到最多
+10 分钟。冷却结束进入 half-open，只放行恢复探测；Tensor 成功后关闭并重置对应退避。
+状态与 `/metrics` 会暴露每个桶的阈值、实测
 时间、chunk 大小、分类回退计数、抑制桶和熔断状态。兼容字段
 `adaptive_tensor_threshold_rows` 只是所有桶中的最小阈值，不能再被当作运行时全局
 分派阈值。
+日志只记录限频后的 closed/open/half-open 状态转换；被抑制的日志事件仍通过累计
+Prometheus counter 可见，不依赖日志做故障统计。
 
 GPU 和 host cache 都有调度域最大占用限制。可选的
 `--tenant-cache-reservation TENANT=GB` 会保护已经预热的 GPU 页面，使其他调度域
