@@ -521,6 +521,25 @@ impl Gpu {
         self.tensor_bytes
     }
 
+    pub fn request_tensor_probe(&mut self) -> Result<()> {
+        if !self.info.capabilities.matrix_engine {
+            bail!("device {} has no Tensor Core backend", self.device);
+        }
+        if self.tensor_device_backoff.phase == CircuitPhase::Open {
+            self.tensor_device_backoff.phase = CircuitPhase::HalfOpen;
+            self.tensor_device_backoff.retry_at = None;
+            self.tensor_transition_logs.record(
+                Instant::now(),
+                self.device,
+                "device",
+                CircuitPhase::HalfOpen,
+                self.tensor_device_backoff.level,
+                None,
+            );
+        }
+        Ok(())
+    }
+
     pub fn adaptive_status(&self) -> AdaptiveStatus {
         AdaptiveStatus {
             tensor_threshold_rows: self.tensor_threshold_rows,
@@ -1939,6 +1958,10 @@ impl AcceleratorBackend for Gpu {
 
     fn adaptive_status(&self) -> AdaptiveStatus {
         Gpu::adaptive_status(self)
+    }
+
+    fn request_tensor_probe(&mut self) -> Result<()> {
+        Gpu::request_tensor_probe(self)
     }
 
     fn ensure_quantizer(

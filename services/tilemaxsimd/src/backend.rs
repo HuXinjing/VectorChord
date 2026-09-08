@@ -98,6 +98,10 @@ pub trait AcceleratorBackend: Send {
     fn tensor_bytes(&self) -> usize;
     fn adaptive_status(&self) -> AdaptiveStatus;
 
+    fn request_tensor_probe(&mut self) -> anyhow::Result<()> {
+        anyhow::bail!("this accelerator backend has no Tensor circuit")
+    }
+
     fn supports_profile(&self, native_profile: u8) -> bool {
         let capabilities = &self.info().capabilities;
         match native_profile {

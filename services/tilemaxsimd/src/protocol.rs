@@ -20,7 +20,7 @@ const MAGIC: &[u8; 4] = b"VCTM";
 const REQUEST_KIND: u16 = 1;
 const RESPONSE_KIND: u16 = 2;
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
 pub struct Descriptor {
     pub candidate_id: u32,
     pub contract: String,

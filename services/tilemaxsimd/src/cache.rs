@@ -383,6 +383,17 @@ impl GpuCache {
         self.entries.get(key).is_some_and(|entry| entry.ready)
     }
 
+    pub fn pin_state(&self, key: &str) -> Result<bool, &'static str> {
+        let entry = self
+            .entries
+            .get(key)
+            .ok_or("GPU cache entry is not resident")?;
+        if !entry.ready {
+            return Err("GPU cache entry is still loading");
+        }
+        Ok(entry.pinned)
+    }
+
     fn victim(&self) -> Option<(&String, &CacheEntry)> {
         self.entries
             .iter()
@@ -600,6 +611,29 @@ impl GpuCache {
 
     pub fn remove(&mut self, key: &str) -> Result<(), &'static str> {
         self.remove_entry(key).map(|_| ())
+    }
+
+    pub fn set_pinned(&mut self, key: &str, pinned: bool) -> Result<(), &'static str> {
+        let entry = self
+            .entries
+            .get_mut(key)
+            .ok_or("GPU cache entry is not resident")?;
+        if !entry.ready {
+            return Err("GPU cache entry is still loading");
+        }
+        if entry.pinned == pinned {
+            return Ok(());
+        }
+        if pinned {
+            if self.pinned_bytes.saturating_add(entry.allocated_bytes) > self.pinned_max_bytes {
+                return Err("GPU pinned cache budget is exhausted");
+            }
+            self.pinned_bytes = self.pinned_bytes.saturating_add(entry.allocated_bytes);
+        } else {
+            self.pinned_bytes = self.pinned_bytes.saturating_sub(entry.allocated_bytes);
+        }
+        entry.pinned = pinned;
+        Ok(())
     }
 }
 

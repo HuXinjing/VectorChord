@@ -179,6 +179,25 @@ impl Engine {
     }
 
     pub fn prewarm(&mut self, descriptors: &[Descriptor], batch_size: usize) -> Result<()> {
+        self.prewarm_internal(descriptors, batch_size, true, true)
+    }
+
+    pub fn prewarm_runtime(
+        &mut self,
+        descriptors: &[Descriptor],
+        batch_size: usize,
+        pin: bool,
+    ) -> Result<()> {
+        self.prewarm_internal(descriptors, batch_size, pin, false)
+    }
+
+    fn prewarm_internal(
+        &mut self,
+        descriptors: &[Descriptor],
+        batch_size: usize,
+        pin: bool,
+        force_admission: bool,
+    ) -> Result<()> {
         if batch_size == 0 {
             bail!("resident prewarm batch size must be positive");
         }
@@ -207,6 +226,12 @@ impl Engine {
                                 .map(|entry| (index, entry))
                         })
                 {
+                    if pin {
+                        self.devices[device]
+                            .cache
+                            .set_pinned(&key, true)
+                            .map_err(|message| anyhow!(message))?;
+                    }
                     acquired.push((device, key, false));
                     continue;
                 }
@@ -224,8 +249,8 @@ impl Engine {
                             descriptor.rows,
                             descriptor.dimension,
                             descriptor.dtype,
-                            true,
-                            true,
+                            pin,
+                            force_admission,
                         )
                     {
                         admission = Some((device, offset));
@@ -283,6 +308,51 @@ impl Engine {
             }
         }
         Ok(())
+    }
+
+    pub fn set_pinned(&mut self, descriptors: &[Descriptor], pinned: bool) -> Result<()> {
+        let mut targets = Vec::new();
+        for descriptor in unique_descriptors(descriptors) {
+            let key = gpu_cache_key(&descriptor, ScoringProfile::ExactFp16, None);
+            let (device, original) = self
+                .devices
+                .iter()
+                .enumerate()
+                .find_map(|(index, device)| {
+                    device
+                        .cache
+                        .pin_state(&key)
+                        .ok()
+                        .map(|state| (index, state))
+                })
+                .ok_or_else(|| anyhow!("tensor {} is not resident", descriptor.digest))?;
+            targets.push((device, key, original));
+        }
+        let mut changed: Vec<(usize, String, bool)> = Vec::new();
+        for (device, key, original) in &targets {
+            if *original == pinned {
+                continue;
+            }
+            if let Err(message) = self.devices[*device].cache.set_pinned(key, pinned) {
+                for (changed_device, changed_key, old_state) in changed.into_iter().rev() {
+                    let _ = self.devices[changed_device]
+                        .cache
+                        .set_pinned(&changed_key, old_state);
+                }
+                return Err(anyhow!(message));
+            }
+            changed.push((*device, key.clone(), *original));
+        }
+        Ok(())
+    }
+
+    pub fn request_tensor_probe(&mut self, device_ordinal: i32) -> Result<()> {
+        let device = self
+            .devices
+            .iter_mut()
+            .find(|device| device.gpu.info().ordinal == device_ordinal)
+            .ok_or_else(|| anyhow!("accelerator device {device_ordinal} is not configured"))?;
+        device.gpu.request_tensor_probe()
     }
 
     pub fn score(&mut self, request: &Request) -> Result<Vec<(u32, f32)>> {

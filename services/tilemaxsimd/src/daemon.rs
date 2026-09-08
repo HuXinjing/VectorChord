@@ -39,8 +39,113 @@ use crate::scheduler::{RequestQueue, Scheduled, SchedulerPolicy};
 use crate::shard::ShardStore;
 
 const GIB: usize = 1024 * 1024 * 1024;
+const MAX_MANAGEMENT_REQUEST_BYTES: usize = 1024 * 1024;
+const MAX_MANAGEMENT_OPERATIONS: usize = 1024;
 static SHUTDOWN_REQUESTED: AtomicBool = AtomicBool::new(false);
 static RELOAD_REQUESTED: AtomicBool = AtomicBool::new(false);
+
+#[derive(Clone, Debug, Deserialize)]
+struct CacheOperationRequest {
+    descriptors: Vec<protocol::Descriptor>,
+    #[serde(default = "default_prewarm_batch_size")]
+    batch_size: usize,
+    #[serde(default)]
+    pin: bool,
+}
+
+fn default_prewarm_batch_size() -> usize {
+    256
+}
+
+#[derive(Clone, Debug)]
+enum AdminAction {
+    Reload,
+    Prewarm(CacheOperationRequest),
+    Pin(Vec<protocol::Descriptor>),
+    Unpin(Vec<protocol::Descriptor>),
+    ProbeTensorCircuit { device: i32 },
+}
+
+#[derive(Clone, Debug)]
+struct AdminCommand {
+    operation_id: u64,
+    action: AdminAction,
+}
+
+#[derive(Clone, Debug, serde::Serialize)]
+struct OperationRecord {
+    id: u64,
+    kind: String,
+    state: String,
+    created_unix_ms: u128,
+    started_unix_ms: Option<u128>,
+    completed_unix_ms: Option<u128>,
+    error: Option<String>,
+}
+
+#[derive(Debug, Default)]
+struct OperationRegistry {
+    next_id: u64,
+    records: std::collections::VecDeque<OperationRecord>,
+}
+
+impl OperationRegistry {
+    fn create(&mut self, kind: &str) -> Result<u64> {
+        while self.records.len() >= MAX_MANAGEMENT_OPERATIONS {
+            let removable = self
+                .records
+                .iter()
+                .position(|record| matches!(record.state.as_str(), "succeeded" | "failed"));
+            let Some(index) = removable else {
+                bail!("management operation registry is full");
+            };
+            self.records.remove(index);
+        }
+        self.next_id = self.next_id.saturating_add(1).max(1);
+        let id = self.next_id;
+        self.records.push_back(OperationRecord {
+            id,
+            kind: kind.to_owned(),
+            state: "queued".to_owned(),
+            created_unix_ms: unix_time_ms(),
+            started_unix_ms: None,
+            completed_unix_ms: None,
+            error: None,
+        });
+        Ok(id)
+    }
+
+    fn get(&self, id: u64) -> Option<OperationRecord> {
+        self.records.iter().find(|record| record.id == id).cloned()
+    }
+
+    fn start(&mut self, id: u64) {
+        if let Some(record) = self.records.iter_mut().find(|record| record.id == id) {
+            record.state = "running".to_owned();
+            record.started_unix_ms = Some(unix_time_ms());
+        }
+    }
+
+    fn finish(&mut self, id: u64, result: &Result<()>) {
+        if let Some(record) = self.records.iter_mut().find(|record| record.id == id) {
+            record.completed_unix_ms = Some(unix_time_ms());
+            match result {
+                Ok(()) => record.state = "succeeded".to_owned(),
+                Err(error) => {
+                    record.state = "failed".to_owned();
+                    record.error = Some(format!("{error:#}"));
+                }
+            }
+        }
+    }
+}
+
+fn unix_time_ms() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+}
 
 extern "C" fn handle_signal(signal: libc::c_int) {
     if signal == libc::SIGHUP {
@@ -412,7 +517,11 @@ where
         ],
         "management": {
             "reload": "POST /v1/reload on the Unix status socket only",
-            "runtime_cache_warm": false,
+            "runtime_cache_warm": true,
+            "runtime_cache_pin": true,
+            "operation_tracking": true,
+            "graceful_drain": true,
+            "tensor_circuit_probe": true,
             "forced_kernel_selection": false,
         }
     }));
@@ -421,6 +530,8 @@ where
     let ready_cache = engine.status_json();
 
     let (sender, receiver) = mpsc::sync_channel::<Work>(args.max_queued_requests);
+    let (admin_sender, admin_receiver) = mpsc::sync_channel::<AdminCommand>(64);
+    let operations = Arc::new(Mutex::new(OperationRegistry::default()));
     let frame_admission = Arc::new(ByteAdmission::new(
         args.max_inflight_request_gb,
         Arc::clone(&metrics),
@@ -446,6 +557,7 @@ where
     };
     let scheduler_reload = Arc::clone(&reload);
     let scheduler_metrics = Arc::clone(&metrics);
+    let scheduler_operations = Arc::clone(&operations);
     let scheduler = thread::Builder::new()
         .name("tilemaxsim-scheduler".to_owned())
         .spawn(move || {
@@ -455,6 +567,8 @@ where
                 scheduler_config,
                 scheduler_reload,
                 scheduler_metrics,
+                admin_receiver,
+                scheduler_operations,
             )
         })?;
     let status_server = if let Some(path) = args.status_socket.clone() {
@@ -465,7 +579,8 @@ where
         status_listener.set_nonblocking(true)?;
         let status_metrics = Arc::clone(&metrics);
         let status_config = Arc::clone(&public_config);
-        let status_reload = Arc::clone(&reload);
+        let status_admin = admin_sender.clone();
+        let status_operations = Arc::clone(&operations);
         Some(
             thread::Builder::new()
                 .name("tilemaxsim-status".to_owned())
@@ -475,7 +590,8 @@ where
                         path,
                         status_metrics,
                         status_config,
-                        status_reload,
+                        status_admin,
+                        status_operations,
                     )
                 })?,
         )
@@ -488,7 +604,8 @@ where
         status_listener.set_nonblocking(true)?;
         let status_metrics = Arc::clone(&metrics);
         let status_config = Arc::clone(&public_config);
-        let status_reload = Arc::clone(&reload);
+        let status_admin = admin_sender.clone();
+        let status_operations = Arc::clone(&operations);
         Some(
             thread::Builder::new()
                 .name("tilemaxsim-status-tcp".to_owned())
@@ -497,7 +614,8 @@ where
                         status_listener,
                         status_metrics,
                         status_config,
-                        status_reload,
+                        status_admin,
+                        status_operations,
                     )
                 })?,
         )
@@ -534,6 +652,10 @@ where
     let mut scheduler_failed = false;
     let mut fatal_error = None;
     while !SHUTDOWN_REQUESTED.load(Ordering::Relaxed) {
+        if metrics.draining.load(Ordering::Acquire) {
+            metrics.ready.store(false, Ordering::Release);
+            break;
+        }
         if scheduler.is_finished() {
             scheduler_failed = true;
             metrics.ready.store(false, Ordering::Release);
@@ -644,7 +766,6 @@ where
             }
         }
     }
-    SHUTDOWN_REQUESTED.store(true, Ordering::Release);
     drop(listener);
     drop(tcp_listener);
     for reader in readers {
@@ -653,11 +774,13 @@ where
         }
     }
     drop(sender);
+    drop(admin_sender);
     metrics.ready.store(false, Ordering::Release);
     let scheduler_result = scheduler
         .join()
         .map_err(|_| anyhow!("TileMaxSim scheduler thread panicked"))
         .and_then(|result| result);
+    SHUTDOWN_REQUESTED.store(true, Ordering::Release);
     if status_server.is_some_and(|status_server| status_server.join().is_err()) {
         eprintln!("TileMaxSim status thread panicked during shutdown");
     }
@@ -795,6 +918,7 @@ struct SchedulerConfig {
 #[derive(Default)]
 struct RuntimeMetrics {
     ready: AtomicBool,
+    draining: AtomicBool,
     max_connections: usize,
     max_pending_requests: usize,
     max_tenant_pending_requests: usize,
@@ -1230,6 +1354,8 @@ fn run_scheduler(
     config: SchedulerConfig,
     reload: Arc<AtomicBool>,
     metrics: Arc<RuntimeMetrics>,
+    admin_receiver: mpsc::Receiver<AdminCommand>,
+    operations: Arc<Mutex<OperationRegistry>>,
 ) -> Result<()> {
     let mut queue = RequestQueue::new(
         config.policy,
@@ -1239,6 +1365,34 @@ fn run_scheduler(
     );
     let mut channel_open = true;
     while channel_open || !queue.is_empty() {
+        for command in admin_receiver.try_iter() {
+            operations
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .start(command.operation_id);
+            let reload_operation = matches!(&command.action, AdminAction::Reload);
+            let result = match command.action {
+                AdminAction::Reload => engine.reload_shards(),
+                AdminAction::Prewarm(request) => {
+                    engine.prewarm_runtime(&request.descriptors, request.batch_size, request.pin)
+                }
+                AdminAction::Pin(descriptors) => engine.set_pinned(&descriptors, true),
+                AdminAction::Unpin(descriptors) => engine.set_pinned(&descriptors, false),
+                AdminAction::ProbeTensorCircuit { device } => engine.request_tensor_probe(device),
+            };
+            if matches!(&result, Ok(())) {
+                if reload_operation {
+                    metrics.reload_succeeded.fetch_add(1, Ordering::Relaxed);
+                }
+                metrics.update_engine(engine.status_snapshot());
+            } else if reload_operation {
+                metrics.reload_failed.fetch_add(1, Ordering::Relaxed);
+            }
+            operations
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .finish(command.operation_id, &result);
+        }
         if reload.swap(false, Ordering::AcqRel) {
             match engine.reload_shards() {
                 Ok(()) => {
@@ -1763,7 +1917,8 @@ fn run_status_server(
     path: PathBuf,
     metrics: Arc<RuntimeMetrics>,
     config: Arc<serde_json::Value>,
-    reload: Arc<AtomicBool>,
+    admin: mpsc::SyncSender<AdminCommand>,
+    operations: Arc<Mutex<OperationRegistry>>,
 ) {
     while !SHUTDOWN_REQUESTED.load(Ordering::Relaxed) {
         match listener.accept() {
@@ -1774,7 +1929,14 @@ fn run_status_server(
                 connection
                     .set_write_timeout(Some(Duration::from_millis(250)))
                     .ok();
-                handle_status_connection(&mut connection, &metrics, &config, &reload, true);
+                handle_status_connection(
+                    &mut connection,
+                    &metrics,
+                    &config,
+                    &admin,
+                    &operations,
+                    true,
+                );
             }
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                 thread::sleep(Duration::from_millis(20));
@@ -1798,13 +1960,21 @@ fn run_tcp_status_server(
     listener: TcpListener,
     metrics: Arc<RuntimeMetrics>,
     config: Arc<serde_json::Value>,
-    reload: Arc<AtomicBool>,
+    admin: mpsc::SyncSender<AdminCommand>,
+    operations: Arc<Mutex<OperationRegistry>>,
 ) {
     while !SHUTDOWN_REQUESTED.load(Ordering::Relaxed) {
         match listener.accept() {
             Ok((mut connection, _)) => {
                 configure_tcp_status_connection(&connection);
-                handle_status_connection(&mut connection, &metrics, &config, &reload, false);
+                handle_status_connection(
+                    &mut connection,
+                    &metrics,
+                    &config,
+                    &admin,
+                    &operations,
+                    false,
+                );
             }
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                 thread::sleep(Duration::from_millis(20));
@@ -1827,26 +1997,133 @@ fn configure_tcp_status_connection(connection: &TcpStream) {
         .ok();
 }
 
+struct ManagementRequest {
+    method: String,
+    path: String,
+    body: Vec<u8>,
+}
+
+fn read_management_request(connection: &mut impl Read) -> Result<ManagementRequest> {
+    let mut payload = Vec::new();
+    let mut chunk = [0_u8; 4096];
+    let header_end = loop {
+        if payload.len() >= MAX_MANAGEMENT_REQUEST_BYTES {
+            bail!("management request exceeds the configured limit");
+        }
+        let count = connection.read(&mut chunk)?;
+        if count == 0 {
+            bail!("management request ended before its headers");
+        }
+        payload.extend_from_slice(&chunk[..count]);
+        if let Some(index) = payload.windows(4).position(|window| window == b"\r\n\r\n") {
+            break index + 4;
+        }
+    };
+    let headers = std::str::from_utf8(&payload[..header_end])?;
+    let mut lines = headers.split("\r\n");
+    let request_line = lines
+        .next()
+        .ok_or_else(|| anyhow!("missing request line"))?;
+    let mut parts = request_line.split_whitespace();
+    let method = parts
+        .next()
+        .ok_or_else(|| anyhow!("missing HTTP method"))?
+        .to_owned();
+    let path = parts
+        .next()
+        .ok_or_else(|| anyhow!("missing HTTP path"))?
+        .to_owned();
+    let version = parts
+        .next()
+        .ok_or_else(|| anyhow!("missing HTTP version"))?;
+    if parts.next().is_some() || !version.starts_with("HTTP/1.") {
+        bail!("invalid HTTP request line");
+    }
+    let mut content_length = 0_usize;
+    for line in lines.filter(|line| !line.is_empty()) {
+        let (name, value) = line
+            .split_once(':')
+            .ok_or_else(|| anyhow!("invalid HTTP header"))?;
+        if name.eq_ignore_ascii_case("transfer-encoding") {
+            bail!("transfer encoding is not supported");
+        }
+        if name.eq_ignore_ascii_case("content-length") {
+            content_length = value.trim().parse()?;
+        }
+    }
+    if header_end.saturating_add(content_length) > MAX_MANAGEMENT_REQUEST_BYTES {
+        bail!("management request body exceeds the configured limit");
+    }
+    while payload.len() < header_end + content_length {
+        let count = connection.read(&mut chunk)?;
+        if count == 0 {
+            bail!("management request body is truncated");
+        }
+        payload.extend_from_slice(&chunk[..count]);
+        if payload.len() > MAX_MANAGEMENT_REQUEST_BYTES {
+            bail!("management request exceeds the configured limit");
+        }
+    }
+    Ok(ManagementRequest {
+        method,
+        path,
+        body: payload[header_end..header_end + content_length].to_vec(),
+    })
+}
+
+fn submit_admin_operation(
+    operations: &Mutex<OperationRegistry>,
+    admin: &mpsc::SyncSender<AdminCommand>,
+    kind: &str,
+    action: AdminAction,
+) -> Result<u64> {
+    let id = operations
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .create(kind)?;
+    if let Err(error) = admin.try_send(AdminCommand {
+        operation_id: id,
+        action,
+    }) {
+        let result = Err(anyhow!("management executor is unavailable: {error}"));
+        operations
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .finish(id, &result);
+        return result.map(|()| id);
+    }
+    Ok(id)
+}
+
 fn handle_status_connection(
     connection: &mut (impl Read + Write),
     metrics: &RuntimeMetrics,
     config: &serde_json::Value,
-    reload: &AtomicBool,
+    admin: &mpsc::SyncSender<AdminCommand>,
+    operations: &Mutex<OperationRegistry>,
     local_admin: bool,
 ) {
-    let mut request = [0_u8; 1024];
-    let Ok(count) = connection.read(&mut request) else {
-        return;
+    let request = match read_management_request(connection) {
+        Ok(request) => request,
+        Err(error) => {
+            write_http_response(
+                connection,
+                "400 Bad Request",
+                "application/json",
+                &serde_json::json!({"error": error.to_string()}).to_string(),
+            );
+            return;
+        }
     };
-    let request = String::from_utf8_lossy(&request[..count]);
-    let (status, content_type, body) = if request.starts_with("GET /livez ") {
+    let (status, content_type, body) = if request.method == "GET" && request.path == "/livez" {
         (
             "200 OK",
             "application/json",
             serde_json::json!({"live": true}).to_string(),
         )
-    } else if request.starts_with("GET /healthz ") {
-        let ready = metrics.ready.load(Ordering::Acquire);
+    } else if request.method == "GET" && request.path == "/healthz" {
+        let is_draining = metrics.draining.load(Ordering::Acquire);
+        let ready = metrics.ready.load(Ordering::Acquire) && !is_draining;
         (
             if ready {
                 "200 OK"
@@ -1854,17 +2131,23 @@ fn handle_status_connection(
                 "503 Service Unavailable"
             },
             "application/json",
-            serde_json::json!({"ready": ready}).to_string(),
+            if ready {
+                // Preserve the original readiness response contract used by
+                // tilemaxsimctl and existing container health checks.
+                serde_json::json!({"ready": true}).to_string()
+            } else {
+                serde_json::json!({"ready": false, "draining": is_draining}).to_string()
+            },
         )
-    } else if request.starts_with("GET /metrics ") {
+    } else if request.method == "GET" && request.path == "/metrics" {
         (
             "200 OK",
             "text/plain; version=0.0.4",
             render_metrics(metrics),
         )
-    } else if request.starts_with("GET /v1/config ") {
+    } else if request.method == "GET" && request.path == "/v1/config" {
         ("200 OK", "application/json", config.to_string())
-    } else if request.starts_with("GET /v1/cache ") {
+    } else if request.method == "GET" && request.path == "/v1/cache" {
         let engine = metrics
             .engine
             .lock()
@@ -1873,27 +2156,139 @@ fn handle_status_connection(
         (
             "200 OK",
             "application/json",
-            serde_json::to_string(&engine).expect("engine status is serializable"),
+            serde_json::json!({
+                "api_version": "tilemaxsim.management.v1",
+                "generated_at_unix_ms": unix_time_ms(),
+                "cache": engine,
+            })
+            .to_string(),
         )
-    } else if request.starts_with("POST /v1/reload ") {
-        if local_admin {
-            reload.store(true, Ordering::Release);
-            (
-                "202 Accepted",
-                "application/json",
-                serde_json::json!({"accepted": true}).to_string(),
-            )
-        } else {
-            (
-                "403 Forbidden",
-                "application/json",
-                serde_json::json!({"error": "reload is restricted to the Unix status socket"})
+    } else if request.method == "GET" && request.path.starts_with("/v1/operations/") {
+        let id = request.path["/v1/operations/".len()..].parse::<u64>();
+        match id.ok().and_then(|id| {
+            operations
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .get(id)
+        }) {
+            Some(mut record) => {
+                // TCP status is intentionally readable by an orchestrator, but
+                // backend errors may contain local paths or vendor diagnostics.
+                if !local_admin && record.error.is_some() {
+                    record.error = Some("operation failed; inspect the Unix management socket or daemon logs".to_owned());
+                }
+                (
+                    "200 OK",
+                    "application/json",
+                    serde_json::json!({
+                        "api_version": "tilemaxsim.management.v1",
+                        "operation": record,
+                    })
                     .to_string(),
-            )
+                )
+            }
+            None => (
+                "404 Not Found",
+                "application/json",
+                serde_json::json!({"error": "operation not found"}).to_string(),
+            ),
+        }
+    } else if !local_admin && request.method == "POST" {
+        (
+            "403 Forbidden",
+            "application/json",
+            serde_json::json!({"error": "management writes require the Unix status socket"})
+                .to_string(),
+        )
+    } else if request.method == "POST" && request.path == "/v1/drain" {
+        metrics.draining.store(true, Ordering::Release);
+        metrics.ready.store(false, Ordering::Release);
+        (
+            "202 Accepted",
+            "application/json",
+            serde_json::json!({"accepted": true, "state": "draining"}).to_string(),
+        )
+    } else if request.method == "POST" && metrics.draining.load(Ordering::Acquire) {
+        (
+            "409 Conflict",
+            "application/json",
+            serde_json::json!({"error": "daemon is draining and no longer accepts management writes"}).to_string(),
+        )
+    } else if request.method == "POST" && request.path == "/v1/reload" {
+        operation_response(submit_admin_operation(
+            operations,
+            admin,
+            "reload",
+            AdminAction::Reload,
+        ))
+    } else if request.method == "POST" && request.path == "/v1/cache/prewarm" {
+        match serde_json::from_slice::<CacheOperationRequest>(&request.body) {
+            Ok(payload) => operation_response(submit_admin_operation(
+                operations,
+                admin,
+                "cache-prewarm",
+                AdminAction::Prewarm(payload),
+            )),
+            Err(error) => (
+                "400 Bad Request",
+                "application/json",
+                serde_json::json!({"error": error.to_string()}).to_string(),
+            ),
+        }
+    } else if request.method == "POST"
+        && matches!(request.path.as_str(), "/v1/cache/pin" | "/v1/cache/unpin")
+    {
+        match serde_json::from_slice::<CacheOperationRequest>(&request.body) {
+            Ok(payload) => {
+                let (kind, action) = if request.path.ends_with("/pin") {
+                    ("cache-pin", AdminAction::Pin(payload.descriptors))
+                } else {
+                    ("cache-unpin", AdminAction::Unpin(payload.descriptors))
+                };
+                operation_response(submit_admin_operation(operations, admin, kind, action))
+            }
+            Err(error) => (
+                "400 Bad Request",
+                "application/json",
+                serde_json::json!({"error": error.to_string()}).to_string(),
+            ),
+        }
+    } else if request.method == "POST"
+        && request.path.starts_with("/v1/devices/")
+        && request.path.ends_with("/tensor-circuit/probe")
+    {
+        let raw = request
+            .path
+            .trim_start_matches("/v1/devices/")
+            .trim_end_matches("/tensor-circuit/probe")
+            .trim_end_matches('/');
+        match raw.parse::<i32>() {
+            Ok(device) => operation_response(submit_admin_operation(
+                operations,
+                admin,
+                "tensor-circuit-probe",
+                AdminAction::ProbeTensorCircuit { device },
+            )),
+            Err(error) => (
+                "400 Bad Request",
+                "application/json",
+                serde_json::json!({"error": error.to_string()}).to_string(),
+            ),
         }
     } else {
         ("404 Not Found", "text/plain", "not found\n".to_owned())
     };
+    write_http_response(connection, status, content_type, &body);
+}
+
+fn operation_response(result: Result<u64>) -> (&'static str, &'static str, String) {
+    match result {
+        Ok(id) => ("202 Accepted", "application/json", serde_json::json!({"accepted": true, "operation_id": id, "operation_url": format!("/v1/operations/{id}")}).to_string()),
+        Err(error) => ("503 Service Unavailable", "application/json", serde_json::json!({"error": error.to_string()}).to_string()),
+    }
+}
+
+fn write_http_response(connection: &mut impl Write, status: &str, content_type: &str, body: &str) {
     let response = format!(
         "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
         body.len()
@@ -1915,6 +2310,18 @@ fn render_metrics(metrics: &RuntimeMetrics) -> String {
         output,
         "tilemaxsim_ready {}",
         usize::from(metrics.ready.load(Ordering::Relaxed))
+    )
+    .unwrap();
+    writeln!(
+        output,
+        "# HELP tilemaxsim_draining Whether the daemon has stopped accepting new work."
+    )
+    .unwrap();
+    writeln!(output, "# TYPE tilemaxsim_draining gauge").unwrap();
+    writeln!(
+        output,
+        "tilemaxsim_draining {}",
+        usize::from(metrics.draining.load(Ordering::Relaxed))
     )
     .unwrap();
     writeln!(
@@ -2815,9 +3222,10 @@ mod tests {
     #[cfg(feature = "backend-cpu")]
     use super::verify_backends;
     use super::{
-        ByteAdmission, PendingAdmission, RuntimeMetrics, candidate_fmas, handle_status_connection,
-        is_fatal_cuda_diagnostic, kib_to_bytes, quantum_end, render_metrics,
-        resolve_quantum_candidates, tenant_hash,
+        AdminAction, ByteAdmission, OperationRegistry, PendingAdmission, RuntimeMetrics,
+        candidate_fmas, handle_status_connection, is_fatal_cuda_diagnostic, kib_to_bytes,
+        quantum_end, read_management_request, render_metrics, resolve_quantum_candidates,
+        tenant_hash,
     };
     #[cfg(feature = "backend-cpu")]
     use crate::backend::{AcceleratorBackend, BackendKind};
@@ -2827,8 +3235,8 @@ mod tests {
     use crate::protocol::Descriptor;
     use crate::shard::HostCacheStatus;
     use std::io::{Read, Write};
-    use std::sync::Arc;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::Ordering;
+    use std::sync::{Arc, Mutex, mpsc};
 
     #[test]
     fn scheduler_quantum_uses_calibration_unless_operator_overrides_it() {
@@ -2884,31 +3292,94 @@ mod tests {
     fn management_reads_are_public_but_reload_is_unix_only() {
         let metrics = RuntimeMetrics::default();
         let config = serde_json::json!({"api_version": "tilemaxsim.management.v1"});
-        let reload = AtomicBool::new(false);
+        let (admin, commands) = mpsc::sync_channel(4);
+        let operations = Mutex::new(OperationRegistry::default());
 
         let mut config_request = StatusExchange::new("GET /v1/config HTTP/1.1\r\n\r\n");
-        handle_status_connection(&mut config_request, &metrics, &config, &reload, false);
+        handle_status_connection(
+            &mut config_request,
+            &metrics,
+            &config,
+            &admin,
+            &operations,
+            false,
+        );
         let response = String::from_utf8(config_request.response).unwrap();
         assert!(response.starts_with("HTTP/1.1 200 OK"));
         assert!(response.contains("tilemaxsim.management.v1"));
 
         let mut remote_reload = StatusExchange::new("POST /v1/reload HTTP/1.1\r\n\r\n");
-        handle_status_connection(&mut remote_reload, &metrics, &config, &reload, false);
+        handle_status_connection(
+            &mut remote_reload,
+            &metrics,
+            &config,
+            &admin,
+            &operations,
+            false,
+        );
         assert!(
             String::from_utf8(remote_reload.response)
                 .unwrap()
                 .starts_with("HTTP/1.1 403 Forbidden")
         );
-        assert!(!reload.load(Ordering::Acquire));
+        assert!(commands.try_recv().is_err());
 
         let mut local_reload = StatusExchange::new("POST /v1/reload HTTP/1.1\r\n\r\n");
-        handle_status_connection(&mut local_reload, &metrics, &config, &reload, true);
+        handle_status_connection(
+            &mut local_reload,
+            &metrics,
+            &config,
+            &admin,
+            &operations,
+            true,
+        );
         assert!(
             String::from_utf8(local_reload.response)
                 .unwrap()
                 .starts_with("HTTP/1.1 202 Accepted")
         );
-        assert!(reload.load(Ordering::Acquire));
+        let command = commands.try_recv().unwrap();
+        assert!(matches!(command.action, AdminAction::Reload));
+        assert_eq!(
+            operations
+                .lock()
+                .unwrap()
+                .get(command.operation_id)
+                .unwrap()
+                .state,
+            "queued"
+        );
+    }
+
+    #[test]
+    fn management_parser_honours_content_length_and_rejects_truncation() {
+        let mut valid = std::io::Cursor::new(
+            b"POST /v1/cache/pin HTTP/1.1\r\nContent-Length: 2\r\n\r\n{}".to_vec(),
+        );
+        let request = read_management_request(&mut valid).unwrap();
+        assert_eq!(request.body, b"{}");
+
+        let mut truncated = std::io::Cursor::new(
+            b"POST /v1/cache/pin HTTP/1.1\r\nContent-Length: 3\r\n\r\n{}".to_vec(),
+        );
+        assert!(read_management_request(&mut truncated).is_err());
+    }
+
+    #[test]
+    fn draining_rejects_new_management_writes() {
+        let metrics = RuntimeMetrics::default();
+        metrics.draining.store(true, Ordering::Release);
+        let config = serde_json::json!({});
+        let (admin, commands) = mpsc::sync_channel(1);
+        let operations = Mutex::new(OperationRegistry::default());
+        let mut request = StatusExchange::new("POST /v1/reload HTTP/1.1\r\n\r\n");
+        handle_status_connection(&mut request, &metrics, &config, &admin, &operations, true);
+        assert!(
+            String::from_utf8(request.response)
+                .unwrap()
+                .starts_with("HTTP/1.1 409 Conflict")
+        );
+        assert!(commands.try_recv().is_err());
     }
 
     #[test]
