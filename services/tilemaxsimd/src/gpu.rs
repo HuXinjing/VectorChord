@@ -845,17 +845,7 @@ impl Gpu {
             self.calibration_failures += 1;
             return None;
         }
-        let chunk_candidates = self.calibrate_tensor_chunk_candidates(
-            dimension,
-            candidates,
-            &document_offsets,
-            &document_rows,
-            one,
-            zero,
-        )?;
-        if unsafe { vctm_gpu_set_tensor_chunk_candidates(self.native.as_ptr(), chunk_candidates) }
-            != 0
-        {
+        if unsafe { vctm_gpu_set_tensor_chunk_candidates(self.native.as_ptr(), 65_536) } != 0 {
             self.calibration_failures += 1;
             return None;
         }
@@ -895,6 +885,19 @@ impl Gpu {
                 break;
             }
         }
+        let chunk_candidates = self.calibrate_tensor_chunk_candidates(
+            dimension,
+            candidates,
+            if threshold == u32::MAX {
+                512
+            } else {
+                threshold
+            },
+            &document_offsets,
+            &document_rows,
+            one,
+            zero,
+        )?;
         successful.then(|| TensorCalibrationBucket {
             candidate_count: u32::try_from(candidates).unwrap_or(u32::MAX),
             reference_document_rows: u32::try_from(
@@ -913,17 +916,19 @@ impl Gpu {
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn calibrate_tensor_chunk_candidates(
         &mut self,
         dimension: u32,
         candidates: usize,
+        total_query_rows: u32,
         document_offsets: &[u64],
         document_rows: &[u32],
         one: &[u8; 2],
         zero: &[u8; 2],
     ) -> Option<usize> {
         const REPETITIONS: usize = 3;
-        let (queries, offsets) = calibration_queries(512, dimension, 32, one, zero);
+        let (queries, offsets) = calibration_queries(total_query_rows, dimension, 32, one, zero);
         let mut choices = [64_usize, 256, 1024, 4096, candidates]
             .into_iter()
             .filter(|choice| *choice <= candidates)
