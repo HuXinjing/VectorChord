@@ -132,8 +132,8 @@ priority、模型/量化 contract、shape，以及由
 分布，以及 64--2048 个批内 query rows，对共享内存 tile kernel 与 cuBLAS FP16
 Tensor Core GEMM + 分段 MaxSim 归约做有界 AB/BA 校准。只有数值一致且收益达到门槛
 才采纳交叉点。grouped GEMM 的 candidate chunk 也只在用户配置的 workspace 内从
-可用档位实测选择，不借用系统中未预留的空闲显存。执行层以匹配候选数和 row-group
-桶的交叉点积工作量为基准，直接比较实际
+可用档位实测选择，不借用系统中未预留的空闲显存。执行层以匹配候选数，以及最接近
+的 row-group 数、最大文档 rows 和 rows 不均衡度校准桶的交叉点积工作量为基准，直接比较实际
 `query rows × document rows × dimension`；连续批处理带来的 query 复用和长尾文档
 形状是两个独立输入。校准失败、workspace 不足、数值不一致或后端失败时确定性回退
 tile/warp。请求/容量类失败只抑制对应 workload 桶 60 秒；连续三次设备类失败才打开

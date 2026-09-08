@@ -310,7 +310,8 @@ explicit matrix dispatch won strongly once candidate count or concurrency grew.
 The current implementation addresses that gap with the multi-bucket work and
 grouping model described above. Dispatch compares measured crossover
 dot-product work with the actual query rows, total document rows and dimension,
-while exact row-count cardinality selects the grouping profile. The daemon's
+while row-count cardinality, maximum document rows and row-imbalance ratio
+select the nearest calibrated shape profile. The daemon's
 default candidate quantum is derived from the largest useful bucket common to
 every active device; a non-zero operator setting overrides it. On RTX 4090 it retained tile for 64 candidates
 and two requests, selected Tensor Core for 64 candidates and 16 requests, and

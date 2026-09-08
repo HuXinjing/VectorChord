@@ -227,7 +227,8 @@ material win. The grouped-GEMM candidate chunk is independently selected from
 the sizes that fit the configured workspace; calibration never borrows
 unreserved free VRAM. Runtime dispatch compares actual
 `query rows * document rows * dimension` work with the crossover work of the
-matching candidate-count and row-group bucket. This keeps continuous batching
+matching candidate-count bucket and the closest row-group, maximum-row and
+row-imbalance profile. This keeps continuous batching
 and highly uneven document lengths as separate inputs. Architecture defaults
 are used only if calibration cannot complete; unsupported hardware, workspace
 pressure, numerical disagreement, or backend failure deterministically falls
