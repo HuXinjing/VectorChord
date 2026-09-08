@@ -26,9 +26,9 @@ NVIDIA production stages use digest-pinned CUDA runtime images matching their
 builder generation (CUDA 12.6 for Ada/Hopper and CUDA 13.3 for Blackwell).
 `tilemaxsimd` dynamically links cuBLAS and cuBLASLt, so a plain Ubuntu final
 stage is not runnable even though the CUDA driver is injected by the container
-runtime. CI now builds the final stage, runs both CLI smoke checks, and rejects
-any `ldd` dependency reported as missing; testing only the compiler stage is
-not considered image validation.
+runtime. Before publication, operators must build the final stage, run both CLI
+smoke checks, and reject any `ldd` dependency reported as missing; testing only
+the compiler stage is not considered image validation.
 
 The CUDA executor also fails during startup when compute capability cannot be
 read, is older than SM80, or a Blackwell-class device is paired with a pre-13.0
@@ -79,9 +79,9 @@ cargo build --release --manifest-path services/tilemaxsimd/Cargo.toml \
 It reserves one `MTLStorageModeShared` arena in Apple unified memory and runs
 native MSL FP16/FP32 exact MaxSim. Compatible resident requests share one
 command-buffer submission and segmented result reduction. INT8, FP8 and PQ are
-reported unsupported rather than silently falling back. The macOS ARM64 CI
-job compiles the Objective-C++ bridge and runs the same device-level exact
-conformance probe as CUDA. Until that external job passes, Metal remains
+reported unsupported rather than silently falling back. A macOS ARM64 release
+validation must compile the Objective-C++ bridge and run the same device-level
+exact conformance probe as CUDA. Until that validation passes, Metal remains
 experimental rather than production-supported.
 
 ## NVIDIA architecture policy
@@ -89,11 +89,11 @@ experimental rather than production-supported.
 The CUDA 12 artifact contains native `sm_80`, `sm_89`, `sm_90`, `sm_90a` and
 forward-compatible `compute_90` PTX. The independent CUDA 13.3 Blackwell image
 (`services/Dockerfile.tilemaxsimd-blackwell`) contains native `sm_120` and
-`sm_121` plus `compute_121` PTX; SM121 is the GB10/DGX Spark target. Its opt-in
-CI job inspects the resulting cubins instead of treating a build flag as proof.
-Runtime dispatch uses the device architecture and a
+`sm_121` plus `compute_121` PTX; SM121 is the GB10/DGX Spark target. Runtime
+dispatch uses the device architecture and a
 production-shaped 320-dimensional microbenchmark rather than a model-name-only
-rule.
+rule. Release validation must inspect the resulting cubins instead of treating
+a build flag as proof.
 
 - Ada/RTX 4090 uses aligned `half2` loads, FP32 accumulation, scoped
   persisting-L2 query windows, 16-byte `cp.async` document loads,
@@ -279,9 +279,8 @@ The full VectorChord workflow has not yet been rerun under those profilers, so
 its CUDA 13 cubin instruction audit and kernel-specific hardware-counter proof
 remain pending, as do end-to-end
 L2-to-L1-to-L0 cold-cache distributions and sustained multi-tenant p50/p95/p99
-tests on an exclusive device. The mandatory hardware-validation workflow is
-intentionally unchanged and still fails closed when those tools or artifacts
-are absent.
+tests on an exclusive device. Any future release gate must fail closed when
+those tools or artifacts are absent.
 
 ### Resident concurrency sweep
 
@@ -357,14 +356,13 @@ Every native backend needs target-hardware evidence for:
 Passing a compile or exposing a device name is not sufficient to advertise a
 backend as production-supported.
 
-The manually dispatched `tilemaxsimd-hardware-validation.yml` workflow is the
-H200 release gate. Its self-hosted runner must carry the `gpu-h200` label. The
-runner script refuses a device whose name or compute capability is not H200 /
-9.0, builds native SM90/SM90a code, inspects the cubins and instructions, runs
-all ignored real-device numerical and latency tests serially, and uploads the
-device fingerprint, raw output and checksum manifest. It additionally records
-the runtime-selected cuBLAS kernel with Nsight Systems and fails unless Nsight
-Compute observes activity on the SM tensor pipeline. This matters because the
-cuBLAS implementation is selected from the installed library at runtime and is
-not contained in this repository's cubin. A queued or skipped job is not
-validation evidence.
+The repository provides `services/tilemaxsimd/scripts/validate_nvidia_hardware.sh`
+for an operator-run H200 release gate. The script refuses a device whose name or
+compute capability is not H200 / 9.0, builds native SM90/SM90a code, inspects
+the cubins and instructions, and runs real-device numerical and latency tests.
+Release evidence should retain the device fingerprint, raw output and checksum
+manifest. It must also record the runtime-selected cuBLAS kernel with Nsight
+Systems and require Nsight Compute activity on the SM tensor pipeline. This
+matters because the cuBLAS implementation is selected from the installed
+library at runtime and is not contained in this repository's cubin. An omitted
+or partial run is not validation evidence.

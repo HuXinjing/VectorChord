@@ -316,14 +316,10 @@ are deliberately not exposed because they could bypass cache isolation or
 calibrated fallback. Runtime prewarm obeys normal admission limits; startup
 resident manifests remain the explicit operator-owned forced pinned preload.
 
-Release workflows attach SPDX SBOM and maximum-mode SLSA provenance OCI
-attestations to every container image, add a GitHub build-provenance
-attestation, and keylessly sign each immutable digest with Cosign. Consumers
-can verify provenance with `gh attestation verify oci://IMAGE:TAG -R
-HuXinjing/VectorChord` and verify the image signature with `cosign verify
---certificate-oidc-issuer https://token.actions.githubusercontent.com
---certificate-identity-regexp '^https://github.com/HuXinjing/VectorChord/'
-IMAGE@sha256:DIGEST`.
+Container build definitions remain in the repository, but image publication is
+not automated. Operators publishing a release must scan the exact image digest,
+attach an SPDX SBOM and provenance, and sign that immutable digest before making
+it available to consumers.
 
 `GET /livez` reports process liveness separately from readiness. The packaged
 `tilemaxsimctl --probe live|ready` probe can wait on the status socket without

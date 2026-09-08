@@ -193,12 +193,8 @@ PostgreSQL 可以通过本地 Unix socket 或 `tcp://HOST:PORT` 连接 daemon。
 隔离与校准回退。运行时 prewarm 遵守正常准入限制；只有启动期 resident manifest
 是运维人员显式配置的强制 pinned 预热。
 
-发布工作流会为每个容器镜像附加 SPDX SBOM、max 模式 SLSA provenance、GitHub
-构建来源证明，并用 Cosign OIDC 对不可变 digest 做无密钥签名。可使用
-`gh attestation verify oci://IMAGE:TAG -R HuXinjing/VectorChord` 校验来源证明，使用
-`cosign verify --certificate-oidc-issuer https://token.actions.githubusercontent.com
---certificate-identity-regexp '^https://github.com/HuXinjing/VectorChord/'
-IMAGE@sha256:DIGEST` 校验镜像签名。
+仓库保留容器构建定义，但不再自动发布镜像。人工发布时必须扫描最终镜像的不可变
+digest，并在对外提供前附带 SPDX SBOM、provenance 和签名。
 部署和协议细节见
 [`docs/TILEMAXSIM_CUDA_SIDECAR.md`](docs/TILEMAXSIM_CUDA_SIDECAR.md) 与
 [`docs/TILEMAXSIM_IPC_V2.md`](docs/TILEMAXSIM_IPC_V2.md)。

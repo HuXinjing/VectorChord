@@ -75,7 +75,8 @@ TCP status 只读。`/v1/config` 用于控制面能力发现，`/v1/cache` 是�
 - `deploy/systemd/`：非容器部署示例。
 - `tests/`：PostgreSQL 扩展回归；`services/test_tilemaxsim_rust_daemon.py`：真实 daemon/IPC
   集成；`services/tilemaxsimd` 内 Rust tests：allocator、调度、协议、量化与 kernel contract。
-- `.github/workflows/`：CI 和 release；发布镜像必须携带 SBOM、provenance 和 digest 签名。
+- `services/Dockerfile.*` 与验证脚本：当前采用人工构建和发布；发布者必须对最终镜像
+  digest 执行扫描，并附带 SBOM、provenance 和签名。
 
 常见修改落点：调度策略改 `scheduler.rs`；kernel 选择改 `dispatch.rs`；CUDA 实现改
 `gpu.rs`；缓存策略改 `cache.rs`，但跨层上传/回滚同时检查 `engine.rs`；协议字段先改
