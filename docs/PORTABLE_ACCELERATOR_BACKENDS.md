@@ -260,14 +260,53 @@ instead of applying a Hopper model-name rule. GPU memory before and after the
 validation was identical (65,837 MiB used, 77,322 MiB free), and all transferred
 source/toolchain files were removed from the remote host.
 
-This run does **not** close the complete H200 release gate. The host did not
-provide `nvdisasm`, Nsight Systems or Nsight Compute, and no packages were
-installed. Consequently the CUDA 13 cubin instruction audit and hardware
-counter proof of Tensor Pipeline activity remain pending, as do end-to-end
+This run does **not** close the complete H200 release gate. At the time of the
+run the host did not provide `nvdisasm`, Nsight Systems or Nsight Compute, and
+no packages were installed. These tools were subsequently installed in an
+isolated user-owned directory without changing the driver: `nvdisasm` decoded
+an SM90a cubin, Nsight Systems captured ten SM90 Tensor Core GEMMs, and a
+sudo-scoped Nsight Compute probe measured 41.33% Tensor Pipeline activity.
+The full VectorChord workflow has not yet been rerun under those profilers, so
+its CUDA 13 cubin instruction audit and kernel-specific hardware-counter proof
+remain pending, as do end-to-end
 L2-to-L1-to-L0 cold-cache distributions and sustained multi-tenant p50/p95/p99
 tests on an exclusive device. The mandatory hardware-validation workflow is
 intentionally unchanged and still fails closed when those tools or artifacts
 are absent.
+
+### Resident concurrency sweep
+
+A follow-up synthetic FP16 sweep on the same shared H200 used 32 query rows per
+request, 32 rows per document, dimension 320 and resident L0 tensors. The table
+reports single-buffer tile time divided by explicit Tensor Core time; values
+above one favour Tensor Core. Each point through 4,096 candidates used 20 timed
+iterations. The 34,054-candidate points used five timed iterations, and its
+8/16/32/64-request points were repeated three times.
+
+| Candidates | 2 requests | 8 requests | 16 requests | 32 requests | 64 requests |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 64 | 0.58x | 1.10x | 1.56x | 2.14x | 2.59x |
+| 512 | 1.52x | 4.40x | 6.65x | 6.97x | 7.59x |
+| 4,096 | 5.27x | 9.53x | 10.52x | 10.69x | 10.97x |
+| 34,054 | 7.56x | 10.67x | 13.82x | 15.53x | 16.11x |
+
+For 34,054 candidates, the median tile/Tensor times across the repeated large
+batches were 41.5824/3.8990 ms at eight requests, 83.1257/5.9925 ms at 16,
+165.1969/10.6387 ms at 32 and 329.3798/20.4426 ms at 64. The 64-request speedup
+was tightly grouped at 15.989--16.130x despite the shared device.
+
+This result exposes a dispatch-model gap rather than proving that every large
+online request should use Tensor Core. The startup probe used 64 candidates and
+left `tensor_threshold_rows` disabled (`u32::MAX`), even though explicit matrix
+dispatch won strongly once either candidate count or concurrency grew. Query
+rows alone are therefore not a sufficient crossover variable. Production auto
+dispatch must incorporate candidate count, document rows and their resulting
+work estimate (plus launch/grouping cost), then calibrate more than one candidate
+bucket. Until that change is validated, these numbers demonstrate available
+kernel capability but not automatic end-to-end acceleration. The sweep excludes
+scheduler queueing, H2D cache misses, PostgreSQL candidate generation and network
+latency, and its repeated synthetic document shape is more GEMM-friendly than a
+variable-length production corpus.
 
 ## Vendor acceptance gates
 
