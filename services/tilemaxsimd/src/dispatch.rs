@@ -52,6 +52,7 @@ pub struct TensorDispatchDecision {
     pub adjusted_threshold_rows: u64,
     pub effective_query_rows: u64,
     pub estimated_dot_products: u128,
+    pub crossover_dot_products: u128,
 }
 
 pub fn choose_tensor(
@@ -81,36 +82,50 @@ pub fn choose_tensor(
         .filter(|bucket| bucket.reference_row_groups == selected_group_profile)
         .collect::<Vec<_>>();
     matching.sort_unstable_by_key(|bucket| bucket.candidate_count);
-    let reference_rows = matching.first()?.reference_document_rows.max(1) as u64;
-    let normalized_candidates =
-        input.total_document_rows.saturating_add(reference_rows - 1) / reference_rows;
+    let actual_candidates = u64::try_from(input.candidate_count).unwrap_or(u64::MAX);
     let selected = matching
         .iter()
         .rev()
-        .find(|bucket| u64::from(bucket.candidate_count) <= normalized_candidates)
+        .find(|bucket| u64::from(bucket.candidate_count) <= actual_candidates)
         .copied()
         .unwrap_or(matching[0]);
-
-    let candidate_penalty = u64::from(selected.candidate_count)
-        .saturating_add(normalized_candidates - 1)
-        / normalized_candidates;
-    let adjusted_threshold_rows =
-        u64::from(selected.threshold_query_rows).saturating_mul(candidate_penalty.max(1));
     let effective_query_rows = u64::from(input.total_query_rows)
         .saturating_mul(u64::from(input.dimension))
         .saturating_add(319)
         / 320;
+    let estimated_dot_products = u128::from(input.total_query_rows)
+        .saturating_mul(u128::from(input.total_document_rows))
+        .saturating_mul(u128::from(input.dimension));
+    let crossover_dot_products = u128::from(selected.threshold_query_rows)
+        .saturating_mul(u128::from(selected.candidate_count))
+        .saturating_mul(u128::from(selected.reference_document_rows))
+        .saturating_mul(320);
+    let adjusted_threshold_rows = if input.total_document_rows == 0 {
+        u64::MAX
+    } else {
+        let reference_document_values = u128::from(selected.candidate_count)
+            .saturating_mul(u128::from(selected.reference_document_rows));
+        let scaled = u128::from(selected.threshold_query_rows)
+            .saturating_mul(reference_document_values)
+            .saturating_mul(320)
+            .saturating_add(
+                u128::from(input.total_document_rows)
+                    .saturating_mul(u128::from(input.dimension))
+                    .saturating_sub(1),
+            )
+            / u128::from(input.total_document_rows).saturating_mul(u128::from(input.dimension));
+        u64::try_from(scaled).unwrap_or(u64::MAX)
+    };
     Some(TensorDispatchDecision {
         use_tensor: selected.threshold_query_rows != u32::MAX
-            && effective_query_rows >= adjusted_threshold_rows,
+            && estimated_dot_products >= crossover_dot_products,
         selected_candidate_bucket: selected.candidate_count,
         selected_document_rows: selected.reference_document_rows,
         selected_row_groups: selected.reference_row_groups,
         adjusted_threshold_rows,
         effective_query_rows,
-        estimated_dot_products: u128::from(input.total_query_rows)
-            .saturating_mul(u128::from(input.total_document_rows))
-            .saturating_mul(u128::from(input.dimension)),
+        estimated_dot_products,
+        crossover_dot_products,
     })
 }
 
@@ -337,7 +352,7 @@ mod tests {
     }
 
     #[test]
-    fn longer_documents_increase_the_effective_candidate_bucket() {
+    fn longer_documents_can_cross_over_without_faking_candidate_count() {
         let buckets = [bucket(64, 1, 256), bucket(512, 1, 64)];
         let decision = choose_tensor(
             TensorDispatchInput {
@@ -350,7 +365,26 @@ mod tests {
             &buckets,
         )
         .unwrap();
-        assert_eq!(decision.selected_candidate_bucket, 512);
+        assert_eq!(decision.selected_candidate_bucket, 64);
         assert!(decision.use_tensor);
+        assert!(decision.estimated_dot_products >= decision.crossover_dot_products);
+    }
+
+    #[test]
+    fn sparse_long_tail_keeps_the_fragmented_shape_profile() {
+        let buckets = [bucket(512, 1, 64), bucket(512, 8, 512)];
+        let decision = choose_tensor(
+            TensorDispatchInput {
+                candidate_count: 512,
+                total_query_rows: 128,
+                total_document_rows: 511 + 4096,
+                document_row_groups: 2,
+                dimension: 320,
+            },
+            &buckets,
+        )
+        .unwrap();
+        assert_eq!(decision.selected_row_groups, 8);
+        assert!(!decision.use_tensor);
     }
 }
