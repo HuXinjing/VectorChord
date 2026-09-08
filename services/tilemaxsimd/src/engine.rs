@@ -81,6 +81,11 @@ pub struct DeviceStatus {
     pub calibration_failures: u64,
     pub tensor_calibration_buckets: Vec<crate::dispatch::TensorCalibrationBucket>,
     pub tensor_chunk_candidates: u32,
+    pub tensor_circuit_open: bool,
+    pub tensor_suppressed_bucket_count: u32,
+    pub tensor_request_fallbacks: u64,
+    pub tensor_capacity_fallbacks: u64,
+    pub tensor_device_fallbacks: u64,
 }
 
 #[derive(Clone, Debug, Default, serde::Serialize)]
@@ -1021,6 +1026,11 @@ impl Engine {
                     calibration_failures: adaptive.calibration_failures,
                     tensor_calibration_buckets: adaptive.tensor_calibration_buckets,
                     tensor_chunk_candidates: adaptive.tensor_chunk_candidates,
+                    tensor_circuit_open: adaptive.tensor_circuit_open,
+                    tensor_suppressed_bucket_count: adaptive.tensor_suppressed_bucket_count,
+                    tensor_request_fallbacks: adaptive.tensor_request_fallbacks,
+                    tensor_capacity_fallbacks: adaptive.tensor_capacity_fallbacks,
+                    tensor_device_fallbacks: adaptive.tensor_device_fallbacks,
                 }
             })
             .collect();
@@ -1055,6 +1065,7 @@ impl Engine {
                     "gpu_pinned_bytes": device.pinned_bytes,
                     "gpu_tenant_count": device.tenants,
                     "adaptive_tensor_threshold_rows": device.tensor_threshold_rows,
+                    "adaptive_tensor_minimum_calibrated_threshold_rows": device.tensor_threshold_rows,
                     "adaptive_calibration_complete": device.calibration_complete,
                     "adaptive_batch_warp_calls": device.batch_warp_calls,
                     "adaptive_batch_tensor_calls": device.batch_tensor_calls,
@@ -1062,6 +1073,11 @@ impl Engine {
                     "adaptive_calibration_failures": device.calibration_failures,
                     "adaptive_tensor_calibration_buckets": device.tensor_calibration_buckets,
                     "adaptive_tensor_chunk_candidates": device.tensor_chunk_candidates,
+                    "adaptive_tensor_circuit_open": device.tensor_circuit_open,
+                    "adaptive_tensor_suppressed_bucket_count": device.tensor_suppressed_bucket_count,
+                    "adaptive_tensor_request_fallbacks": device.tensor_request_fallbacks,
+                    "adaptive_tensor_capacity_fallbacks": device.tensor_capacity_fallbacks,
+                    "adaptive_tensor_device_fallbacks": device.tensor_device_fallbacks,
                     "gpu_hits": device.hits,
                     "gpu_misses": device.misses,
                     "gpu_evictions": device.evictions,

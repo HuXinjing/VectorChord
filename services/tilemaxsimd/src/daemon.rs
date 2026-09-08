@@ -2398,10 +2398,18 @@ fn render_metrics(metrics: &RuntimeMetrics) -> String {
     )
     .unwrap();
     writeln!(output, "# TYPE tilemaxsim_gpu_h2d_bytes_total counter").unwrap();
-    writeln!(output, "# HELP tilemaxsim_gpu_adaptive_tensor_threshold_rows Calibrated query-row crossover; 4294967295 disables Tensor Core.").unwrap();
+    writeln!(output, "# HELP tilemaxsim_gpu_adaptive_tensor_threshold_rows Deprecated minimum query-row crossover across all workload buckets; it is not the runtime dispatch threshold.").unwrap();
     writeln!(
         output,
         "# TYPE tilemaxsim_gpu_adaptive_tensor_threshold_rows gauge"
+    )
+    .unwrap();
+    writeln!(output, "# HELP tilemaxsim_gpu_tensor_runtime_state Recoverable Tensor Core circuit and workload-bucket suppression state.").unwrap();
+    writeln!(output, "# TYPE tilemaxsim_gpu_tensor_runtime_state gauge").unwrap();
+    writeln!(output, "# HELP tilemaxsim_gpu_tensor_fallback_total Tensor Core fallbacks classified by native failure category.").unwrap();
+    writeln!(
+        output,
+        "# TYPE tilemaxsim_gpu_tensor_fallback_total counter"
     )
     .unwrap();
     writeln!(
@@ -2483,6 +2491,15 @@ fn render_metrics(metrics: &RuntimeMetrics) -> String {
         )
         .unwrap();
         writeln!(output, "tilemaxsim_gpu_adaptive_tensor_threshold_rows{{slot=\"{}\",device=\"{}\",complete=\"{}\"}} {}", device.slot, device.device, device.calibration_complete, device.tensor_threshold_rows).unwrap();
+        writeln!(output, "tilemaxsim_gpu_tensor_runtime_state{{slot=\"{}\",device=\"{}\",kind=\"circuit_open\"}} {}", device.slot, device.device, u8::from(device.tensor_circuit_open)).unwrap();
+        writeln!(output, "tilemaxsim_gpu_tensor_runtime_state{{slot=\"{}\",device=\"{}\",kind=\"suppressed_buckets\"}} {}", device.slot, device.device, device.tensor_suppressed_bucket_count).unwrap();
+        for (kind, value) in [
+            ("request", device.tensor_request_fallbacks),
+            ("capacity", device.tensor_capacity_fallbacks),
+            ("device", device.tensor_device_fallbacks),
+        ] {
+            writeln!(output, "tilemaxsim_gpu_tensor_fallback_total{{slot=\"{}\",device=\"{}\",kind=\"{kind}\"}} {value}", device.slot, device.device).unwrap();
+        }
         writeln!(output, "tilemaxsim_gpu_adaptive_dispatch_total{{slot=\"{}\",device=\"{}\",kernel=\"tile\"}} {}", device.slot, device.device, device.batch_warp_calls).unwrap();
         writeln!(output, "tilemaxsim_gpu_adaptive_dispatch_total{{slot=\"{}\",device=\"{}\",kernel=\"tensor\"}} {}", device.slot, device.device, device.batch_tensor_calls).unwrap();
         for bucket in &device.tensor_calibration_buckets {
