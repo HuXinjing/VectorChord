@@ -209,6 +209,8 @@ IMAGE@sha256:DIGEST` 校验镜像签名。
 多硬件 backend 边界、CPU/CUDA 隔离构建、NVIDIA 架构策略，以及 Metal、昇腾、
 沐曦后端的验收门槛见
 [《Portable accelerator backends》](docs/PORTABLE_ACCELERATOR_BACKENDS.md)。
+首次参与开发可先阅读[《代码地图》](docs/CODEBASE_GUIDE.zh-CN.md)，其中按请求链路说明
+PostgreSQL 扩展、daemon、三级缓存、调度、后端和测试的修改落点。
 报告只公开聚合指标和可复现程序，不公开私有评测语料、生成张量、模型权重或内部路径。
 
 开发机语料包含 34,054 个张量描述符、34,027 个唯一张量，逻辑 FP16 数据量为

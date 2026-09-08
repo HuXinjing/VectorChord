@@ -340,6 +340,8 @@ private evaluation corpus, generated tensors, model weights, or internal paths.
 The accelerator boundary, isolated CPU/CUDA builds, NVIDIA architecture policy
 and acceptance gates for future Metal, Ascend and MetaX executors are documented
 in [Portable accelerator backends](docs/PORTABLE_ACCELERATOR_BACKENDS.md).
+New contributors can follow the end-to-end module and request-path guide in
+[Codebase map (Chinese)](docs/CODEBASE_GUIDE.zh-CN.md).
 
 The development corpus contains 34,054 descriptors, 34,027 unique tensors, and
 16.28 GB of logical FP16 tensor data. Absolute latency depends on storage, CPU,
