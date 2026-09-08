@@ -267,7 +267,7 @@ class RustDaemonTest(unittest.TestCase):
                 check=False,
             )
             self.assertNotEqual(completed.returncode, 0)
-            self.assertIn("--gpu-memory-gb", completed.stderr)
+            self.assertIn("--device-memory-gb", completed.stderr)
             self.assertFalse(socket_path.exists())
 
     @unittest.skipUnless(torch.cuda.is_available(), "CUDA is unavailable")
