@@ -1692,20 +1692,45 @@ mod tests {
     #[test]
     #[ignore = "microbenchmark requires an explicitly assigned CUDA device"]
     fn benchmark_batched_tensor_core_for_320d_candidates() {
+        let bench_size = |name: &str, default: usize, maximum: usize| {
+            let value = std::env::var(name).map_or(default, |raw| raw.parse::<usize>().unwrap());
+            assert!(
+                value > 0 && value <= maximum,
+                "{name} must be in 1..={maximum}"
+            );
+            value
+        };
         let device = std::env::var("VCTM_TEST_GPU")
             .unwrap_or_else(|_| "0".to_owned())
             .parse::<i32>()
             .unwrap();
-        let mut gpu = Gpu::create(device, 96 * 1024 * 1024, 48 * 1024 * 1024).unwrap();
         const DIM: usize = 320;
-        const DOC_ROWS: usize = 32;
-        const CANDIDATES: usize = 64;
-        const REQUESTS: usize = 8;
-        const QUERY_ROWS: usize = 32;
-        let document = (0..DOC_ROWS * DIM)
+        let document_rows = bench_size("VCTM_BENCH_DOCUMENT_ROWS", 32, 256);
+        let candidates = bench_size("VCTM_BENCH_CANDIDATES", 64, 100_000);
+        let requests = bench_size("VCTM_BENCH_REQUESTS", 8, 256);
+        assert!(requests >= 2, "VCTM_BENCH_REQUESTS must be at least 2");
+        let query_rows = bench_size("VCTM_BENCH_QUERY_ROWS", 32, 256);
+        let warmups = bench_size("VCTM_BENCH_WARMUPS", 3, 100);
+        let iterations = bench_size("VCTM_BENCH_ITERATIONS", 20, 100);
+        let document_bytes = document_rows * DIM * 2;
+        let resident_bytes = candidates
+            .checked_mul(document_bytes)
+            .and_then(|bytes| bytes.checked_add(128 * 1024 * 1024))
+            .expect("benchmark resident arena size overflow");
+        let workspace_bytes = candidates
+            .checked_mul(requests)
+            .and_then(|values| values.checked_mul(query_rows))
+            .and_then(|values| values.checked_mul(std::mem::size_of::<f32>()))
+            .and_then(|bytes| bytes.checked_add(64 * 1024 * 1024))
+            .expect("benchmark workspace size overflow");
+        let total_bytes = resident_bytes
+            .checked_add(workspace_bytes)
+            .expect("benchmark GPU arena size overflow");
+        let mut gpu = Gpu::create(device, total_bytes, workspace_bytes).unwrap();
+        let document = (0..document_rows * DIM)
             .flat_map(|index| if index % 37 == 0 { 0x3c00_u16 } else { 0_u16 }.to_le_bytes())
             .collect::<Vec<_>>();
-        let offsets = (0..CANDIDATES)
+        let offsets = (0..candidates)
             .map(|index| index as u64 * document.len() as u64)
             .collect::<Vec<_>>();
         let uploads = offsets
@@ -1713,14 +1738,14 @@ mod tests {
             .map(|offset| (*offset, document.as_slice()))
             .collect::<Vec<_>>();
         gpu.upload_batch(&uploads).unwrap();
-        let rows = vec![DOC_ROWS as u32; CANDIDATES];
-        let queries = (0..REQUESTS * QUERY_ROWS * DIM)
+        let rows = vec![document_rows as u32; candidates];
+        let queries = (0..requests * query_rows * DIM)
             .flat_map(|index| if index % 41 == 0 { 0x3800_u16 } else { 0_u16 }.to_le_bytes())
             .collect::<Vec<_>>();
-        let query_offsets = (0..=REQUESTS)
-            .map(|index| (index * QUERY_ROWS) as u32)
+        let query_offsets = (0..=requests)
+            .map(|index| (index * query_rows) as u32)
             .collect::<Vec<_>>();
-        for _ in 0..3 {
+        for _ in 0..warmups {
             gpu.score_batch_native(
                 true,
                 &queries,
@@ -1736,7 +1761,7 @@ mod tests {
         let measure = |gpu: &mut Gpu, tensor| {
             let started = Instant::now();
             let mut result = Vec::new();
-            for _ in 0..20 {
+            for _ in 0..iterations {
                 result = gpu
                     .score_batch_native(
                         tensor,
@@ -1750,7 +1775,10 @@ mod tests {
                     )
                     .unwrap();
             }
-            (started.elapsed().as_secs_f64() * 1000.0 / 20.0, result)
+            (
+                started.elapsed().as_secs_f64() * 1000.0 / iterations as f64,
+                result,
+            )
         };
         unsafe {
             assert_eq!(vctm_gpu_set_double_buffered_tile(gpu.native.as_ptr(), 0), 0);
@@ -1767,7 +1795,7 @@ mod tests {
         assert!(batch_scores_close(&tile, &double_buffer));
         assert!(batch_scores_close(&tile, &tensor));
         eprintln!(
-            "tilemaxsim_320d candidates={CANDIDATES} requests={REQUESTS} tile_query_rows={} calibrated_threshold_rows={} single_buffer_ms={tile_ms:.4} double_buffer_ms={double_buffer_ms:.4} double_buffer_speedup={:.3} tensor_ms={tensor_ms:.4} tensor_speedup={:.3}",
+            "tilemaxsim_320d candidates={candidates} requests={requests} query_rows={query_rows} document_rows={document_rows} warmups={warmups} iterations={iterations} tile_query_rows={} calibrated_threshold_rows={} single_buffer_ms={tile_ms:.4} double_buffer_ms={double_buffer_ms:.4} double_buffer_speedup={:.3} tensor_ms={tensor_ms:.4} tensor_speedup={:.3}",
             gpu.info.document_tile_query_rows.unwrap_or_default(),
             gpu.tensor_threshold_rows,
             tile_ms / double_buffer_ms,
