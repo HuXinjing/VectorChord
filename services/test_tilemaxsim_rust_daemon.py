@@ -16,6 +16,7 @@ import os
 import socket
 import subprocess
 import tempfile
+import threading
 import time
 import unittest
 from concurrent.futures import ThreadPoolExecutor
@@ -37,6 +38,121 @@ class RustDaemonTest(unittest.TestCase):
     @staticmethod
     def _release_binary() -> Path:
         return Path(__file__).parent / "tilemaxsimd" / "target" / "release" / "tilemaxsimd"
+
+    @staticmethod
+    def _unix_http(socket_path: Path, method: str, path: str, payload=None):
+        body = b"" if payload is None else json.dumps(payload).encode("utf-8")
+        request = (
+            f"{method} {path} HTTP/1.1\r\nHost: localhost\r\n"
+            f"Content-Length: {len(body)}\r\nConnection: close\r\n\r\n"
+        ).encode("ascii") + body
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
+            connection.settimeout(10)
+            connection.connect(os.fspath(socket_path))
+            connection.sendall(request)
+            response = b""
+            while part := connection.recv(65536):
+                response += part
+        header, response_body = response.split(b"\r\n\r\n", 1)
+        status = int(header.split(b" ", 2)[1])
+        return status, json.loads(response_body)
+
+    @unittest.skipUnless(torch.cuda.is_available(), "CUDA is unavailable")
+    def test_runtime_management_operations_and_graceful_drain(self) -> None:
+        binary = self._release_binary()
+        if not binary.exists():
+            self.skipTest("release tilemaxsimd binary has not been built")
+        device = max(
+            range(torch.cuda.device_count()),
+            key=lambda index: torch.cuda.mem_get_info(index)[0],
+        )
+        with tempfile.TemporaryDirectory(prefix="tilemaxsim-management-e2e-") as directory:
+            root = Path(directory)
+            shard_root = root / "shards"
+            shard_root.mkdir()
+            document = np.asarray([[1.0, 0.0], [0.0, 1.0]], dtype="<f2")
+            digest = hashlib.sha256(document.tobytes()).hexdigest()
+            writer = ImmutableShardWriter(
+                shard_root, target_bytes=4096, alignment=256, fsync=False
+            )
+            try:
+                writer.add(digest, document.tobytes(), 2, 2, "float16")
+                writer.finish()
+            finally:
+                writer.close()
+            descriptor = {
+                "candidate_id": 1,
+                "contract": "model@1",
+                "digest": digest,
+                "rows": 2,
+                "dimension": 2,
+                "dtype": protocol.DTYPE_F16,
+            }
+            socket_path = root / "tilemaxsimd.sock"
+            status_path = root / "status.sock"
+            process = subprocess.Popen(
+                [
+                    os.fspath(binary),
+                    "--socket",
+                    os.fspath(socket_path),
+                    "--status-socket",
+                    os.fspath(status_path),
+                    "--gpu-memory-gb",
+                    f"{device}=0.05",
+                    "--gpu-workspace-gb",
+                    "0.02",
+                    "--host-cache-gb",
+                    "0.01",
+                    "--contract-root",
+                    f"model@1={shard_root}",
+                ],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.STDOUT,
+            )
+            try:
+                for _ in range(1500):
+                    if status_path.exists() or process.poll() is not None:
+                        break
+                    time.sleep(0.01)
+                self.assertIsNone(process.poll())
+
+                def submit(path: str, payload):
+                    status, response = self._unix_http(status_path, "POST", path, payload)
+                    self.assertEqual(status, 202, response)
+                    operation_path = response["operation_url"]
+                    for _ in range(200):
+                        _, operation = self._unix_http(
+                            status_path, "GET", operation_path
+                        )
+                        state = operation["operation"]["state"]
+                        if state in ("succeeded", "failed"):
+                            self.assertEqual(state, "succeeded", operation)
+                            return
+                        time.sleep(0.01)
+                    self.fail(f"operation {operation_path} did not finish")
+
+                submit(
+                    "/v1/cache/prewarm",
+                    {"descriptors": [descriptor], "batch_size": 1, "pin": False},
+                )
+                status, cache = self._unix_http(status_path, "GET", "/v1/cache")
+                self.assertEqual(status, 200)
+                self.assertEqual(cache["api_version"], "tilemaxsim.management.v1")
+                self.assertGreaterEqual(cache["cache"]["devices"][0]["entries"], 1)
+                submit("/v1/cache/pin", {"descriptors": [descriptor]})
+                submit("/v1/cache/unpin", {"descriptors": [descriptor]})
+                submit(f"/v1/devices/{device}/tensor-circuit/probe", {})
+
+                status, response = self._unix_http(
+                    status_path, "POST", "/v1/drain", {}
+                )
+                self.assertEqual(status, 202, response)
+                process.wait(timeout=10)
+                self.assertEqual(process.returncode, 0)
+            finally:
+                if process.poll() is None:
+                    process.terminate()
+                    process.wait(timeout=10)
 
     def run_daemon(
         self,
@@ -778,6 +894,13 @@ class RustDaemonTest(unittest.TestCase):
                 "--scheduler-min-shared-candidates-milli", "1000",
                 "--request-timeout-ms", "30000", "--socket-io-timeout-ms", "30000",
             ], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+            output_lines: list[str] = []
+            output_reader = threading.Thread(
+                target=lambda: output_lines.extend(process.stdout or ()),
+                name="tilemaxsim-test-log-reader",
+                daemon=True,
+            )
+            output_reader.start()
             try:
                 for _ in range(1500):
                     if (socket_path.exists() and status_path.exists()) or process.poll() is not None:
@@ -822,7 +945,11 @@ class RustDaemonTest(unittest.TestCase):
             finally:
                 if process.poll() is None:
                     process.terminate()
-                output, _ = process.communicate(timeout=30)
+                process.wait(timeout=30)
+                output_reader.join(timeout=5)
+                output = "".join(output_lines)
+                if process.stdout is not None:
+                    process.stdout.close()
                 self.assertEqual(process.returncode, 0, output)
 
     @unittest.skipUnless(torch.cuda.is_available(), "CUDA is unavailable")
