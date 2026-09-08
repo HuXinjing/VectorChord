@@ -130,7 +130,9 @@ struct Args {
     priority_band: i32,
     #[arg(long, default_value_t = 2)]
     scheduler_batch_window_ms: u64,
-    #[arg(long, default_value_t = 1024)]
+    /// Maximum candidates in a cooperative scheduling quantum; zero selects
+    /// the largest useful candidate bucket calibrated on every active device.
+    #[arg(long, default_value_t = 0)]
     scheduler_quantum_candidates: usize,
     #[arg(long, default_value_t = 250_000)]
     scheduler_quantum_tokens: u64,
@@ -253,7 +255,6 @@ where
         || args.socket_io_timeout_ms == 0
         || args.request_timeout_ms == 0
         || args.priority_aging_ms == 0
-        || args.scheduler_quantum_candidates == 0
         || args.scheduler_quantum_tokens == 0
         || args.scheduler_quantum_fmas == 0
         || args.scheduler_max_microbatch_requests == 0
@@ -335,6 +336,11 @@ where
             })
         );
     }
+    let calibrated_quantum_candidates = engine.recommended_quantum_candidates();
+    let effective_quantum_candidates = resolve_quantum_candidates(
+        args.scheduler_quantum_candidates,
+        calibrated_quantum_candidates,
+    );
     let _instance_lock = acquire_instance_lock(&args.socket)?;
     remove_stale_socket(&args.socket)?;
     let listener = UnixListener::bind(&args.socket)
@@ -394,7 +400,9 @@ where
             "batch_window_ms": args.scheduler_batch_window_ms,
             "max_microbatch_requests": args.scheduler_max_microbatch_requests,
             "min_shared_candidates_milli": args.scheduler_min_shared_candidates_milli,
-            "quantum_candidates": args.scheduler_quantum_candidates,
+            "quantum_candidates": effective_quantum_candidates,
+            "quantum_candidates_mode": if args.scheduler_quantum_candidates == 0 { "auto" } else { "fixed" },
+            "calibrated_quantum_candidates": calibrated_quantum_candidates,
             "quantum_tokens": args.scheduler_quantum_tokens,
             "quantum_fmas": args.scheduler_quantum_fmas,
         },
@@ -428,7 +436,7 @@ where
         priority_aging: Duration::from_millis(args.priority_aging_ms),
         priority_band: args.priority_band,
         batch_window: Duration::from_millis(args.scheduler_batch_window_ms),
-        quantum_candidates: args.scheduler_quantum_candidates,
+        quantum_candidates: effective_quantum_candidates,
         quantum_tokens: args.scheduler_quantum_tokens,
         quantum_fmas: args.scheduler_quantum_fmas,
         max_microbatch_requests: args.scheduler_max_microbatch_requests,
@@ -1698,6 +1706,14 @@ fn candidate_fmas(query_rows: u32, dimension: u32, document_rows: u32) -> u64 {
         .saturating_mul(u64::from(dimension))
 }
 
+fn resolve_quantum_candidates(configured: usize, calibrated: Option<usize>) -> usize {
+    if configured == 0 {
+        calibrated.filter(|value| *value > 0).unwrap_or(1024)
+    } else {
+        configured
+    }
+}
+
 fn estimated_next_work(work: &Work, config: &SchedulerConfig) -> u64 {
     let end = next_quantum_end(work, config);
     work.request.candidates[work.next_candidate..end]
@@ -2771,7 +2787,8 @@ mod tests {
     use super::verify_backends;
     use super::{
         ByteAdmission, PendingAdmission, RuntimeMetrics, candidate_fmas, handle_status_connection,
-        is_fatal_cuda_diagnostic, kib_to_bytes, quantum_end, render_metrics, tenant_hash,
+        is_fatal_cuda_diagnostic, kib_to_bytes, quantum_end, render_metrics,
+        resolve_quantum_candidates, tenant_hash,
     };
     #[cfg(feature = "backend-cpu")]
     use crate::backend::{AcceleratorBackend, BackendKind};
@@ -2783,6 +2800,13 @@ mod tests {
     use std::io::{Read, Write};
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
+
+    #[test]
+    fn scheduler_quantum_uses_calibration_unless_operator_overrides_it() {
+        assert_eq!(resolve_quantum_candidates(0, Some(4096)), 4096);
+        assert_eq!(resolve_quantum_candidates(0, None), 1024);
+        assert_eq!(resolve_quantum_candidates(256, Some(4096)), 256);
+    }
 
     struct StatusExchange {
         request: std::io::Cursor<Vec<u8>>,

@@ -92,6 +92,22 @@ pub struct EngineStatus {
 }
 
 impl Engine {
+    pub fn recommended_quantum_candidates(&self) -> Option<usize> {
+        self.devices
+            .iter()
+            .filter_map(|device| {
+                device
+                    .gpu
+                    .adaptive_status()
+                    .tensor_calibration_buckets
+                    .iter()
+                    .filter(|bucket| bucket.threshold_query_rows != u32::MAX)
+                    .map(|bucket| bucket.candidate_count as usize)
+                    .max()
+            })
+            .min()
+    }
+
     pub fn new<B: AcceleratorBackend + 'static>(
         gpus: Vec<B>,
         block_bytes: usize,
