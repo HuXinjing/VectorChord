@@ -10,6 +10,7 @@ backend-core = []
 backend-cuda = ["backend-core"]
 backend-cpu = ["backend-core"]
 backend-metal = ["backend-core"]
+backend-vulkan = ["backend-core", "dep:wgpu", "dep:pollster"]
 
 [dependencies]
 anyhow = "1.0"
@@ -20,7 +21,14 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 sha2 = "0.10"
 
+wgpu = { version = "24", default-features = false, features = ["wgsl", "vulkan-portability"], optional = true }
+pollster = { version = "0.4", optional = true }
+
 [build-dependencies]
 cc = { version = "1.2", features = ["parallel"] }
 
 [workspace]
+
+[[example]]
+name = "vulkan_probe"
+required-features = ["backend-vulkan"]

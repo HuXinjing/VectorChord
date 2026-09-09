@@ -12,6 +12,7 @@ images; vendor SDKs are never linked into one universal binary.
 | Shared backend SDK | `backend-core` | none | available |
 | CPU reference | `backend-cpu` | none | exact FP16/FP32 available |
 | NVIDIA | `backend-cuda` | CUDA Runtime, cuBLAS | available; RTX 4090 validated; H200 functional gate passed, profiling gate pending |
+| AMD / Vulkan | `backend-vulkan` | Vulkan loader and hardware ICD | experimental exact FP16/FP32; see [AMD/WSL guide](TILEMAXSIM_AMD_VULKAN.md) |
 | Apple | `backend-metal` | Metal/Foundation | exact FP16/FP32 experimental; macOS GPU gate required |
 | Ascend | downstream `backend-ascend` executor | CANN/Ascend C | implementation pending on Ascend CI |
 | MetaX | downstream `backend-metax` executor | MXMACA/mcBLAS | implementation pending on MetaX CI |

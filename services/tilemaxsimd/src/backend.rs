@@ -12,6 +12,7 @@ pub enum BackendKind {
     Cpu,
     Cuda,
     Metal,
+    Vulkan,
     Ascend,
     Metax,
 }

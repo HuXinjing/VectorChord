@@ -1,0 +1,24 @@
+# Experimental AMD/cross-vendor Vulkan executor. A GPU Vulkan ICD is required.
+FROM rust:1.96.0-bookworm@sha256:5e2214abe154fe26e39f64488952e5c991eeed1d6d6da7cc8381ae83927f0cfc AS build
+WORKDIR /build/tilemaxsimd
+COPY services/tilemaxsimd/ .
+RUN cargo build --release --locked --no-default-features --features backend-vulkan
+
+FROM build AS test
+RUN rustup component add clippy rustfmt \
+    && cargo fmt --check \
+    && cargo clippy --all-targets --locked --no-default-features --features backend-vulkan -- -D warnings \
+    && cargo test --locked --no-default-features --features backend-vulkan
+
+FROM ubuntu:24.04@sha256:33ceb71981b602c1a7443a53469e4dba065f7503eab3078a2d7a57a2ab987517 AS runtime
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        ca-certificates libgcc-s1 libvulkan1 mesa-vulkan-drivers vulkan-tools \
+    && rm -rf /var/lib/apt/lists/* \
+    && useradd --system --uid 10001 --create-home vectorchord \
+    && mkdir -p /run/vectorchord /var/lib/vectorchord \
+    && chown vectorchord:vectorchord /run/vectorchord /var/lib/vectorchord
+COPY --from=build /build/tilemaxsimd/target/release/tilemaxsimd /usr/local/bin/tilemaxsimd-vulkan
+COPY --from=build /build/tilemaxsimd/target/release/tilemaxsimctl /usr/local/bin/tilemaxsimctl
+USER vectorchord
+ENTRYPOINT ["/usr/local/bin/tilemaxsimd-vulkan"]
+HEALTHCHECK --interval=10s --timeout=5s --retries=3 CMD ["/usr/local/bin/tilemaxsimctl", "--socket", "/run/vectorchord/tilemaxsim-status.sock"]

@@ -16,8 +16,18 @@ pub mod protocol;
 pub mod quant;
 pub mod scheduler;
 pub mod shard;
+#[cfg(feature = "backend-vulkan")]
+pub mod vulkan;
 
 #[cfg(any(
+    all(
+        feature = "backend-vulkan",
+        any(
+            feature = "backend-cpu",
+            feature = "backend-cuda",
+            feature = "backend-metal"
+        )
+    ),
     all(feature = "backend-cuda", feature = "backend-cpu"),
     all(feature = "backend-cuda", feature = "backend-metal"),
     all(feature = "backend-cpu", feature = "backend-metal")

@@ -1,0 +1,24 @@
+# Experimental RX 6400 / WSL2 daemon. Build both Vulkan Dockerfiles first.
+services:
+  tilemaxsimd:
+    image: vectorchord-tilemaxsimd:portable-vulkan-wsl
+    devices:
+      - /dev/dxg:/dev/dxg
+    volumes:
+      - /usr/lib/wsl:/usr/lib/wsl:ro
+      - tensors:/var/lib/vectorchord
+    ports:
+      - "127.0.0.1:39192:9191"
+      - "127.0.0.1:39092:9090"
+    command:
+      - --socket=/run/vectorchord/tilemaxsim.sock
+      - --status-socket=/run/vectorchord/tilemaxsim-status.sock
+      - --listen=0.0.0.0:9191
+      - --status-listen=0.0.0.0:9090
+      - --device-memory-gb=0=0.125
+      - --gpu-workspace-gb=0.03125
+      - --host-cache-gb=0.125
+      - --max-inflight-request-gb=0.0625
+      - --contract-root=${TILEMAXSIM_MODEL_CONTRACT:-local-test@1}=/var/lib/vectorchord
+volumes:
+  tensors:

@@ -5,11 +5,19 @@ use anyhow::Result;
 #[cfg(not(any(
     feature = "backend-cuda",
     feature = "backend-cpu",
-    feature = "backend-metal"
+    feature = "backend-metal",
+    feature = "backend-vulkan"
 )))]
 compile_error!("the tilemaxsimd executable requires one accelerator backend");
 
 fn main() -> Result<()> {
+    #[cfg(feature = "backend-vulkan")]
+    return tilemaxsimd::daemon::run_with_backend_factory(|device, total, workspace| {
+        Ok(Box::new(tilemaxsimd::vulkan::VulkanBackend::create(
+            device, total, workspace,
+        )?))
+    });
+
     #[cfg(feature = "backend-cpu")]
     return tilemaxsimd::daemon::run_with_backend_factory(|device, total, workspace| {
         Ok(Box::new(tilemaxsimd::cpu::CpuBackend::create(

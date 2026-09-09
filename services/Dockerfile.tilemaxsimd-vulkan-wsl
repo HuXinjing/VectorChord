@@ -1,0 +1,28 @@
+# Build the generic Vulkan image first. This layer adds isolated WSL Dozen.
+ARG TILEMAXSIM_VULKAN_IMAGE=vectorchord-tilemaxsimd:portable-vulkan
+FROM ${TILEMAXSIM_VULKAN_IMAGE} AS runtime-base
+FROM ubuntu:24.04@sha256:33ceb71981b602c1a7443a53469e4dba065f7503eab3078a2d7a57a2ab987517 AS dozen
+COPY --from=runtime-base /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
+RUN sed -i 's|http://|https://|g' /etc/apt/sources.list.d/ubuntu.sources \
+    && apt-get update && apt-get install -y --no-install-recommends \
+       build-essential ninja-build python3-mako python3-yaml python3-packaging \
+       python3-pip bison flex pkg-config libdrm-dev libexpat1-dev libzstd-dev \
+       zlib1g-dev directx-headers-dev ca-certificates curl \
+    && pip3 install --break-system-packages meson==1.7.2 \
+    && rm -rf /var/lib/apt/lists/*
+WORKDIR /build
+RUN curl -fL --retry 3 https://archive.mesa3d.org/mesa-25.2.8.tar.xz -o mesa.tar.xz \
+    && echo '097842f3e49d996868b38688db87b006f7d4541e93ce86d2f341d8b3e7be7c93  mesa.tar.xz' | sha256sum -c - \
+    && tar -xf mesa.tar.xz \
+    && meson setup build mesa-25.2.8 --prefix=/opt/dozen --libdir=lib \
+       -Dbuildtype=release -Dvulkan-drivers=microsoft-experimental \
+       -Dgallium-drivers= -Dplatforms= -Dglx=disabled -Degl=disabled \
+       -Dgbm=disabled -Dopengl=false -Dgles1=disabled -Dgles2=disabled \
+       -Dllvm=disabled -Dvideo-codecs= -Dlibunwind=disabled -Dvalgrind=disabled \
+    && ninja -C build -j4 && ninja -C build install
+FROM runtime-base
+COPY --from=dozen /opt/dozen/lib/libvulkan_dzn.so /opt/dozen/lib/libvulkan_dzn.so
+COPY --from=dozen /opt/dozen/share/vulkan/icd.d/ /opt/dozen/share/vulkan/icd.d/
+ENV VK_DRIVER_FILES=/opt/dozen/share/vulkan/icd.d/dzn_icd.x86_64.json \
+    LD_LIBRARY_PATH=/usr/lib/wsl/lib \
+    TILEMAXSIM_VULKAN_ALLOW_NONCONFORMANT=1
