@@ -1277,7 +1277,7 @@ fn resolve_descriptor_manifest(request: &mut protocol::Request, metrics: &Runtim
             let entry = cache
                 .remove(position)
                 .expect("descriptor manifest position came from the same cache");
-            request.candidates = Arc::clone(&entry.1);
+            request.replace_candidates(Arc::clone(&entry.1));
             cache.push_back(entry);
             metrics
                 .descriptor_manifest_hits
@@ -1432,7 +1432,7 @@ fn resolve_descriptor_catalog(request: &mut protocol::Request, metrics: &Runtime
         let selection = selection_cache
             .remove(selection_position)
             .expect("descriptor catalog selection position came from the same cache");
-        request.candidates = Arc::clone(&selection.1);
+        request.replace_candidates(Arc::clone(&selection.1));
         selection_cache.push_back(selection);
         cache.push_back(entry);
         metrics
@@ -1466,7 +1466,7 @@ fn resolve_descriptor_catalog(request: &mut protocol::Request, metrics: &Runtime
         descriptor.candidate_id = ordinal as u32;
         resolved.push(descriptor);
     }
-    request.candidates = Arc::new(resolved);
+    request.replace_candidates(Arc::new(resolved));
     while selection_cache.len() >= MAX_DESCRIPTOR_CATALOG_SELECTIONS {
         selection_cache.pop_front();
     }
@@ -1861,7 +1861,7 @@ fn run_scheduler(
                 saturating_atomic_add(
                     &metrics.document_rows_scored,
                     quantum
-                        .candidates
+                        .candidate_slice()
                         .iter()
                         .map(|candidate| u64::from(candidate.rows))
                         .sum(),
@@ -2018,7 +2018,9 @@ fn request_quantum(work: &Work, config: &SchedulerConfig) -> protocol::Request {
         quantization_contract: work.request.quantization_contract.clone(),
         top_k: work.request.top_k,
         query: work.request.query.clone(),
-        candidates: Arc::new(work.request.candidates[work.next_candidate..end].to_vec()),
+        candidates: Arc::clone(&work.request.candidates),
+        candidate_start: work.next_candidate,
+        candidate_end: end,
         manifest_digest: work.request.manifest_digest,
         catalog_digest: work.request.catalog_digest,
         catalog_selection_digest: work.request.catalog_selection_digest,
@@ -3698,6 +3700,8 @@ mod tests {
                     Descriptor { candidate_id: 1, contract: "model-v1".into(), digest: "22".repeat(32), rows: 1, dimension: 2, dtype: 3 },
                 ]
             } else { vec![] }),
+            candidate_start: 0,
+            candidate_end: if registration { 2 } else { 0 },
             manifest_digest: None,
             catalog_digest: Some([0x5a; 32]),
             catalog_selection_digest: None,

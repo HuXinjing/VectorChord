@@ -75,11 +75,25 @@ pub struct Request {
     pub top_k: Option<usize>,
     pub query: Vec<u8>,
     pub candidates: Arc<Vec<Descriptor>>,
+    pub candidate_start: usize,
+    pub candidate_end: usize,
     pub manifest_digest: Option<[u8; 32]>,
     pub catalog_digest: Option<[u8; 32]>,
     pub catalog_selection_digest: Option<[u8; 32]>,
     pub catalog_public_ids: Vec<i64>,
     pub catalog_registration: bool,
+}
+
+impl Request {
+    pub fn candidate_slice(&self) -> &[Descriptor] {
+        &self.candidates[self.candidate_start..self.candidate_end]
+    }
+
+    pub fn replace_candidates(&mut self, candidates: Arc<Vec<Descriptor>>) {
+        self.candidate_start = 0;
+        self.candidate_end = candidates.len();
+        self.candidates = candidates;
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -620,6 +634,8 @@ pub fn parse(frame: &[u8]) -> Result<Request> {
         });
     }
     reader.finish()?;
+    let candidates = Arc::new(candidates);
+    let candidate_end = candidates.len();
     Ok(Request {
         protocol_version: version,
         request_id,
@@ -639,7 +655,9 @@ pub fn parse(frame: &[u8]) -> Result<Request> {
         quantization_contract,
         top_k,
         query,
-        candidates: Arc::new(candidates),
+        candidates,
+        candidate_start: 0,
+        candidate_end,
         manifest_digest,
         catalog_digest,
         catalog_selection_digest,

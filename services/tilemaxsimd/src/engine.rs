@@ -379,7 +379,7 @@ impl Engine {
                 .as_deref()
                 .ok_or_else(|| anyhow!("PQ-family request has no quantization contract"))?;
             let model_contract = request
-                .candidates
+                .candidate_slice()
                 .first()
                 .ok_or_else(|| anyhow!("PQ-family request has no candidates"))?
                 .contract
@@ -421,10 +421,11 @@ impl Engine {
                 request.scoring_profile
             );
         }
-        if request.candidates.is_empty() {
+        let candidates = request.candidate_slice();
+        if candidates.is_empty() {
             return Ok(Vec::new());
         }
-        let mut scores = vec![None; request.candidates.len()];
+        let mut scores = vec![None; candidates.len()];
         let mut hit_chunks = (0..self.devices.len())
             .map(|_| Vec::<ResidentTensor>::new())
             .collect::<Vec<_>>();
@@ -432,7 +433,7 @@ impl Engine {
         let mut missing_indices = Vec::new();
         let mut first_candidate_by_key = HashMap::<String, usize>::new();
         let mut duplicate_candidates = Vec::<(usize, usize)>::new();
-        for (index, descriptor) in request.candidates.iter().enumerate() {
+        for (index, descriptor) in candidates.iter().enumerate() {
             let key = gpu_cache_key(
                 descriptor,
                 request.scoring_profile,
@@ -647,7 +648,7 @@ impl Engine {
         }
 
         request
-            .candidates
+            .candidate_slice()
             .iter()
             .enumerate()
             .map(|(index, descriptor)| {
@@ -708,11 +709,11 @@ impl Engine {
                 || request.dtype != leader.dtype
                 || request.scoring_profile != leader.scoring_profile
                 || request.quantization_contract != leader.quantization_contract
-                || request.candidates.len() != leader.candidates.len()
+                || request.candidate_slice().len() != leader.candidate_slice().len()
                 || request
-                    .candidates
+                    .candidate_slice()
                     .iter()
-                    .zip(leader.candidates.iter())
+                    .zip(leader.candidate_slice().iter())
                     .any(|(left, right)| cache_key(left) != cache_key(right))
         }) {
             return Ok(None);
@@ -726,7 +727,7 @@ impl Engine {
                 .as_deref()
                 .ok_or_else(|| anyhow!("PQ-family request has no quantization contract"))?;
             let model_contract = leader
-                .candidates
+                .candidate_slice()
                 .first()
                 .ok_or_else(|| anyhow!("PQ-family request has no candidates"))?
                 .contract
@@ -756,7 +757,7 @@ impl Engine {
         let mut chunks = (0..self.devices.len())
             .map(|_| Vec::<ResidentTensor>::new())
             .collect::<Vec<_>>();
-        for (candidate_index, descriptor) in leader.candidates.iter().enumerate() {
+        for (candidate_index, descriptor) in leader.candidate_slice().iter().enumerate() {
             let key = gpu_cache_key(
                 descriptor,
                 leader.scoring_profile,
@@ -793,7 +794,7 @@ impl Engine {
                 return Err(error);
             }
         }
-        let mut scores = vec![vec![None; leader.candidates.len()]; requests.len()];
+        let mut scores = vec![vec![None; leader.candidate_slice().len()]; requests.len()];
         let result = (|| -> Result<()> {
             let completed = std::thread::scope(|scope| {
                 let mut workers = Vec::new();
@@ -1206,7 +1207,7 @@ fn attach_candidate_ids(
         .zip(requests)
         .map(|(request_scores, request)| {
             request
-                .candidates
+                .candidate_slice()
                 .iter()
                 .zip(request_scores)
                 .map(|(candidate, score)| {
@@ -1530,6 +1531,8 @@ mod tests {
             top_k: None,
             query: vec![0; 640],
             candidates: Arc::new(vec![descriptor(candidate_id, "same-content", 1)]),
+            candidate_start: 0,
+            candidate_end: 1,
             manifest_digest: None,
             catalog_digest: None,
             catalog_selection_digest: None,
