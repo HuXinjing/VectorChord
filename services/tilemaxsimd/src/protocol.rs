@@ -21,6 +21,10 @@ pub const VERSION_QUANTIZED_EXTERNAL: u16 = 5;
 /// referenced tensor payloads. The daemon owns bounded GPU quantization and
 /// returns only the requested global top-k.
 pub const VERSION_LOGICAL_EXTERNAL: u16 = 6;
+/// Logical top-k with fixed-width content-addressed descriptors. The model
+/// contract, dimension, and dtype are request-wide, so repeating two textual
+/// SHA-256 representations per candidate only wastes wire and parse time.
+pub const VERSION_COMPACT_LOGICAL_EXTERNAL: u16 = 7;
 const MAGIC: &[u8; 4] = b"VCTM";
 const REQUEST_KIND: u16 = 1;
 const RESPONSE_KIND: u16 = 2;
@@ -61,6 +65,7 @@ pub enum ScoringProfile {
     ExactFp16,
     Int8,
     Fp8E4m3,
+    RawFp8E4m3,
     Pq,
     OpqRpq,
 }
@@ -73,6 +78,7 @@ impl ScoringProfile {
             3 => Self::Fp8E4m3,
             4 => Self::Pq,
             5 => Self::OpqRpq,
+            6 => Self::RawFp8E4m3,
             _ => bail!("unsupported TileMaxSim scoring profile"),
         })
     }
@@ -82,6 +88,7 @@ impl ScoringProfile {
             Self::ExactFp16 => "exact-fp16-v1",
             Self::Int8 => "int8-row-scale-v1",
             Self::Fp8E4m3 => "fp8-e4m3-row-scale-v1",
+            Self::RawFp8E4m3 => "fp8-e4m3-raw-v1",
             Self::Pq => "pq-adc-v1",
             Self::OpqRpq => "opq-rpq-adc-v1",
         }
@@ -92,6 +99,9 @@ impl ScoringProfile {
             Self::ExactFp16 => 1,
             Self::Int8 => 2,
             Self::Fp8E4m3 => 3,
+            // The native kernel consumes the same byte-plus-scale layout as
+            // row-scaled E4M3. Raw E4M3 stores an identity scale per row.
+            Self::RawFp8E4m3 => 3,
             Self::Pq => 4,
             Self::OpqRpq => 5,
         }
@@ -207,9 +217,10 @@ pub fn parse(frame: &[u8]) -> Result<Request> {
             | VERSION_PROFILED_EXTERNAL
             | VERSION_QUANTIZED_EXTERNAL
             | VERSION_LOGICAL_EXTERNAL
+            | VERSION_COMPACT_LOGICAL_EXTERNAL
     ) || kind != REQUEST_KIND
     {
-        bail!("Rust daemon requires TileMaxSim external protocol v2 through v6");
+        bail!("Rust daemon requires TileMaxSim external protocol v2 through v7");
     }
     if usize::try_from(body_bytes).ok() != Some(frame.len() - HEADER_BYTES) {
         bail!("request body length mismatch");
@@ -223,6 +234,7 @@ pub fn parse(frame: &[u8]) -> Result<Request> {
     let scoring_profile = if matches!(
         version,
         VERSION_PROFILED_EXTERNAL | VERSION_QUANTIZED_EXTERNAL | VERSION_LOGICAL_EXTERNAL
+            | VERSION_COMPACT_LOGICAL_EXTERNAL
     ) {
         let profile = ScoringProfile::parse(reader.u8()?)?;
         if reader.u8()? != 0 {
@@ -238,7 +250,7 @@ pub fn parse(frame: &[u8]) -> Result<Request> {
     let contract_bytes = reader.u32()? as usize;
     let quantization_contract_bytes = if matches!(
         version,
-        VERSION_QUANTIZED_EXTERNAL | VERSION_LOGICAL_EXTERNAL
+        VERSION_QUANTIZED_EXTERNAL | VERSION_LOGICAL_EXTERNAL | VERSION_COMPACT_LOGICAL_EXTERNAL
     ) {
         reader.u32()? as usize
     } else {
@@ -256,6 +268,7 @@ pub fn parse(frame: &[u8]) -> Result<Request> {
             | VERSION_PROFILED_EXTERNAL
             | VERSION_QUANTIZED_EXTERNAL
             | VERSION_LOGICAL_EXTERNAL
+            | VERSION_COMPACT_LOGICAL_EXTERNAL
     ) {
         (reader.i32()?, reader.u32()?, reader.u32()? as usize)
     } else {
@@ -270,11 +283,12 @@ pub fn parse(frame: &[u8]) -> Result<Request> {
             | VERSION_PROFILED_EXTERNAL
             | VERSION_QUANTIZED_EXTERNAL
             | VERSION_LOGICAL_EXTERNAL
+            | VERSION_COMPACT_LOGICAL_EXTERNAL
     ) && !(1..=600_000).contains(&timeout_ms)
     {
         bail!("scheduler timeout must be between 1 and 600000 milliseconds");
     }
-    let top_k = if version == VERSION_LOGICAL_EXTERNAL {
+    let top_k = if matches!(version, VERSION_LOGICAL_EXTERNAL | VERSION_COMPACT_LOGICAL_EXTERNAL) {
         let value = reader.u32()? as usize;
         if value == 0 || value > candidate_count as usize {
             bail!("logical top-k must be between 1 and candidate count");
@@ -286,7 +300,7 @@ pub fn parse(frame: &[u8]) -> Result<Request> {
     let contract = reader.text(contract_bytes, 512, "model contract")?;
     let quantization_contract = if matches!(
         version,
-        VERSION_QUANTIZED_EXTERNAL | VERSION_LOGICAL_EXTERNAL
+        VERSION_QUANTIZED_EXTERNAL | VERSION_LOGICAL_EXTERNAL | VERSION_COMPACT_LOGICAL_EXTERNAL
     ) && quantization_contract_bytes > 0
     {
         let value = reader.text(quantization_contract_bytes, 128, "quantization contract")?;
@@ -313,6 +327,7 @@ pub fn parse(frame: &[u8]) -> Result<Request> {
             | VERSION_PROFILED_EXTERNAL
             | VERSION_QUANTIZED_EXTERNAL
             | VERSION_LOGICAL_EXTERNAL
+            | VERSION_COMPACT_LOGICAL_EXTERNAL
     ) {
         reader.text(tenant_bytes, 256, "scheduler tenant")?
     } else {
@@ -328,6 +343,20 @@ pub fn parse(frame: &[u8]) -> Result<Request> {
     for _ in 0..candidate_count {
         let candidate_id = reader.u32()?;
         let rows = reader.u32()?;
+        if version == VERSION_COMPACT_LOGICAL_EXTERNAL {
+            if !candidate_ids.insert(candidate_id) {
+                bail!("duplicate candidate ID");
+            }
+            let digest = hex::encode(reader.take(32)?);
+            total_tokens = total_tokens.checked_add(rows as usize)
+                .ok_or_else(|| anyhow!("token overflow"))?;
+            total_bytes = total_bytes.checked_add(tensor_bytes(rows, dimension, dtype)?)
+                .ok_or_else(|| anyhow!("byte overflow"))?;
+            candidates.push(Descriptor {
+                candidate_id, contract: contract.clone(), digest, rows, dimension, dtype,
+            });
+            continue;
+        }
         let reference_bytes = reader.u32()? as usize;
         let checksum_bytes = reader.u32()? as usize;
         if !candidate_ids.insert(candidate_id) {
@@ -353,7 +382,7 @@ pub fn parse(frame: &[u8]) -> Result<Request> {
         total_bytes = total_bytes
             .checked_add(bytes)
             .ok_or_else(|| anyhow!("byte overflow"))?;
-        if version != VERSION_LOGICAL_EXTERNAL
+        if !matches!(version, VERSION_LOGICAL_EXTERNAL | VERSION_COMPACT_LOGICAL_EXTERNAL)
             && (total_tokens > 1_000_000 || total_bytes > 1024 * 1024 * 1024)
         {
             bail!("request exceeds tensor limits");
@@ -591,6 +620,40 @@ mod tests {
         let request = parse(&frame).unwrap();
         assert_eq!(request.top_k, Some(1));
         assert_eq!(request.candidates.len(), 2);
+    }
+
+    #[test]
+    fn compact_logical_protocol_expands_fixed_width_digests() {
+        let contract = "model@1";
+        let mut body = Vec::new();
+        body.extend_from_slice(&320_u32.to_le_bytes());
+        body.extend_from_slice(&1_u32.to_le_bytes());
+        body.extend_from_slice(&1_u32.to_le_bytes());
+        body.extend_from_slice(&[2, 1, 1, 0]);
+        body.extend_from_slice(&(contract.len() as u32).to_le_bytes());
+        body.extend_from_slice(&0_u32.to_le_bytes());
+        body.extend_from_slice(&0_i32.to_le_bytes());
+        body.extend_from_slice(&4_000_u32.to_le_bytes());
+        body.extend_from_slice(&6_u32.to_le_bytes());
+        body.extend_from_slice(&1_u32.to_le_bytes());
+        body.extend_from_slice(contract.as_bytes());
+        body.extend_from_slice(b"tenant");
+        body.extend_from_slice(&vec![0_u8; 640]);
+        body.extend_from_slice(&7_u32.to_le_bytes());
+        body.extend_from_slice(&32_u32.to_le_bytes());
+        body.extend_from_slice(&[0xab; 32]);
+        let mut frame = Vec::new();
+        frame.extend_from_slice(MAGIC);
+        frame.extend_from_slice(&VERSION_COMPACT_LOGICAL_EXTERNAL.to_le_bytes());
+        frame.extend_from_slice(&REQUEST_KIND.to_le_bytes());
+        frame.extend_from_slice(&42_u64.to_le_bytes());
+        frame.extend_from_slice(&(body.len() as u64).to_le_bytes());
+        frame.extend_from_slice(&body);
+
+        let request = parse(&frame).unwrap();
+        assert_eq!(request.top_k, Some(1));
+        assert_eq!(request.candidates[0].candidate_id, 7);
+        assert_eq!(request.candidates[0].digest, "ab".repeat(32));
     }
 
     #[test]

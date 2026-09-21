@@ -31,7 +31,8 @@ use crate::backend_sdk::{BackendProvider, validate_provider};
 use crate::dispatch::{self, DispatchInput, DispatchThresholds, KernelKind};
 use crate::engine::{Engine, EngineStatus};
 use crate::protocol::{
-    self, HEADER_BYTES, VERSION_EXTERNAL, VERSION_LOGICAL_EXTERNAL, VERSION_PROFILED_EXTERNAL,
+    self, HEADER_BYTES, VERSION_COMPACT_LOGICAL_EXTERNAL, VERSION_EXTERNAL,
+    VERSION_LOGICAL_EXTERNAL, VERSION_PROFILED_EXTERNAL,
     VERSION_QUANTIZED_EXTERNAL, VERSION_SCHEDULED_EXTERNAL,
 };
 use crate::quant::QuantizationRegistry;
@@ -240,9 +241,9 @@ struct Args {
     /// the largest useful candidate bucket calibrated on every active device.
     #[arg(long, default_value_t = 0)]
     scheduler_quantum_candidates: usize,
-    #[arg(long, default_value_t = 250_000)]
+    #[arg(long, default_value_t = 4_000_000)]
     scheduler_quantum_tokens: u64,
-    #[arg(long, default_value_t = 4_000_000_000)]
+    #[arg(long, default_value_t = 64_000_000_000)]
     scheduler_quantum_fmas: u64,
     #[arg(long, default_value_t = 8)]
     scheduler_max_microbatch_requests: usize,
@@ -907,6 +908,8 @@ struct Work {
     connection: ClientStream,
     accepted_at: Instant,
     deadline: Instant,
+    frame_read_elapsed: Duration,
+    parse_elapsed: Duration,
     next_candidate: usize,
     results: Vec<(u32, f32)>,
     gpu_elapsed: Duration,
@@ -1238,8 +1241,10 @@ fn read_and_enqueue(
                 return;
             }
         };
+    let frame_read_elapsed = accepted_at.elapsed();
     let version = header_version(&frame);
     let request_id = header_request_id(&frame);
+    let parse_started = Instant::now();
     let request = match protocol::parse(&frame) {
         Ok(request) => request,
         Err(error) => {
@@ -1252,6 +1257,7 @@ fn read_and_enqueue(
             return;
         }
     };
+    let parse_elapsed = parse_started.elapsed();
     if request.candidates.iter().any(|candidate| {
         candidate_fmas(request.query_rows, request.dimension, candidate.rows)
             > config.maximum_candidate_fmas
@@ -1324,6 +1330,8 @@ fn read_and_enqueue(
         connection,
         accepted_at,
         deadline,
+        frame_read_elapsed,
+        parse_elapsed,
         next_candidate: 0,
         results: Vec::new(),
         gpu_elapsed: Duration::ZERO,
@@ -1661,6 +1669,12 @@ fn run_scheduler(
                     "total_ms": work.accepted_at.elapsed().as_secs_f64() * 1000.0,
                     "gpu_ms": work.gpu_elapsed.as_secs_f64() * 1000.0,
                     "queue_ms": work.accepted_at.elapsed().saturating_sub(work.gpu_elapsed).as_secs_f64() * 1000.0,
+                    "frame_read_ms": work.frame_read_elapsed.as_secs_f64() * 1000.0,
+                    "parse_ms": work.parse_elapsed.as_secs_f64() * 1000.0,
+                    "scheduler_and_write_ms": work.accepted_at.elapsed()
+                        .saturating_sub(work.gpu_elapsed)
+                        .saturating_sub(work.frame_read_elapsed)
+                        .saturating_sub(work.parse_elapsed).as_secs_f64() * 1000.0,
                     "queue_depth": queue.len(),
                     "cache": engine.status_json(),
                 })
@@ -3141,6 +3155,7 @@ fn header_version(frame: &[u8]) -> u16 {
             VERSION_PROFILED_EXTERNAL => VERSION_PROFILED_EXTERNAL,
             VERSION_QUANTIZED_EXTERNAL => VERSION_QUANTIZED_EXTERNAL,
             VERSION_LOGICAL_EXTERNAL => VERSION_LOGICAL_EXTERNAL,
+            VERSION_COMPACT_LOGICAL_EXTERNAL => VERSION_COMPACT_LOGICAL_EXTERNAL,
             _ => VERSION_EXTERNAL,
         }
     }

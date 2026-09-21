@@ -53,6 +53,8 @@ pub enum PostgresMaxsimScoringProfile {
     Int8,
     #[name = c"fp8_e4m3"]
     Fp8E4m3,
+    #[name = c"raw_fp8_e4m3"]
+    RawFp8E4m3,
     #[name = c"pq"]
     Pq,
     #[name = c"opq_rpq"]

@@ -412,6 +412,7 @@ impl Engine {
             ScoringProfile::ExactFp16
                 | ScoringProfile::Int8
                 | ScoringProfile::Fp8E4m3
+                | ScoringProfile::RawFp8E4m3
                 | ScoringProfile::Pq
                 | ScoringProfile::OpqRpq
         ) {
@@ -674,6 +675,7 @@ impl Engine {
             crate::protocol::ScoringProfile::ExactFp16
                 | crate::protocol::ScoringProfile::Int8
                 | crate::protocol::ScoringProfile::Fp8E4m3
+                | crate::protocol::ScoringProfile::RawFp8E4m3
                 | crate::protocol::ScoringProfile::Pq
                 | crate::protocol::ScoringProfile::OpqRpq
         ) {
@@ -1249,7 +1251,7 @@ fn validate_entry(
     let exact_bytes = descriptor.rows as usize * descriptor.dimension as usize * scalar_bytes;
     let expected_bytes = match profile {
         ScoringProfile::ExactFp16 => exact_bytes,
-        ScoringProfile::Int8 | ScoringProfile::Fp8E4m3 => {
+        ScoringProfile::Int8 | ScoringProfile::Fp8E4m3 | ScoringProfile::RawFp8E4m3 => {
             scaled_payload_bytes(descriptor.rows, descriptor.dimension)?
         }
         ScoringProfile::Pq | ScoringProfile::OpqRpq => {
@@ -1279,7 +1281,10 @@ fn encode_for_profile(
     if profile == ScoringProfile::ExactFp16 {
         return Ok(payload);
     }
-    if !matches!(profile, ScoringProfile::Int8 | ScoringProfile::Fp8E4m3) {
+    if !matches!(
+        profile,
+        ScoringProfile::Int8 | ScoringProfile::Fp8E4m3 | ScoringProfile::RawFp8E4m3
+    ) {
         bail!("unsupported TileMaxSim encoding profile");
     }
     let rows = descriptor.rows as usize;
@@ -1298,17 +1303,26 @@ fn encode_for_profile(
     let scale_offset = align_up(code_bytes, size_of::<f32>())?;
     let mut encoded = vec![0_u8; scaled_payload_bytes(descriptor.rows, descriptor.dimension)?];
     for row in 0..rows {
-        let mut maximum = 0.0_f32;
-        for column in 0..dimension {
-            maximum = maximum
-                .max(read_scalar(&payload, row * dimension + column, descriptor.dtype)?.abs());
-        }
+        let maximum = if profile == ScoringProfile::RawFp8E4m3 {
+            0.0
+        } else {
+            let mut maximum = 0.0_f32;
+            for column in 0..dimension {
+                maximum = maximum
+                    .max(read_scalar(&payload, row * dimension + column, descriptor.dtype)?.abs());
+            }
+            maximum
+        };
         let bound = if profile == ScoringProfile::Int8 {
             127.0
         } else {
             448.0
         };
-        let scale = if maximum == 0.0 { 1.0 } else { maximum / bound };
+        let scale = if profile == ScoringProfile::RawFp8E4m3 || maximum == 0.0 {
+            1.0
+        } else {
+            maximum / bound
+        };
         for column in 0..dimension {
             let value = read_scalar(&payload, row * dimension + column, descriptor.dtype)?;
             encoded[row * dimension + column] = if profile == ScoringProfile::Int8 {
@@ -1535,6 +1549,31 @@ mod tests {
         assert_ne!(
             gpu_cache_key(&descriptor, ScoringProfile::Fp8E4m3, None),
             gpu_cache_key(&descriptor, ScoringProfile::Int8, None)
+        );
+    }
+
+    #[test]
+    fn raw_fp8_encoding_uses_identity_scales_and_a_distinct_cache_namespace() {
+        let descriptor = descriptor(1, "a", 1);
+        let mut payload = Vec::with_capacity(640);
+        for column in 0..320 {
+            let bits = if column == 0 { 0x3c00_u16 } else { 0_u16 };
+            payload.extend_from_slice(&bits.to_le_bytes());
+        }
+        let encoded = encode_for_profile(
+            &descriptor,
+            Arc::from(payload),
+            ScoringProfile::RawFp8E4m3,
+        )
+        .unwrap();
+        assert_eq!(e4m3fn_to_f32(encoded[0]), 1.0);
+        assert_eq!(
+            f32::from_le_bytes(encoded[320..324].try_into().unwrap()),
+            1.0
+        );
+        assert_ne!(
+            gpu_cache_key(&descriptor, ScoringProfile::RawFp8E4m3, None),
+            gpu_cache_key(&descriptor, ScoringProfile::Fp8E4m3, None)
         );
     }
 }

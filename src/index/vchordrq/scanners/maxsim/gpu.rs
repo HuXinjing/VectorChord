@@ -31,6 +31,7 @@ const SCHEDULED_EXTERNAL_VERSION: u16 = 3;
 const PROFILED_EXTERNAL_VERSION: u16 = 4;
 const QUANTIZED_EXTERNAL_VERSION: u16 = 5;
 const LOGICAL_EXTERNAL_VERSION: u16 = 6;
+const COMPACT_LOGICAL_EXTERNAL_VERSION: u16 = 7;
 const REQUEST_KIND: u16 = 1;
 const RESPONSE_KIND: u16 = 2;
 const HEADER_LEN: usize = 24;
@@ -486,7 +487,7 @@ fn encode_external_descriptors(
         writer.u32(u32::try_from(tenant.len()).map_err(|_| RerankError::RequestTooLarge)?)?;
         if let Some(top_k) = logical_top_k {
             writer.u32(u32::try_from(top_k).map_err(|_| RerankError::RequestTooLarge)?)?;
-            LOGICAL_EXTERNAL_VERSION
+            COMPACT_LOGICAL_EXTERNAL_VERSION
         } else if quantized {
             QUANTIZED_EXTERNAL_VERSION
         } else {
@@ -533,6 +534,16 @@ fn encode_external_descriptors(
             u32::try_from(heap_keys.len()).map_err(|_| RerankError::RequestTooLarge)?;
         writer.u32(candidate_id)?;
         writer.u32(descriptor.rows)?;
+        if logical_top_k.is_some() {
+            let digest = descriptor.tensor_ref.strip_prefix("sha256://").ok_or(
+                RerankError::InvalidDescriptor("unsupported tensor reference"),
+            )?;
+            let bytes = decode_lower_hex_sha256(digest.as_bytes())
+                .ok_or(RerankError::InvalidDescriptor("invalid tensor digest"))?;
+            writer.bytes(&bytes)?;
+            heap_keys.push(descriptor.candidate.heap_key);
+            continue;
+        }
         writer.u32(
             u32::try_from(descriptor.tensor_ref.len()).map_err(|_| RerankError::RequestTooLarge)?,
         )?;
@@ -566,11 +577,33 @@ fn encode_external_descriptors(
     })
 }
 
+fn decode_lower_hex_sha256(value: &[u8]) -> Option<[u8; 32]> {
+    if value.len() != 64 {
+        return None;
+    }
+    let mut decoded = [0_u8; 32];
+    for (output, pair) in decoded.iter_mut().zip(value.chunks_exact(2)) {
+        let high = match pair[0] {
+            b'0'..=b'9' => pair[0] - b'0',
+            b'a'..=b'f' => pair[0] - b'a' + 10,
+            _ => return None,
+        };
+        let low = match pair[1] {
+            b'0'..=b'9' => pair[1] - b'0',
+            b'a'..=b'f' => pair[1] - b'a' + 10,
+            _ => return None,
+        };
+        *output = high << 4 | low;
+    }
+    Some(decoded)
+}
+
 fn scoring_profile_code(profile: PostgresMaxsimScoringProfile) -> u8 {
     match profile {
         PostgresMaxsimScoringProfile::ExactFp16 => 1,
         PostgresMaxsimScoringProfile::Int8 => 2,
         PostgresMaxsimScoringProfile::Fp8E4m3 => 3,
+        PostgresMaxsimScoringProfile::RawFp8E4m3 => 6,
         PostgresMaxsimScoringProfile::Pq => 4,
         PostgresMaxsimScoringProfile::OpqRpq => 5,
     }
@@ -1512,6 +1545,16 @@ mod tests {
     use std::rc::Rc;
     use vector::vect::VectOwned;
 
+    #[test]
+    fn compact_digest_decoder_accepts_only_canonical_lower_hex() {
+        assert_eq!(
+            decode_lower_hex_sha256("ab".repeat(32).as_bytes()),
+            Some([0xab; 32])
+        );
+        assert_eq!(decode_lower_hex_sha256("AB".repeat(32).as_bytes()), None);
+        assert_eq!(decode_lower_hex_sha256(b"abcd"), None);
+    }
+
     struct MockTensorSource(BTreeMap<HeapKey, Vec<OwnedVector>>);
 
     impl CandidateTensorSource for MockTensorSource {
@@ -2283,7 +2326,7 @@ mod tests {
 
         assert_eq!(
             observations.borrow().as_slice(),
-            &[(LOGICAL_EXTERNAL_VERSION, 3, 1)]
+            &[(COMPACT_LOGICAL_EXTERNAL_VERSION, 3, 1)]
         );
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].heap_key, pages[2]);
