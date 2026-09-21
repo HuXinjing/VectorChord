@@ -250,7 +250,13 @@ impl<T: TileMaxsimTransport> GpuExternalTileMaxsimBackend<T> {
             remaining_logical_timeout(deadline)?,
             max_response_bytes,
         )?;
-        decode_response_for_version(&response, encoded.version, request_id, &encoded.heap_keys)
+        decode_response_for_version(
+            &response,
+            encoded.version,
+            request_id,
+            &encoded.heap_keys,
+            effective_top_k,
+        )
     }
 
     #[cfg(test)]
@@ -337,6 +343,7 @@ impl<T: TileMaxsimTransport> GpuExternalTileMaxsimBackend<T> {
                 encoded.version,
                 request_id,
                 &encoded.heap_keys,
+                encoded.heap_keys.len(),
             )?)?;
         }
     }
@@ -898,7 +905,7 @@ fn decode_response(
     request_id: u64,
     heap_keys: &[HeapKey],
 ) -> Result<RerankResults, RerankError> {
-    decode_response_for_version(frame, VERSION, request_id, heap_keys)
+    decode_response_for_version(frame, VERSION, request_id, heap_keys, heap_keys.len())
 }
 
 fn decode_response_for_version(
@@ -906,6 +913,7 @@ fn decode_response_for_version(
     expected_version: u16,
     request_id: u64,
     heap_keys: &[HeapKey],
+    expected_result_count: usize,
 ) -> Result<RerankResults, RerankError> {
     let mut cursor = Cursor::new(frame);
     if cursor.bytes(4)? != MAGIC {
@@ -939,7 +947,7 @@ fn decode_response_for_version(
     }
     let result_count = usize::try_from(cursor.u32()?)
         .map_err(|_| RerankError::Protocol("result count is too large".into()))?;
-    if result_count != heap_keys.len() {
+    if result_count != expected_result_count || expected_result_count > heap_keys.len() {
         return Err(RerankError::Protocol("partial result set".into()));
     }
     let mut seen = vec![false; heap_keys.len()];
@@ -961,9 +969,6 @@ fn decode_response_for_version(
         results.push((Reverse(distance), Reverse(heap_key)));
     }
     cursor.finish()?;
-    if seen.iter().any(|seen| !seen) {
-        return Err(RerankError::Protocol("partial result set".into()));
-    }
     Ok(RerankResults { inner: results })
 }
 
@@ -1749,6 +1754,34 @@ mod tests {
         let duplicate = success_response(7, &[(0, 1.0), (0, 2.0)]);
         assert!(matches!(
             decode_response(&duplicate, 7, &keys),
+            Err(RerankError::Protocol(_))
+        ));
+    }
+
+    #[test]
+    fn logical_response_accepts_any_requested_top_k_including_all_candidates() {
+        let keys = [[0, 0, 1], [0, 0, 2], [0, 0, 3]];
+        let subset =
+            success_response_with_version(LOGICAL_EXTERNAL_VERSION, 7, &[(2, 3.0), (0, 1.0)]);
+        let subset_results =
+            decode_response_for_version(&subset, LOGICAL_EXTERNAL_VERSION, 7, &keys, 2)
+                .unwrap()
+                .collect::<Vec<_>>();
+        assert_eq!(subset_results.len(), 2);
+
+        let full = success_response_with_version(
+            LOGICAL_EXTERNAL_VERSION,
+            8,
+            &[(0, 1.0), (1, 2.0), (2, 3.0)],
+        );
+        let full_results =
+            decode_response_for_version(&full, LOGICAL_EXTERNAL_VERSION, 8, &keys, keys.len())
+                .unwrap()
+                .collect::<Vec<_>>();
+        assert_eq!(full_results.len(), keys.len());
+
+        assert!(matches!(
+            decode_response_for_version(&subset, LOGICAL_EXTERNAL_VERSION, 7, &keys, 1,),
             Err(RerankError::Protocol(_))
         ));
     }
