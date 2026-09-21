@@ -10,6 +10,7 @@
 
 use anyhow::{Result, anyhow, bail};
 use std::collections::HashSet;
+use std::sync::Arc;
 
 pub const HEADER_BYTES: usize = 24;
 pub const VERSION_EXTERNAL: u16 = 2;
@@ -69,7 +70,7 @@ pub struct Request {
     pub quantization_contract: Option<String>,
     pub top_k: Option<usize>,
     pub query: Vec<u8>,
-    pub candidates: Vec<Descriptor>,
+    pub candidates: Arc<Vec<Descriptor>>,
     pub manifest_digest: Option<[u8; 32]>,
     pub catalog_digest: Option<[u8; 32]>,
     pub catalog_public_ids: Vec<i64>,
@@ -614,7 +615,7 @@ pub fn parse(frame: &[u8]) -> Result<Request> {
         quantization_contract,
         top_k,
         query,
-        candidates,
+        candidates: Arc::new(candidates),
         manifest_digest,
         catalog_digest,
         catalog_public_ids,

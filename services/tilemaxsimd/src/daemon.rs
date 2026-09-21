@@ -54,6 +54,10 @@ const MAX_DESCRIPTOR_CATALOG_ENTRIES: usize = 1_000_000;
 type DescriptorCatalog = HashMap<i64, protocol::Descriptor>;
 static DESCRIPTOR_CATALOGS: OnceLock<Mutex<VecDeque<(String, DescriptorCatalog)>>> =
     OnceLock::new();
+const MAX_DESCRIPTOR_CATALOG_SELECTIONS: usize = 128;
+type DescriptorCatalogSelection = (String, Arc<Vec<protocol::Descriptor>>);
+static DESCRIPTOR_CATALOG_SELECTIONS: OnceLock<Mutex<VecDeque<DescriptorCatalogSelection>>> =
+    OnceLock::new();
 
 #[derive(Clone, Debug, Deserialize)]
 struct CacheOperationRequest {
@@ -1273,7 +1277,7 @@ fn resolve_descriptor_manifest(request: &mut protocol::Request, metrics: &Runtim
             let entry = cache
                 .remove(position)
                 .expect("descriptor manifest position came from the same cache");
-            request.candidates = entry.1.as_ref().clone();
+            request.candidates = Arc::clone(&entry.1);
             cache.push_back(entry);
             metrics
                 .descriptor_manifest_hits
@@ -1316,7 +1320,7 @@ fn resolve_descriptor_manifest(request: &mut protocol::Request, metrics: &Runtim
             .descriptor_manifest_evictions
             .fetch_add(1, Ordering::Relaxed);
     }
-    cache.push_back((key, Arc::new(request.candidates.clone())));
+    cache.push_back((key, Arc::clone(&request.candidates)));
     metrics
         .descriptor_manifest_registrations
         .fetch_add(1, Ordering::Relaxed);
@@ -1333,6 +1337,14 @@ fn descriptor_catalog_key(request: &protocol::Request, digest: &[u8; 32]) -> Str
         request.candidate_dtype,
         hex::encode(digest),
     )
+}
+
+fn descriptor_catalog_selection_key(catalog_key: &str, public_ids: &[i64]) -> String {
+    let mut digest = Sha256::new();
+    for public_id in public_ids {
+        digest.update(public_id.to_le_bytes());
+    }
+    format!("{catalog_key}\0{}", hex::encode(digest.finalize()))
 }
 
 fn resolve_descriptor_catalog(request: &mut protocol::Request, metrics: &RuntimeMetrics) -> bool {
@@ -1400,6 +1412,30 @@ fn resolve_descriptor_catalog(request: &mut protocol::Request, metrics: &Runtime
     let entry = cache
         .remove(position)
         .expect("descriptor catalog position came from the same cache");
+    let selection_key = descriptor_catalog_selection_key(&key, &request.catalog_public_ids);
+    let selections = DESCRIPTOR_CATALOG_SELECTIONS.get_or_init(|| Mutex::new(VecDeque::new()));
+    let mut selection_cache = selections.lock().unwrap_or_else(|error| error.into_inner());
+    if let Some(selection_position) = selection_cache
+        .iter()
+        .position(|(candidate, _)| candidate == &selection_key)
+    {
+        let selection = selection_cache
+            .remove(selection_position)
+            .expect("descriptor catalog selection position came from the same cache");
+        request.candidates = Arc::clone(&selection.1);
+        selection_cache.push_back(selection);
+        cache.push_back(entry);
+        metrics
+            .descriptor_catalog_hits
+            .fetch_add(1, Ordering::Relaxed);
+        metrics.descriptor_bytes_avoided.fetch_add(
+            u64::try_from(request.candidates.len())
+                .unwrap_or(u64::MAX)
+                .saturating_mul(32),
+            Ordering::Relaxed,
+        );
+        return true;
+    }
     let mut resolved = Vec::with_capacity(request.catalog_public_ids.len());
     for (ordinal, public_id) in request.catalog_public_ids.iter().enumerate() {
         let Some(descriptor) = entry.1.get(public_id) else {
@@ -1413,7 +1449,11 @@ fn resolve_descriptor_catalog(request: &mut protocol::Request, metrics: &Runtime
         descriptor.candidate_id = ordinal as u32;
         resolved.push(descriptor);
     }
-    request.candidates = resolved;
+    request.candidates = Arc::new(resolved);
+    while selection_cache.len() >= MAX_DESCRIPTOR_CATALOG_SELECTIONS {
+        selection_cache.pop_front();
+    }
+    selection_cache.push_back((selection_key, Arc::clone(&request.candidates)));
     metrics
         .descriptor_catalog_hits
         .fetch_add(1, Ordering::Relaxed);
@@ -1961,7 +2001,7 @@ fn request_quantum(work: &Work, config: &SchedulerConfig) -> protocol::Request {
         quantization_contract: work.request.quantization_contract.clone(),
         top_k: work.request.top_k,
         query: work.request.query.clone(),
-        candidates: work.request.candidates[work.next_candidate..end].to_vec(),
+        candidates: Arc::new(work.request.candidates[work.next_candidate..end].to_vec()),
         manifest_digest: work.request.manifest_digest,
         catalog_digest: work.request.catalog_digest,
         catalog_public_ids: Vec::new(),
@@ -3601,18 +3641,63 @@ mod tests {
         AdminAction, ByteAdmission, OperationRegistry, PendingAdmission, RuntimeMetrics,
         candidate_fmas, handle_status_connection, header_version, is_fatal_cuda_diagnostic,
         kib_to_bytes, quantum_end, read_management_request, render_metrics,
-        resolve_quantum_candidates, tenant_hash,
+        resolve_descriptor_catalog, resolve_quantum_candidates, tenant_hash,
     };
     #[cfg(feature = "backend-cpu")]
     use crate::backend::{AcceleratorBackend, BackendKind};
     #[cfg(feature = "backend-cpu")]
     use crate::cpu::CpuBackend;
     use crate::engine::{DeviceStatus, EngineStatus};
-    use crate::protocol::Descriptor;
+    use crate::protocol::{Descriptor, Request, ScoringProfile, VERSION_CATALOG_LOGICAL_EXTERNAL};
     use crate::shard::HostCacheStatus;
     use std::io::{Read, Write};
     use std::sync::atomic::Ordering;
     use std::sync::{Arc, Mutex, mpsc};
+
+    fn catalog_request(registration: bool) -> Request {
+        Request {
+            protocol_version: VERSION_CATALOG_LOGICAL_EXTERNAL,
+            request_id: 1,
+            tenant: "selection-cache-test".into(),
+            model_contract: "model-v1".into(),
+            priority: 0,
+            timeout_ms: 1_000,
+            query_rows: 1,
+            dimension: 2,
+            dtype: 1,
+            candidate_dtype: 3,
+            scoring_profile: ScoringProfile::RawFp8E4m3,
+            quantization_contract: None,
+            top_k: Some(1),
+            query: vec![0; 8],
+            candidates: Arc::new(if registration {
+                vec![
+                    Descriptor { candidate_id: 0, contract: "model-v1".into(), digest: "11".repeat(32), rows: 1, dimension: 2, dtype: 3 },
+                    Descriptor { candidate_id: 1, contract: "model-v1".into(), digest: "22".repeat(32), rows: 1, dimension: 2, dtype: 3 },
+                ]
+            } else { vec![] }),
+            manifest_digest: None,
+            catalog_digest: Some([0x5a; 32]),
+            catalog_public_ids: vec![7, 9],
+            catalog_registration: registration,
+        }
+    }
+
+    #[test]
+    fn repeated_catalog_selection_reuses_the_resolved_descriptor_vector() {
+        let metrics = RuntimeMetrics::default();
+        let mut registration = catalog_request(true);
+        assert!(resolve_descriptor_catalog(&mut registration, &metrics));
+
+        let mut first = catalog_request(false);
+        assert!(resolve_descriptor_catalog(&mut first, &metrics));
+        let first_candidates = Arc::clone(&first.candidates);
+        assert_eq!(first.candidates.iter().map(|item| item.candidate_id).collect::<Vec<_>>(), vec![0, 1]);
+
+        let mut second = catalog_request(false);
+        assert!(resolve_descriptor_catalog(&mut second, &metrics));
+        assert!(Arc::ptr_eq(&first_candidates, &second.candidates));
+    }
 
     #[test]
     fn error_responses_preserve_every_supported_external_protocol_version() {

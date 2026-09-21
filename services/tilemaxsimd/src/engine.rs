@@ -712,7 +712,7 @@ impl Engine {
                 || request
                     .candidates
                     .iter()
-                    .zip(&leader.candidates)
+                    .zip(leader.candidates.iter())
                     .any(|(left, right)| cache_key(left) != cache_key(right))
         }) {
             return Ok(None);
@@ -1529,7 +1529,7 @@ mod tests {
             quantization_contract: None,
             top_k: None,
             query: vec![0; 640],
-            candidates: vec![descriptor(candidate_id, "same-content", 1)],
+            candidates: Arc::new(vec![descriptor(candidate_id, "same-content", 1)]),
             manifest_digest: None,
             catalog_digest: None,
             catalog_public_ids: Vec::new(),
