@@ -1247,7 +1247,12 @@ fn validate_entry(
     profile: ScoringProfile,
     active_quantizer: Option<&ActiveQuantizer>,
 ) -> Result<()> {
-    let scalar_bytes = if descriptor.dtype == 1 { 4 } else { 2 };
+    let scalar_bytes = match descriptor.dtype {
+        1 => 4,
+        2 => 2,
+        3 => 1,
+        _ => 0,
+    };
     let exact_bytes = descriptor.rows as usize * descriptor.dimension as usize * scalar_bytes;
     let expected_bytes = match profile {
         ScoringProfile::ExactFp16 => exact_bytes,
@@ -1279,8 +1284,14 @@ fn encode_for_profile(
     profile: ScoringProfile,
 ) -> Result<Arc<[u8]>> {
     if profile == ScoringProfile::ExactFp16 {
+        if descriptor.dtype == 3 {
+            bail!("raw FP8 canonical tensors require the fp8_e4m3_raw scoring profile");
+        }
         return Ok(payload);
     }
+    // fp8_e4m3_row_scaled is not a vLLM output dtype (including the pinned
+    // vLLM 0.16.0 deployment). It is deliberately derived here from canonical
+    // FP16/FP32 tensors as E4M3 codes plus one FP32 scale for every row.
     if !matches!(
         profile,
         ScoringProfile::Int8 | ScoringProfile::Fp8E4m3 | ScoringProfile::RawFp8E4m3
@@ -1289,7 +1300,12 @@ fn encode_for_profile(
     }
     let rows = descriptor.rows as usize;
     let dimension = descriptor.dimension as usize;
-    let scalar_bytes = if descriptor.dtype == 1 { 4 } else { 2 };
+    let scalar_bytes = match descriptor.dtype {
+        1 => 4,
+        2 => 2,
+        3 => 1,
+        _ => 0,
+    };
     let expected = rows
         .checked_mul(dimension)
         .and_then(|count| count.checked_mul(scalar_bytes))
@@ -1302,6 +1318,14 @@ fn encode_for_profile(
         .ok_or_else(|| anyhow!("INT8 tensor size overflow"))?;
     let scale_offset = align_up(code_bytes, size_of::<f32>())?;
     let mut encoded = vec![0_u8; scaled_payload_bytes(descriptor.rows, descriptor.dimension)?];
+    if profile == ScoringProfile::RawFp8E4m3 && descriptor.dtype == 3 {
+        encoded[..code_bytes].copy_from_slice(&payload);
+        for row in 0..rows {
+            let offset = scale_offset + row * size_of::<f32>();
+            encoded[offset..offset + 4].copy_from_slice(&1.0_f32.to_le_bytes());
+        }
+        return Ok(Arc::from(encoded));
+    }
     for row in 0..rows {
         let maximum = if profile == ScoringProfile::RawFp8E4m3 {
             0.0
@@ -1408,6 +1432,7 @@ fn read_scalar(payload: &[u8], index: usize, dtype: u8) -> Result<f32> {
                 payload[offset..offset + 2].try_into().unwrap(),
             )))
         }
+        3 => Ok(e4m3fn_to_f32(payload[index])),
         _ => bail!("unsupported source tensor dtype"),
     }
 }
@@ -1560,12 +1585,9 @@ mod tests {
             let bits = if column == 0 { 0x3c00_u16 } else { 0_u16 };
             payload.extend_from_slice(&bits.to_le_bytes());
         }
-        let encoded = encode_for_profile(
-            &descriptor,
-            Arc::from(payload),
-            ScoringProfile::RawFp8E4m3,
-        )
-        .unwrap();
+        let encoded =
+            encode_for_profile(&descriptor, Arc::from(payload), ScoringProfile::RawFp8E4m3)
+                .unwrap();
         assert_eq!(e4m3fn_to_f32(encoded[0]), 1.0);
         assert_eq!(
             f32::from_le_bytes(encoded[320..324].try_into().unwrap()),

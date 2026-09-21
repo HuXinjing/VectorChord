@@ -46,7 +46,7 @@ enum Command {
         rows: u32,
         #[arg(long)]
         dimension: u32,
-        #[arg(long, value_parser = ["float16", "float32"])]
+        #[arg(long, value_parser = ["float16", "float32", "fp8_e4m3_raw", "fp8_e4m3"])]
         dtype: String,
         #[arg(long)]
         expected_sha256: Option<String>,
@@ -310,6 +310,7 @@ fn tensor_bytes(rows: u32, dimension: u32, dtype: &str) -> Result<usize> {
         bail!("invalid tensor shape");
     }
     let scalar_bytes = match dtype {
+        "fp8_e4m3_raw" | "fp8_e4m3" => 1usize,
         "float16" => 2usize,
         "float32" => 4usize,
         _ => bail!("unsupported tensor dtype"),
@@ -328,6 +329,7 @@ fn publish_object(
     payload: &[u8],
     expected_sha256: Option<&str>,
 ) -> Result<PublishedDescriptor> {
+    let dtype = if dtype == "fp8_e4m3" { "fp8_e4m3_raw" } else { dtype };
     if payload.len() != tensor_bytes(rows, dimension, dtype)? {
         bail!("tensor payload length disagrees with its shape");
     }
@@ -454,6 +456,7 @@ mod tests {
     use std::collections::HashSet;
     use std::fs;
     use std::io::Cursor;
+    use std::time::SystemTime;
 
     #[test]
     fn readiness_requires_success_status_and_true_body() {
@@ -498,6 +501,17 @@ mod tests {
                 .join(&first.tensor_checksum[7..9])
                 .exists()
         );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn publish_object_canonicalizes_raw_fp8_dtype() {
+        let root = std::env::temp_dir().join(format!(
+            "tilemaxsimctl-fp8-{}-{}", std::process::id(),
+            SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        let descriptor = publish_object(&root, 1, 2, "fp8_e4m3", &[0x38, 0xb8], None).unwrap();
+        assert_eq!(descriptor.tensor_dtype, "fp8_e4m3_raw");
         fs::remove_dir_all(root).unwrap();
     }
 

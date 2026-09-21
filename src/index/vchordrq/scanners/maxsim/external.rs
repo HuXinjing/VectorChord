@@ -24,6 +24,7 @@ const MAX_TENSOR_DIMENSION: u32 = 60_000;
 pub(super) enum ExternalTensorDtype {
     F32,
     F16,
+    Fp8E4m3,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -524,9 +525,10 @@ pub(super) fn validate_descriptor(
     let dtype = match dtype.as_str() {
         "float32" => ExternalTensorDtype::F32,
         "float16" => ExternalTensorDtype::F16,
+        "fp8_e4m3_raw" | "fp8_e4m3" => ExternalTensorDtype::Fp8E4m3,
         _ => {
             return Err(RerankError::InvalidDescriptor(
-                "tensor dtype must be float16 or float32",
+                "tensor dtype must be float16, float32, or fp8_e4m3_raw",
             ));
         }
     };

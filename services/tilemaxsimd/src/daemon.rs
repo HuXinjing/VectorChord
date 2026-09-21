@@ -32,8 +32,8 @@ use crate::dispatch::{self, DispatchInput, DispatchThresholds, KernelKind};
 use crate::engine::{Engine, EngineStatus};
 use crate::protocol::{
     self, HEADER_BYTES, VERSION_COMPACT_LOGICAL_EXTERNAL, VERSION_EXTERNAL,
-    VERSION_LOGICAL_EXTERNAL, VERSION_PROFILED_EXTERNAL,
-    VERSION_QUANTIZED_EXTERNAL, VERSION_SCHEDULED_EXTERNAL,
+    VERSION_LOGICAL_EXTERNAL, VERSION_PROFILED_EXTERNAL, VERSION_QUANTIZED_EXTERNAL,
+    VERSION_SCHEDULED_EXTERNAL,
 };
 use crate::quant::QuantizationRegistry;
 use crate::scheduler::{RequestQueue, Scheduled, SchedulerPolicy};
@@ -3233,6 +3233,7 @@ fn load_resident_manifests(values: &[(String, PathBuf)]) -> Result<Vec<protocol:
             let (dtype, scalar_bytes) = match record.tensor_dtype.as_str() {
                 "float16" => (2, 2),
                 "float32" => (1, 4),
+                "fp8_e4m3_raw" | "fp8_e4m3" => (3, 1),
                 _ => bail!("resident manifest has an unsupported tensor dtype"),
             };
             let expected_bytes =

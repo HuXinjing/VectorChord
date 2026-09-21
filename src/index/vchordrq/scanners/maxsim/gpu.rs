@@ -32,6 +32,7 @@ const PROFILED_EXTERNAL_VERSION: u16 = 4;
 const QUANTIZED_EXTERNAL_VERSION: u16 = 5;
 const LOGICAL_EXTERNAL_VERSION: u16 = 6;
 const COMPACT_LOGICAL_EXTERNAL_VERSION: u16 = 7;
+const TYPED_COMPACT_LOGICAL_EXTERNAL_VERSION: u16 = 8;
 const REQUEST_KIND: u16 = 1;
 const RESPONSE_KIND: u16 = 2;
 const HEADER_LEN: usize = 24;
@@ -63,6 +64,7 @@ pub(super) fn report_gpu_fallback(error: &RerankError) {
 enum TensorDtype {
     F32 = 1,
     F16 = 2,
+    Fp8E4m3 = 3,
 }
 
 pub(super) trait TileMaxsimTransport {
@@ -226,38 +228,63 @@ impl<T: TileMaxsimTransport> GpuExternalTileMaxsimBackend<T> {
         // A descriptor source may legitimately omit stale or unavailable
         // candidates. Preserve the previous batched behavior by returning as
         // many results as remain instead of rejecting the whole rerank.
-        let effective_top_k = top_k.min(descriptors.len());
-        let request_id = NEXT_REQUEST_ID.fetch_add(1, Ordering::Relaxed);
-        let encoded = encode_external_descriptors(
-            request_id,
-            &self.model_contract_id,
-            query,
-            &descriptors,
-            self.max_batch_tokens,
-            self.max_batch_bytes,
-            self.scheduling.as_ref(),
-            self.scoring_profile,
-            self.quantization_contract.as_deref(),
-            remaining_logical_timeout(deadline)?,
-            Some(effective_top_k),
-        )?;
-        let max_response_bytes = HEADER_LEN
-            .checked_add(8)
-            .and_then(|size| size.checked_add(effective_top_k.checked_mul(8)?))
-            .map(|size| size.max(HEADER_LEN + 8 + MAX_REMOTE_ERROR_BYTES))
-            .ok_or(RerankError::RequestTooLarge)?;
-        let response = self.transport.round_trip(
-            &encoded.frame,
-            remaining_logical_timeout(deadline)?,
-            max_response_bytes,
-        )?;
-        decode_response_for_version(
-            &response,
-            encoded.version,
-            request_id,
-            &encoded.heap_keys,
-            effective_top_k,
-        )
+        // A rolling upgrade may mix canonical FP16 and raw FP8 objects. The
+        // compact protocol has one request-wide dtype, so score homogeneous
+        // groups independently and merge their bounded top-k results.
+        let groups = if self.scoring_profile == PostgresMaxsimScoringProfile::RawFp8E4m3 {
+            let (raw, legacy): (Vec<_>, Vec<_>) = descriptors
+                .into_iter()
+                .partition(|item| item.dtype == ExternalTensorDtype::Fp8E4m3);
+            [legacy, raw]
+                .into_iter()
+                .filter(|group| !group.is_empty())
+                .collect::<Vec<_>>()
+        } else {
+            vec![descriptors]
+        };
+        let mut merged = BinaryHeap::new();
+        for group in groups {
+            let group_top_k = top_k.min(group.len());
+            let request_id = NEXT_REQUEST_ID.fetch_add(1, Ordering::Relaxed);
+            let encoded = encode_external_descriptors(
+                request_id,
+                &self.model_contract_id,
+                query,
+                &group,
+                self.max_batch_tokens,
+                self.max_batch_bytes,
+                self.scheduling.as_ref(),
+                self.scoring_profile,
+                self.quantization_contract.as_deref(),
+                remaining_logical_timeout(deadline)?,
+                Some(group_top_k),
+            )?;
+            let max_response_bytes = HEADER_LEN
+                .checked_add(8)
+                .and_then(|size| size.checked_add(group_top_k.checked_mul(8)?))
+                .map(|size| size.max(HEADER_LEN + 8 + MAX_REMOTE_ERROR_BYTES))
+                .ok_or(RerankError::RequestTooLarge)?;
+            let response = self.transport.round_trip(
+                &encoded.frame,
+                remaining_logical_timeout(deadline)?,
+                max_response_bytes,
+            )?;
+            merged.extend(
+                decode_response_for_version(
+                    &response,
+                    encoded.version,
+                    request_id,
+                    &encoded.heap_keys,
+                    group_top_k,
+                )?
+                .inner,
+            );
+        }
+        let mut retained = BinaryHeap::new();
+        for _ in 0..top_k.min(merged.len()) {
+            retained.push(merged.pop().expect("bounded merged heap length"));
+        }
+        Ok(RerankResults { inner: retained })
     }
 
     #[cfg(test)]
@@ -429,9 +456,18 @@ fn encode_external_descriptors(
         }
     }
     let (dtype, dimension) = tensor_metadata(query)?;
-    let external_dtype = match dtype {
-        TensorDtype::F32 => ExternalTensorDtype::F32,
-        TensorDtype::F16 => ExternalTensorDtype::F16,
+    let external_dtype = descriptors.first().map_or_else(
+        || match dtype {
+            TensorDtype::F32 => ExternalTensorDtype::F32,
+            TensorDtype::F16 => ExternalTensorDtype::F16,
+            TensorDtype::Fp8E4m3 => unreachable!("query tensors originate as vector or halfvec"),
+        },
+        |item| item.dtype,
+    );
+    let storage_dtype = match external_dtype {
+        ExternalTensorDtype::F32 => TensorDtype::F32,
+        ExternalTensorDtype::F16 => TensorDtype::F16,
+        ExternalTensorDtype::Fp8E4m3 => TensorDtype::Fp8E4m3,
     };
     let query_rows = u32::try_from(query.len()).map_err(|_| RerankError::RequestTooLarge)?;
     let mut total_tokens = query.len();
@@ -469,7 +505,11 @@ fn encode_external_descriptors(
     writer.u8(1)?; // sum_query_max_document_dot
     if profiled {
         writer.u8(scoring_profile_code(scoring_profile))?;
-        writer.u8(0)?;
+        writer.u8(if storage_dtype == dtype {
+            0
+        } else {
+            storage_dtype as u8
+        })?;
     } else {
         writer.u16(0)?;
     }
@@ -487,7 +527,11 @@ fn encode_external_descriptors(
         writer.u32(u32::try_from(tenant.len()).map_err(|_| RerankError::RequestTooLarge)?)?;
         if let Some(top_k) = logical_top_k {
             writer.u32(u32::try_from(top_k).map_err(|_| RerankError::RequestTooLarge)?)?;
-            COMPACT_LOGICAL_EXTERNAL_VERSION
+            if storage_dtype == dtype {
+                COMPACT_LOGICAL_EXTERNAL_VERSION
+            } else {
+                TYPED_COMPACT_LOGICAL_EXTERNAL_VERSION
+            }
         } else if quantized {
             QUANTIZED_EXTERNAL_VERSION
         } else {
@@ -524,7 +568,7 @@ fn encode_external_descriptors(
             return Err(RerankError::RequestTooLarge);
         }
         declared_tensor_bytes = declared_tensor_bytes
-            .checked_add(tensor_bytes(descriptor.rows, dimension, dtype)?)
+            .checked_add(tensor_bytes(descriptor.rows, dimension, storage_dtype)?)
             .ok_or(RerankError::RequestTooLarge)?;
         if logical_top_k.is_none() && declared_tensor_bytes > max_batch_bytes {
             return Err(RerankError::RequestTooLarge);
@@ -627,6 +671,7 @@ fn collect_external_batch<S: CandidateTensorDescriptorSource>(
     let external_dtype = match dtype {
         TensorDtype::F32 => ExternalTensorDtype::F32,
         TensorDtype::F16 => ExternalTensorDtype::F16,
+        TensorDtype::Fp8E4m3 => unreachable!("query tensors originate as vector or halfvec"),
     };
     let query_rows = u32::try_from(query.len()).map_err(|_| RerankError::RequestTooLarge)?;
     let query_bytes = tensor_bytes(query_rows, dimension, dtype)?;
@@ -765,6 +810,7 @@ fn tensor_bytes(rows: u32, dimension: u32, dtype: TensorDtype) -> Result<usize, 
     let scalar_bytes = match dtype {
         TensorDtype::F32 => 4usize,
         TensorDtype::F16 => 2usize,
+        TensorDtype::Fp8E4m3 => 1usize,
     };
     usize::try_from(rows)
         .ok()
@@ -927,10 +973,47 @@ fn encode_tensor_values(
                     writer.u16(value.to_bits())?;
                 }
             }
+            (TensorDtype::Fp8E4m3, OwnedVector::Vecf32(vector)) => {
+                for value in vector.slice() {
+                    writer.u8(f32_to_e4m3fn(*value))?;
+                }
+            }
+            (TensorDtype::Fp8E4m3, OwnedVector::Vecf16(vector)) => {
+                for value in vector.slice() {
+                    writer.u8(f32_to_e4m3fn(value.to_f32()))?;
+                }
+            }
             _ => return Err(RerankError::TensorMismatch),
         }
     }
     Ok(())
+}
+
+fn e4m3fn_to_f32(bits: u8) -> f32 {
+    let sign = if bits & 0x80 == 0 { 1.0 } else { -1.0 };
+    let exponent = (bits >> 3) & 0x0f;
+    let fraction = bits & 0x07;
+    if exponent == 0 {
+        sign * fraction as f32 * 2.0_f32.powi(-9)
+    } else if exponent == 0x0f && fraction == 0x07 {
+        f32::NAN
+    } else {
+        sign * (1.0 + fraction as f32 / 8.0) * 2.0_f32.powi(exponent as i32 - 7)
+    }
+}
+
+fn f32_to_e4m3fn(value: f32) -> u8 {
+    let negative = value.is_sign_negative();
+    let magnitude = value.abs().min(448.0);
+    let mut best = (f32::INFINITY, 0_u8);
+    for bits in 0_u8..=0x7e {
+        let candidate = e4m3fn_to_f32(bits);
+        let distance = (candidate - magnitude).abs();
+        if distance < best.0 {
+            best = (distance, bits);
+        }
+    }
+    best.1 | if negative { 0x80 } else { 0 }
 }
 
 fn decode_response(
