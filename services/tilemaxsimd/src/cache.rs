@@ -273,6 +273,7 @@ pub struct GpuCache {
     default_tenant_max_bytes: usize,
     pinned_max_bytes: usize,
     pinned_bytes: usize,
+    generation: u64,
     pub hits: u64,
     pub misses: u64,
     pub evictions: u64,
@@ -309,6 +310,7 @@ impl GpuCache {
             default_tenant_max_bytes: capacity * tenant_max_percent as usize / 100,
             pinned_max_bytes: capacity * pinned_max_percent as usize / 100,
             pinned_bytes: 0,
+            generation: 0,
             hits: 0,
             misses: 0,
             evictions: 0,
@@ -338,6 +340,10 @@ impl GpuCache {
 
     pub fn pinned_bytes(&self) -> usize {
         self.pinned_bytes
+    }
+
+    pub fn generation(&self) -> u64 {
+        self.generation
     }
 
     pub fn free_bytes(&self) -> usize {
@@ -372,6 +378,22 @@ impl GpuCache {
         let entry = self.entries.get_mut(key).filter(|entry| entry.ready)?;
         entry.references += 1;
         Some(entry.clone())
+    }
+
+    /// Record a hit for an immutable resident-selection plan without taking a
+    /// per-entry lease. The engine is single-threaded and validates the cache
+    /// generation before using such a plan, so no admission or eviction can
+    /// overlap its synchronous GPU call.
+    pub fn touch_resident(&mut self, key: &str) -> Result<(), &'static str> {
+        let frequency = self.sketch.increment(&key);
+        let entry = self
+            .entries
+            .get_mut(key)
+            .filter(|entry| entry.ready)
+            .ok_or("cached GPU selection is no longer resident")?;
+        entry.priority = self.inflation + f64::from(frequency) / entry.allocated_bytes as f64;
+        self.hits += 1;
+        Ok(())
     }
 
     pub fn record_access_miss(&mut self, key: &str) {
@@ -432,6 +454,7 @@ impl GpuCache {
             .entries
             .remove(key)
             .ok_or("GPU cache entry disappeared")?;
+        self.generation = self.generation.wrapping_add(1);
         self.allocator.release(entry.offset as usize)?;
         if entry.pinned {
             self.pinned_bytes = self.pinned_bytes.saturating_sub(entry.allocated_bytes);
@@ -573,6 +596,7 @@ impl GpuCache {
                 priority,
             },
         );
+        self.generation = self.generation.wrapping_add(1);
         *self.tenant_allocated.entry(tenant.to_owned()).or_default() += allocated_bytes;
         if pinned {
             self.pinned_bytes += allocated_bytes;
@@ -717,6 +741,28 @@ mod tests {
             Admission::Rejected
         );
         assert!(cache.entry("hot").is_some());
+    }
+
+    #[test]
+    fn resident_plan_touch_preserves_leases_and_generation() {
+        let mut cache = GpuCache::new(256, 256).unwrap();
+        let initial_generation = cache.generation();
+        assert!(matches!(
+            cache.admit("resident".into(), 64, 1, 32, 2, false, true),
+            Admission::Admitted { .. }
+        ));
+        cache.mark_ready("resident").unwrap();
+        cache.release("resident").unwrap();
+        let resident_generation = cache.generation();
+        assert_ne!(resident_generation, initial_generation);
+
+        cache.touch_resident("resident").unwrap();
+        assert_eq!(cache.generation(), resident_generation);
+        assert_eq!(cache.entry("resident").unwrap().references, 0);
+
+        cache.remove("resident").unwrap();
+        assert_ne!(cache.generation(), resident_generation);
+        assert!(cache.touch_resident("resident").is_err());
     }
 
     #[test]

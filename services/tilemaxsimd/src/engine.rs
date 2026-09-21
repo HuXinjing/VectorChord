@@ -14,7 +14,7 @@ use crate::protocol::{Descriptor, Request, ScoringProfile};
 use crate::quant::{ActiveQuantizer, QuantizationRegistry};
 use crate::shard::{HostCacheStatus, ShardStore, cache_key};
 use anyhow::{Result, anyhow, bail};
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::mem::size_of;
 use std::sync::{Arc, OnceLock};
 
@@ -25,6 +25,7 @@ struct MissingTensor {
     payload: Arc<[u8]>,
 }
 
+#[derive(Clone)]
 struct ResidentTensor {
     candidate_index: usize,
     device: usize,
@@ -33,6 +34,17 @@ struct ResidentTensor {
     rows: u32,
     transient: bool,
     newly_admitted: bool,
+}
+
+const MAX_RESIDENT_SELECTION_PLANS: usize = 64;
+
+struct ResidentSelectionPlan {
+    candidates: Arc<Vec<Descriptor>>,
+    candidate_start: usize,
+    candidate_end: usize,
+    chunks: Vec<Vec<ResidentTensor>>,
+    duplicate_candidates: Vec<(usize, usize)>,
+    device_generations: Vec<u64>,
 }
 
 struct DeviceState {
@@ -47,6 +59,7 @@ pub struct Engine {
     store: ShardStore,
     next_device: usize,
     quantization_registry: Option<QuantizationRegistry>,
+    resident_selection_plans: VecDeque<ResidentSelectionPlan>,
 }
 
 type BatchedCandidateScores = Vec<Vec<(u32, f32)>>;
@@ -171,6 +184,7 @@ impl Engine {
             store,
             next_device: 0,
             quantization_registry,
+            resident_selection_plans: VecDeque::new(),
         })
     }
 
@@ -355,6 +369,88 @@ impl Engine {
         device.gpu.request_tensor_probe()
     }
 
+    fn score_cached_resident_selection(
+        &mut self,
+        request: &Request,
+    ) -> Option<Result<Vec<(u32, f32)>>> {
+        let generations = self
+            .devices
+            .iter()
+            .map(|device| device.cache.generation())
+            .collect::<Vec<_>>();
+        let position = self.resident_selection_plans.iter().position(|plan| {
+            Arc::ptr_eq(&plan.candidates, &request.candidates)
+                && plan.candidate_start == request.candidate_start
+                && plan.candidate_end == request.candidate_end
+                && plan.device_generations == generations
+        })?;
+        let plan = self
+            .resident_selection_plans
+            .remove(position)
+            .expect("resident selection position came from the same cache");
+        let mut scores = vec![None; request.candidate_slice().len()];
+        let touched = self.devices.iter_mut().zip(&plan.chunks).try_for_each(
+            |(device, chunk)| -> Result<()> {
+                for tensor in chunk {
+                    device
+                        .cache
+                        .touch_resident(&tensor.key)
+                        .map_err(|message| anyhow!(message))?;
+                }
+                Ok(())
+            },
+        );
+        let result = touched
+            .and_then(|()| self.score_devices(request, None, &plan.chunks, &mut scores))
+            .and_then(|()| {
+                finalize_scores(request, scores, plan.duplicate_candidates.iter().copied())
+            });
+        self.resident_selection_plans.push_back(plan);
+        Some(result)
+    }
+
+    fn remember_resident_selection(
+        &mut self,
+        request: &Request,
+        chunks: &[Vec<ResidentTensor>],
+        duplicate_candidates: &[(usize, usize)],
+    ) {
+        self.resident_selection_plans.retain(|plan| {
+            !(Arc::ptr_eq(&plan.candidates, &request.candidates)
+                && plan.candidate_start == request.candidate_start
+                && plan.candidate_end == request.candidate_end)
+        });
+        let chunks = chunks
+            .iter()
+            .map(|chunk| {
+                chunk
+                    .iter()
+                    .cloned()
+                    .map(|mut tensor| {
+                        tensor.transient = false;
+                        tensor.newly_admitted = false;
+                        tensor
+                    })
+                    .collect()
+            })
+            .collect();
+        self.resident_selection_plans.push_back(ResidentSelectionPlan {
+            candidates: Arc::clone(&request.candidates),
+            candidate_start: request.candidate_start,
+            candidate_end: request.candidate_end,
+            chunks,
+            duplicate_candidates: duplicate_candidates.to_vec(),
+            device_generations: self
+                .devices
+                .iter()
+                .map(|device| device.cache.generation())
+                .collect(),
+        });
+        while self.resident_selection_plans.len() > MAX_RESIDENT_SELECTION_PLANS {
+            self.resident_selection_plans.pop_front();
+        }
+    }
+
     pub fn score(&mut self, request: &Request) -> Result<Vec<(u32, f32)>> {
         let native_profile = request.scoring_profile.native_code();
         if self
@@ -425,6 +521,12 @@ impl Engine {
         if candidates.is_empty() {
             return Ok(Vec::new());
         }
+        if request.scoring_profile == ScoringProfile::RawFp8E4m3
+            && request.quantization_contract.is_none()
+            && let Some(result) = self.score_cached_resident_selection(request)
+        {
+            return result;
+        }
         let mut scores = vec![None; candidates.len()];
         let mut hit_chunks = (0..self.devices.len())
             .map(|_| Vec::<ResidentTensor>::new())
@@ -481,6 +583,13 @@ impl Engine {
 
         let hit_result =
             self.score_devices(request, active_quantizer.as_ref(), &hit_chunks, &mut scores);
+        if missing_descriptors.is_empty()
+            && request.scoring_profile == ScoringProfile::RawFp8E4m3
+            && request.quantization_contract.is_none()
+            && hit_result.is_ok()
+        {
+            self.remember_resident_selection(request, &hit_chunks, &duplicate_candidates);
+        }
         let hit_cleanup = self.release_chunks(&hit_chunks);
         hit_result?;
         hit_cleanup?;
@@ -643,20 +752,7 @@ impl Engine {
         // Equal content-addressed tensors have equal TileMaxSim scores. Preserve
         // every logical candidate id while avoiding duplicate cache acquisitions,
         // uploads, and kernel work inside one request.
-        for (duplicate_index, first_index) in duplicate_candidates {
-            scores[duplicate_index] = scores[first_index];
-        }
-
-        request
-            .candidate_slice()
-            .iter()
-            .enumerate()
-            .map(|(index, descriptor)| {
-                scores[index]
-                    .map(|score| (descriptor.candidate_id, score))
-                    .ok_or_else(|| anyhow!("missing native TileMaxSim result"))
-            })
-            .collect()
+        finalize_scores(request, scores, duplicate_candidates)
     }
 
     /// Score an exact-profile microbatch that shares the same candidate list.
@@ -1226,6 +1322,26 @@ fn unique_descriptors(descriptors: &[Descriptor]) -> Vec<Descriptor> {
         .iter()
         .filter(|descriptor| seen.insert(cache_key(descriptor)))
         .cloned()
+        .collect()
+}
+
+fn finalize_scores(
+    request: &Request,
+    mut scores: Vec<Option<f32>>,
+    duplicate_candidates: impl IntoIterator<Item = (usize, usize)>,
+) -> Result<Vec<(u32, f32)>> {
+    for (duplicate_index, first_index) in duplicate_candidates {
+        scores[duplicate_index] = scores[first_index];
+    }
+    request
+        .candidate_slice()
+        .iter()
+        .enumerate()
+        .map(|(index, descriptor)| {
+            scores[index]
+                .map(|score| (descriptor.candidate_id, score))
+                .ok_or_else(|| anyhow!("missing native TileMaxSim result"))
+        })
         .collect()
 }
 
