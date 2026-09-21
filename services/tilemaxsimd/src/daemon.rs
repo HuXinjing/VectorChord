@@ -1917,13 +1917,7 @@ fn run_scheduler(
                         } else {
                             metrics.completed.fetch_add(1, Ordering::Relaxed);
                             if let Some(top_k) = work.request.top_k {
-                                work.results.sort_unstable_by(|left, right| {
-                                    right
-                                        .1
-                                        .total_cmp(&left.1)
-                                        .then_with(|| left.0.cmp(&right.0))
-                                });
-                                work.results.truncate(top_k);
+                                retain_ranked_top_k(&mut work.results, top_k);
                             }
                             Some(protocol::success(version, request_id, &work.results))
                         }
@@ -1961,6 +1955,8 @@ fn run_scheduler(
                 serde_json::json!({
                     "event": "tilemaxsim_rust_request",
                     "request_id": request_id,
+                    "candidate_count": work.request.candidates.len(),
+                    "top_k": work.request.top_k,
                     "tenant_hash": tenant_hash(&tenant),
                     "priority": priority,
                     "total_ms": work.accepted_at.elapsed().as_secs_f64() * 1000.0,
@@ -1979,6 +1975,20 @@ fn run_scheduler(
         }
     }
     Ok(())
+}
+
+fn retain_ranked_top_k(results: &mut Vec<(u32, f32)>, top_k: usize) {
+    let rank = |left: &(u32, f32), right: &(u32, f32)| {
+        right
+            .1
+            .total_cmp(&left.1)
+            .then_with(|| left.0.cmp(&right.0))
+    };
+    if top_k < results.len() {
+        results.select_nth_unstable_by(top_k, rank);
+        results.truncate(top_k);
+    }
+    results.sort_unstable_by(rank);
 }
 
 fn works_are_batch_compatible(left: &Work, right: &Work, minimum_overlap_milli: u16) -> bool {
@@ -3674,6 +3684,7 @@ mod tests {
         candidate_fmas, handle_status_connection, header_version, is_fatal_cuda_diagnostic,
         kib_to_bytes, quantum_end, read_management_request, render_metrics,
         resolve_descriptor_catalog, resolve_descriptor_manifest, resolve_quantum_candidates,
+        retain_ranked_top_k,
         tenant_hash,
     };
     #[cfg(feature = "backend-cpu")]
@@ -3753,6 +3764,26 @@ mod tests {
                 .load(Ordering::Relaxed),
             0
         );
+    }
+
+    #[test]
+    fn ranked_top_k_matches_full_score_and_id_ordering() {
+        let input: Vec<(u32, f32)> = vec![
+            (9, 0.2),
+            (4, 0.9),
+            (7, 0.5),
+            (2, 0.9),
+            (8, -0.1),
+            (1, 0.5),
+        ];
+        let mut expected = input.clone();
+        expected.sort_unstable_by(|left, right| {
+            right.1.total_cmp(&left.1).then_with(|| left.0.cmp(&right.0))
+        });
+        expected.truncate(4);
+        let mut actual = input;
+        retain_ranked_top_k(&mut actual, 4);
+        assert_eq!(actual, expected);
     }
 
     #[test]
