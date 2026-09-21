@@ -1531,6 +1531,9 @@ mod tests {
             query: vec![0; 640],
             candidates: vec![descriptor(candidate_id, "same-content", 1)],
             manifest_digest: None,
+            catalog_digest: None,
+            catalog_public_ids: Vec::new(),
+            catalog_registration: false,
         };
         let requests = [request(1, 11), request(2, 99)];
         let attached =

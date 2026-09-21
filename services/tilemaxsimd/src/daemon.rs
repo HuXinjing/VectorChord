@@ -47,7 +47,12 @@ static SHUTDOWN_REQUESTED: AtomicBool = AtomicBool::new(false);
 static RELOAD_REQUESTED: AtomicBool = AtomicBool::new(false);
 const MAX_DESCRIPTOR_MANIFESTS: usize = 64;
 const MAX_DESCRIPTOR_MANIFEST_CANDIDATES: usize = 1_000_000;
-static DESCRIPTOR_MANIFESTS: OnceLock<Mutex<VecDeque<(String, Arc<Vec<protocol::Descriptor>>)>>> =
+type DescriptorManifest = (String, Arc<Vec<protocol::Descriptor>>);
+static DESCRIPTOR_MANIFESTS: OnceLock<Mutex<VecDeque<DescriptorManifest>>> = OnceLock::new();
+const MAX_DESCRIPTOR_CATALOGS: usize = 64;
+const MAX_DESCRIPTOR_CATALOG_ENTRIES: usize = 1_000_000;
+type DescriptorCatalog = HashMap<i64, protocol::Descriptor>;
+static DESCRIPTOR_CATALOGS: OnceLock<Mutex<VecDeque<(String, DescriptorCatalog)>>> =
     OnceLock::new();
 
 #[derive(Clone, Debug, Deserialize)]
@@ -989,6 +994,10 @@ struct RuntimeMetrics {
     descriptor_manifest_registrations: AtomicU64,
     descriptor_manifest_evictions: AtomicU64,
     descriptor_bytes_avoided: AtomicU64,
+    descriptor_catalog_hits: AtomicU64,
+    descriptor_catalog_misses: AtomicU64,
+    descriptor_catalog_registrations: AtomicU64,
+    descriptor_catalog_evictions: AtomicU64,
     latency_observations: AtomicU64,
     total_latency_us: AtomicU64,
     gpu_latency_us: AtomicU64,
@@ -1234,7 +1243,10 @@ fn descriptor_manifest_key(request: &protocol::Request, digest: &[u8; 32]) -> St
     format!(
         "{}\0{}\0{}\0{}\0{}\0{}",
         request.tenant,
-        request.candidates.first().map_or("", |value| value.contract.as_str()),
+        request
+            .candidates
+            .first()
+            .map_or("", |value| value.contract.as_str()),
         request.scoring_profile.cache_tag(),
         request.dimension,
         request.candidate_dtype,
@@ -1311,6 +1323,110 @@ fn resolve_descriptor_manifest(request: &mut protocol::Request, metrics: &Runtim
     true
 }
 
+fn descriptor_catalog_key(request: &protocol::Request, digest: &[u8; 32]) -> String {
+    format!(
+        "{}\0{}\0{}\0{}\0{}\0{}",
+        request.tenant,
+        request.model_contract,
+        request.scoring_profile.cache_tag(),
+        request.dimension,
+        request.candidate_dtype,
+        hex::encode(digest),
+    )
+}
+
+fn resolve_descriptor_catalog(request: &mut protocol::Request, metrics: &RuntimeMetrics) -> bool {
+    let Some(digest) = request.catalog_digest else {
+        return true;
+    };
+    let key = descriptor_catalog_key(request, &digest);
+    let catalogs = DESCRIPTOR_CATALOGS.get_or_init(|| Mutex::new(VecDeque::new()));
+    let mut cache = catalogs.lock().unwrap_or_else(|error| error.into_inner());
+    if request.catalog_registration {
+        let incoming = request.catalog_public_ids.len();
+        if incoming != request.candidates.len() {
+            return false;
+        }
+        let position = cache.iter().position(|(candidate, _)| candidate == &key);
+        let mut entry = position
+            .and_then(|position| cache.remove(position))
+            .unwrap_or_else(|| (key.clone(), HashMap::new()));
+        for (&public_id, descriptor) in request
+            .catalog_public_ids
+            .iter()
+            .zip(request.candidates.iter())
+        {
+            if let Some(existing) = entry.1.get(&public_id) {
+                if existing.contract != descriptor.contract
+                    || existing.digest != descriptor.digest
+                    || existing.rows != descriptor.rows
+                    || existing.dimension != descriptor.dimension
+                    || existing.dtype != descriptor.dtype
+                {
+                    cache.push_back(entry);
+                    metrics
+                        .descriptor_catalog_misses
+                        .fetch_add(1, Ordering::Relaxed);
+                    return false;
+                }
+            } else {
+                entry.1.insert(public_id, descriptor.clone());
+            }
+        }
+        let mut total = cache.iter().map(|(_, values)| values.len()).sum::<usize>();
+        while cache.len() >= MAX_DESCRIPTOR_CATALOGS
+            || total.saturating_add(entry.1.len()) > MAX_DESCRIPTOR_CATALOG_ENTRIES
+        {
+            let Some((_, evicted)) = cache.pop_front() else {
+                break;
+            };
+            total = total.saturating_sub(evicted.len());
+            metrics
+                .descriptor_catalog_evictions
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        cache.push_back(entry);
+        metrics
+            .descriptor_catalog_registrations
+            .fetch_add(1, Ordering::Relaxed);
+        return true;
+    }
+    let Some(position) = cache.iter().position(|(candidate, _)| candidate == &key) else {
+        metrics
+            .descriptor_catalog_misses
+            .fetch_add(1, Ordering::Relaxed);
+        return false;
+    };
+    let entry = cache
+        .remove(position)
+        .expect("descriptor catalog position came from the same cache");
+    let mut resolved = Vec::with_capacity(request.catalog_public_ids.len());
+    for (ordinal, public_id) in request.catalog_public_ids.iter().enumerate() {
+        let Some(descriptor) = entry.1.get(public_id) else {
+            cache.push_back(entry);
+            metrics
+                .descriptor_catalog_misses
+                .fetch_add(1, Ordering::Relaxed);
+            return false;
+        };
+        let mut descriptor = descriptor.clone();
+        descriptor.candidate_id = ordinal as u32;
+        resolved.push(descriptor);
+    }
+    request.candidates = resolved;
+    metrics
+        .descriptor_catalog_hits
+        .fetch_add(1, Ordering::Relaxed);
+    metrics.descriptor_bytes_avoided.fetch_add(
+        u64::try_from(request.candidates.len())
+            .unwrap_or(u64::MAX)
+            .saturating_mul(32),
+        Ordering::Relaxed,
+    );
+    cache.push_back(entry);
+    true
+}
+
 fn read_and_enqueue(
     mut connection: ClientStream,
     sender: &mpsc::SyncSender<Work>,
@@ -1357,6 +1473,14 @@ fn read_and_enqueue(
             return;
         }
     };
+    if !resolve_descriptor_catalog(&mut request, &metrics) {
+        metrics.failed.fetch_add(1, Ordering::Relaxed);
+        write_response_nonfatal(
+            &mut connection,
+            &protocol::failure(version, request_id, 4, "descriptor catalog miss"),
+        );
+        return;
+    }
     if !resolve_descriptor_manifest(&mut request, &metrics) {
         metrics.failed.fetch_add(1, Ordering::Relaxed);
         write_response_nonfatal(
@@ -1839,6 +1963,9 @@ fn request_quantum(work: &Work, config: &SchedulerConfig) -> protocol::Request {
         query: work.request.query.clone(),
         candidates: work.request.candidates[work.next_candidate..end].to_vec(),
         manifest_digest: work.request.manifest_digest,
+        catalog_digest: work.request.catalog_digest,
+        catalog_public_ids: Vec::new(),
+        catalog_registration: false,
     }
 }
 
@@ -2474,8 +2601,14 @@ fn render_metrics(metrics: &RuntimeMetrics) -> String {
     )
     .unwrap();
     for (outcome, value) in [
-        ("hit", metrics.descriptor_manifest_hits.load(Ordering::Relaxed)),
-        ("miss", metrics.descriptor_manifest_misses.load(Ordering::Relaxed)),
+        (
+            "hit",
+            metrics.descriptor_manifest_hits.load(Ordering::Relaxed),
+        ),
+        (
+            "miss",
+            metrics.descriptor_manifest_misses.load(Ordering::Relaxed),
+        ),
         (
             "registration",
             metrics
@@ -2484,12 +2617,46 @@ fn render_metrics(metrics: &RuntimeMetrics) -> String {
         ),
         (
             "eviction",
-            metrics.descriptor_manifest_evictions.load(Ordering::Relaxed),
+            metrics
+                .descriptor_manifest_evictions
+                .load(Ordering::Relaxed),
         ),
     ] {
         writeln!(
             output,
             "tilemaxsim_descriptor_manifest_total{{outcome=\"{outcome}\"}} {value}"
+        )
+        .unwrap();
+    }
+    writeln!(
+        output,
+        "# HELP tilemaxsim_descriptor_catalog_total Versioned descriptor catalog outcomes."
+    )
+    .unwrap();
+    writeln!(output, "# TYPE tilemaxsim_descriptor_catalog_total counter").unwrap();
+    for (outcome, value) in [
+        (
+            "hit",
+            metrics.descriptor_catalog_hits.load(Ordering::Relaxed),
+        ),
+        (
+            "miss",
+            metrics.descriptor_catalog_misses.load(Ordering::Relaxed),
+        ),
+        (
+            "registration",
+            metrics
+                .descriptor_catalog_registrations
+                .load(Ordering::Relaxed),
+        ),
+        (
+            "eviction",
+            metrics.descriptor_catalog_evictions.load(Ordering::Relaxed),
+        ),
+    ] {
+        writeln!(
+            output,
+            "tilemaxsim_descriptor_catalog_total{{outcome=\"{outcome}\"}} {value}"
         )
         .unwrap();
     }
@@ -3319,6 +3486,9 @@ fn header_version(frame: &[u8]) -> u16 {
             protocol::VERSION_MANIFEST_LOGICAL_EXTERNAL => {
                 protocol::VERSION_MANIFEST_LOGICAL_EXTERNAL
             }
+            protocol::VERSION_CATALOG_LOGICAL_EXTERNAL => {
+                protocol::VERSION_CATALOG_LOGICAL_EXTERNAL
+            }
             _ => VERSION_EXTERNAL,
         }
     }
@@ -3429,9 +3599,9 @@ mod tests {
     use super::verify_backends;
     use super::{
         AdminAction, ByteAdmission, OperationRegistry, PendingAdmission, RuntimeMetrics,
-        candidate_fmas, handle_status_connection, is_fatal_cuda_diagnostic, kib_to_bytes,
-        header_version, quantum_end, read_management_request, render_metrics, resolve_quantum_candidates,
-        tenant_hash,
+        candidate_fmas, handle_status_connection, header_version, is_fatal_cuda_diagnostic,
+        kib_to_bytes, quantum_end, read_management_request, render_metrics,
+        resolve_quantum_candidates, tenant_hash,
     };
     #[cfg(feature = "backend-cpu")]
     use crate::backend::{AcceleratorBackend, BackendKind};

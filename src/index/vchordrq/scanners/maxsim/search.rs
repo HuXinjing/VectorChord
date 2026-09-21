@@ -158,7 +158,8 @@ fn execute_external_search(
         gucs::vchordrq_maxsim_gpu_max_batch_bytes() as usize,
     )
     .with_scoring_profile(gucs::vchordrq_maxsim_scoring_profile())
-    .with_quantization_contract(gucs::vchordrq_maxsim_quantization_contract());
+    .with_quantization_contract(gucs::vchordrq_maxsim_quantization_contract())
+    .with_catalog_revision(gucs::vchordrq_maxsim_catalog_revision());
     if let Some(tenant) = gucs::vchordrq_maxsim_tenant() {
         backend = backend.with_scheduling(tenant, gucs::vchordrq_maxsim_priority());
     }

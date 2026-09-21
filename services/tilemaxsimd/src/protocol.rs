@@ -32,6 +32,9 @@ pub const VERSION_TYPED_COMPACT_LOGICAL_EXTERNAL: u16 = 8;
 /// SHA-256 digest of the canonical compact descriptor list; the daemon resolves
 /// the list from its bounded manifest cache.
 pub const VERSION_MANIFEST_LOGICAL_EXTERNAL: u16 = 9;
+/// Versioned descriptor catalog. Registration frames merge stable public IDs
+/// into one immutable revision; selection frames carry only delta-varint IDs.
+pub const VERSION_CATALOG_LOGICAL_EXTERNAL: u16 = 10;
 const MAGIC: &[u8; 4] = b"VCTM";
 const REQUEST_KIND: u16 = 1;
 const RESPONSE_KIND: u16 = 2;
@@ -68,6 +71,9 @@ pub struct Request {
     pub query: Vec<u8>,
     pub candidates: Vec<Descriptor>,
     pub manifest_digest: Option<[u8; 32]>,
+    pub catalog_digest: Option<[u8; 32]>,
+    pub catalog_public_ids: Vec<i64>,
+    pub catalog_registration: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -157,6 +163,30 @@ impl<'a> Reader<'a> {
         Ok(i32::from_le_bytes(self.take(4)?.try_into().unwrap()))
     }
 
+    fn i64(&mut self) -> Result<i64> {
+        Ok(i64::from_le_bytes(self.take(8)?.try_into().unwrap()))
+    }
+
+    fn varint_u64(&mut self) -> Result<u64> {
+        let mut value = 0_u64;
+        let mut bytes = 0_usize;
+        for shift in (0..=63).step_by(7) {
+            let byte = self.u8()?;
+            bytes += 1;
+            if shift == 63 && byte > 1 {
+                bail!("catalog public ID varint overflow");
+            }
+            value |= u64::from(byte & 0x7f) << shift;
+            if byte & 0x80 == 0 {
+                if bytes > 1 && byte == 0 {
+                    bail!("non-canonical catalog public ID varint");
+                }
+                return Ok(value);
+            }
+        }
+        bail!("catalog public ID varint overflow")
+    }
+
     fn text(&mut self, count: usize, maximum: usize, name: &str) -> Result<String> {
         if count == 0 || count > maximum {
             bail!("invalid {name} length");
@@ -233,9 +263,10 @@ pub fn parse(frame: &[u8]) -> Result<Request> {
             | VERSION_COMPACT_LOGICAL_EXTERNAL
             | VERSION_TYPED_COMPACT_LOGICAL_EXTERNAL
             | VERSION_MANIFEST_LOGICAL_EXTERNAL
+            | VERSION_CATALOG_LOGICAL_EXTERNAL
     ) || kind != REQUEST_KIND
     {
-        bail!("Rust daemon requires TileMaxSim external protocol v2 through v9");
+        bail!("Rust daemon requires TileMaxSim external protocol v2 through v10");
     }
     if usize::try_from(body_bytes).ok() != Some(frame.len() - HEADER_BYTES) {
         bail!("request body length mismatch");
@@ -254,10 +285,17 @@ pub fn parse(frame: &[u8]) -> Result<Request> {
             | VERSION_COMPACT_LOGICAL_EXTERNAL
             | VERSION_TYPED_COMPACT_LOGICAL_EXTERNAL
             | VERSION_MANIFEST_LOGICAL_EXTERNAL
+            | VERSION_CATALOG_LOGICAL_EXTERNAL
     ) {
         let profile = ScoringProfile::parse(reader.u8()?)?;
         let storage_dtype = reader.u8()?;
-        if !matches!(version, VERSION_TYPED_COMPACT_LOGICAL_EXTERNAL | VERSION_MANIFEST_LOGICAL_EXTERNAL) && storage_dtype != 0 {
+        if !matches!(
+            version,
+            VERSION_TYPED_COMPACT_LOGICAL_EXTERNAL
+                | VERSION_MANIFEST_LOGICAL_EXTERNAL
+                | VERSION_CATALOG_LOGICAL_EXTERNAL
+        ) && storage_dtype != 0
+        {
             bail!("unsupported reserved bits");
         }
         (profile, storage_dtype)
@@ -271,7 +309,12 @@ pub fn parse(frame: &[u8]) -> Result<Request> {
     let contract_bytes = reader.u32()? as usize;
     let quantization_contract_bytes = if matches!(
         version,
-        VERSION_QUANTIZED_EXTERNAL | VERSION_LOGICAL_EXTERNAL | VERSION_COMPACT_LOGICAL_EXTERNAL | VERSION_TYPED_COMPACT_LOGICAL_EXTERNAL | VERSION_MANIFEST_LOGICAL_EXTERNAL
+        VERSION_QUANTIZED_EXTERNAL
+            | VERSION_LOGICAL_EXTERNAL
+            | VERSION_COMPACT_LOGICAL_EXTERNAL
+            | VERSION_TYPED_COMPACT_LOGICAL_EXTERNAL
+            | VERSION_MANIFEST_LOGICAL_EXTERNAL
+            | VERSION_CATALOG_LOGICAL_EXTERNAL
     ) {
         reader.u32()? as usize
     } else {
@@ -292,6 +335,7 @@ pub fn parse(frame: &[u8]) -> Result<Request> {
             | VERSION_COMPACT_LOGICAL_EXTERNAL
             | VERSION_TYPED_COMPACT_LOGICAL_EXTERNAL
             | VERSION_MANIFEST_LOGICAL_EXTERNAL
+            | VERSION_CATALOG_LOGICAL_EXTERNAL
     ) {
         (reader.i32()?, reader.u32()?, reader.u32()? as usize)
     } else {
@@ -309,13 +353,18 @@ pub fn parse(frame: &[u8]) -> Result<Request> {
             | VERSION_COMPACT_LOGICAL_EXTERNAL
             | VERSION_TYPED_COMPACT_LOGICAL_EXTERNAL
             | VERSION_MANIFEST_LOGICAL_EXTERNAL
+            | VERSION_CATALOG_LOGICAL_EXTERNAL
     ) && !(1..=600_000).contains(&timeout_ms)
     {
         bail!("scheduler timeout must be between 1 and 600000 milliseconds");
     }
     let top_k = if matches!(
         version,
-        VERSION_LOGICAL_EXTERNAL | VERSION_COMPACT_LOGICAL_EXTERNAL | VERSION_TYPED_COMPACT_LOGICAL_EXTERNAL | VERSION_MANIFEST_LOGICAL_EXTERNAL
+        VERSION_LOGICAL_EXTERNAL
+            | VERSION_COMPACT_LOGICAL_EXTERNAL
+            | VERSION_TYPED_COMPACT_LOGICAL_EXTERNAL
+            | VERSION_MANIFEST_LOGICAL_EXTERNAL
+            | VERSION_CATALOG_LOGICAL_EXTERNAL
     ) {
         let value = reader.u32()? as usize;
         if value == 0 || value > candidate_count as usize {
@@ -328,7 +377,12 @@ pub fn parse(frame: &[u8]) -> Result<Request> {
     let contract = reader.text(contract_bytes, 512, "model contract")?;
     let quantization_contract = if matches!(
         version,
-        VERSION_QUANTIZED_EXTERNAL | VERSION_LOGICAL_EXTERNAL | VERSION_COMPACT_LOGICAL_EXTERNAL | VERSION_TYPED_COMPACT_LOGICAL_EXTERNAL | VERSION_MANIFEST_LOGICAL_EXTERNAL
+        VERSION_QUANTIZED_EXTERNAL
+            | VERSION_LOGICAL_EXTERNAL
+            | VERSION_COMPACT_LOGICAL_EXTERNAL
+            | VERSION_TYPED_COMPACT_LOGICAL_EXTERNAL
+            | VERSION_MANIFEST_LOGICAL_EXTERNAL
+            | VERSION_CATALOG_LOGICAL_EXTERNAL
     ) && quantization_contract_bytes > 0
     {
         let value = reader.text(quantization_contract_bytes, 128, "quantization contract")?;
@@ -358,6 +412,7 @@ pub fn parse(frame: &[u8]) -> Result<Request> {
             | VERSION_COMPACT_LOGICAL_EXTERNAL
             | VERSION_TYPED_COMPACT_LOGICAL_EXTERNAL
             | VERSION_MANIFEST_LOGICAL_EXTERNAL
+            | VERSION_CATALOG_LOGICAL_EXTERNAL
     ) {
         reader.text(tenant_bytes, 256, "scheduler tenant")?
     } else {
@@ -371,14 +426,62 @@ pub fn parse(frame: &[u8]) -> Result<Request> {
     } else {
         None
     };
+    let (catalog_digest, catalog_registration, mut catalog_public_ids) =
+        if version == VERSION_CATALOG_LOGICAL_EXTERNAL {
+            let mode = reader.u8()?;
+            if !matches!(mode, 1 | 2) {
+                bail!("invalid descriptor catalog frame mode");
+            }
+            let digest = reader.take(32)?.try_into().unwrap();
+            let mut public_ids = Vec::with_capacity(candidate_count as usize);
+            if mode == 1 {
+                let mut previous = 0_u64;
+                for _ in 0..candidate_count {
+                    let delta = reader.varint_u64()?;
+                    if delta == 0 {
+                        bail!("catalog public IDs must be strictly increasing");
+                    }
+                    let current = previous
+                        .checked_add(delta)
+                        .ok_or_else(|| anyhow!("catalog public ID overflow"))?;
+                    if current > i64::MAX as u64 {
+                        bail!("catalog public ID overflow");
+                    }
+                    public_ids.push(current as i64);
+                    previous = current;
+                }
+            }
+            (Some(digest), mode == 2, public_ids)
+        } else {
+            (None, false, Vec::new())
+        };
     let mut total_tokens = query_rows as usize;
     let mut total_bytes = query_bytes;
     let mut candidate_ids = HashSet::new();
     let mut candidates = Vec::with_capacity(candidate_count as usize);
-    for _ in 0..if manifest_digest.is_some() { 0 } else { candidate_count } {
-        let candidate_id = reader.u32()?;
+    for ordinal in
+        0..if manifest_digest.is_some() || (catalog_digest.is_some() && !catalog_registration) {
+            0
+        } else {
+            candidate_count
+        }
+    {
+        let (public_id, candidate_id) = if catalog_registration {
+            let public_id = reader.i64()?;
+            if public_id <= 0
+                || catalog_public_ids
+                    .last()
+                    .is_some_and(|previous| *previous >= public_id)
+            {
+                bail!("catalog public IDs must be positive and strictly increasing");
+            }
+            catalog_public_ids.push(public_id);
+            (Some(public_id), ordinal)
+        } else {
+            (None, reader.u32()?)
+        };
         let rows = reader.u32()?;
-        if matches!(version, VERSION_COMPACT_LOGICAL_EXTERNAL | VERSION_TYPED_COMPACT_LOGICAL_EXTERNAL) {
+        if catalog_registration {
             if !candidate_ids.insert(candidate_id) {
                 bail!("duplicate candidate ID");
             }
@@ -387,7 +490,15 @@ pub fn parse(frame: &[u8]) -> Result<Request> {
                 .checked_add(rows as usize)
                 .ok_or_else(|| anyhow!("token overflow"))?;
             total_bytes = total_bytes
-                .checked_add(tensor_bytes(rows, dimension, if storage_dtype == 0 { dtype } else { storage_dtype })?)
+                .checked_add(tensor_bytes(
+                    rows,
+                    dimension,
+                    if storage_dtype == 0 {
+                        dtype
+                    } else {
+                        storage_dtype
+                    },
+                )?)
                 .ok_or_else(|| anyhow!("byte overflow"))?;
             candidates.push(Descriptor {
                 candidate_id,
@@ -395,7 +506,48 @@ pub fn parse(frame: &[u8]) -> Result<Request> {
                 digest,
                 rows,
                 dimension,
-                dtype: if storage_dtype == 0 { dtype } else { storage_dtype },
+                dtype: if storage_dtype == 0 {
+                    dtype
+                } else {
+                    storage_dtype
+                },
+            });
+            debug_assert!(public_id.is_some());
+            continue;
+        }
+        if matches!(
+            version,
+            VERSION_COMPACT_LOGICAL_EXTERNAL | VERSION_TYPED_COMPACT_LOGICAL_EXTERNAL
+        ) {
+            if !candidate_ids.insert(candidate_id) {
+                bail!("duplicate candidate ID");
+            }
+            let digest = hex::encode(reader.take(32)?);
+            total_tokens = total_tokens
+                .checked_add(rows as usize)
+                .ok_or_else(|| anyhow!("token overflow"))?;
+            total_bytes = total_bytes
+                .checked_add(tensor_bytes(
+                    rows,
+                    dimension,
+                    if storage_dtype == 0 {
+                        dtype
+                    } else {
+                        storage_dtype
+                    },
+                )?)
+                .ok_or_else(|| anyhow!("byte overflow"))?;
+            candidates.push(Descriptor {
+                candidate_id,
+                contract: contract.clone(),
+                digest,
+                rows,
+                dimension,
+                dtype: if storage_dtype == 0 {
+                    dtype
+                } else {
+                    storage_dtype
+                },
             });
             continue;
         }
@@ -426,7 +578,9 @@ pub fn parse(frame: &[u8]) -> Result<Request> {
             .ok_or_else(|| anyhow!("byte overflow"))?;
         if !matches!(
             version,
-            VERSION_LOGICAL_EXTERNAL | VERSION_COMPACT_LOGICAL_EXTERNAL | VERSION_TYPED_COMPACT_LOGICAL_EXTERNAL
+            VERSION_LOGICAL_EXTERNAL
+                | VERSION_COMPACT_LOGICAL_EXTERNAL
+                | VERSION_TYPED_COMPACT_LOGICAL_EXTERNAL
         ) && (total_tokens > 1_000_000 || total_bytes > 1024 * 1024 * 1024)
         {
             bail!("request exceeds tensor limits");
@@ -451,13 +605,20 @@ pub fn parse(frame: &[u8]) -> Result<Request> {
         query_rows,
         dimension,
         dtype,
-        candidate_dtype: if storage_dtype == 0 { dtype } else { storage_dtype },
+        candidate_dtype: if storage_dtype == 0 {
+            dtype
+        } else {
+            storage_dtype
+        },
         scoring_profile,
         quantization_contract,
         top_k,
         query,
         candidates,
         manifest_digest,
+        catalog_digest,
+        catalog_public_ids,
+        catalog_registration,
     })
 }
 
@@ -768,6 +929,81 @@ mod tests {
         assert_eq!(request.candidate_dtype, 3);
         assert!(request.candidates.is_empty());
         assert_eq!(request.manifest_digest, Some([0xcd; 32]));
+    }
+
+    #[test]
+    fn catalog_selection_decodes_delta_varint_public_ids() {
+        let contract = "model@1";
+        let mut body = Vec::new();
+        body.extend_from_slice(&2_u32.to_le_bytes());
+        body.extend_from_slice(&1_u32.to_le_bytes());
+        body.extend_from_slice(&3_u32.to_le_bytes());
+        body.extend_from_slice(&[2, 1, 1, 0]);
+        body.extend_from_slice(&(contract.len() as u32).to_le_bytes());
+        body.extend_from_slice(&0_u32.to_le_bytes());
+        body.extend_from_slice(&0_i32.to_le_bytes());
+        body.extend_from_slice(&4_000_u32.to_le_bytes());
+        body.extend_from_slice(&6_u32.to_le_bytes());
+        body.extend_from_slice(&2_u32.to_le_bytes());
+        body.extend_from_slice(contract.as_bytes());
+        body.extend_from_slice(b"tenant");
+        body.extend_from_slice(&[0_u8; 4]);
+        body.push(1);
+        body.extend_from_slice(&[0xcd; 32]);
+        body.extend_from_slice(&[7, 3, 0xac, 0x02]);
+        let mut frame = Vec::new();
+        frame.extend_from_slice(MAGIC);
+        frame.extend_from_slice(&VERSION_CATALOG_LOGICAL_EXTERNAL.to_le_bytes());
+        frame.extend_from_slice(&REQUEST_KIND.to_le_bytes());
+        frame.extend_from_slice(&42_u64.to_le_bytes());
+        frame.extend_from_slice(&(body.len() as u64).to_le_bytes());
+        frame.extend_from_slice(&body);
+
+        let request = parse(&frame).unwrap();
+        assert_eq!(request.catalog_digest, Some([0xcd; 32]));
+        assert_eq!(request.catalog_public_ids, vec![7, 10, 310]);
+        assert!(!request.catalog_registration);
+        assert!(request.candidates.is_empty());
+    }
+
+    #[test]
+    fn catalog_registration_carries_public_id_descriptor_pairs() {
+        let contract = "model@1";
+        let mut body = Vec::new();
+        body.extend_from_slice(&2_u32.to_le_bytes());
+        body.extend_from_slice(&1_u32.to_le_bytes());
+        body.extend_from_slice(&2_u32.to_le_bytes());
+        body.extend_from_slice(&[2, 1, 1, 0]);
+        body.extend_from_slice(&(contract.len() as u32).to_le_bytes());
+        body.extend_from_slice(&0_u32.to_le_bytes());
+        body.extend_from_slice(&0_i32.to_le_bytes());
+        body.extend_from_slice(&4_000_u32.to_le_bytes());
+        body.extend_from_slice(&6_u32.to_le_bytes());
+        body.extend_from_slice(&1_u32.to_le_bytes());
+        body.extend_from_slice(contract.as_bytes());
+        body.extend_from_slice(b"tenant");
+        body.extend_from_slice(&[0_u8; 4]);
+        body.push(2);
+        body.extend_from_slice(&[0xef; 32]);
+        for (public_id, rows, digest) in [(7_i64, 3_u32, 0xab), (10, 4, 0xbc)] {
+            body.extend_from_slice(&public_id.to_le_bytes());
+            body.extend_from_slice(&rows.to_le_bytes());
+            body.extend_from_slice(&[digest; 32]);
+        }
+        let mut frame = Vec::new();
+        frame.extend_from_slice(MAGIC);
+        frame.extend_from_slice(&VERSION_CATALOG_LOGICAL_EXTERNAL.to_le_bytes());
+        frame.extend_from_slice(&REQUEST_KIND.to_le_bytes());
+        frame.extend_from_slice(&42_u64.to_le_bytes());
+        frame.extend_from_slice(&(body.len() as u64).to_le_bytes());
+        frame.extend_from_slice(&body);
+
+        let request = parse(&frame).unwrap();
+        assert!(request.catalog_registration);
+        assert_eq!(request.catalog_public_ids, vec![7, 10]);
+        assert_eq!(request.candidates.len(), 2);
+        assert_eq!(request.candidates[1].candidate_id, 1);
+        assert_eq!(request.candidates[1].rows, 4);
     }
 
     #[test]

@@ -137,6 +137,9 @@ static VCHORDRQ_MAXSIM_GPU_TIMEOUT_MS: GucSetting<i32> = GucSetting::<i32>::new(
 static VCHORDRQ_MAXSIM_TENANT: GucSetting<Option<CString>> =
     GucSetting::<Option<CString>>::new(Some(c""));
 
+static VCHORDRQ_MAXSIM_CATALOG_REVISION: GucSetting<Option<CString>> =
+    GucSetting::<Option<CString>>::new(Some(c""));
+
 static VCHORDRQ_MAXSIM_PRIORITY: GucSetting<i32> = GucSetting::<i32>::new(0);
 
 static VCHORDRQ_MAXSIM_GPU_MAX_BATCH_TOKENS: GucSetting<i32> = GucSetting::<i32>::new(1_000_000);
@@ -301,6 +304,14 @@ pub fn init() {
         c"Logical tenant used only by the TileMaxSim GPU scheduler.",
         c"Authorization and source filtering must be completed before setting this request-local value.",
         &VCHORDRQ_MAXSIM_TENANT,
+        GucContext::Userset,
+        GucFlags::default(),
+    );
+    GucRegistry::define_string_guc(
+        c"vchordrq.maxsim_catalog_revision",
+        c"Opaque, source-scoped revision for the TileMaxSim descriptor catalog.",
+        c"Set transaction-locally only after applying tenant and source authorization filters.",
+        &VCHORDRQ_MAXSIM_CATALOG_REVISION,
         GucContext::Userset,
         GucFlags::default(),
     );
@@ -704,6 +715,13 @@ pub fn vchordrq_maxsim_tenant() -> Option<String> {
     VCHORDRQ_MAXSIM_TENANT.get().and_then(|tenant| {
         let tenant = tenant.to_string_lossy().into_owned();
         (!tenant.is_empty()).then_some(tenant)
+    })
+}
+
+pub fn vchordrq_maxsim_catalog_revision() -> Option<String> {
+    VCHORDRQ_MAXSIM_CATALOG_REVISION.get().and_then(|revision| {
+        let revision = revision.to_string_lossy().into_owned();
+        (!revision.is_empty()).then_some(revision)
     })
 }
 

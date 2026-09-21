@@ -74,12 +74,7 @@ impl ExternalTensorColumns {
 #[derive(Clone, Debug)]
 pub(super) struct ExternalTensorDescriptor {
     pub candidate: PageCandidate,
-    /// Stable application identifier. It stays inside PostgreSQL and is never
-    /// encoded into the sidecar request.
-    #[allow(
-        dead_code,
-        reason = "returned by the score API through a separate visible-row map"
-    )]
+    /// Stable application identifier used by the versioned sidecar catalog.
     pub public_id: i64,
     pub tensor_ref: String,
     pub rows: u32,

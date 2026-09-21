@@ -329,7 +329,11 @@ fn publish_object(
     payload: &[u8],
     expected_sha256: Option<&str>,
 ) -> Result<PublishedDescriptor> {
-    let dtype = if dtype == "fp8_e4m3" { "fp8_e4m3_raw" } else { dtype };
+    let dtype = if dtype == "fp8_e4m3" {
+        "fp8_e4m3_raw"
+    } else {
+        dtype
+    };
     if payload.len() != tensor_bytes(rows, dimension, dtype)? {
         bail!("tensor payload length disagrees with its shape");
     }
@@ -507,8 +511,12 @@ mod tests {
     #[test]
     fn publish_object_canonicalizes_raw_fp8_dtype() {
         let root = std::env::temp_dir().join(format!(
-            "tilemaxsimctl-fp8-{}-{}", std::process::id(),
-            SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap().as_nanos()
+            "tilemaxsimctl-fp8-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
         ));
         let descriptor = publish_object(&root, 1, 2, "fp8_e4m3", &[0x38, 0xb8], None).unwrap();
         assert_eq!(descriptor.tensor_dtype, "fp8_e4m3_raw");

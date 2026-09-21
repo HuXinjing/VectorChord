@@ -35,6 +35,7 @@ const LOGICAL_EXTERNAL_VERSION: u16 = 6;
 const COMPACT_LOGICAL_EXTERNAL_VERSION: u16 = 7;
 const TYPED_COMPACT_LOGICAL_EXTERNAL_VERSION: u16 = 8;
 const MANIFEST_LOGICAL_EXTERNAL_VERSION: u16 = 9;
+const CATALOG_LOGICAL_EXTERNAL_VERSION: u16 = 10;
 const REQUEST_KIND: u16 = 1;
 const RESPONSE_KIND: u16 = 2;
 const HEADER_LEN: usize = 24;
@@ -150,6 +151,7 @@ pub(super) struct GpuExternalTileMaxsimBackend<T> {
     scheduling: Option<TileMaxsimScheduling>,
     scoring_profile: PostgresMaxsimScoringProfile,
     quantization_contract: Option<String>,
+    catalog_revision: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -175,6 +177,7 @@ impl<T> GpuExternalTileMaxsimBackend<T> {
             scheduling: None,
             scoring_profile: PostgresMaxsimScoringProfile::ExactFp16,
             quantization_contract: None,
+            catalog_revision: None,
         }
     }
 
@@ -193,6 +196,13 @@ impl<T> GpuExternalTileMaxsimBackend<T> {
 
     pub(super) fn with_scheduling(mut self, tenant: String, priority: i32) -> Self {
         self.scheduling = Some(TileMaxsimScheduling { tenant, priority });
+        self
+    }
+
+    pub(super) fn with_catalog_revision(mut self, revision: Option<String>) -> Self {
+        self.catalog_revision = revision.filter(|value| {
+            !value.is_empty() && value.len() <= 4096 && !value.chars().any(char::is_control)
+        });
         self
     }
 }
@@ -245,7 +255,19 @@ impl<T: TileMaxsimTransport> GpuExternalTileMaxsimBackend<T> {
             vec![descriptors]
         };
         let mut merged = BinaryHeap::new();
-        for group in groups {
+        for mut group in groups {
+            if self.catalog_revision.is_some() {
+                group.sort_unstable_by_key(|descriptor| descriptor.public_id);
+                if group.iter().any(|descriptor| descriptor.public_id <= 0)
+                    || group
+                        .windows(2)
+                        .any(|pair| pair[0].public_id == pair[1].public_id)
+                {
+                    return Err(RerankError::InvalidDescriptor(
+                        "catalog public IDs must be positive and unique",
+                    ));
+                }
+            }
             let group_top_k = top_k.min(group.len());
             let request_id = NEXT_REQUEST_ID.fetch_add(1, Ordering::Relaxed);
             let encoded = encode_external_descriptors(
@@ -266,54 +288,54 @@ impl<T: TileMaxsimTransport> GpuExternalTileMaxsimBackend<T> {
                 .and_then(|size| size.checked_add(group_top_k.checked_mul(8)?))
                 .map(|size| size.max(HEADER_LEN + 8 + MAX_REMOTE_ERROR_BYTES))
                 .ok_or(RerankError::RequestTooLarge)?;
-            let reference = manifest_reference(&encoded)?;
-            let response = self.transport.round_trip(
-                &reference,
-                remaining_logical_timeout(deadline)?,
+            if let Some(revision) = self.catalog_revision.as_deref() {
+                let (reference, registration) = catalog_frames(&encoded, &group, revision)?;
+                let response = self.transport.round_trip(
+                    &reference,
+                    remaining_logical_timeout(deadline)?,
+                    max_response_bytes,
+                )?;
+                let decoded = match decode_response_for_version(
+                    &response,
+                    CATALOG_LOGICAL_EXTERNAL_VERSION,
+                    request_id,
+                    &encoded.heap_keys,
+                    group_top_k,
+                ) {
+                    Err(RerankError::Remote(message)) if message == "descriptor catalog miss" => {
+                        let response = self.transport.round_trip(
+                            &registration,
+                            remaining_logical_timeout(deadline)?,
+                            max_response_bytes,
+                        )?;
+                        decode_response_for_version(
+                            &response,
+                            CATALOG_LOGICAL_EXTERNAL_VERSION,
+                            request_id,
+                            &encoded.heap_keys,
+                            group_top_k,
+                        )?
+                    }
+                    Err(RerankError::Protocol(message)) if message == "unsupported version" => self
+                        .round_trip_manifest_fallback(
+                            &encoded,
+                            request_id,
+                            group_top_k,
+                            deadline,
+                            max_response_bytes,
+                        )?,
+                    other => other?,
+                };
+                merged.extend(decoded.inner);
+                continue;
+            }
+            let decoded = self.round_trip_manifest_fallback(
+                &encoded,
+                request_id,
+                group_top_k,
+                deadline,
                 max_response_bytes,
             )?;
-            let decoded = decode_response_for_version(
-                &response,
-                MANIFEST_LOGICAL_EXTERNAL_VERSION,
-                request_id,
-                &encoded.heap_keys,
-                group_top_k,
-            );
-            let decoded = match decoded {
-                Err(RerankError::Remote(message)) if message == "descriptor manifest miss" => {
-                    let response = self.transport.round_trip(
-                        &encoded.frame,
-                        remaining_logical_timeout(deadline)?,
-                        max_response_bytes,
-                    )?;
-                    decode_response_for_version(
-                        &response,
-                        encoded.version,
-                        request_id,
-                        &encoded.heap_keys,
-                        group_top_k,
-                    )?
-                }
-                Err(RerankError::Protocol(message)) if message == "unsupported version" => {
-                    // A v2-v8 daemon rejects the v9 reference before it can
-                    // report a manifest miss. Retry the already validated v8
-                    // registration frame so extension-first rolling upgrades
-                    // remain available.
-                    let response = self.transport.round_trip(
-                        &encoded.frame,
-                        remaining_logical_timeout(deadline)?,
-                        max_response_bytes,
-                    )?;
-                    decode_response_for_version(
-                        &response,
-                        encoded.version,
-                        request_id,
-                        &encoded.heap_keys,
-                        group_top_k,
-                    )?
-                }
-                other => other?,
-            };
             merged.extend(decoded.inner);
         }
         let mut retained = BinaryHeap::new();
@@ -321,6 +343,65 @@ impl<T: TileMaxsimTransport> GpuExternalTileMaxsimBackend<T> {
             retained.push(merged.pop().expect("bounded merged heap length"));
         }
         Ok(RerankResults { inner: retained })
+    }
+
+    fn round_trip_manifest_fallback(
+        &mut self,
+        encoded: &EncodedRequest,
+        request_id: u64,
+        group_top_k: usize,
+        deadline: Instant,
+        max_response_bytes: usize,
+    ) -> Result<RerankResults, RerankError> {
+        let reference = manifest_reference(encoded)?;
+        let response = self.transport.round_trip(
+            &reference,
+            remaining_logical_timeout(deadline)?,
+            max_response_bytes,
+        )?;
+        let decoded = decode_response_for_version(
+            &response,
+            MANIFEST_LOGICAL_EXTERNAL_VERSION,
+            request_id,
+            &encoded.heap_keys,
+            group_top_k,
+        );
+        let decoded = match decoded {
+            Err(RerankError::Remote(message)) if message == "descriptor manifest miss" => {
+                let response = self.transport.round_trip(
+                    &encoded.frame,
+                    remaining_logical_timeout(deadline)?,
+                    max_response_bytes,
+                )?;
+                decode_response_for_version(
+                    &response,
+                    encoded.version,
+                    request_id,
+                    &encoded.heap_keys,
+                    group_top_k,
+                )?
+            }
+            Err(RerankError::Protocol(message)) if message == "unsupported version" => {
+                // A v2-v8 daemon rejects the v9 reference before it can
+                // report a manifest miss. Retry the already validated v8
+                // registration frame so extension-first rolling upgrades
+                // remain available.
+                let response = self.transport.round_trip(
+                    &encoded.frame,
+                    remaining_logical_timeout(deadline)?,
+                    max_response_bytes,
+                )?;
+                decode_response_for_version(
+                    &response,
+                    encoded.version,
+                    request_id,
+                    &encoded.heap_keys,
+                    group_top_k,
+                )?
+            }
+            other => other?,
+        };
+        Ok(decoded)
     }
 
     #[cfg(test)]
@@ -452,6 +533,78 @@ fn manifest_reference(encoded: &EncodedRequest) -> Result<Vec<u8>, RerankError> 
             .to_le_bytes(),
     );
     Ok(frame)
+}
+
+fn catalog_frames(
+    encoded: &EncodedRequest,
+    descriptors: &[ExternalTensorDescriptor],
+    revision: &str,
+) -> Result<(Vec<u8>, Vec<u8>), RerankError> {
+    if !matches!(
+        encoded.version,
+        COMPACT_LOGICAL_EXTERNAL_VERSION | TYPED_COMPACT_LOGICAL_EXTERNAL_VERSION
+    ) || descriptors.len() != encoded.heap_keys.len()
+    {
+        return Err(RerankError::Protocol(
+            "catalog frames require a compact logical request".into(),
+        ));
+    }
+    let digest: [u8; 32] = Sha256::digest(revision.as_bytes()).into();
+    let mut reference = encoded.frame[..encoded.descriptor_offset].to_vec();
+    reference.push(1);
+    reference.extend_from_slice(&digest);
+    let mut previous = 0_u64;
+    for descriptor in descriptors {
+        let current = u64::try_from(descriptor.public_id)
+            .map_err(|_| RerankError::InvalidDescriptor("catalog public ID is not positive"))?;
+        let delta = current
+            .checked_sub(previous)
+            .filter(|value| *value > 0)
+            .ok_or(RerankError::InvalidDescriptor(
+                "catalog public IDs are not strictly increasing",
+            ))?;
+        encode_varint(&mut reference, delta);
+        previous = current;
+    }
+    finalize_catalog_frame(&mut reference)?;
+
+    let mut registration = encoded.frame[..encoded.descriptor_offset].to_vec();
+    registration.push(2);
+    registration.extend_from_slice(&digest);
+    for descriptor in descriptors {
+        registration.extend_from_slice(&descriptor.public_id.to_le_bytes());
+        registration.extend_from_slice(&descriptor.rows.to_le_bytes());
+        let digest = descriptor
+            .tensor_ref
+            .strip_prefix("sha256://")
+            .and_then(|value| decode_lower_hex_sha256(value.as_bytes()))
+            .ok_or(RerankError::InvalidDescriptor("invalid tensor digest"))?;
+        registration.extend_from_slice(&digest);
+    }
+    finalize_catalog_frame(&mut registration)?;
+    Ok((reference, registration))
+}
+
+fn encode_varint(output: &mut Vec<u8>, mut value: u64) {
+    while value >= 0x80 {
+        output.push((value as u8 & 0x7f) | 0x80);
+        value >>= 7;
+    }
+    output.push(value as u8);
+}
+
+fn finalize_catalog_frame(frame: &mut [u8]) -> Result<(), RerankError> {
+    frame[4..6].copy_from_slice(&CATALOG_LOGICAL_EXTERNAL_VERSION.to_le_bytes());
+    let body_len = frame
+        .len()
+        .checked_sub(HEADER_LEN)
+        .ok_or(RerankError::RequestTooLarge)?;
+    frame[16..24].copy_from_slice(
+        &u64::try_from(body_len)
+            .map_err(|_| RerankError::RequestTooLarge)?
+            .to_le_bytes(),
+    );
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1779,6 +1932,42 @@ mod tests {
         legacy_rejection: bool,
     }
 
+    struct CatalogMissTransport {
+        calls: Rc<RefCell<Vec<(u16, u8, usize)>>>,
+    }
+
+    impl TileMaxsimTransport for CatalogMissTransport {
+        fn round_trip(
+            &mut self,
+            request: &[u8],
+            _timeout: Duration,
+            _max_response_bytes: usize,
+        ) -> Result<Vec<u8>, RerankError> {
+            let version = u16::from_le_bytes(request[4..6].try_into().unwrap());
+            let request_id = u64::from_le_bytes(request[8..16].try_into().unwrap());
+            let mode_offset = request.len()
+                - if self.calls.borrow().len() == 1 {
+                    77
+                } else {
+                    34
+                };
+            let mode = request[mode_offset];
+            self.calls.borrow_mut().push((version, mode, request.len()));
+            if self.calls.borrow().len() == 1 {
+                return Ok(error_response_with_version(
+                    version,
+                    request_id,
+                    "descriptor catalog miss",
+                ));
+            }
+            Ok(success_response_with_version(
+                version,
+                request_id,
+                &[(0, 0.75)],
+            ))
+        }
+    }
+
     impl TileMaxsimTransport for ManifestMissTransport {
         fn round_trip(
             &mut self,
@@ -2565,6 +2754,56 @@ mod tests {
         );
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].heap_key, candidate.heap_key);
+    }
+
+    #[test]
+    fn catalog_request_registers_once_then_uses_public_id_selection() {
+        let candidate = PageCandidate {
+            approximate_distance: Distance::ZERO,
+            heap_key: [0, 0, 7],
+        };
+        let calls = Rc::new(RefCell::new(Vec::new()));
+        let mut backend = GpuExternalTileMaxsimBackend::new(
+            CatalogMissTransport {
+                calls: Rc::clone(&calls),
+            },
+            "contract@1".into(),
+            Duration::from_secs(1),
+            100,
+            4096,
+        )
+        .with_catalog_revision(Some("[[\"brain-a\",\"17\"]]".into()));
+        for _ in 0..2 {
+            let mut candidates = vec![candidate].into_iter();
+            let mut source = MockDescriptorSource(BTreeMap::from([(
+                candidate.heap_key,
+                external_descriptor(
+                    candidate,
+                    7,
+                    &format!("sha256://{}", "a".repeat(64)),
+                    2,
+                    2,
+                    ExternalTensorDtype::F32,
+                ),
+            )]));
+            assert_eq!(
+                backend
+                    .rerank_logical(&[vector(&[1.0, 0.0])], &mut candidates, &mut source, 1,)
+                    .unwrap()
+                    .count(),
+                1
+            );
+        }
+        let calls = calls.borrow();
+        assert_eq!(
+            calls.iter().map(|call| call.0).collect::<Vec<_>>(),
+            vec![10, 10, 10]
+        );
+        assert_eq!(
+            calls.iter().map(|call| call.1).collect::<Vec<_>>(),
+            vec![1, 2, 1]
+        );
+        assert!(calls[0].2 < calls[1].2);
     }
 
     #[test]
