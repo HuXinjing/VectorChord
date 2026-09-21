@@ -23,7 +23,7 @@ use distance::Distance;
 use pgrx::datum::{Array, DatumWithOid, FromDatum, IntoDatum};
 use pgrx::iter::TableIterator;
 use pgrx::{name, pg_extern};
-use std::collections::{BTreeMap, BTreeSet, BinaryHeap};
+use std::collections::{BTreeMap, BTreeSet, BinaryHeap, HashSet};
 use std::time::Duration;
 use vchordrq::types::OwnedVector;
 use vector::VectorBorrowed;
@@ -59,6 +59,74 @@ fn _vchordrq_tilemaxsim_rerank_halfvec(
         .and_then(|query| {
             collect_candidate_ids(candidate_ids)
                 .and_then(|candidate_ids| execute_rerank(source_oid, query, candidate_ids, top_k))
+        })
+        .unwrap_or_else(|error| pgrx::error!("{error}"));
+    TableIterator::new(rows)
+}
+
+/// One exact scan with two independently ranked result windows. The daemon
+/// already computes one score per visible candidate; returning those scores
+/// once lets PostgreSQL derive a global window and a caller-governed subset
+/// window without submitting the same query tensor to the GPU twice.
+#[pg_extern(sql = "")]
+fn _vchordrq_tilemaxsim_rerank_scoped_vector(
+    source_oid: pgrx::pg_sys::Oid,
+    query: Array<'_, VectorInput<'_>>,
+    candidate_ids: Array<'_, i64>,
+    scoped_candidate_ids: Array<'_, i64>,
+    top_k: i32,
+) -> TableIterator<
+    'static,
+    (
+        name!(scope, i16),
+        name!(public_id, i64),
+        name!(similarity, f32),
+    ),
+> {
+    let rows = collect_vector_query(query)
+        .and_then(|query| collect_candidate_ids(candidate_ids).map(|ids| (query, ids)))
+        .and_then(|(query, candidate_ids)| {
+            collect_candidate_ids(scoped_candidate_ids).and_then(|scoped_candidate_ids| {
+                execute_rerank_scoped(
+                    source_oid,
+                    query,
+                    candidate_ids,
+                    scoped_candidate_ids,
+                    top_k,
+                )
+            })
+        })
+        .unwrap_or_else(|error| pgrx::error!("{error}"));
+    TableIterator::new(rows)
+}
+
+#[pg_extern(sql = "")]
+fn _vchordrq_tilemaxsim_rerank_scoped_halfvec(
+    source_oid: pgrx::pg_sys::Oid,
+    query: Array<'_, HalfvecInput<'_>>,
+    candidate_ids: Array<'_, i64>,
+    scoped_candidate_ids: Array<'_, i64>,
+    top_k: i32,
+) -> TableIterator<
+    'static,
+    (
+        name!(scope, i16),
+        name!(public_id, i64),
+        name!(similarity, f32),
+    ),
+> {
+    let rows = collect_halfvec_query(query)
+        .and_then(|query| collect_candidate_ids(candidate_ids).map(|ids| (query, ids)))
+        .and_then(|(query, candidate_ids)| {
+            collect_candidate_ids(scoped_candidate_ids).and_then(|scoped_candidate_ids| {
+                execute_rerank_scoped(
+                    source_oid,
+                    query,
+                    candidate_ids,
+                    scoped_candidate_ids,
+                    top_k,
+                )
+            })
         })
         .unwrap_or_else(|error| pgrx::error!("{error}"));
     TableIterator::new(rows)
@@ -233,6 +301,153 @@ fn execute_rerank(
         .into_iter()
         .map(|(distance, public_id)| (public_id, -distance.to_f32()))
         .collect::<Vec<_>>();
+    profile::update(|profile| {
+        profile.result_finalize_us += profile::duration_us(result_timer.elapsed());
+        profile.returned_rows = output.len() as u64;
+    });
+    profile_guard.finish(total_timer.elapsed());
+    Ok(output.into_iter())
+}
+
+fn execute_rerank_scoped(
+    source_oid: pgrx::pg_sys::Oid,
+    query: Vec<OwnedVector>,
+    candidate_ids: Vec<i64>,
+    scoped_candidate_ids: Vec<i64>,
+    top_k: i32,
+) -> Result<std::vec::IntoIter<(i16, i64, f32)>, RerankError> {
+    validate_top_k(candidate_ids.len(), top_k)?;
+    let candidate_set = candidate_ids.iter().copied().collect::<HashSet<_>>();
+    if scoped_candidate_ids
+        .iter()
+        .any(|public_id| !candidate_set.contains(public_id))
+    {
+        return Err(RerankError::Configuration(
+            "scoped_candidate_ids must be a subset of candidate_ids",
+        ));
+    }
+    if !matches!(gucs::vchordrq_maxsim_backend(), PostgresMaxsimBackend::Gpu) {
+        return Err(RerankError::Configuration(
+            "external TileMaxSim rerank requires vchordrq.maxsim_backend = 'gpu'",
+        ));
+    }
+    require_mvcc_snapshot()?;
+
+    let profile_guard = profile::ProfileGuard::start(gucs::vchordrq_maxsim_profile());
+    let total_timer = profile::ProfileTimer::start();
+    profile::update(|profile| {
+        profile.query_tokens = query.len() as u64;
+        profile.generated_candidates = candidate_ids.len() as u64;
+    });
+    let preflight_timer = profile::ProfileTimer::start();
+    let binding = resolve_tilemaxsim_source(source_oid)?;
+    let source_lock = RelationLock::open(source_oid, pgrx::pg_sys::AccessShareLock as _)?;
+    let descriptor_lock = binding
+        .descriptor_oid
+        .map(|oid| RelationLock::open(oid, pgrx::pg_sys::AccessShareLock as _))
+        .transpose()?;
+    if source_lock.oid() != binding.source_oid
+        || descriptor_lock.as_ref().map(RelationLock::oid) != binding.descriptor_oid
+    {
+        return Err(RerankError::Registry(
+            "registered TileMaxSim tensor source changed during execution".into(),
+        ));
+    }
+    preflight_descriptor_access(&binding)?;
+    profile::update(|profile| {
+        profile.preflight_us += profile::duration_us(preflight_timer.elapsed());
+    });
+
+    let endpoint = gucs::vchordrq_maxsim_gpu_endpoint()
+        .map(|endpoint| endpoint.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let mut backend = GpuExternalTileMaxsimBackend::new(
+        UnixSocketTransport::new(endpoint),
+        binding.model_contract_id.clone(),
+        Duration::from_millis(gucs::vchordrq_maxsim_gpu_timeout_ms() as u64),
+        gucs::vchordrq_maxsim_gpu_max_batch_tokens() as usize,
+        gucs::vchordrq_maxsim_gpu_max_batch_bytes() as usize,
+    )
+    .with_scoring_profile(gucs::vchordrq_maxsim_scoring_profile())
+    .with_quantization_contract(gucs::vchordrq_maxsim_quantization_contract())
+    .with_catalog_revision(gucs::vchordrq_maxsim_catalog_revision());
+    if let Some(tenant) = gucs::vchordrq_maxsim_tenant() {
+        backend = backend.with_scheduling(tenant, gucs::vchordrq_maxsim_priority());
+    }
+    let sidecar_timer = profile::ProfileTimer::start();
+    let mut sorted_candidate_ids = candidate_ids.clone();
+    sorted_candidate_ids.sort_unstable();
+    let fast_public_ids = public_id_map(&sorted_candidate_ids)?;
+    // The daemon has already produced all exact scores before applying its
+    // response window. Ask for every score once; two bounded heaps below avoid
+    // returning that full set through SQL.
+    let result_limit = sorted_candidate_ids.len();
+    let (results, public_ids) =
+        match backend.rerank_raw_fp8_catalog(&query, &sorted_candidate_ids, result_limit)? {
+            CatalogSelectionOutcome::Hit(results) => {
+                profile::update(|profile| {
+                    profile.visible_candidates = fast_public_ids.len() as u64;
+                });
+                (results, fast_public_ids)
+            }
+            CatalogSelectionOutcome::Miss | CatalogSelectionOutcome::Unsupported => {
+                let descriptor_timer = profile::ProfileTimer::start();
+                let (mut source, public_ids) = load_visible_descriptors(&binding, &candidate_ids)?;
+                let mut candidates = public_ids
+                    .keys()
+                    .copied()
+                    .map(|heap_key| PageCandidate {
+                        approximate_distance: Distance::ZERO,
+                        heap_key,
+                    })
+                    .collect::<Vec<_>>()
+                    .into_iter();
+                profile::update(|profile| {
+                    profile.descriptor_us += profile::duration_us(descriptor_timer.elapsed());
+                    profile.visible_candidates = public_ids.len() as u64;
+                    profile.descriptors = public_ids.len() as u64;
+                });
+                let results =
+                    backend.rerank_logical(&query, &mut candidates, &mut source, result_limit)?;
+                (results, public_ids)
+            }
+        };
+    let window = top_k as usize;
+    let scoped_set = scoped_candidate_ids.into_iter().collect::<HashSet<_>>();
+    let mut global = BinaryHeap::with_capacity(window.saturating_add(1));
+    let mut scoped = BinaryHeap::with_capacity(window.saturating_add(1));
+    for result in results {
+        let public_id = public_ids.get(&result.heap_key).copied().ok_or_else(|| {
+            RerankError::Protocol("sidecar result has no visible public ID".into())
+        })?;
+        super::retain_top_k(&mut global, window, (result.distance, public_id));
+        if scoped_set.contains(&public_id) {
+            super::retain_top_k(&mut scoped, window, (result.distance, public_id));
+        }
+    }
+    profile::update(|profile| {
+        profile.sidecar_us += profile::duration_us(sidecar_timer.elapsed());
+    });
+    let result_timer = profile::ProfileTimer::start();
+    let sort_window = |mut rows: Vec<(Distance, i64)>| {
+        rows.sort_unstable_by(|(left_distance, left_id), (right_distance, right_id)| {
+            left_distance
+                .cmp(right_distance)
+                .then_with(|| left_id.cmp(right_id))
+        });
+        rows
+    };
+    let mut output = Vec::with_capacity(window.saturating_mul(2));
+    output.extend(
+        sort_window(global.into_vec())
+            .into_iter()
+            .map(|(distance, public_id)| (0_i16, public_id, -distance.to_f32())),
+    );
+    output.extend(
+        sort_window(scoped.into_vec())
+            .into_iter()
+            .map(|(distance, public_id)| (1_i16, public_id, -distance.to_f32())),
+    );
     profile::update(|profile| {
         profile.result_finalize_us += profile::duration_us(result_timer.elapsed());
         profile.returned_rows = output.len() as u64;

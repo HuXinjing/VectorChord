@@ -2123,6 +2123,37 @@ REVOKE ALL ON FUNCTION vchordrq_tilemaxsim_rerank(regclass, halfvec[], bigint[],
 GRANT EXECUTE ON FUNCTION vchordrq_tilemaxsim_rerank(regclass, vector[], bigint[], integer) TO PUBLIC;
 GRANT EXECUTE ON FUNCTION vchordrq_tilemaxsim_rerank(regclass, halfvec[], bigint[], integer) TO PUBLIC;
 
+CREATE FUNCTION vchordrq_tilemaxsim_rerank_scoped(
+    source_relation regclass,
+    query vector[],
+    candidate_ids bigint[],
+    scoped_candidate_ids bigint[],
+    top_k integer
+)
+RETURNS TABLE(scope smallint, public_id bigint, similarity real)
+STRICT VOLATILE PARALLEL UNSAFE LANGUAGE c
+AS 'MODULE_PATHNAME', '_vchordrq_tilemaxsim_rerank_scoped_vector_wrapper';
+
+CREATE FUNCTION vchordrq_tilemaxsim_rerank_scoped(
+    source_relation regclass,
+    query halfvec[],
+    candidate_ids bigint[],
+    scoped_candidate_ids bigint[],
+    top_k integer
+)
+RETURNS TABLE(scope smallint, public_id bigint, similarity real)
+STRICT VOLATILE PARALLEL UNSAFE LANGUAGE c
+AS 'MODULE_PATHNAME', '_vchordrq_tilemaxsim_rerank_scoped_halfvec_wrapper';
+
+COMMENT ON FUNCTION vchordrq_tilemaxsim_rerank_scoped(regclass, vector[], bigint[], bigint[], integer)
+IS 'One exact TileMaxSim scan returning independently ranked global (scope 0) and caller-scoped (scope 1) windows.';
+COMMENT ON FUNCTION vchordrq_tilemaxsim_rerank_scoped(regclass, halfvec[], bigint[], bigint[], integer)
+IS 'One exact TileMaxSim scan returning independently ranked global (scope 0) and caller-scoped (scope 1) windows.';
+REVOKE ALL ON FUNCTION vchordrq_tilemaxsim_rerank_scoped(regclass, vector[], bigint[], bigint[], integer) FROM PUBLIC;
+REVOKE ALL ON FUNCTION vchordrq_tilemaxsim_rerank_scoped(regclass, halfvec[], bigint[], bigint[], integer) FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION vchordrq_tilemaxsim_rerank_scoped(regclass, vector[], bigint[], bigint[], integer) TO PUBLIC;
+GRANT EXECUTE ON FUNCTION vchordrq_tilemaxsim_rerank_scoped(regclass, halfvec[], bigint[], bigint[], integer) TO PUBLIC;
+
 CREATE FUNCTION _vchordrq_tilemaxsim_source_sql_drop()
 RETURNS event_trigger
 LANGUAGE plpgsql
