@@ -1660,6 +1660,7 @@ mod tests {
             catalog_selection_digest: None,
             catalog_public_ids: Vec::new(),
             catalog_registration: false,
+            scoped_candidate_ordinals: Vec::new(),
         };
         let requests = [request(1, 11), request(2, 99)];
         let attached =

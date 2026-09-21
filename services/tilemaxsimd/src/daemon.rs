@@ -12,7 +12,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use clap::Parser;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt::Write as FmtWrite;
 use std::fs::{self, OpenOptions};
 use std::io::{BufRead, Read, Write};
@@ -1917,7 +1917,17 @@ fn run_scheduler(
                         } else {
                             metrics.completed.fetch_add(1, Ordering::Relaxed);
                             if let Some(top_k) = work.request.top_k {
-                                retain_ranked_top_k(&mut work.results, top_k);
+                                if work.request.protocol_version
+                                    == protocol::VERSION_SCOPED_CATALOG_SELECTION_REFERENCE
+                                {
+                                    retain_ranked_scoped_top_k(
+                                        &mut work.results,
+                                        top_k,
+                                        &work.request.scoped_candidate_ordinals,
+                                    );
+                                } else {
+                                    retain_ranked_top_k(&mut work.results, top_k);
+                                }
                             }
                             Some(protocol::success(version, request_id, &work.results))
                         }
@@ -1991,6 +2001,26 @@ fn retain_ranked_top_k(results: &mut Vec<(u32, f32)>, top_k: usize) {
     results.sort_unstable_by(rank);
 }
 
+fn retain_ranked_scoped_top_k(
+    results: &mut Vec<(u32, f32)>,
+    top_k: usize,
+    scoped_ordinals: &[u32],
+) {
+    const SCOPED_RESULT_TAG: u32 = 1 << 31;
+    let scoped_set = scoped_ordinals.iter().copied().collect::<HashSet<_>>();
+    let mut scoped = results
+        .iter()
+        .filter(|(candidate_id, _)| scoped_set.contains(candidate_id))
+        .copied()
+        .collect::<Vec<_>>();
+    retain_ranked_top_k(results, top_k);
+    retain_ranked_top_k(&mut scoped, top_k);
+    results.reserve(scoped.len());
+    results.extend(scoped.into_iter().map(|(candidate_id, similarity)| {
+        (candidate_id | SCOPED_RESULT_TAG, similarity)
+    }));
+}
+
 fn works_are_batch_compatible(left: &Work, right: &Work, minimum_overlap_milli: u16) -> bool {
     use std::collections::HashSet;
     let left_request = &left.request;
@@ -2044,6 +2074,7 @@ fn request_quantum(work: &Work, config: &SchedulerConfig) -> protocol::Request {
         catalog_selection_digest: work.request.catalog_selection_digest,
         catalog_public_ids: Vec::new(),
         catalog_registration: false,
+        scoped_candidate_ordinals: work.request.scoped_candidate_ordinals.clone(),
     }
 }
 
@@ -3570,6 +3601,9 @@ fn header_version(frame: &[u8]) -> u16 {
             protocol::VERSION_CATALOG_SELECTION_REFERENCE => {
                 protocol::VERSION_CATALOG_SELECTION_REFERENCE
             }
+            protocol::VERSION_SCOPED_CATALOG_SELECTION_REFERENCE => {
+                protocol::VERSION_SCOPED_CATALOG_SELECTION_REFERENCE
+            }
             _ => VERSION_EXTERNAL,
         }
     }
@@ -3684,7 +3718,7 @@ mod tests {
         candidate_fmas, handle_status_connection, header_version, is_fatal_cuda_diagnostic,
         kib_to_bytes, quantum_end, read_management_request, render_metrics,
         resolve_descriptor_catalog, resolve_descriptor_manifest, resolve_quantum_candidates,
-        retain_ranked_top_k,
+        retain_ranked_scoped_top_k, retain_ranked_top_k,
         tenant_hash,
     };
     #[cfg(feature = "backend-cpu")]
@@ -3728,6 +3762,7 @@ mod tests {
             catalog_selection_digest: None,
             catalog_public_ids: vec![7, 9],
             catalog_registration: registration,
+            scoped_candidate_ordinals: Vec::new(),
         }
     }
 
@@ -3787,8 +3822,15 @@ mod tests {
     }
 
     #[test]
+    fn scoped_top_k_returns_two_independently_ranked_tagged_windows() {
+        let mut input = vec![(0, 0.2), (1, 0.9), (2, 0.8), (3, 0.7), (4, 0.6)];
+        retain_ranked_scoped_top_k(&mut input, 2, &[0, 3, 4]);
+        assert_eq!(input, vec![(1, 0.9), (2, 0.8), (3 | (1 << 31), 0.7), (4 | (1 << 31), 0.6)]);
+    }
+
+    #[test]
     fn error_responses_preserve_every_supported_external_protocol_version() {
-        for version in 2_u16..=11 {
+        for version in 2_u16..=12 {
             let mut frame = vec![0_u8; crate::protocol::HEADER_BYTES];
             frame[4..6].copy_from_slice(&version.to_le_bytes());
             assert_eq!(header_version(&frame), version);

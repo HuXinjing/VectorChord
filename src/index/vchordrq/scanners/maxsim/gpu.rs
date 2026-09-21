@@ -38,6 +38,7 @@ const TYPED_COMPACT_LOGICAL_EXTERNAL_VERSION: u16 = 8;
 const MANIFEST_LOGICAL_EXTERNAL_VERSION: u16 = 9;
 const CATALOG_LOGICAL_EXTERNAL_VERSION: u16 = 10;
 const CATALOG_SELECTION_REFERENCE_VERSION: u16 = 11;
+const SCOPED_CATALOG_SELECTION_REFERENCE_VERSION: u16 = 12;
 const REQUEST_KIND: u16 = 1;
 const RESPONSE_KIND: u16 = 2;
 const HEADER_LEN: usize = 24;
@@ -166,6 +167,15 @@ pub(super) struct TileMaxsimScheduling {
 
 pub(super) enum CatalogSelectionOutcome {
     Hit(RerankResults),
+    Miss,
+    Unsupported,
+}
+
+pub(super) enum ScopedCatalogSelectionOutcome {
+    Hit {
+        global: RerankResults,
+        scoped: RerankResults,
+    },
     Miss,
     Unsupported,
 }
@@ -366,6 +376,117 @@ impl<T: TileMaxsimTransport> GpuExternalTileMaxsimBackend<T> {
             }
         }
         Ok(CatalogSelectionOutcome::Miss)
+    }
+
+    /// Score one catalog selection once while retaining two independent
+    /// windows in the daemon. This avoids both a second GPU request and the
+    /// full-score response previously needed to derive an additive scope.
+    pub(super) fn rerank_raw_fp8_catalog_scoped(
+        &mut self,
+        query: &[OwnedVector],
+        public_ids: &[i64],
+        scoped_public_ids: &[i64],
+        top_k: usize,
+    ) -> Result<ScopedCatalogSelectionOutcome, RerankError> {
+        let Some(revision) = self.catalog_revision.as_deref() else {
+            return Ok(ScopedCatalogSelectionOutcome::Unsupported);
+        };
+        if self.scoring_profile != PostgresMaxsimScoringProfile::RawFp8E4m3 {
+            return Ok(ScopedCatalogSelectionOutcome::Unsupported);
+        }
+        if public_ids.is_empty() || scoped_public_ids.is_empty() || top_k == 0 {
+            return Err(RerankError::Configuration(
+                "scoped catalog rerank requires nonempty candidates, scope, and top-k",
+            ));
+        }
+        let mut sorted_ids = public_ids.to_vec();
+        sorted_ids.sort_unstable();
+        if sorted_ids.len() > MAX_EXTERNAL_CANDIDATES_PER_BATCH
+            || sorted_ids[0] <= 0
+            || sorted_ids.windows(2).any(|pair| pair[0] == pair[1])
+        {
+            return Err(RerankError::InvalidDescriptor(
+                "catalog public IDs must be positive and unique",
+            ));
+        }
+        let mut sorted_scope = scoped_public_ids.to_vec();
+        sorted_scope.sort_unstable();
+        sorted_scope.dedup();
+        if sorted_scope
+            .iter()
+            .any(|id| sorted_ids.binary_search(id).is_err())
+        {
+            return Err(RerankError::InvalidDescriptor(
+                "scoped catalog public IDs must be a subset of the candidate set",
+            ));
+        }
+        let expected_global = top_k.min(sorted_ids.len());
+        let expected_scoped = top_k.min(sorted_scope.len());
+        let max_response_bytes = HEADER_LEN
+            .checked_add(8)
+            .and_then(|size| {
+                size.checked_add(
+                    expected_global
+                        .checked_add(expected_scoped)?
+                        .checked_mul(8)?,
+                )
+            })
+            .map(|size| size.max(HEADER_LEN + 8 + MAX_REMOTE_ERROR_BYTES))
+            .ok_or(RerankError::RequestTooLarge)?;
+        let (_, dimension) = tensor_metadata(query)?;
+        let dtype_hint_key = format!(
+            "{}\0{}\0{}\0{}\0{}",
+            self.model_contract_id,
+            self.scheduling
+                .as_ref()
+                .map_or("__default__", |value| value.tenant.as_str()),
+            scoring_profile_code(self.scoring_profile),
+            dimension,
+            revision,
+        );
+        let mut storage_dtypes = vec![TensorDtype::Fp8E4m3, TensorDtype::F16, TensorDtype::F32];
+        if let Some(hint) = catalog_dtype_hint(&dtype_hint_key) {
+            storage_dtypes.retain(|dtype| *dtype != hint);
+            storage_dtypes.insert(0, hint);
+        }
+        for storage_dtype in storage_dtypes {
+            let request_id = NEXT_REQUEST_ID.fetch_add(1, Ordering::Relaxed);
+            let (frame, heap_keys) = encode_raw_fp8_scoped_catalog_selection_reference(
+                request_id,
+                &self.model_contract_id,
+                query,
+                &sorted_ids,
+                &sorted_scope,
+                self.max_batch_tokens,
+                self.max_batch_bytes,
+                self.scheduling.as_ref(),
+                revision,
+                self.timeout,
+                expected_global,
+                storage_dtype,
+            )?;
+            let response = self
+                .transport
+                .round_trip(&frame, self.timeout, max_response_bytes)?;
+            match decode_scoped_response(
+                &response,
+                request_id,
+                &heap_keys,
+                expected_global,
+                expected_scoped,
+            ) {
+                Ok((global, scoped)) => {
+                    remember_catalog_dtype(&dtype_hint_key, storage_dtype);
+                    return Ok(ScopedCatalogSelectionOutcome::Hit { global, scoped });
+                }
+                Err(RerankError::Remote(message)) if message == "descriptor catalog miss" => {}
+                Err(RerankError::Protocol(message)) if message == "unsupported version" => {
+                    return Ok(ScopedCatalogSelectionOutcome::Unsupported);
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(ScopedCatalogSelectionOutcome::Miss)
     }
 
     /// Submit a complete external descriptor set as one logical request. The
@@ -906,6 +1027,93 @@ fn encode_raw_fp8_catalog_selection_reference(
         u64::try_from(body_len).map_err(|_| RerankError::RequestTooLarge)?,
     );
     Ok((writer.finish(), heap_keys))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn encode_raw_fp8_scoped_catalog_selection_reference(
+    request_id: u64,
+    model_contract_id: &str,
+    query: &[OwnedVector],
+    public_ids: &[i64],
+    scoped_public_ids: &[i64],
+    max_batch_tokens: usize,
+    max_batch_bytes: usize,
+    scheduling: Option<&TileMaxsimScheduling>,
+    revision: &str,
+    timeout: Duration,
+    top_k: usize,
+    storage_dtype: TensorDtype,
+) -> Result<(Vec<u8>, Vec<HeapKey>), RerankError> {
+    let (mut frame, heap_keys) = encode_raw_fp8_catalog_selection_reference(
+        request_id,
+        model_contract_id,
+        query,
+        public_ids,
+        max_batch_tokens,
+        max_batch_bytes,
+        scheduling,
+        revision,
+        timeout,
+        top_k,
+        storage_dtype,
+    )?;
+    let mut ordinals = Vec::with_capacity(scoped_public_ids.len());
+    for public_id in scoped_public_ids {
+        let ordinal = public_ids.binary_search(public_id).map_err(|_| {
+            RerankError::InvalidDescriptor(
+                "scoped catalog public IDs must be a subset of the candidate set",
+            )
+        })?;
+        ordinals.push(u32::try_from(ordinal).map_err(|_| RerankError::RequestTooLarge)?);
+    }
+    ordinals.sort_unstable();
+    ordinals.dedup();
+    if ordinals.is_empty() {
+        return Err(RerankError::InvalidDescriptor(
+            "scoped catalog public IDs must not be empty",
+        ));
+    }
+    // v11 ends after the two catalog digests. v12 changes only the mode byte
+    // and appends a compact, delta-varint ordinal subset.
+    let mode_offset = frame
+        .len()
+        .checked_sub(65)
+        .ok_or(RerankError::RequestTooLarge)?;
+    if frame.get(mode_offset).copied() != Some(3) {
+        return Err(RerankError::Protocol(
+            "invalid catalog selection reference layout".into(),
+        ));
+    }
+    frame[mode_offset] = 4;
+    frame.extend_from_slice(
+        &u32::try_from(ordinals.len())
+            .map_err(|_| RerankError::RequestTooLarge)?
+            .to_le_bytes(),
+    );
+    let mut previous_plus_one = 0_u64;
+    for ordinal in ordinals {
+        let current_plus_one = u64::from(ordinal) + 1;
+        let mut delta = current_plus_one
+            .checked_sub(previous_plus_one)
+            .filter(|value| *value > 0)
+            .ok_or(RerankError::InvalidDescriptor(
+                "scoped catalog ordinals are not strictly increasing",
+            ))?;
+        while delta >= 0x80 {
+            frame.push((delta as u8 & 0x7f) | 0x80);
+            delta >>= 7;
+        }
+        frame.push(delta as u8);
+        previous_plus_one = current_plus_one;
+    }
+    if frame.len() > max_batch_bytes {
+        return Err(RerankError::RequestTooLarge);
+    }
+    frame[4..6].copy_from_slice(&SCOPED_CATALOG_SELECTION_REFERENCE_VERSION.to_le_bytes());
+    let body_len =
+        u64::try_from(frame.len() - HEADER_LEN).map_err(|_| RerankError::RequestTooLarge)?;
+    frame[16..24].copy_from_slice(&body_len.to_le_bytes());
+    Ok((frame, heap_keys))
 }
 
 fn catalog_frames(
@@ -1679,6 +1887,87 @@ fn decode_response_for_version(
     }
     cursor.finish()?;
     Ok(RerankResults { inner: results })
+}
+
+fn decode_scoped_response(
+    frame: &[u8],
+    request_id: u64,
+    heap_keys: &[HeapKey],
+    expected_global: usize,
+    expected_scoped: usize,
+) -> Result<(RerankResults, RerankResults), RerankError> {
+    const SCOPED_RESULT_TAG: u32 = 1 << 31;
+    let mut cursor = Cursor::new(frame);
+    if cursor.bytes(4)? != MAGIC
+        || cursor.u16()? != SCOPED_CATALOG_SELECTION_REFERENCE_VERSION
+        || cursor.u16()? != RESPONSE_KIND
+    {
+        return Err(RerankError::Protocol("unsupported version".into()));
+    }
+    if cursor.u64()? != request_id {
+        return Err(RerankError::Protocol("request ID mismatch".into()));
+    }
+    let body_len = usize::try_from(cursor.u64()?)
+        .map_err(|_| RerankError::Protocol("response body is too large".into()))?;
+    if body_len != frame.len().saturating_sub(HEADER_LEN) {
+        return Err(RerankError::Protocol("response length mismatch".into()));
+    }
+    let status = cursor.u32()?;
+    if status != 0 {
+        let length = usize::try_from(cursor.u32()?)
+            .map_err(|_| RerankError::Protocol("remote error is too large".into()))?;
+        if length > MAX_REMOTE_ERROR_BYTES {
+            return Err(RerankError::Protocol("remote error is too large".into()));
+        }
+        let message = std::str::from_utf8(cursor.bytes(length)?)
+            .map_err(|_| RerankError::Protocol("remote error is not UTF-8".into()))?;
+        cursor.finish()?;
+        return Err(RerankError::Remote(message.into()));
+    }
+    let result_count = usize::try_from(cursor.u32()?)
+        .map_err(|_| RerankError::Protocol("result count is too large".into()))?;
+    if result_count != expected_global.saturating_add(expected_scoped) {
+        return Err(RerankError::Protocol("partial scoped result set".into()));
+    }
+    let mut seen_global = vec![false; heap_keys.len()];
+    let mut seen_scoped = vec![false; heap_keys.len()];
+    let mut global = BinaryHeap::new();
+    let mut scoped = BinaryHeap::new();
+    for _ in 0..result_count {
+        let tagged_id = cursor.u32()?;
+        let is_scoped = tagged_id & SCOPED_RESULT_TAG != 0;
+        let candidate_id = usize::try_from(tagged_id & !SCOPED_RESULT_TAG)
+            .map_err(|_| RerankError::Protocol("candidate ID is too large".into()))?;
+        let Some(heap_key) = heap_keys.get(candidate_id).copied() else {
+            return Err(RerankError::Protocol("unknown candidate ID".into()));
+        };
+        let seen = if is_scoped {
+            &mut seen_scoped
+        } else {
+            &mut seen_global
+        };
+        if std::mem::replace(&mut seen[candidate_id], true) {
+            return Err(RerankError::Protocol("duplicate candidate ID".into()));
+        }
+        let similarity = f32::from_bits(cursor.u32()?);
+        if !similarity.is_finite() {
+            return Err(RerankError::Protocol("non-finite similarity".into()));
+        }
+        let entry = (Reverse(Distance::from_f32(-similarity)), Reverse(heap_key));
+        if is_scoped {
+            scoped.push(entry);
+        } else {
+            global.push(entry);
+        }
+    }
+    cursor.finish()?;
+    if global.len() != expected_global || scoped.len() != expected_scoped {
+        return Err(RerankError::Protocol("mis-tagged scoped result set".into()));
+    }
+    Ok((
+        RerankResults { inner: global },
+        RerankResults { inner: scoped },
+    ))
 }
 
 struct BoundedWriter {

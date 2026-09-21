@@ -13,9 +13,12 @@ use super::external::{
     CandidateTensorDescriptorSource, ExternalTensorDescriptor, ExternalTensorStorage,
     TileMaxsimSourceBinding, resolve_tilemaxsim_source, validate_descriptor,
 };
-use super::gpu::{CatalogSelectionOutcome, GpuExternalTileMaxsimBackend, UnixSocketTransport};
+use super::gpu::{
+    CatalogSelectionOutcome, GpuExternalTileMaxsimBackend, ScopedCatalogSelectionOutcome,
+    UnixSocketTransport,
+};
 use super::profile;
-use super::rerank::RerankError;
+use super::rerank::{RerankError, RerankResults};
 use crate::datatype::memory_halfvec::HalfvecInput;
 use crate::datatype::memory_vector::VectorInput;
 use crate::index::gucs::{self, PostgresMaxsimBackend};
@@ -86,7 +89,7 @@ fn _vchordrq_tilemaxsim_rerank_scoped_vector(
     let rows = collect_vector_query(query)
         .and_then(|query| collect_candidate_ids(candidate_ids).map(|ids| (query, ids)))
         .and_then(|(query, candidate_ids)| {
-            collect_candidate_ids(scoped_candidate_ids).and_then(|scoped_candidate_ids| {
+            collect_optional_candidate_ids(scoped_candidate_ids).and_then(|scoped_candidate_ids| {
                 execute_rerank_scoped(
                     source_oid,
                     query,
@@ -118,7 +121,7 @@ fn _vchordrq_tilemaxsim_rerank_scoped_halfvec(
     let rows = collect_halfvec_query(query)
         .and_then(|query| collect_candidate_ids(candidate_ids).map(|ids| (query, ids)))
         .and_then(|(query, candidate_ids)| {
-            collect_candidate_ids(scoped_candidate_ids).and_then(|scoped_candidate_ids| {
+            collect_optional_candidate_ids(scoped_candidate_ids).and_then(|scoped_candidate_ids| {
                 execute_rerank_scoped(
                     source_oid,
                     query,
@@ -166,6 +169,16 @@ fn validate_query(query: &[OwnedVector]) -> Result<(), RerankError> {
 }
 
 fn collect_candidate_ids(candidate_ids: Array<'_, i64>) -> Result<Vec<i64>, RerankError> {
+    let result = collect_optional_candidate_ids(candidate_ids)?;
+    if result.is_empty() {
+        return Err(RerankError::Configuration(
+            "candidate_ids must contain at least one ID",
+        ));
+    }
+    Ok(result)
+}
+
+fn collect_optional_candidate_ids(candidate_ids: Array<'_, i64>) -> Result<Vec<i64>, RerankError> {
     let mut result = Vec::with_capacity(candidate_ids.len());
     let mut unique = BTreeSet::new();
     for public_id in candidate_ids.iter() {
@@ -178,11 +191,6 @@ fn collect_candidate_ids(candidate_ids: Array<'_, i64>) -> Result<Vec<i64>, Rera
             ));
         }
         result.push(public_id);
-    }
-    if result.is_empty() {
-        return Err(RerankError::Configuration(
-            "candidate_ids must contain at least one ID",
-        ));
     }
     Ok(result)
 }
@@ -378,53 +386,85 @@ fn execute_rerank_scoped(
     let mut sorted_candidate_ids = candidate_ids.clone();
     sorted_candidate_ids.sort_unstable();
     let fast_public_ids = public_id_map(&sorted_candidate_ids)?;
-    // The daemon has already produced all exact scores before applying its
-    // response window. Ask for every score once; two bounded heaps below avoid
-    // returning that full set through SQL.
-    let result_limit = sorted_candidate_ids.len();
-    let (results, public_ids) =
-        match backend.rerank_raw_fp8_catalog(&query, &sorted_candidate_ids, result_limit)? {
-            CatalogSelectionOutcome::Hit(results) => {
-                profile::update(|profile| {
-                    profile.visible_candidates = fast_public_ids.len() as u64;
-                });
-                (results, fast_public_ids)
-            }
-            CatalogSelectionOutcome::Miss | CatalogSelectionOutcome::Unsupported => {
-                let descriptor_timer = profile::ProfileTimer::start();
-                let (mut source, public_ids) = load_visible_descriptors(&binding, &candidate_ids)?;
-                let mut candidates = public_ids
-                    .keys()
-                    .copied()
-                    .map(|heap_key| PageCandidate {
+    let window = top_k as usize;
+    let mut sorted_scoped_ids = scoped_candidate_ids.clone();
+    sorted_scoped_ids.sort_unstable();
+    sorted_scoped_ids.dedup();
+    let (global, scoped) = match backend.rerank_raw_fp8_catalog_scoped(
+        &query,
+        &sorted_candidate_ids,
+        &sorted_scoped_ids,
+        window,
+    )? {
+        ScopedCatalogSelectionOutcome::Hit { global, scoped } => {
+            profile::update(|profile| {
+                profile.visible_candidates = fast_public_ids.len() as u64;
+            });
+            let map_results = |results: RerankResults| {
+                let mut mapped = BinaryHeap::with_capacity(window.saturating_add(1));
+                for result in results {
+                    let public_id =
+                        fast_public_ids
+                            .get(&result.heap_key)
+                            .copied()
+                            .ok_or_else(|| {
+                                RerankError::Protocol(
+                                    "sidecar result has no visible public ID".into(),
+                                )
+                            })?;
+                    super::retain_top_k(&mut mapped, window, (result.distance, public_id));
+                }
+                Ok::<_, RerankError>(mapped)
+            };
+            (map_results(global)?, map_results(scoped)?)
+        }
+        ScopedCatalogSelectionOutcome::Miss | ScopedCatalogSelectionOutcome::Unsupported => {
+            // Rolling-upgrade and cold-catalog fallback: preserve exact
+            // semantics with the legacy full-score path until v12 is warm.
+            let result_limit = sorted_candidate_ids.len();
+            let (results, public_ids) = match backend.rerank_raw_fp8_catalog(
+                &query,
+                &sorted_candidate_ids,
+                result_limit,
+            )? {
+                CatalogSelectionOutcome::Hit(results) => (results, fast_public_ids),
+                CatalogSelectionOutcome::Miss | CatalogSelectionOutcome::Unsupported => {
+                    let descriptor_timer = profile::ProfileTimer::start();
+                    let (mut source, public_ids) =
+                        load_visible_descriptors(&binding, &candidate_ids)?;
+                    let mut candidates = public_ids.keys().copied().map(|heap_key| PageCandidate {
                         approximate_distance: Distance::ZERO,
                         heap_key,
-                    })
-                    .collect::<Vec<_>>()
-                    .into_iter();
-                profile::update(|profile| {
-                    profile.descriptor_us += profile::duration_us(descriptor_timer.elapsed());
-                    profile.visible_candidates = public_ids.len() as u64;
-                    profile.descriptors = public_ids.len() as u64;
-                });
-                let results =
-                    backend.rerank_logical(&query, &mut candidates, &mut source, result_limit)?;
-                (results, public_ids)
+                    });
+                    profile::update(|profile| {
+                        profile.descriptor_us += profile::duration_us(descriptor_timer.elapsed());
+                        profile.visible_candidates = public_ids.len() as u64;
+                        profile.descriptors = public_ids.len() as u64;
+                    });
+                    let results = backend.rerank_logical(
+                        &query,
+                        &mut candidates,
+                        &mut source,
+                        result_limit,
+                    )?;
+                    (results, public_ids)
+                }
+            };
+            let scoped_set = sorted_scoped_ids.into_iter().collect::<HashSet<_>>();
+            let mut global = BinaryHeap::with_capacity(window.saturating_add(1));
+            let mut scoped = BinaryHeap::with_capacity(window.saturating_add(1));
+            for result in results {
+                let public_id = public_ids.get(&result.heap_key).copied().ok_or_else(|| {
+                    RerankError::Protocol("sidecar result has no visible public ID".into())
+                })?;
+                super::retain_top_k(&mut global, window, (result.distance, public_id));
+                if scoped_set.contains(&public_id) {
+                    super::retain_top_k(&mut scoped, window, (result.distance, public_id));
+                }
             }
-        };
-    let window = top_k as usize;
-    let scoped_set = scoped_candidate_ids.into_iter().collect::<HashSet<_>>();
-    let mut global = BinaryHeap::with_capacity(window.saturating_add(1));
-    let mut scoped = BinaryHeap::with_capacity(window.saturating_add(1));
-    for result in results {
-        let public_id = public_ids.get(&result.heap_key).copied().ok_or_else(|| {
-            RerankError::Protocol("sidecar result has no visible public ID".into())
-        })?;
-        super::retain_top_k(&mut global, window, (result.distance, public_id));
-        if scoped_set.contains(&public_id) {
-            super::retain_top_k(&mut scoped, window, (result.distance, public_id));
+            (global, scoped)
         }
-    }
+    };
     profile::update(|profile| {
         profile.sidecar_us += profile::duration_us(sidecar_timer.elapsed());
     });
