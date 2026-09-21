@@ -226,7 +226,15 @@ impl TinyLfu {
             self.tables[row][index] = self.tables[row][index].saturating_add(1);
         }
         self.samples += 1;
-        let estimate = self.estimate(key).max(1);
+        // Reuse the positions computed above. Calling `estimate(key)` here
+        // would hash the same content key a second time on every cache hit.
+        let estimate = indices
+            .into_iter()
+            .enumerate()
+            .map(|(row, index)| self.tables[row][index])
+            .min()
+            .unwrap_or(0)
+            .max(1);
         if self.samples >= self.width * 10 {
             for table in &mut self.tables {
                 for value in table {
