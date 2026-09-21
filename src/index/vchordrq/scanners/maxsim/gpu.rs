@@ -12,6 +12,7 @@ use super::candidate::{HeapKey, PageCandidate};
 use super::external::{
     CandidateTensorDescriptorSource, ExternalTensorDescriptor, ExternalTensorDtype,
 };
+use super::profile;
 use super::rerank::{CandidateTensorSource, ExactMaxsimBackend, RerankError, RerankResults};
 use crate::index::gucs::PostgresMaxsimScoringProfile;
 use distance::Distance;
@@ -157,6 +158,7 @@ pub(super) struct GpuExternalTileMaxsimBackend<T> {
     scoring_profile: PostgresMaxsimScoringProfile,
     quantization_contract: Option<String>,
     catalog_revision: Option<String>,
+    catalog_storage_dtype: Option<TensorDtype>,
 }
 
 #[derive(Clone, Debug)]
@@ -220,6 +222,7 @@ impl<T> GpuExternalTileMaxsimBackend<T> {
             scoring_profile: PostgresMaxsimScoringProfile::ExactFp16,
             quantization_contract: None,
             catalog_revision: None,
+            catalog_storage_dtype: None,
         }
     }
 
@@ -246,6 +249,27 @@ impl<T> GpuExternalTileMaxsimBackend<T> {
             !value.is_empty() && value.len() <= 4096 && !value.chars().any(char::is_control)
         });
         self
+    }
+
+    pub(super) fn with_catalog_storage_dtype(mut self, dtype: Option<ExternalTensorDtype>) -> Self {
+        self.catalog_storage_dtype = dtype.map(|dtype| match dtype {
+            ExternalTensorDtype::F32 => TensorDtype::F32,
+            ExternalTensorDtype::F16 => TensorDtype::F16,
+            ExternalTensorDtype::Fp8E4m3 => TensorDtype::Fp8E4m3,
+        });
+        self
+    }
+
+    fn catalog_storage_dtypes(&self, hint_key: &str) -> Vec<TensorDtype> {
+        let mut dtypes = vec![TensorDtype::Fp8E4m3, TensorDtype::F16, TensorDtype::F32];
+        let preferred = self
+            .catalog_storage_dtype
+            .or_else(|| catalog_dtype_hint(hint_key));
+        if let Some(preferred) = preferred {
+            dtypes.retain(|dtype| *dtype != preferred);
+            dtypes.insert(0, preferred);
+        }
+        dtypes
     }
 }
 
@@ -301,11 +325,7 @@ impl<T: TileMaxsimTransport> GpuExternalTileMaxsimBackend<T> {
         // Probe those bounded protocol-defined dtypes before touching the
         // descriptor relation. Mixed-dtype candidate sets fail all probes and
         // deliberately fall back to the materializing registration path.
-        let mut storage_dtypes = vec![TensorDtype::Fp8E4m3, TensorDtype::F16, TensorDtype::F32];
-        if let Some(hint) = catalog_dtype_hint(&dtype_hint_key) {
-            storage_dtypes.retain(|dtype| *dtype != hint);
-            storage_dtypes.insert(0, hint);
-        }
+        let storage_dtypes = self.catalog_storage_dtypes(&dtype_hint_key);
         for storage_dtype in storage_dtypes {
             let reference_request_id = NEXT_REQUEST_ID.fetch_add(1, Ordering::Relaxed);
             let (reference_frame, reference_heap_keys) =
@@ -444,12 +464,9 @@ impl<T: TileMaxsimTransport> GpuExternalTileMaxsimBackend<T> {
             dimension,
             revision,
         );
-        let mut storage_dtypes = vec![TensorDtype::Fp8E4m3, TensorDtype::F16, TensorDtype::F32];
-        if let Some(hint) = catalog_dtype_hint(&dtype_hint_key) {
-            storage_dtypes.retain(|dtype| *dtype != hint);
-            storage_dtypes.insert(0, hint);
-        }
+        let storage_dtypes = self.catalog_storage_dtypes(&dtype_hint_key);
         for storage_dtype in storage_dtypes {
+            let encode_timer = profile::ProfileTimer::start();
             let request_id = NEXT_REQUEST_ID.fetch_add(1, Ordering::Relaxed);
             let (frame, heap_keys) = encode_raw_fp8_scoped_catalog_selection_reference(
                 request_id,
@@ -465,16 +482,28 @@ impl<T: TileMaxsimTransport> GpuExternalTileMaxsimBackend<T> {
                 expected_global,
                 storage_dtype,
             )?;
+            profile::update(|entry| {
+                entry.sidecar_encode_us += profile::duration_us(encode_timer.elapsed());
+            });
+            let transport_timer = profile::ProfileTimer::start();
             let response = self
                 .transport
                 .round_trip(&frame, self.timeout, max_response_bytes)?;
-            match decode_scoped_response(
+            profile::update(|entry| {
+                entry.sidecar_transport_us += profile::duration_us(transport_timer.elapsed());
+            });
+            let decode_timer = profile::ProfileTimer::start();
+            let decoded = decode_scoped_response(
                 &response,
                 request_id,
                 &heap_keys,
                 expected_global,
                 expected_scoped,
-            ) {
+            );
+            profile::update(|entry| {
+                entry.sidecar_decode_us += profile::duration_us(decode_timer.elapsed());
+            });
+            match decoded {
                 Ok((global, scoped)) => {
                     remember_catalog_dtype(&dtype_hint_key, storage_dtype);
                     return Ok(ScopedCatalogSelectionOutcome::Hit { global, scoped });
@@ -3529,6 +3558,46 @@ mod tests {
                 .map(|call| (call.0, call.1))
                 .collect::<Vec<_>>(),
             vec![(11, 3), (10, 1), (11, 3), (10, 1), (11, 3), (10, 1)],
+        );
+    }
+
+    #[test]
+    fn explicit_catalog_storage_dtype_is_probed_first() {
+        let calls = Rc::new(RefCell::new(Vec::new()));
+        let backend = GpuExternalTileMaxsimBackend::new(
+            CatalogMissTransport {
+                calls: Rc::clone(&calls),
+            },
+            "contract@1".into(),
+            Duration::from_secs(1),
+            100,
+            4096,
+        )
+        .with_catalog_storage_dtype(Some(ExternalTensorDtype::F16));
+
+        assert_eq!(
+            backend.catalog_storage_dtypes("explicit-dtype-test"),
+            vec![TensorDtype::F16, TensorDtype::Fp8E4m3, TensorDtype::F32]
+        );
+    }
+
+    #[test]
+    fn catalog_storage_dtype_keeps_bounded_fallbacks() {
+        let calls = Rc::new(RefCell::new(Vec::new()));
+        let backend = GpuExternalTileMaxsimBackend::new(
+            CatalogMissTransport {
+                calls: Rc::clone(&calls),
+            },
+            "contract@1".into(),
+            Duration::from_secs(1),
+            100,
+            4096,
+        )
+        .with_catalog_storage_dtype(Some(ExternalTensorDtype::Fp8E4m3));
+
+        assert_eq!(
+            backend.catalog_storage_dtypes("fallback-dtype-test"),
+            vec![TensorDtype::Fp8E4m3, TensorDtype::F16, TensorDtype::F32]
         );
     }
 

@@ -10,8 +10,8 @@
 
 use super::candidate::{HeapKey, PageCandidate};
 use super::external::{
-    CandidateTensorDescriptorSource, ExternalTensorDescriptor, ExternalTensorStorage,
-    TileMaxsimSourceBinding, resolve_tilemaxsim_source, validate_descriptor,
+    CandidateTensorDescriptorSource, ExternalTensorDescriptor, ExternalTensorDtype,
+    ExternalTensorStorage, TileMaxsimSourceBinding, resolve_tilemaxsim_source, validate_descriptor,
 };
 use super::gpu::{
     CatalogSelectionOutcome, GpuExternalTileMaxsimBackend, ScopedCatalogSelectionOutcome,
@@ -247,7 +247,8 @@ fn execute_rerank(
     )
     .with_scoring_profile(gucs::vchordrq_maxsim_scoring_profile())
     .with_quantization_contract(gucs::vchordrq_maxsim_quantization_contract())
-    .with_catalog_revision(gucs::vchordrq_maxsim_catalog_revision());
+    .with_catalog_revision(gucs::vchordrq_maxsim_catalog_revision())
+    .with_catalog_storage_dtype(probe_catalog_storage_dtype(&binding, &candidate_ids)?);
     if let Some(tenant) = gucs::vchordrq_maxsim_tenant() {
         backend = backend.with_scheduling(tenant, gucs::vchordrq_maxsim_priority());
     }
@@ -378,7 +379,8 @@ fn execute_rerank_scoped(
     )
     .with_scoring_profile(gucs::vchordrq_maxsim_scoring_profile())
     .with_quantization_contract(gucs::vchordrq_maxsim_quantization_contract())
-    .with_catalog_revision(gucs::vchordrq_maxsim_catalog_revision());
+    .with_catalog_revision(gucs::vchordrq_maxsim_catalog_revision())
+    .with_catalog_storage_dtype(probe_catalog_storage_dtype(&binding, &candidate_ids)?);
     if let Some(tenant) = gucs::vchordrq_maxsim_tenant() {
         backend = backend.with_scheduling(tenant, gucs::vchordrq_maxsim_priority());
     }
@@ -618,6 +620,87 @@ fn load_visible_descriptors(
         Ok((descriptors, public_ids))
     })?;
     Ok((MaterializedDescriptorSource(descriptors), public_ids))
+}
+
+/// Read one descriptor from the already-authorized candidate population so a
+/// fresh PostgreSQL backend can address the daemon catalog with the correct
+/// storage dtype on its first request. Catalog fast paths require a homogeneous
+/// dtype; mixed populations still miss and fall back to descriptor validation.
+fn probe_catalog_storage_dtype(
+    binding: &TileMaxsimSourceBinding,
+    candidate_ids: &[i64],
+) -> Result<Option<ExternalTensorDtype>, RerankError> {
+    if candidate_ids.is_empty() {
+        return Ok(None);
+    }
+    let source_relation = relation_name(binding.source_oid)?;
+    let names = &binding.column_names;
+    let model_contract = pgrx::spi::quote_identifier(&names.model_contract);
+    let public_id = pgrx::spi::quote_identifier(&names.public_id);
+    let tensor_dtype = pgrx::spi::quote_identifier(&names.tensor_dtype);
+    let query = match binding.storage {
+        ExternalTensorStorage::SameHeap => format!(
+            "SELECT h.{tensor_dtype} AS tensor_dtype
+               FROM ONLY {source_relation} AS h
+              WHERE h.{model_contract} = $1
+                AND h.{public_id}::bigint = $2
+              LIMIT 1"
+        ),
+        ExternalTensorStorage::DescriptorRelation => {
+            let descriptor_oid = binding.descriptor_oid.ok_or_else(|| {
+                RerankError::Registry("registered descriptor relation is missing".into())
+            })?;
+            let descriptor_relation = relation_name(descriptor_oid)?;
+            let descriptor_public_id = pgrx::spi::quote_identifier(
+                names.descriptor_public_id.as_deref().ok_or_else(|| {
+                    RerankError::Registry(
+                        "registered descriptor public ID column is missing".into(),
+                    )
+                })?,
+            );
+            format!(
+                "SELECT d.{tensor_dtype} AS tensor_dtype
+                   FROM ONLY {source_relation} AS h
+                   JOIN ONLY {descriptor_relation} AS d
+                     ON d.{descriptor_public_id}::bigint = h.{public_id}::bigint
+                  WHERE h.{model_contract} = $1
+                    AND h.{public_id}::bigint = $2
+                  LIMIT 1"
+            )
+        }
+    };
+    let dtype = pgrx::spi::Spi::connect(|client| {
+        let prepared = client
+            .prepare(
+                query.as_str(),
+                &[
+                    pgrx::pg_sys::PgOid::from(pgrx::pg_sys::TEXTOID),
+                    pgrx::pg_sys::PgOid::from(pgrx::pg_sys::INT8OID),
+                ],
+            )
+            .map_err(registry_error)?;
+        let args: [DatumWithOid<'_>; 2] = [
+            binding.model_contract_id.clone().into(),
+            candidate_ids[0].into(),
+        ];
+        let rows = client
+            .select(&prepared, Some(1), &args)
+            .map_err(registry_error)?;
+        let Some(row) = rows.into_iter().next() else {
+            return Ok(None);
+        };
+        required_heap_column::<String>(&row, "tensor_dtype").map(Some)
+    })?;
+    dtype
+        .map(|dtype| match dtype.as_str() {
+            "float16" => Ok(ExternalTensorDtype::F16),
+            "float32" => Ok(ExternalTensorDtype::F32),
+            "fp8_e4m3_raw" => Ok(ExternalTensorDtype::Fp8E4m3),
+            _ => Err(RerankError::InvalidDescriptor(
+                "descriptor query returned an unsupported tensor dtype",
+            )),
+        })
+        .transpose()
 }
 
 fn candidate_for_ordinal(ordinal: usize) -> Result<PageCandidate, RerankError> {
