@@ -1518,16 +1518,19 @@ mod tests {
             protocol_version: 5,
             request_id,
             tenant: "tenant".to_owned(),
+            model_contract: "contract".to_owned(),
             priority: 0,
             timeout_ms: 1000,
             query_rows: 1,
             dimension: 320,
             dtype: 2,
+            candidate_dtype: 2,
             scoring_profile: ScoringProfile::ExactFp16,
             quantization_contract: None,
             top_k: None,
             query: vec![0; 640],
             candidates: vec![descriptor(candidate_id, "same-content", 1)],
+            manifest_digest: None,
         };
         let requests = [request(1, 11), request(2, 99)];
         let attached =

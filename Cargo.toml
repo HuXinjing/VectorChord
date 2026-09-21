@@ -47,6 +47,7 @@ rayon.workspace = true
 rusqlite = { version = "0.39.0", features = ["bundled"] }
 seq-macro.workspace = true
 serde.workspace = true
+sha2 = "0.10"
 toml = "1.1.2"
 validator.workspace = true
 wyhash.workspace = true

@@ -12,7 +12,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use clap::Parser;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::fmt::Write as FmtWrite;
 use std::fs::{self, OpenOptions};
 use std::io::{BufRead, Read, Write};
@@ -22,7 +22,7 @@ use std::os::unix::fs::{FileTypeExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, mpsc};
+use std::sync::{Arc, Mutex, OnceLock, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -45,6 +45,10 @@ const MAX_MANAGEMENT_OPERATIONS: usize = 1024;
 const MAX_QUEUED_MANAGEMENT_OPERATIONS: usize = 64;
 static SHUTDOWN_REQUESTED: AtomicBool = AtomicBool::new(false);
 static RELOAD_REQUESTED: AtomicBool = AtomicBool::new(false);
+const MAX_DESCRIPTOR_MANIFESTS: usize = 64;
+const MAX_DESCRIPTOR_MANIFEST_CANDIDATES: usize = 1_000_000;
+static DESCRIPTOR_MANIFESTS: OnceLock<Mutex<VecDeque<(String, Arc<Vec<protocol::Descriptor>>)>>> =
+    OnceLock::new();
 
 #[derive(Clone, Debug, Deserialize)]
 struct CacheOperationRequest {
@@ -980,6 +984,11 @@ struct RuntimeMetrics {
     scheduler_microbatch_requests: AtomicU64,
     gpu_fused_microbatches: AtomicU64,
     gpu_fused_requests: AtomicU64,
+    descriptor_manifest_hits: AtomicU64,
+    descriptor_manifest_misses: AtomicU64,
+    descriptor_manifest_registrations: AtomicU64,
+    descriptor_manifest_evictions: AtomicU64,
+    descriptor_bytes_avoided: AtomicU64,
     latency_observations: AtomicU64,
     total_latency_us: AtomicU64,
     gpu_latency_us: AtomicU64,
@@ -1211,6 +1220,97 @@ struct ReaderConfig {
     maximum_candidate_fmas: u64,
 }
 
+fn descriptor_manifest_digest(candidates: &[protocol::Descriptor]) -> [u8; 32] {
+    let mut hash = Sha256::new();
+    for candidate in candidates {
+        hash.update(candidate.candidate_id.to_le_bytes());
+        hash.update(candidate.rows.to_le_bytes());
+        hash.update(hex::decode(&candidate.digest).expect("validated descriptor digest"));
+    }
+    hash.finalize().into()
+}
+
+fn descriptor_manifest_key(request: &protocol::Request, digest: &[u8; 32]) -> String {
+    format!(
+        "{}\0{}\0{}\0{}\0{}\0{}",
+        request.tenant,
+        request.candidates.first().map_or("", |value| value.contract.as_str()),
+        request.scoring_profile.cache_tag(),
+        request.dimension,
+        request.candidate_dtype,
+        hex::encode(digest),
+    )
+}
+
+fn resolve_descriptor_manifest(request: &mut protocol::Request, metrics: &RuntimeMetrics) -> bool {
+    let manifests = DESCRIPTOR_MANIFESTS.get_or_init(|| Mutex::new(VecDeque::new()));
+    if let Some(digest) = request.manifest_digest {
+        // Reference requests do not carry candidates, so their contract comes
+        // from the canonical request field encoded into every descriptor.
+        let key = format!(
+            "{}\0{}\0{}\0{}\0{}\0{}",
+            request.tenant,
+            request.model_contract,
+            request.scoring_profile.cache_tag(),
+            request.dimension,
+            request.candidate_dtype,
+            hex::encode(digest),
+        );
+        let mut cache = manifests.lock().unwrap_or_else(|error| error.into_inner());
+        if let Some(position) = cache.iter().position(|(candidate, _)| candidate == &key) {
+            let entry = cache
+                .remove(position)
+                .expect("descriptor manifest position came from the same cache");
+            request.candidates = entry.1.as_ref().clone();
+            cache.push_back(entry);
+            metrics
+                .descriptor_manifest_hits
+                .fetch_add(1, Ordering::Relaxed);
+            metrics.descriptor_bytes_avoided.fetch_add(
+                u64::try_from(request.candidates.len())
+                    .unwrap_or(u64::MAX)
+                    .saturating_mul(40),
+                Ordering::Relaxed,
+            );
+            return true;
+        }
+        metrics
+            .descriptor_manifest_misses
+            .fetch_add(1, Ordering::Relaxed);
+        return false;
+    }
+    if request.candidates.is_empty() {
+        return true;
+    }
+    let digest = descriptor_manifest_digest(&request.candidates);
+    let key = descriptor_manifest_key(request, &digest);
+    let mut cache = manifests.lock().unwrap_or_else(|error| error.into_inner());
+    if cache.iter().any(|(candidate, _)| candidate == &key) {
+        return true;
+    }
+    let incoming = request.candidates.len();
+    let mut cached_candidates = cache
+        .iter()
+        .map(|(_, candidates)| candidates.len())
+        .sum::<usize>();
+    while cache.len() >= MAX_DESCRIPTOR_MANIFESTS
+        || cached_candidates.saturating_add(incoming) > MAX_DESCRIPTOR_MANIFEST_CANDIDATES
+    {
+        let Some((_, evicted)) = cache.pop_front() else {
+            break;
+        };
+        cached_candidates = cached_candidates.saturating_sub(evicted.len());
+        metrics
+            .descriptor_manifest_evictions
+            .fetch_add(1, Ordering::Relaxed);
+    }
+    cache.push_back((key, Arc::new(request.candidates.clone())));
+    metrics
+        .descriptor_manifest_registrations
+        .fetch_add(1, Ordering::Relaxed);
+    true
+}
+
 fn read_and_enqueue(
     mut connection: ClientStream,
     sender: &mpsc::SyncSender<Work>,
@@ -1245,7 +1345,7 @@ fn read_and_enqueue(
     let version = header_version(&frame);
     let request_id = header_request_id(&frame);
     let parse_started = Instant::now();
-    let request = match protocol::parse(&frame) {
+    let mut request = match protocol::parse(&frame) {
         Ok(request) => request,
         Err(error) => {
             metrics.failed.fetch_add(1, Ordering::Relaxed);
@@ -1257,6 +1357,14 @@ fn read_and_enqueue(
             return;
         }
     };
+    if !resolve_descriptor_manifest(&mut request, &metrics) {
+        metrics.failed.fetch_add(1, Ordering::Relaxed);
+        write_response_nonfatal(
+            &mut connection,
+            &protocol::failure(version, request_id, 4, "descriptor manifest miss"),
+        );
+        return;
+    }
     let parse_elapsed = parse_started.elapsed();
     if request.candidates.iter().any(|candidate| {
         candidate_fmas(request.query_rows, request.dimension, candidate.rows)
@@ -1718,16 +1826,19 @@ fn request_quantum(work: &Work, config: &SchedulerConfig) -> protocol::Request {
         protocol_version: work.request.protocol_version,
         request_id: work.request.request_id,
         tenant: work.request.tenant.clone(),
+        model_contract: work.request.model_contract.clone(),
         priority: work.request.priority,
         timeout_ms: work.request.timeout_ms,
         query_rows: work.request.query_rows,
         dimension: work.request.dimension,
         dtype: work.request.dtype,
+        candidate_dtype: work.request.candidate_dtype,
         scoring_profile: work.request.scoring_profile,
         quantization_contract: work.request.quantization_contract.clone(),
         top_k: work.request.top_k,
         query: work.request.query.clone(),
         candidates: work.request.candidates[work.next_candidate..end].to_vec(),
+        manifest_digest: work.request.manifest_digest,
     }
 }
 
@@ -2350,6 +2461,52 @@ fn render_metrics(metrics: &RuntimeMetrics) -> String {
         output,
         "tilemaxsim_ready {}",
         usize::from(metrics.ready.load(Ordering::Relaxed))
+    )
+    .unwrap();
+    writeln!(
+        output,
+        "# HELP tilemaxsim_descriptor_manifest_total Descriptor manifest cache outcomes."
+    )
+    .unwrap();
+    writeln!(
+        output,
+        "# TYPE tilemaxsim_descriptor_manifest_total counter"
+    )
+    .unwrap();
+    for (outcome, value) in [
+        ("hit", metrics.descriptor_manifest_hits.load(Ordering::Relaxed)),
+        ("miss", metrics.descriptor_manifest_misses.load(Ordering::Relaxed)),
+        (
+            "registration",
+            metrics
+                .descriptor_manifest_registrations
+                .load(Ordering::Relaxed),
+        ),
+        (
+            "eviction",
+            metrics.descriptor_manifest_evictions.load(Ordering::Relaxed),
+        ),
+    ] {
+        writeln!(
+            output,
+            "tilemaxsim_descriptor_manifest_total{{outcome=\"{outcome}\"}} {value}"
+        )
+        .unwrap();
+    }
+    writeln!(
+        output,
+        "# HELP tilemaxsim_descriptor_bytes_avoided_total Compact descriptor bytes omitted by manifest references."
+    )
+    .unwrap();
+    writeln!(
+        output,
+        "# TYPE tilemaxsim_descriptor_bytes_avoided_total counter"
+    )
+    .unwrap();
+    writeln!(
+        output,
+        "tilemaxsim_descriptor_bytes_avoided_total {}",
+        metrics.descriptor_bytes_avoided.load(Ordering::Relaxed)
     )
     .unwrap();
     writeln!(
@@ -3156,6 +3313,12 @@ fn header_version(frame: &[u8]) -> u16 {
             VERSION_QUANTIZED_EXTERNAL => VERSION_QUANTIZED_EXTERNAL,
             VERSION_LOGICAL_EXTERNAL => VERSION_LOGICAL_EXTERNAL,
             VERSION_COMPACT_LOGICAL_EXTERNAL => VERSION_COMPACT_LOGICAL_EXTERNAL,
+            protocol::VERSION_TYPED_COMPACT_LOGICAL_EXTERNAL => {
+                protocol::VERSION_TYPED_COMPACT_LOGICAL_EXTERNAL
+            }
+            protocol::VERSION_MANIFEST_LOGICAL_EXTERNAL => {
+                protocol::VERSION_MANIFEST_LOGICAL_EXTERNAL
+            }
             _ => VERSION_EXTERNAL,
         }
     }
@@ -3267,7 +3430,7 @@ mod tests {
     use super::{
         AdminAction, ByteAdmission, OperationRegistry, PendingAdmission, RuntimeMetrics,
         candidate_fmas, handle_status_connection, is_fatal_cuda_diagnostic, kib_to_bytes,
-        quantum_end, read_management_request, render_metrics, resolve_quantum_candidates,
+        header_version, quantum_end, read_management_request, render_metrics, resolve_quantum_candidates,
         tenant_hash,
     };
     #[cfg(feature = "backend-cpu")]
@@ -3280,6 +3443,15 @@ mod tests {
     use std::io::{Read, Write};
     use std::sync::atomic::Ordering;
     use std::sync::{Arc, Mutex, mpsc};
+
+    #[test]
+    fn error_responses_preserve_every_supported_external_protocol_version() {
+        for version in 2_u16..=9 {
+            let mut frame = vec![0_u8; crate::protocol::HEADER_BYTES];
+            frame[4..6].copy_from_slice(&version.to_le_bytes());
+            assert_eq!(header_version(&frame), version);
+        }
+    }
 
     #[test]
     fn scheduler_quantum_uses_calibration_unless_operator_overrides_it() {
@@ -3532,6 +3704,8 @@ mod tests {
         ));
         assert!(output.contains("tilemaxsim_host_cache_bytes{kind=\"used\"} 128"));
         assert!(output.contains("tilemaxsim_storage_read_bytes_total 256"));
+        assert!(output.contains("tilemaxsim_descriptor_manifest_total{outcome=\"hit\"} 0"));
+        assert!(output.contains("tilemaxsim_descriptor_bytes_avoided_total 0"));
         assert!(output.contains("# TYPE tilemaxsim_gpu_tuning_value gauge"));
         assert!(!output.contains("tenant-a"));
     }

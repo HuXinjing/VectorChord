@@ -28,6 +28,10 @@ pub const VERSION_COMPACT_LOGICAL_EXTERNAL: u16 = 7;
 /// Compact logical request with a request-wide canonical storage dtype in the
 /// former reserved profile byte. Query and document tensors may differ.
 pub const VERSION_TYPED_COMPACT_LOGICAL_EXTERNAL: u16 = 8;
+/// Descriptor-manifest reference. The request carries the query tensor and a
+/// SHA-256 digest of the canonical compact descriptor list; the daemon resolves
+/// the list from its bounded manifest cache.
+pub const VERSION_MANIFEST_LOGICAL_EXTERNAL: u16 = 9;
 const MAGIC: &[u8; 4] = b"VCTM";
 const REQUEST_KIND: u16 = 1;
 const RESPONSE_KIND: u16 = 2;
@@ -49,6 +53,7 @@ pub struct Request {
     /// Logical scheduling domain. It is never used for authorization or
     /// tensor lookup; the caller must already have applied hard ACL filters.
     pub tenant: String,
+    pub model_contract: String,
     /// Higher values run first within the scheduler's fairness policy.
     pub priority: i32,
     /// Client-supplied end-to-end budget. Zero is used only by legacy v2.
@@ -56,11 +61,13 @@ pub struct Request {
     pub query_rows: u32,
     pub dimension: u32,
     pub dtype: u8,
+    pub candidate_dtype: u8,
     pub scoring_profile: ScoringProfile,
     pub quantization_contract: Option<String>,
     pub top_k: Option<usize>,
     pub query: Vec<u8>,
     pub candidates: Vec<Descriptor>,
+    pub manifest_digest: Option<[u8; 32]>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -225,9 +232,10 @@ pub fn parse(frame: &[u8]) -> Result<Request> {
             | VERSION_LOGICAL_EXTERNAL
             | VERSION_COMPACT_LOGICAL_EXTERNAL
             | VERSION_TYPED_COMPACT_LOGICAL_EXTERNAL
+            | VERSION_MANIFEST_LOGICAL_EXTERNAL
     ) || kind != REQUEST_KIND
     {
-        bail!("Rust daemon requires TileMaxSim external protocol v2 through v8");
+        bail!("Rust daemon requires TileMaxSim external protocol v2 through v9");
     }
     if usize::try_from(body_bytes).ok() != Some(frame.len() - HEADER_BYTES) {
         bail!("request body length mismatch");
@@ -245,10 +253,11 @@ pub fn parse(frame: &[u8]) -> Result<Request> {
             | VERSION_LOGICAL_EXTERNAL
             | VERSION_COMPACT_LOGICAL_EXTERNAL
             | VERSION_TYPED_COMPACT_LOGICAL_EXTERNAL
+            | VERSION_MANIFEST_LOGICAL_EXTERNAL
     ) {
         let profile = ScoringProfile::parse(reader.u8()?)?;
         let storage_dtype = reader.u8()?;
-        if version != VERSION_TYPED_COMPACT_LOGICAL_EXTERNAL && storage_dtype != 0 {
+        if !matches!(version, VERSION_TYPED_COMPACT_LOGICAL_EXTERNAL | VERSION_MANIFEST_LOGICAL_EXTERNAL) && storage_dtype != 0 {
             bail!("unsupported reserved bits");
         }
         (profile, storage_dtype)
@@ -262,7 +271,7 @@ pub fn parse(frame: &[u8]) -> Result<Request> {
     let contract_bytes = reader.u32()? as usize;
     let quantization_contract_bytes = if matches!(
         version,
-        VERSION_QUANTIZED_EXTERNAL | VERSION_LOGICAL_EXTERNAL | VERSION_COMPACT_LOGICAL_EXTERNAL | VERSION_TYPED_COMPACT_LOGICAL_EXTERNAL
+        VERSION_QUANTIZED_EXTERNAL | VERSION_LOGICAL_EXTERNAL | VERSION_COMPACT_LOGICAL_EXTERNAL | VERSION_TYPED_COMPACT_LOGICAL_EXTERNAL | VERSION_MANIFEST_LOGICAL_EXTERNAL
     ) {
         reader.u32()? as usize
     } else {
@@ -282,6 +291,7 @@ pub fn parse(frame: &[u8]) -> Result<Request> {
             | VERSION_LOGICAL_EXTERNAL
             | VERSION_COMPACT_LOGICAL_EXTERNAL
             | VERSION_TYPED_COMPACT_LOGICAL_EXTERNAL
+            | VERSION_MANIFEST_LOGICAL_EXTERNAL
     ) {
         (reader.i32()?, reader.u32()?, reader.u32()? as usize)
     } else {
@@ -297,13 +307,15 @@ pub fn parse(frame: &[u8]) -> Result<Request> {
             | VERSION_QUANTIZED_EXTERNAL
             | VERSION_LOGICAL_EXTERNAL
             | VERSION_COMPACT_LOGICAL_EXTERNAL
+            | VERSION_TYPED_COMPACT_LOGICAL_EXTERNAL
+            | VERSION_MANIFEST_LOGICAL_EXTERNAL
     ) && !(1..=600_000).contains(&timeout_ms)
     {
         bail!("scheduler timeout must be between 1 and 600000 milliseconds");
     }
     let top_k = if matches!(
         version,
-        VERSION_LOGICAL_EXTERNAL | VERSION_COMPACT_LOGICAL_EXTERNAL | VERSION_TYPED_COMPACT_LOGICAL_EXTERNAL
+        VERSION_LOGICAL_EXTERNAL | VERSION_COMPACT_LOGICAL_EXTERNAL | VERSION_TYPED_COMPACT_LOGICAL_EXTERNAL | VERSION_MANIFEST_LOGICAL_EXTERNAL
     ) {
         let value = reader.u32()? as usize;
         if value == 0 || value > candidate_count as usize {
@@ -316,7 +328,7 @@ pub fn parse(frame: &[u8]) -> Result<Request> {
     let contract = reader.text(contract_bytes, 512, "model contract")?;
     let quantization_contract = if matches!(
         version,
-        VERSION_QUANTIZED_EXTERNAL | VERSION_LOGICAL_EXTERNAL | VERSION_COMPACT_LOGICAL_EXTERNAL | VERSION_TYPED_COMPACT_LOGICAL_EXTERNAL
+        VERSION_QUANTIZED_EXTERNAL | VERSION_LOGICAL_EXTERNAL | VERSION_COMPACT_LOGICAL_EXTERNAL | VERSION_TYPED_COMPACT_LOGICAL_EXTERNAL | VERSION_MANIFEST_LOGICAL_EXTERNAL
     ) && quantization_contract_bytes > 0
     {
         let value = reader.text(quantization_contract_bytes, 128, "quantization contract")?;
@@ -345,6 +357,7 @@ pub fn parse(frame: &[u8]) -> Result<Request> {
             | VERSION_LOGICAL_EXTERNAL
             | VERSION_COMPACT_LOGICAL_EXTERNAL
             | VERSION_TYPED_COMPACT_LOGICAL_EXTERNAL
+            | VERSION_MANIFEST_LOGICAL_EXTERNAL
     ) {
         reader.text(tenant_bytes, 256, "scheduler tenant")?
     } else {
@@ -353,11 +366,16 @@ pub fn parse(frame: &[u8]) -> Result<Request> {
     let query_bytes = tensor_bytes(query_rows, dimension, dtype)?;
     let query = reader.take(query_bytes)?.to_vec();
     validate_finite(&query, dtype)?;
+    let manifest_digest = if version == VERSION_MANIFEST_LOGICAL_EXTERNAL {
+        Some(reader.take(32)?.try_into().unwrap())
+    } else {
+        None
+    };
     let mut total_tokens = query_rows as usize;
     let mut total_bytes = query_bytes;
     let mut candidate_ids = HashSet::new();
     let mut candidates = Vec::with_capacity(candidate_count as usize);
-    for _ in 0..candidate_count {
+    for _ in 0..if manifest_digest.is_some() { 0 } else { candidate_count } {
         let candidate_id = reader.u32()?;
         let rows = reader.u32()?;
         if matches!(version, VERSION_COMPACT_LOGICAL_EXTERNAL | VERSION_TYPED_COMPACT_LOGICAL_EXTERNAL) {
@@ -427,16 +445,19 @@ pub fn parse(frame: &[u8]) -> Result<Request> {
         protocol_version: version,
         request_id,
         tenant,
+        model_contract: contract,
         priority,
         timeout_ms,
         query_rows,
         dimension,
         dtype,
+        candidate_dtype: if storage_dtype == 0 { dtype } else { storage_dtype },
         scoring_profile,
         quantization_contract,
         top_k,
         query,
         candidates,
+        manifest_digest,
     })
 }
 
@@ -714,6 +735,39 @@ mod tests {
         assert_eq!(request.dtype, 2);
         assert_eq!(request.candidates[0].dtype, 3);
         assert_eq!(request.scoring_profile, ScoringProfile::RawFp8E4m3);
+    }
+
+    #[test]
+    fn manifest_protocol_carries_only_the_descriptor_digest() {
+        let contract = "model@1";
+        let mut body = Vec::new();
+        body.extend_from_slice(&320_u32.to_le_bytes());
+        body.extend_from_slice(&1_u32.to_le_bytes());
+        body.extend_from_slice(&45_601_u32.to_le_bytes());
+        body.extend_from_slice(&[2, 1, 6, 3]);
+        body.extend_from_slice(&(contract.len() as u32).to_le_bytes());
+        body.extend_from_slice(&0_u32.to_le_bytes());
+        body.extend_from_slice(&0_i32.to_le_bytes());
+        body.extend_from_slice(&4_000_u32.to_le_bytes());
+        body.extend_from_slice(&6_u32.to_le_bytes());
+        body.extend_from_slice(&50_u32.to_le_bytes());
+        body.extend_from_slice(contract.as_bytes());
+        body.extend_from_slice(b"tenant");
+        body.extend_from_slice(&vec![0_u8; 640]);
+        body.extend_from_slice(&[0xcd; 32]);
+        let mut frame = Vec::new();
+        frame.extend_from_slice(MAGIC);
+        frame.extend_from_slice(&VERSION_MANIFEST_LOGICAL_EXTERNAL.to_le_bytes());
+        frame.extend_from_slice(&REQUEST_KIND.to_le_bytes());
+        frame.extend_from_slice(&42_u64.to_le_bytes());
+        frame.extend_from_slice(&(body.len() as u64).to_le_bytes());
+        frame.extend_from_slice(&body);
+
+        let request = parse(&frame).unwrap();
+        assert_eq!(request.top_k, Some(50));
+        assert_eq!(request.candidate_dtype, 3);
+        assert!(request.candidates.is_empty());
+        assert_eq!(request.manifest_digest, Some([0xcd; 32]));
     }
 
     #[test]

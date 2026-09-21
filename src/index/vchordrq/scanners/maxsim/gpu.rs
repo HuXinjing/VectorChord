@@ -15,6 +15,7 @@ use super::external::{
 use super::rerank::{CandidateTensorSource, ExactMaxsimBackend, RerankError, RerankResults};
 use crate::index::gucs::PostgresMaxsimScoringProfile;
 use distance::Distance;
+use sha2::{Digest, Sha256};
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
 use std::io::{Read, Write};
@@ -33,6 +34,7 @@ const QUANTIZED_EXTERNAL_VERSION: u16 = 5;
 const LOGICAL_EXTERNAL_VERSION: u16 = 6;
 const COMPACT_LOGICAL_EXTERNAL_VERSION: u16 = 7;
 const TYPED_COMPACT_LOGICAL_EXTERNAL_VERSION: u16 = 8;
+const MANIFEST_LOGICAL_EXTERNAL_VERSION: u16 = 9;
 const REQUEST_KIND: u16 = 1;
 const RESPONSE_KIND: u16 = 2;
 const HEADER_LEN: usize = 24;
@@ -264,21 +266,55 @@ impl<T: TileMaxsimTransport> GpuExternalTileMaxsimBackend<T> {
                 .and_then(|size| size.checked_add(group_top_k.checked_mul(8)?))
                 .map(|size| size.max(HEADER_LEN + 8 + MAX_REMOTE_ERROR_BYTES))
                 .ok_or(RerankError::RequestTooLarge)?;
+            let reference = manifest_reference(&encoded)?;
             let response = self.transport.round_trip(
-                &encoded.frame,
+                &reference,
                 remaining_logical_timeout(deadline)?,
                 max_response_bytes,
             )?;
-            merged.extend(
-                decode_response_for_version(
-                    &response,
-                    encoded.version,
-                    request_id,
-                    &encoded.heap_keys,
-                    group_top_k,
-                )?
-                .inner,
+            let decoded = decode_response_for_version(
+                &response,
+                MANIFEST_LOGICAL_EXTERNAL_VERSION,
+                request_id,
+                &encoded.heap_keys,
+                group_top_k,
             );
+            let decoded = match decoded {
+                Err(RerankError::Remote(message)) if message == "descriptor manifest miss" => {
+                    let response = self.transport.round_trip(
+                        &encoded.frame,
+                        remaining_logical_timeout(deadline)?,
+                        max_response_bytes,
+                    )?;
+                    decode_response_for_version(
+                        &response,
+                        encoded.version,
+                        request_id,
+                        &encoded.heap_keys,
+                        group_top_k,
+                    )?
+                }
+                Err(RerankError::Protocol(message)) if message == "unsupported version" => {
+                    // A v2-v8 daemon rejects the v9 reference before it can
+                    // report a manifest miss. Retry the already validated v8
+                    // registration frame so extension-first rolling upgrades
+                    // remain available.
+                    let response = self.transport.round_trip(
+                        &encoded.frame,
+                        remaining_logical_timeout(deadline)?,
+                        max_response_bytes,
+                    )?;
+                    decode_response_for_version(
+                        &response,
+                        encoded.version,
+                        request_id,
+                        &encoded.heap_keys,
+                        group_top_k,
+                    )?
+                }
+                other => other?,
+            };
+            merged.extend(decoded.inner);
         }
         let mut retained = BinaryHeap::new();
         for _ in 0..top_k.min(merged.len()) {
@@ -388,6 +424,34 @@ struct EncodedRequest {
     frame: Vec<u8>,
     heap_keys: Vec<HeapKey>,
     version: u16,
+    descriptor_offset: usize,
+}
+
+fn manifest_reference(encoded: &EncodedRequest) -> Result<Vec<u8>, RerankError> {
+    if !matches!(
+        encoded.version,
+        COMPACT_LOGICAL_EXTERNAL_VERSION | TYPED_COMPACT_LOGICAL_EXTERNAL_VERSION
+    ) {
+        return Err(RerankError::Protocol(
+            "manifest reference requires a compact logical request".into(),
+        ));
+    }
+    let mut hash = Sha256::new();
+    hash.update(&encoded.frame[encoded.descriptor_offset..]);
+    let digest = hash.finalize();
+    let mut frame = encoded.frame[..encoded.descriptor_offset].to_vec();
+    frame.extend_from_slice(&digest);
+    frame[4..6].copy_from_slice(&MANIFEST_LOGICAL_EXTERNAL_VERSION.to_le_bytes());
+    let body_len = frame
+        .len()
+        .checked_sub(HEADER_LEN)
+        .ok_or(RerankError::RequestTooLarge)?;
+    frame[16..24].copy_from_slice(
+        &u64::try_from(body_len)
+            .map_err(|_| RerankError::RequestTooLarge)?
+            .to_le_bytes(),
+    );
+    Ok(frame)
 }
 
 #[cfg(test)]
@@ -548,6 +612,7 @@ fn encode_external_descriptors(
         writer.bytes(tenant.as_bytes())?;
     }
     encode_tensor_values(&mut writer, query, dtype)?;
+    let descriptor_offset = writer.len();
 
     if descriptors.len() > MAX_EXTERNAL_CANDIDATES_PER_BATCH {
         return Err(RerankError::RequestTooLarge);
@@ -618,6 +683,7 @@ fn encode_external_descriptors(
         frame: writer.finish(),
         heap_keys,
         version,
+        descriptor_offset,
     })
 }
 
@@ -926,6 +992,7 @@ fn encode_request<S: CandidateTensorSource>(
         frame: writer.finish(),
         heap_keys,
         version: VERSION,
+        descriptor_offset: 0,
     })
 }
 
@@ -1707,6 +1774,43 @@ mod tests {
         observations: Rc<RefCell<Vec<(u16, u32, u32)>>>,
     }
 
+    struct ManifestMissTransport {
+        versions: Rc<RefCell<Vec<u16>>>,
+        legacy_rejection: bool,
+    }
+
+    impl TileMaxsimTransport for ManifestMissTransport {
+        fn round_trip(
+            &mut self,
+            request: &[u8],
+            _timeout: Duration,
+            _max_response_bytes: usize,
+        ) -> Result<Vec<u8>, RerankError> {
+            let version = u16::from_le_bytes(request[4..6].try_into().unwrap());
+            let request_id = u64::from_le_bytes(request[8..16].try_into().unwrap());
+            self.versions.borrow_mut().push(version);
+            if version == MANIFEST_LOGICAL_EXTERNAL_VERSION {
+                if self.legacy_rejection {
+                    return Ok(error_response_with_version(
+                        EXTERNAL_VERSION,
+                        request_id,
+                        "unsupported external protocol version",
+                    ));
+                }
+                return Ok(error_response_with_version(
+                    version,
+                    request_id,
+                    "descriptor manifest miss",
+                ));
+            }
+            Ok(success_response_with_version(
+                version,
+                request_id,
+                &[(0, 0.75)],
+            ))
+        }
+    }
+
     impl TileMaxsimTransport for LogicalTransport {
         fn round_trip(
             &mut self,
@@ -1821,10 +1925,14 @@ mod tests {
     }
 
     fn error_response(request_id: u64, message: &str) -> Vec<u8> {
+        error_response_with_version(VERSION, request_id, message)
+    }
+
+    fn error_response_with_version(version: u16, request_id: u64, message: &str) -> Vec<u8> {
         let body_len = 8 + message.len();
         let mut response = Vec::with_capacity(HEADER_LEN + body_len);
         response.extend_from_slice(MAGIC);
-        response.extend_from_slice(&VERSION.to_le_bytes());
+        response.extend_from_slice(&version.to_le_bytes());
         response.extend_from_slice(&RESPONSE_KIND.to_le_bytes());
         response.extend_from_slice(&request_id.to_le_bytes());
         response.extend_from_slice(&(body_len as u64).to_le_bytes());
@@ -2409,10 +2517,98 @@ mod tests {
 
         assert_eq!(
             observations.borrow().as_slice(),
-            &[(COMPACT_LOGICAL_EXTERNAL_VERSION, 3, 1)]
+            &[(MANIFEST_LOGICAL_EXTERNAL_VERSION, 3, 1)]
         );
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].heap_key, pages[2]);
+    }
+
+    #[test]
+    fn logical_external_request_registers_after_a_manifest_miss() {
+        let candidate = PageCandidate {
+            approximate_distance: Distance::ZERO,
+            heap_key: [0, 0, 1],
+        };
+        let mut candidates = vec![candidate].into_iter();
+        let mut source = MockDescriptorSource(BTreeMap::from([(
+            candidate.heap_key,
+            external_descriptor(
+                candidate,
+                7,
+                &format!("sha256://{}", "a".repeat(64)),
+                2,
+                2,
+                ExternalTensorDtype::F32,
+            ),
+        )]));
+        let versions = Rc::new(RefCell::new(Vec::new()));
+        let results = GpuExternalTileMaxsimBackend::new(
+            ManifestMissTransport {
+                versions: Rc::clone(&versions),
+                legacy_rejection: false,
+            },
+            "contract@1".into(),
+            Duration::from_secs(1),
+            100,
+            4096,
+        )
+        .rerank_logical(&[vector(&[1.0, 0.0])], &mut candidates, &mut source, 1)
+        .unwrap()
+        .collect::<Vec<_>>();
+
+        assert_eq!(
+            versions.borrow().as_slice(),
+            &[
+                MANIFEST_LOGICAL_EXTERNAL_VERSION,
+                COMPACT_LOGICAL_EXTERNAL_VERSION
+            ]
+        );
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].heap_key, candidate.heap_key);
+    }
+
+    #[test]
+    fn logical_external_request_falls_back_during_extension_first_upgrade() {
+        let candidate = PageCandidate {
+            approximate_distance: Distance::ZERO,
+            heap_key: [0, 0, 2],
+        };
+        let mut candidates = vec![candidate].into_iter();
+        let mut source = MockDescriptorSource(BTreeMap::from([(
+            candidate.heap_key,
+            external_descriptor(
+                candidate,
+                8,
+                &format!("sha256://{}", "a".repeat(64)),
+                2,
+                2,
+                ExternalTensorDtype::F32,
+            ),
+        )]));
+        let versions = Rc::new(RefCell::new(Vec::new()));
+        let results = GpuExternalTileMaxsimBackend::new(
+            ManifestMissTransport {
+                versions: Rc::clone(&versions),
+                legacy_rejection: true,
+            },
+            "contract@1".into(),
+            Duration::from_secs(1),
+            100,
+            4096,
+        )
+        .rerank_logical(&[vector(&[1.0, 0.0])], &mut candidates, &mut source, 1)
+        .unwrap()
+        .collect::<Vec<_>>();
+
+        assert_eq!(
+            versions.borrow().as_slice(),
+            &[
+                MANIFEST_LOGICAL_EXTERNAL_VERSION,
+                COMPACT_LOGICAL_EXTERNAL_VERSION
+            ]
+        );
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].heap_key, candidate.heap_key);
     }
 
     #[test]
