@@ -1259,6 +1259,14 @@ fn descriptor_manifest_key(request: &protocol::Request, digest: &[u8; 32]) -> St
 }
 
 fn resolve_descriptor_manifest(request: &mut protocol::Request, metrics: &RuntimeMetrics) -> bool {
+    // Catalog protocols already bind the descriptor population to a catalog
+    // digest (and, for v11, a selection digest).  Once the catalog resolver
+    // restores candidates, registering the same population in the legacy
+    // manifest cache is redundant and re-hashes every descriptor on every
+    // request.
+    if request.catalog_digest.is_some() {
+        return true;
+    }
     let manifests = DESCRIPTOR_MANIFESTS.get_or_init(|| Mutex::new(VecDeque::new()));
     if let Some(digest) = request.manifest_digest {
         // Reference requests do not carry candidates, so their contract comes
@@ -3665,7 +3673,8 @@ mod tests {
         AdminAction, ByteAdmission, OperationRegistry, PendingAdmission, RuntimeMetrics,
         candidate_fmas, handle_status_connection, header_version, is_fatal_cuda_diagnostic,
         kib_to_bytes, quantum_end, read_management_request, render_metrics,
-        resolve_descriptor_catalog, resolve_quantum_candidates, tenant_hash,
+        resolve_descriptor_catalog, resolve_descriptor_manifest, resolve_quantum_candidates,
+        tenant_hash,
     };
     #[cfg(feature = "backend-cpu")]
     use crate::backend::{AcceleratorBackend, BackendKind};
@@ -3730,6 +3739,20 @@ mod tests {
         second.catalog_public_ids.clear();
         assert!(resolve_descriptor_catalog(&mut second, &metrics));
         assert!(Arc::ptr_eq(&first_candidates, &second.candidates));
+    }
+
+    #[test]
+    fn catalog_requests_do_not_duplicate_entries_in_the_manifest_cache() {
+        let metrics = RuntimeMetrics::default();
+        let mut request = catalog_request(true);
+
+        assert!(resolve_descriptor_manifest(&mut request, &metrics));
+        assert_eq!(
+            metrics
+                .descriptor_manifest_registrations
+                .load(Ordering::Relaxed),
+            0
+        );
     }
 
     #[test]
