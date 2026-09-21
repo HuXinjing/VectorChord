@@ -13,7 +13,7 @@ use super::external::{
     CandidateTensorDescriptorSource, ExternalTensorDescriptor, ExternalTensorStorage,
     TileMaxsimSourceBinding, resolve_tilemaxsim_source, validate_descriptor,
 };
-use super::gpu::{GpuExternalTileMaxsimBackend, UnixSocketTransport};
+use super::gpu::{CatalogSelectionOutcome, GpuExternalTileMaxsimBackend, UnixSocketTransport};
 use super::profile;
 use super::rerank::RerankError;
 use crate::datatype::memory_halfvec::HalfvecInput;
@@ -159,29 +159,12 @@ fn execute_rerank(
         profile.preflight_us += profile::duration_us(preflight_timer.elapsed());
     });
 
-    let descriptor_timer = profile::ProfileTimer::start();
-    let (mut source, public_ids) = load_visible_descriptors(&binding, &candidate_ids)?;
-    let mut candidates = public_ids
-        .keys()
-        .copied()
-        .map(|heap_key| PageCandidate {
-            approximate_distance: Distance::ZERO,
-            heap_key,
-        })
-        .collect::<Vec<_>>()
-        .into_iter();
-    profile::update(|profile| {
-        profile.descriptor_us += profile::duration_us(descriptor_timer.elapsed());
-        profile.visible_candidates = public_ids.len() as u64;
-        profile.descriptors = public_ids.len() as u64;
-    });
-
     let endpoint = gucs::vchordrq_maxsim_gpu_endpoint()
         .map(|endpoint| endpoint.to_string_lossy().into_owned())
         .unwrap_or_default();
     let mut backend = GpuExternalTileMaxsimBackend::new(
         UnixSocketTransport::new(endpoint),
-        binding.model_contract_id,
+        binding.model_contract_id.clone(),
         Duration::from_millis(gucs::vchordrq_maxsim_gpu_timeout_ms() as u64),
         gucs::vchordrq_maxsim_gpu_max_batch_tokens() as usize,
         gucs::vchordrq_maxsim_gpu_max_batch_bytes() as usize,
@@ -194,8 +177,41 @@ fn execute_rerank(
     }
     let sidecar_timer = profile::ProfileTimer::start();
     let result_limit = top_k as usize;
+    let mut sorted_candidate_ids = candidate_ids.clone();
+    sorted_candidate_ids.sort_unstable();
+    let fast_public_ids = public_id_map(&sorted_candidate_ids)?;
+    let (results, public_ids) =
+        match backend.rerank_raw_fp8_catalog(&query, &sorted_candidate_ids, result_limit)? {
+            CatalogSelectionOutcome::Hit(results) => {
+                profile::update(|profile| {
+                    profile.visible_candidates = fast_public_ids.len() as u64;
+                });
+                (results, fast_public_ids)
+            }
+            CatalogSelectionOutcome::Miss | CatalogSelectionOutcome::Unsupported => {
+                let descriptor_timer = profile::ProfileTimer::start();
+                let (mut source, public_ids) = load_visible_descriptors(&binding, &candidate_ids)?;
+                let mut candidates = public_ids
+                    .keys()
+                    .copied()
+                    .map(|heap_key| PageCandidate {
+                        approximate_distance: Distance::ZERO,
+                        heap_key,
+                    })
+                    .collect::<Vec<_>>()
+                    .into_iter();
+                profile::update(|profile| {
+                    profile.descriptor_us += profile::duration_us(descriptor_timer.elapsed());
+                    profile.visible_candidates = public_ids.len() as u64;
+                    profile.descriptors = public_ids.len() as u64;
+                });
+                let results =
+                    backend.rerank_logical(&query, &mut candidates, &mut source, result_limit)?;
+                (results, public_ids)
+            }
+        };
     let mut best = BinaryHeap::with_capacity(result_limit.saturating_add(1));
-    for result in backend.rerank_logical(&query, &mut candidates, &mut source, result_limit)? {
+    for result in results {
         let public_id = public_ids.get(&result.heap_key).copied().ok_or_else(|| {
             RerankError::Protocol("sidecar result has no visible public ID".into())
         })?;
@@ -223,6 +239,23 @@ fn execute_rerank(
     });
     profile_guard.finish(total_timer.elapsed());
     Ok(output.into_iter())
+}
+
+fn public_id_map(candidate_ids: &[i64]) -> Result<BTreeMap<HeapKey, i64>, RerankError> {
+    let mut public_ids = BTreeMap::new();
+    for (ordinal, public_id) in candidate_ids.iter().copied().enumerate() {
+        if public_id <= 0
+            || public_ids
+                .insert(candidate_for_ordinal(ordinal)?.heap_key, public_id)
+                .is_some()
+            || ordinal > 0 && candidate_ids[ordinal - 1] == public_id
+        {
+            return Err(RerankError::InvalidDescriptor(
+                "catalog public IDs must be positive and unique",
+            ));
+        }
+    }
+    Ok(public_ids)
 }
 
 fn validate_top_k(candidate_count: usize, top_k: i32) -> Result<(), RerankError> {

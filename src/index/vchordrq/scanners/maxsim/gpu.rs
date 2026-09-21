@@ -17,11 +17,12 @@ use crate::index::gucs::PostgresMaxsimScoringProfile;
 use distance::Distance;
 use sha2::{Digest, Sha256};
 use std::cmp::Reverse;
-use std::collections::BinaryHeap;
+use std::collections::{BinaryHeap, VecDeque};
 use std::io::{Read, Write};
 use std::mem::size_of_val;
 use std::net::{TcpStream, ToSocketAddrs};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 use vchordrq::types::OwnedVector;
 
@@ -48,6 +49,8 @@ const MAX_TENANT_BYTES: usize = 256;
 
 static NEXT_REQUEST_ID: AtomicU64 = AtomicU64::new(1);
 static LAST_FALLBACK_WARNING_SECONDS: AtomicU64 = AtomicU64::new(0);
+const MAX_CATALOG_DTYPE_HINTS: usize = 64;
+static CATALOG_DTYPE_HINTS: OnceLock<Mutex<VecDeque<(String, TensorDtype)>>> = OnceLock::new();
 
 pub(super) fn report_gpu_fallback(error: &RerankError) {
     let now = std::time::SystemTime::now()
@@ -160,6 +163,34 @@ pub(super) struct TileMaxsimScheduling {
     pub priority: i32,
 }
 
+pub(super) enum CatalogSelectionOutcome {
+    Hit(RerankResults),
+    Miss,
+    Unsupported,
+}
+
+fn catalog_dtype_hint(key: &str) -> Option<TensorDtype> {
+    let hints = CATALOG_DTYPE_HINTS.get_or_init(|| Mutex::new(VecDeque::new()));
+    let mut hints = hints.lock().unwrap_or_else(|error| error.into_inner());
+    let position = hints.iter().position(|(candidate, _)| candidate == key)?;
+    let entry = hints.remove(position)?;
+    let dtype = entry.1;
+    hints.push_back(entry);
+    Some(dtype)
+}
+
+fn remember_catalog_dtype(key: &str, dtype: TensorDtype) {
+    let hints = CATALOG_DTYPE_HINTS.get_or_init(|| Mutex::new(VecDeque::new()));
+    let mut hints = hints.lock().unwrap_or_else(|error| error.into_inner());
+    if let Some(position) = hints.iter().position(|(candidate, _)| candidate == key) {
+        hints.remove(position);
+    }
+    while hints.len() >= MAX_CATALOG_DTYPE_HINTS {
+        hints.pop_front();
+    }
+    hints.push_back((key.to_string(), dtype));
+}
+
 impl<T> GpuExternalTileMaxsimBackend<T> {
     pub(super) fn new(
         transport: T,
@@ -208,6 +239,101 @@ impl<T> GpuExternalTileMaxsimBackend<T> {
 }
 
 impl<T: TileMaxsimTransport> GpuExternalTileMaxsimBackend<T> {
+    /// Probe a warm raw-FP8 descriptor catalog without reading descriptor rows
+    /// from PostgreSQL. A miss deliberately returns before materialization so
+    /// the caller can load descriptors only for the registration slow path.
+    pub(super) fn rerank_raw_fp8_catalog(
+        &mut self,
+        query: &[OwnedVector],
+        public_ids: &[i64],
+        top_k: usize,
+    ) -> Result<CatalogSelectionOutcome, RerankError> {
+        let Some(revision) = self.catalog_revision.as_deref() else {
+            return Ok(CatalogSelectionOutcome::Unsupported);
+        };
+        if self.scoring_profile != PostgresMaxsimScoringProfile::RawFp8E4m3 {
+            return Ok(CatalogSelectionOutcome::Unsupported);
+        }
+        if public_ids.is_empty() {
+            return Ok(CatalogSelectionOutcome::Hit(RerankResults {
+                inner: BinaryHeap::new(),
+            }));
+        }
+        if top_k == 0 || public_ids.len() > MAX_EXTERNAL_CANDIDATES_PER_BATCH {
+            return Err(RerankError::RequestTooLarge);
+        }
+        let mut sorted_ids = public_ids.to_vec();
+        sorted_ids.sort_unstable();
+        if sorted_ids[0] <= 0 || sorted_ids.windows(2).any(|pair| pair[0] == pair[1]) {
+            return Err(RerankError::InvalidDescriptor(
+                "catalog public IDs must be positive and unique",
+            ));
+        }
+        let max_response_bytes = HEADER_LEN
+            .checked_add(8)
+            .and_then(|size| size.checked_add(top_k.min(sorted_ids.len()).checked_mul(8)?))
+            .map(|size| size.max(HEADER_LEN + 8 + MAX_REMOTE_ERROR_BYTES))
+            .ok_or(RerankError::RequestTooLarge)?;
+        let (_, dimension) = tensor_metadata(query)?;
+        let dtype_hint_key = format!(
+            "{}\0{}\0{}\0{}\0{}",
+            self.model_contract_id,
+            self.scheduling
+                .as_ref()
+                .map_or("__default__", |value| value.tenant.as_str()),
+            scoring_profile_code(self.scoring_profile),
+            dimension,
+            revision,
+        );
+        // Raw FP8 is the desired Hopper storage contract, but a rolling
+        // migration may still have an otherwise identical FP16/F32 catalog.
+        // Probe those bounded protocol-defined dtypes before touching the
+        // descriptor relation. Mixed-dtype candidate sets fail all probes and
+        // deliberately fall back to the materializing registration path.
+        let mut storage_dtypes = vec![TensorDtype::Fp8E4m3, TensorDtype::F16, TensorDtype::F32];
+        if let Some(hint) = catalog_dtype_hint(&dtype_hint_key) {
+            storage_dtypes.retain(|dtype| *dtype != hint);
+            storage_dtypes.insert(0, hint);
+        }
+        for storage_dtype in storage_dtypes {
+            let request_id = NEXT_REQUEST_ID.fetch_add(1, Ordering::Relaxed);
+            let (frame, heap_keys) = encode_raw_fp8_catalog_selection(
+                request_id,
+                &self.model_contract_id,
+                query,
+                &sorted_ids,
+                self.max_batch_tokens,
+                self.max_batch_bytes,
+                self.scheduling.as_ref(),
+                revision,
+                self.timeout,
+                top_k.min(sorted_ids.len()),
+                storage_dtype,
+            )?;
+            let response = self
+                .transport
+                .round_trip(&frame, self.timeout, max_response_bytes)?;
+            match decode_response_for_version(
+                &response,
+                CATALOG_LOGICAL_EXTERNAL_VERSION,
+                request_id,
+                &heap_keys,
+                top_k.min(sorted_ids.len()),
+            ) {
+                Ok(results) => {
+                    remember_catalog_dtype(&dtype_hint_key, storage_dtype);
+                    return Ok(CatalogSelectionOutcome::Hit(results));
+                }
+                Err(RerankError::Remote(message)) if message == "descriptor catalog miss" => {}
+                Err(RerankError::Protocol(message)) if message == "unsupported version" => {
+                    return Ok(CatalogSelectionOutcome::Unsupported);
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(CatalogSelectionOutcome::Miss)
+    }
+
     /// Submit a complete external descriptor set as one logical request. The
     /// daemon performs bounded cooperative GPU slicing and global top-k, which
     /// avoids one TCP round trip per client-side tensor-token batch.
@@ -533,6 +659,115 @@ fn manifest_reference(encoded: &EncodedRequest) -> Result<Vec<u8>, RerankError> 
             .to_le_bytes(),
     );
     Ok(frame)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn encode_raw_fp8_catalog_selection(
+    request_id: u64,
+    model_contract_id: &str,
+    query: &[OwnedVector],
+    public_ids: &[i64],
+    max_batch_tokens: usize,
+    max_batch_bytes: usize,
+    scheduling: Option<&TileMaxsimScheduling>,
+    revision: &str,
+    timeout: Duration,
+    top_k: usize,
+    storage_dtype: TensorDtype,
+) -> Result<(Vec<u8>, Vec<HeapKey>), RerankError> {
+    if model_contract_id.is_empty()
+        || model_contract_id.len() > MAX_MODEL_CONTRACT_BYTES
+        || model_contract_id.chars().any(char::is_control)
+    {
+        return Err(RerankError::InvalidDescriptor(
+            "model contract is empty, oversized, or contains control characters",
+        ));
+    }
+    if let Some(scheduling) = scheduling {
+        if scheduling.tenant.is_empty()
+            || scheduling.tenant.len() > MAX_TENANT_BYTES
+            || scheduling.tenant.chars().any(char::is_control)
+            || !(-100..=100).contains(&scheduling.priority)
+        {
+            return Err(RerankError::Configuration(
+                "TileMaxSim scheduler tenant or priority is invalid",
+            ));
+        }
+    }
+    let (query_dtype, dimension) = tensor_metadata(query)?;
+    let query_rows = u32::try_from(query.len()).map_err(|_| RerankError::RequestTooLarge)?;
+    if query.len() > max_batch_tokens
+        || tensor_bytes(query_rows, dimension, query_dtype)? > max_batch_bytes
+        || public_ids.len() > MAX_EXTERNAL_CANDIDATES_PER_BATCH
+    {
+        return Err(RerankError::RequestTooLarge);
+    }
+    let tenant = scheduling.map_or("__default__", |value| value.tenant.as_str());
+    let priority = scheduling.map_or(0, |value| value.priority);
+    let mut writer = BoundedWriter::new(max_batch_bytes);
+    writer.zeros(HEADER_LEN)?;
+    writer.u32(dimension)?;
+    writer.u32(query_rows)?;
+    writer.u32(u32::try_from(public_ids.len()).map_err(|_| RerankError::RequestTooLarge)?)?;
+    writer.u8(query_dtype as u8)?;
+    writer.u8(1)?;
+    writer.u8(scoring_profile_code(
+        PostgresMaxsimScoringProfile::RawFp8E4m3,
+    ))?;
+    writer.u8(if query_dtype == storage_dtype {
+        0
+    } else {
+        storage_dtype as u8
+    })?;
+    writer
+        .u32(u32::try_from(model_contract_id.len()).map_err(|_| RerankError::RequestTooLarge)?)?;
+    writer.u32(0)?;
+    writer.i32(priority)?;
+    writer.u32(
+        u32::try_from(timeout.as_millis().clamp(1, 600_000))
+            .map_err(|_| RerankError::RequestTooLarge)?,
+    )?;
+    writer.u32(u32::try_from(tenant.len()).map_err(|_| RerankError::RequestTooLarge)?)?;
+    writer.u32(u32::try_from(top_k).map_err(|_| RerankError::RequestTooLarge)?)?;
+    writer.bytes(model_contract_id.as_bytes())?;
+    writer.bytes(tenant.as_bytes())?;
+    encode_tensor_values(&mut writer, query, query_dtype)?;
+    writer.u8(1)?;
+    writer.bytes(&Sha256::digest(revision.as_bytes()))?;
+    let mut previous = 0_u64;
+    let mut heap_keys = Vec::with_capacity(public_ids.len());
+    for (ordinal, public_id) in public_ids.iter().copied().enumerate() {
+        let current = u64::try_from(public_id)
+            .map_err(|_| RerankError::InvalidDescriptor("catalog public ID is not positive"))?;
+        let delta = current
+            .checked_sub(previous)
+            .filter(|value| *value > 0)
+            .ok_or(RerankError::InvalidDescriptor(
+                "catalog public IDs are not strictly increasing",
+            ))?;
+        let mut remaining = delta;
+        while remaining >= 0x80 {
+            writer.u8((remaining as u8 & 0x7f) | 0x80)?;
+            remaining >>= 7;
+        }
+        writer.u8(remaining as u8)?;
+        let ordinal = u32::try_from(ordinal).map_err(|_| RerankError::RequestTooLarge)?;
+        heap_keys.push([0, (ordinal >> 16) as u16, ordinal as u16]);
+        previous = current;
+    }
+    let body_len = writer
+        .len()
+        .checked_sub(HEADER_LEN)
+        .ok_or_else(|| RerankError::Protocol("invalid request length".into()))?;
+    writer.patch_bytes(0, MAGIC);
+    writer.patch_u16(4, CATALOG_LOGICAL_EXTERNAL_VERSION);
+    writer.patch_u16(6, REQUEST_KIND);
+    writer.patch_u64(8, request_id);
+    writer.patch_u64(
+        16,
+        u64::try_from(body_len).map_err(|_| RerankError::RequestTooLarge)?,
+    );
+    Ok((writer.finish(), heap_keys))
 }
 
 fn catalog_frames(
@@ -1936,6 +2171,29 @@ mod tests {
         calls: Rc<RefCell<Vec<(u16, u8, usize)>>>,
     }
 
+    struct CatalogProbeMissTransport {
+        calls: Rc<RefCell<Vec<(u16, u8, usize)>>>,
+    }
+
+    impl TileMaxsimTransport for CatalogProbeMissTransport {
+        fn round_trip(
+            &mut self,
+            request: &[u8],
+            _timeout: Duration,
+            _max_response_bytes: usize,
+        ) -> Result<Vec<u8>, RerankError> {
+            let version = u16::from_le_bytes(request[4..6].try_into().unwrap());
+            let request_id = u64::from_le_bytes(request[8..16].try_into().unwrap());
+            let mode = request[request.len() - 34];
+            self.calls.borrow_mut().push((version, mode, request.len()));
+            Ok(error_response_with_version(
+                version,
+                request_id,
+                "descriptor catalog miss",
+            ))
+        }
+    }
+
     impl TileMaxsimTransport for CatalogMissTransport {
         fn round_trip(
             &mut self,
@@ -2764,7 +3022,7 @@ mod tests {
         };
         let calls = Rc::new(RefCell::new(Vec::new()));
         let mut backend = GpuExternalTileMaxsimBackend::new(
-            CatalogMissTransport {
+            CatalogProbeMissTransport {
                 calls: Rc::clone(&calls),
             },
             "contract@1".into(),
@@ -2804,6 +3062,35 @@ mod tests {
             vec![1, 2, 1]
         );
         assert!(calls[0].2 < calls[1].2);
+    }
+
+    #[test]
+    fn raw_fp8_catalog_probe_does_not_require_descriptors() {
+        let calls = Rc::new(RefCell::new(Vec::new()));
+        let mut backend = GpuExternalTileMaxsimBackend::new(
+            CatalogMissTransport {
+                calls: Rc::clone(&calls),
+            },
+            "contract@1".into(),
+            Duration::from_secs(1),
+            100,
+            4096,
+        )
+        .with_scoring_profile(PostgresMaxsimScoringProfile::RawFp8E4m3)
+        .with_catalog_revision(Some("revision-17".into()));
+        assert!(matches!(
+            backend
+                .rerank_raw_fp8_catalog(&[vector(&[1.0, 0.0])], &[7, 10], 1)
+                .unwrap(),
+            CatalogSelectionOutcome::Miss
+        ));
+        let calls = calls.borrow();
+        assert_eq!(calls.len(), 3);
+        assert!(
+            calls
+                .iter()
+                .all(|call| call.0 == CATALOG_LOGICAL_EXTERNAL_VERSION && call.1 == 1)
+        );
     }
 
     #[test]
