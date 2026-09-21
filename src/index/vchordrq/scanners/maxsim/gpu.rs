@@ -40,6 +40,8 @@ const MANIFEST_LOGICAL_EXTERNAL_VERSION: u16 = 9;
 const CATALOG_LOGICAL_EXTERNAL_VERSION: u16 = 10;
 const CATALOG_SELECTION_REFERENCE_VERSION: u16 = 11;
 const SCOPED_CATALOG_SELECTION_REFERENCE_VERSION: u16 = 12;
+const PERSISTENT_SCOPED_CATALOG_SELECTION_REFERENCE_VERSION: u16 = 13;
+const PERSISTENT_CATALOG_SELECTION_REFERENCE_VERSION: u16 = 14;
 const REQUEST_KIND: u16 = 1;
 const RESPONSE_KIND: u16 = 2;
 const HEADER_LEN: usize = 24;
@@ -54,6 +56,13 @@ static NEXT_REQUEST_ID: AtomicU64 = AtomicU64::new(1);
 static LAST_FALLBACK_WARNING_SECONDS: AtomicU64 = AtomicU64::new(0);
 const MAX_CATALOG_DTYPE_HINTS: usize = 64;
 static CATALOG_DTYPE_HINTS: OnceLock<Mutex<VecDeque<(String, TensorDtype)>>> = OnceLock::new();
+#[cfg(unix)]
+const MAX_PERSISTENT_TRANSPORT_ENDPOINTS: usize = 16;
+#[cfg(unix)]
+static PERSISTENT_TRANSPORTS: OnceLock<Mutex<VecDeque<(String, TransportStream)>>> =
+    OnceLock::new();
+#[cfg(unix)]
+static PERSISTENT_CAPABILITIES: OnceLock<Mutex<VecDeque<((String, u16), bool)>>> = OnceLock::new();
 
 pub(super) fn report_gpu_fallback(error: &RerankError) {
     let now = std::time::SystemTime::now()
@@ -2144,34 +2153,174 @@ impl TileMaxsimTransport for UnixSocketTransport {
         let deadline = Instant::now()
             .checked_add(timeout)
             .ok_or_else(|| RerankError::Transport("invalid timeout".into()))?;
-        let mut stream = connect_endpoint_interruptible(&self.endpoint, deadline)?;
-        let poll = remaining_until(deadline)?.min(Duration::from_millis(50));
-        stream
-            .set_read_timeout(Some(poll))
-            .map_err(|error| RerankError::Transport(error.to_string()))?;
-        stream
-            .set_write_timeout(Some(poll))
-            .map_err(|error| RerankError::Transport(error.to_string()))?;
-
-        write_interruptible(&mut stream, request, deadline)?;
-        let mut header = [0u8; HEADER_LEN];
-        read_interruptible(&mut stream, &mut header, deadline)?;
-        let body_len = usize::try_from(u64::from_le_bytes(header[16..24].try_into().unwrap()))
-            .map_err(|_| RerankError::Protocol("response body is too large".into()))?;
-        let response_len = HEADER_LEN
-            .checked_add(body_len)
-            .ok_or_else(|| RerankError::Protocol("response length overflow".into()))?;
-        if response_len > max_response_bytes {
-            return Err(RerankError::Protocol(
-                "response exceeds configured limit".into(),
-            ));
+        let request_version = request
+            .get(4..6)
+            .map(|bytes| u16::from_le_bytes(bytes.try_into().unwrap()));
+        let persistent_version = match request_version {
+            Some(CATALOG_SELECTION_REFERENCE_VERSION) => {
+                Some(PERSISTENT_CATALOG_SELECTION_REFERENCE_VERSION)
+            }
+            Some(SCOPED_CATALOG_SELECTION_REFERENCE_VERSION) => {
+                Some(PERSISTENT_SCOPED_CATALOG_SELECTION_REFERENCE_VERSION)
+            }
+            _ => None,
+        };
+        if let Some(persistent_version) = persistent_version
+            && persistent_capability(&self.endpoint, persistent_version) != Some(false)
+        {
+            let mut persistent_request = request.to_vec();
+            persistent_request[4..6].copy_from_slice(&persistent_version.to_le_bytes());
+            let (mut stream, reused) = take_persistent_transport(&self.endpoint)
+                .map(|stream| (stream, true))
+                .unwrap_or((
+                    connect_endpoint_interruptible(&self.endpoint, deadline)?,
+                    false,
+                ));
+            let response = match exchange_frame(
+                &mut stream,
+                &persistent_request,
+                deadline,
+                max_response_bytes,
+            ) {
+                Ok(response) => response,
+                Err(_) if reused => {
+                    stream = connect_endpoint_interruptible(&self.endpoint, deadline)?;
+                    exchange_frame(
+                        &mut stream,
+                        &persistent_request,
+                        deadline,
+                        max_response_bytes,
+                    )?
+                }
+                Err(error) => return Err(error),
+            };
+            if response.get(4..6) == Some(&persistent_version.to_le_bytes()) {
+                let valid_envelope = response_matches_request(&response, &persistent_request);
+                remember_persistent_capability(&self.endpoint, persistent_version, true);
+                if valid_envelope && response_status(&response) == Some(0) {
+                    return_persistent_transport(&self.endpoint, stream);
+                }
+                let mut compatible = response;
+                compatible[4..6].copy_from_slice(&request_version.unwrap().to_le_bytes());
+                return Ok(compatible);
+            }
+            // An older daemon responds with its oldest error protocol. Record
+            // this negotiated version once and retry the idempotent scoring
+            // request in its original one-shot form on a fresh connection.
+            remember_persistent_capability(&self.endpoint, persistent_version, false);
         }
-        let mut response = Vec::with_capacity(response_len);
-        response.extend_from_slice(&header);
-        response.resize(response_len, 0);
-        read_interruptible(&mut stream, &mut response[HEADER_LEN..], deadline)?;
-        Ok(response)
+
+        let mut stream = connect_endpoint_interruptible(&self.endpoint, deadline)?;
+        exchange_frame(&mut stream, request, deadline, max_response_bytes)
     }
+}
+
+#[cfg(unix)]
+fn exchange_frame(
+    stream: &mut TransportStream,
+    request: &[u8],
+    deadline: Instant,
+    max_response_bytes: usize,
+) -> Result<Vec<u8>, RerankError> {
+    let poll = remaining_until(deadline)?.min(Duration::from_millis(50));
+    stream
+        .set_read_timeout(Some(poll))
+        .map_err(|error| RerankError::Transport(error.to_string()))?;
+    stream
+        .set_write_timeout(Some(poll))
+        .map_err(|error| RerankError::Transport(error.to_string()))?;
+    write_interruptible(stream, request, deadline)?;
+    let mut header = [0u8; HEADER_LEN];
+    read_interruptible(stream, &mut header, deadline)?;
+    let body_len = usize::try_from(u64::from_le_bytes(header[16..24].try_into().unwrap()))
+        .map_err(|_| RerankError::Protocol("response body is too large".into()))?;
+    let response_len = HEADER_LEN
+        .checked_add(body_len)
+        .ok_or_else(|| RerankError::Protocol("response length overflow".into()))?;
+    if response_len > max_response_bytes {
+        return Err(RerankError::Protocol(
+            "response exceeds configured limit".into(),
+        ));
+    }
+    let mut response = Vec::with_capacity(response_len);
+    response.extend_from_slice(&header);
+    response.resize(response_len, 0);
+    read_interruptible(stream, &mut response[HEADER_LEN..], deadline)?;
+    Ok(response)
+}
+
+#[cfg(unix)]
+fn response_status(response: &[u8]) -> Option<u32> {
+    response
+        .get(HEADER_LEN..HEADER_LEN + 4)
+        .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
+}
+
+#[cfg(unix)]
+fn response_matches_request(response: &[u8], request: &[u8]) -> bool {
+    response.get(..4) == Some(MAGIC)
+        && response.get(6..8) == Some(&RESPONSE_KIND.to_le_bytes())
+        && response.get(8..16) == request.get(8..16)
+}
+
+#[cfg(unix)]
+fn persistent_capability(endpoint: &str, version: u16) -> Option<bool> {
+    PERSISTENT_CAPABILITIES
+        .get_or_init(|| Mutex::new(VecDeque::new()))
+        .lock()
+        .ok()
+        .and_then(|capabilities| {
+            capabilities
+                .iter()
+                .find(|((candidate, candidate_version), _)| {
+                    candidate == endpoint && *candidate_version == version
+                })
+                .map(|(_, supported)| *supported)
+        })
+}
+
+#[cfg(unix)]
+fn remember_persistent_capability(endpoint: &str, version: u16, supported: bool) {
+    let Ok(mut capabilities) = PERSISTENT_CAPABILITIES
+        .get_or_init(|| Mutex::new(VecDeque::new()))
+        .lock()
+    else {
+        return;
+    };
+    capabilities.retain(|((candidate, candidate_version), _)| {
+        candidate != endpoint || *candidate_version != version
+    });
+    while capabilities.len() >= MAX_PERSISTENT_TRANSPORT_ENDPOINTS {
+        capabilities.pop_front();
+    }
+    capabilities.push_back(((endpoint.to_owned(), version), supported));
+}
+
+#[cfg(unix)]
+fn take_persistent_transport(endpoint: &str) -> Option<TransportStream> {
+    let mut transports = PERSISTENT_TRANSPORTS
+        .get_or_init(|| Mutex::new(VecDeque::new()))
+        .lock()
+        .ok()?;
+    let index = transports
+        .iter()
+        .position(|(candidate, _)| candidate == endpoint)?;
+    transports.remove(index).map(|(_, stream)| stream)
+}
+
+#[cfg(unix)]
+fn return_persistent_transport(endpoint: &str, stream: TransportStream) {
+    let Ok(mut transports) = PERSISTENT_TRANSPORTS
+        .get_or_init(|| Mutex::new(VecDeque::new()))
+        .lock()
+    else {
+        return;
+    };
+    transports.retain(|(candidate, _)| candidate != endpoint);
+    while transports.len() >= MAX_PERSISTENT_TRANSPORT_ENDPOINTS {
+        transports.pop_front();
+    }
+    transports.push_back((endpoint.to_owned(), stream));
 }
 
 #[cfg(unix)]
@@ -2536,7 +2685,9 @@ mod tests {
     use super::*;
     use std::cell::RefCell;
     use std::collections::BTreeMap;
+    use std::net::TcpListener;
     use std::rc::Rc;
+    use std::thread;
     use vector::vect::VectOwned;
 
     #[test]
@@ -2547,6 +2698,153 @@ mod tests {
         );
         assert_eq!(decode_lower_hex_sha256("AB".repeat(32).as_bytes()), None);
         assert_eq!(decode_lower_hex_sha256(b"abcd"), None);
+    }
+
+    #[cfg(unix)]
+    fn transport_test_frame(version: u16, request_id: u64) -> Vec<u8> {
+        let mut frame = Vec::with_capacity(HEADER_LEN);
+        frame.extend_from_slice(MAGIC);
+        frame.extend_from_slice(&version.to_le_bytes());
+        frame.extend_from_slice(&REQUEST_KIND.to_le_bytes());
+        frame.extend_from_slice(&request_id.to_le_bytes());
+        frame.extend_from_slice(&0_u64.to_le_bytes());
+        frame
+    }
+
+    #[cfg(unix)]
+    fn read_transport_test_frame(stream: &mut TcpStream) -> (u16, u64) {
+        let mut header = [0_u8; HEADER_LEN];
+        stream.read_exact(&mut header).unwrap();
+        let body_len =
+            usize::try_from(u64::from_le_bytes(header[16..24].try_into().unwrap())).unwrap();
+        let mut body = vec![0_u8; body_len];
+        stream.read_exact(&mut body).unwrap();
+        (
+            u16::from_le_bytes(header[4..6].try_into().unwrap()),
+            u64::from_le_bytes(header[8..16].try_into().unwrap()),
+        )
+    }
+
+    #[cfg(unix)]
+    fn write_transport_test_response(stream: &mut TcpStream, version: u16, request_id: u64) {
+        let mut response = transport_test_frame(version, request_id);
+        response[6..8].copy_from_slice(&RESPONSE_KIND.to_le_bytes());
+        response[16..24].copy_from_slice(&8_u64.to_le_bytes());
+        response.extend_from_slice(&0_u32.to_le_bytes());
+        response.extend_from_slice(&0_u32.to_le_bytes());
+        stream.write_all(&response).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn tcp_transport_reuses_a_negotiated_persistent_connection() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = format!("tcp://{}", listener.local_addr().unwrap());
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut versions = Vec::new();
+            for _ in 0..2 {
+                let (version, request_id) = read_transport_test_frame(&mut stream);
+                versions.push(version);
+                write_transport_test_response(&mut stream, version, request_id);
+            }
+            versions
+        });
+        let mut transport = UnixSocketTransport::new(endpoint);
+        for request_id in [41, 42] {
+            let response = transport
+                .round_trip(
+                    &transport_test_frame(SCOPED_CATALOG_SELECTION_REFERENCE_VERSION, request_id),
+                    Duration::from_secs(2),
+                    HEADER_LEN + 8,
+                )
+                .unwrap();
+            assert_eq!(
+                u16::from_le_bytes(response[4..6].try_into().unwrap()),
+                SCOPED_CATALOG_SELECTION_REFERENCE_VERSION
+            );
+        }
+        assert_eq!(
+            server.join().unwrap(),
+            vec![
+                PERSISTENT_SCOPED_CATALOG_SELECTION_REFERENCE_VERSION,
+                PERSISTENT_SCOPED_CATALOG_SELECTION_REFERENCE_VERSION,
+            ]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn tcp_transport_reuses_a_global_catalog_connection() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = format!("tcp://{}", listener.local_addr().unwrap());
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut versions = Vec::new();
+            for _ in 0..2 {
+                let (version, request_id) = read_transport_test_frame(&mut stream);
+                versions.push(version);
+                write_transport_test_response(&mut stream, version, request_id);
+            }
+            versions
+        });
+        let mut transport = UnixSocketTransport::new(endpoint);
+        for request_id in [51, 52] {
+            let response = transport
+                .round_trip(
+                    &transport_test_frame(CATALOG_SELECTION_REFERENCE_VERSION, request_id),
+                    Duration::from_secs(2),
+                    HEADER_LEN + 8,
+                )
+                .unwrap();
+            assert_eq!(
+                u16::from_le_bytes(response[4..6].try_into().unwrap()),
+                CATALOG_SELECTION_REFERENCE_VERSION
+            );
+        }
+        assert_eq!(
+            server.join().unwrap(),
+            vec![
+                PERSISTENT_CATALOG_SELECTION_REFERENCE_VERSION,
+                PERSISTENT_CATALOG_SELECTION_REFERENCE_VERSION,
+            ]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn tcp_transport_falls_back_once_for_a_legacy_daemon() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = format!("tcp://{}", listener.local_addr().unwrap());
+        let server = thread::spawn(move || {
+            let mut versions = Vec::new();
+            for response_version in [EXTERNAL_VERSION, SCOPED_CATALOG_SELECTION_REFERENCE_VERSION] {
+                let (mut stream, _) = listener.accept().unwrap();
+                let (version, request_id) = read_transport_test_frame(&mut stream);
+                versions.push(version);
+                write_transport_test_response(&mut stream, response_version, request_id);
+            }
+            versions
+        });
+        let mut transport = UnixSocketTransport::new(endpoint);
+        let response = transport
+            .round_trip(
+                &transport_test_frame(SCOPED_CATALOG_SELECTION_REFERENCE_VERSION, 43),
+                Duration::from_secs(2),
+                HEADER_LEN + 8,
+            )
+            .unwrap();
+        assert_eq!(
+            u16::from_le_bytes(response[4..6].try_into().unwrap()),
+            SCOPED_CATALOG_SELECTION_REFERENCE_VERSION
+        );
+        assert_eq!(
+            server.join().unwrap(),
+            vec![
+                PERSISTENT_SCOPED_CATALOG_SELECTION_REFERENCE_VERSION,
+                SCOPED_CATALOG_SELECTION_REFERENCE_VERSION,
+            ]
+        );
     }
 
     struct MockTensorSource(BTreeMap<HeapKey, Vec<OwnedVector>>);

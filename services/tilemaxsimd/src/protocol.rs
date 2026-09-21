@@ -44,6 +44,12 @@ pub const VERSION_CATALOG_SELECTION_REFERENCE: u16 = 11;
 /// the catalog selection once and returns independent global and scoped top-k
 /// windows; scoped response candidate IDs carry the high-bit tag.
 pub const VERSION_SCOPED_CATALOG_SELECTION_REFERENCE: u16 = 12;
+/// Persistent-connection form of v12. The frame layout and response payload
+/// are unchanged; a client may send the next frame after reading the complete
+/// response instead of paying another transport handshake.
+pub const VERSION_PERSISTENT_SCOPED_CATALOG_SELECTION_REFERENCE: u16 = 13;
+/// Persistent-connection form of v11 for global-only catalog selections.
+pub const VERSION_PERSISTENT_CATALOG_SELECTION_REFERENCE: u16 = 14;
 const MAGIC: &[u8; 4] = b"VCTM";
 const REQUEST_KIND: u16 = 1;
 const RESPONSE_KIND: u16 = 2;
@@ -295,9 +301,11 @@ pub fn parse(frame: &[u8]) -> Result<Request> {
             | VERSION_CATALOG_LOGICAL_EXTERNAL
             | VERSION_CATALOG_SELECTION_REFERENCE
             | VERSION_SCOPED_CATALOG_SELECTION_REFERENCE
+            | VERSION_PERSISTENT_SCOPED_CATALOG_SELECTION_REFERENCE
+            | VERSION_PERSISTENT_CATALOG_SELECTION_REFERENCE
     ) || kind != REQUEST_KIND
     {
-        bail!("Rust daemon requires TileMaxSim external protocol v2 through v12");
+        bail!("Rust daemon requires TileMaxSim external protocol v2 through v14");
     }
     if usize::try_from(body_bytes).ok() != Some(frame.len() - HEADER_BYTES) {
         bail!("request body length mismatch");
@@ -319,6 +327,8 @@ pub fn parse(frame: &[u8]) -> Result<Request> {
             | VERSION_CATALOG_LOGICAL_EXTERNAL
             | VERSION_CATALOG_SELECTION_REFERENCE
             | VERSION_SCOPED_CATALOG_SELECTION_REFERENCE
+            | VERSION_PERSISTENT_SCOPED_CATALOG_SELECTION_REFERENCE
+            | VERSION_PERSISTENT_CATALOG_SELECTION_REFERENCE
     ) {
         let profile = ScoringProfile::parse(reader.u8()?)?;
         let storage_dtype = reader.u8()?;
@@ -329,6 +339,8 @@ pub fn parse(frame: &[u8]) -> Result<Request> {
                 | VERSION_CATALOG_LOGICAL_EXTERNAL
                 | VERSION_CATALOG_SELECTION_REFERENCE
                 | VERSION_SCOPED_CATALOG_SELECTION_REFERENCE
+                | VERSION_PERSISTENT_SCOPED_CATALOG_SELECTION_REFERENCE
+                | VERSION_PERSISTENT_CATALOG_SELECTION_REFERENCE
         ) && storage_dtype != 0
         {
             bail!("unsupported reserved bits");
@@ -352,6 +364,8 @@ pub fn parse(frame: &[u8]) -> Result<Request> {
             | VERSION_CATALOG_LOGICAL_EXTERNAL
             | VERSION_CATALOG_SELECTION_REFERENCE
             | VERSION_SCOPED_CATALOG_SELECTION_REFERENCE
+            | VERSION_PERSISTENT_SCOPED_CATALOG_SELECTION_REFERENCE
+            | VERSION_PERSISTENT_CATALOG_SELECTION_REFERENCE
     ) {
         reader.u32()? as usize
     } else {
@@ -375,6 +389,8 @@ pub fn parse(frame: &[u8]) -> Result<Request> {
             | VERSION_CATALOG_LOGICAL_EXTERNAL
             | VERSION_CATALOG_SELECTION_REFERENCE
             | VERSION_SCOPED_CATALOG_SELECTION_REFERENCE
+            | VERSION_PERSISTENT_SCOPED_CATALOG_SELECTION_REFERENCE
+            | VERSION_PERSISTENT_CATALOG_SELECTION_REFERENCE
     ) {
         (reader.i32()?, reader.u32()?, reader.u32()? as usize)
     } else {
@@ -395,6 +411,8 @@ pub fn parse(frame: &[u8]) -> Result<Request> {
             | VERSION_CATALOG_LOGICAL_EXTERNAL
             | VERSION_CATALOG_SELECTION_REFERENCE
             | VERSION_SCOPED_CATALOG_SELECTION_REFERENCE
+            | VERSION_PERSISTENT_SCOPED_CATALOG_SELECTION_REFERENCE
+            | VERSION_PERSISTENT_CATALOG_SELECTION_REFERENCE
     ) && !(1..=600_000).contains(&timeout_ms)
     {
         bail!("scheduler timeout must be between 1 and 600000 milliseconds");
@@ -408,6 +426,8 @@ pub fn parse(frame: &[u8]) -> Result<Request> {
             | VERSION_CATALOG_LOGICAL_EXTERNAL
             | VERSION_CATALOG_SELECTION_REFERENCE
             | VERSION_SCOPED_CATALOG_SELECTION_REFERENCE
+            | VERSION_PERSISTENT_SCOPED_CATALOG_SELECTION_REFERENCE
+            | VERSION_PERSISTENT_CATALOG_SELECTION_REFERENCE
     ) {
         let value = reader.u32()? as usize;
         if value == 0 || value > candidate_count as usize {
@@ -428,6 +448,8 @@ pub fn parse(frame: &[u8]) -> Result<Request> {
             | VERSION_CATALOG_LOGICAL_EXTERNAL
             | VERSION_CATALOG_SELECTION_REFERENCE
             | VERSION_SCOPED_CATALOG_SELECTION_REFERENCE
+            | VERSION_PERSISTENT_SCOPED_CATALOG_SELECTION_REFERENCE
+            | VERSION_PERSISTENT_CATALOG_SELECTION_REFERENCE
     ) && quantization_contract_bytes > 0
     {
         let value = reader.text(quantization_contract_bytes, 128, "quantization contract")?;
@@ -460,6 +482,8 @@ pub fn parse(frame: &[u8]) -> Result<Request> {
             | VERSION_CATALOG_LOGICAL_EXTERNAL
             | VERSION_CATALOG_SELECTION_REFERENCE
             | VERSION_SCOPED_CATALOG_SELECTION_REFERENCE
+            | VERSION_PERSISTENT_SCOPED_CATALOG_SELECTION_REFERENCE
+            | VERSION_PERSISTENT_CATALOG_SELECTION_REFERENCE
     ) {
         reader.text(tenant_bytes, 256, "scheduler tenant")?
     } else {
@@ -507,9 +531,16 @@ pub fn parse(frame: &[u8]) -> Result<Request> {
             (Some(digest), None, mode == 2, public_ids, Vec::new())
         } else if matches!(
             version,
-            VERSION_CATALOG_SELECTION_REFERENCE | VERSION_SCOPED_CATALOG_SELECTION_REFERENCE
+            VERSION_CATALOG_SELECTION_REFERENCE
+                | VERSION_SCOPED_CATALOG_SELECTION_REFERENCE
+                | VERSION_PERSISTENT_SCOPED_CATALOG_SELECTION_REFERENCE
+                | VERSION_PERSISTENT_CATALOG_SELECTION_REFERENCE
         ) {
-            let expected_mode = if version == VERSION_SCOPED_CATALOG_SELECTION_REFERENCE {
+            let expected_mode = if matches!(
+                version,
+                VERSION_SCOPED_CATALOG_SELECTION_REFERENCE
+                    | VERSION_PERSISTENT_SCOPED_CATALOG_SELECTION_REFERENCE
+            ) {
                 4
             } else {
                 3
@@ -520,7 +551,11 @@ pub fn parse(frame: &[u8]) -> Result<Request> {
             let catalog_digest = reader.take(32)?.try_into().unwrap();
             let selection_digest = reader.take(32)?.try_into().unwrap();
             let mut scoped_ordinals = Vec::new();
-            if version == VERSION_SCOPED_CATALOG_SELECTION_REFERENCE {
+            if matches!(
+                version,
+                VERSION_SCOPED_CATALOG_SELECTION_REFERENCE
+                    | VERSION_PERSISTENT_SCOPED_CATALOG_SELECTION_REFERENCE
+            ) {
                 let scoped_count = reader.u32()? as usize;
                 if scoped_count == 0 || scoped_count > candidate_count as usize {
                     bail!("scoped candidate count must be between 1 and candidate count");
@@ -1108,6 +1143,15 @@ mod tests {
         assert_eq!(request.catalog_selection_digest, Some([0xef; 32]));
         assert!(request.catalog_public_ids.is_empty());
         assert!(request.candidates.is_empty());
+
+        frame[4..6]
+            .copy_from_slice(&VERSION_PERSISTENT_CATALOG_SELECTION_REFERENCE.to_le_bytes());
+        let persistent = parse(&frame).unwrap();
+        assert_eq!(
+            persistent.protocol_version,
+            VERSION_PERSISTENT_CATALOG_SELECTION_REFERENCE
+        );
+        assert!(persistent.scoped_candidate_ordinals.is_empty());
     }
 
     #[test]
@@ -1147,6 +1191,16 @@ mod tests {
         assert_eq!(request.catalog_selection_digest, Some([0xef; 32]));
         assert_eq!(request.scoped_candidate_ordinals, vec![0, 4, 300]);
         assert!(request.candidates.is_empty());
+
+        frame[4..6].copy_from_slice(
+            &VERSION_PERSISTENT_SCOPED_CATALOG_SELECTION_REFERENCE.to_le_bytes(),
+        );
+        let persistent = parse(&frame).unwrap();
+        assert_eq!(
+            persistent.protocol_version,
+            VERSION_PERSISTENT_SCOPED_CATALOG_SELECTION_REFERENCE
+        );
+        assert_eq!(persistent.scoped_candidate_ordinals, vec![0, 4, 300]);
     }
 
     #[test]

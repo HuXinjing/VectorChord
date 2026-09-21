@@ -240,6 +240,9 @@ struct Args {
     max_tenant_queued_requests: usize,
     #[arg(long, default_value_t = 5000)]
     socket_io_timeout_ms: u64,
+    /// Idle lifetime of a negotiated persistent scoring connection after a response.
+    #[arg(long, default_value_t = 60_000)]
+    persistent_idle_timeout_ms: u64,
     #[arg(long, default_value_t = 8000)]
     request_timeout_ms: u64,
     #[arg(long, default_value = "fair-priority", value_parser = parse_scheduler_policy)]
@@ -373,6 +376,7 @@ where
         || args.max_queued_requests == 0
         || args.max_tenant_queued_requests == 0
         || args.socket_io_timeout_ms == 0
+        || args.persistent_idle_timeout_ms == 0
         || args.request_timeout_ms == 0
         || args.priority_aging_ms == 0
         || args.scheduler_quantum_tokens == 0
@@ -510,6 +514,8 @@ where
             "max_tenant_queued_requests": args.max_tenant_queued_requests,
             "max_request_bytes": args.max_request_bytes,
             "max_inflight_request_gb": args.max_inflight_request_gb as f64 / GIB as f64,
+            "socket_io_timeout_ms": args.socket_io_timeout_ms,
+            "persistent_idle_timeout_ms": args.persistent_idle_timeout_ms,
             "request_timeout_ms": args.request_timeout_ms,
         },
         "scheduler": {
@@ -763,6 +769,7 @@ where
             let reader_config = ReaderConfig {
                 maximum: args.max_request_bytes,
                 io_timeout: Duration::from_millis(args.socket_io_timeout_ms),
+                persistent_idle_timeout: Duration::from_millis(args.persistent_idle_timeout_ms),
                 server_timeout: Duration::from_millis(args.request_timeout_ms),
                 maximum_candidate_fmas: args.scheduler_quantum_fmas,
             };
@@ -880,6 +887,13 @@ impl ClientStream {
             Self::Tcp(stream) => stream.set_write_timeout(timeout),
         }
     }
+
+    fn try_clone(&self) -> std::io::Result<Self> {
+        match self {
+            Self::Unix(stream) => stream.try_clone().map(Self::Unix),
+            Self::Tcp(stream) => stream.try_clone().map(Self::Tcp),
+        }
+    }
 }
 
 impl Read for ClientStream {
@@ -926,6 +940,7 @@ struct Work {
     next_candidate: usize,
     results: Vec<(u32, f32)>,
     gpu_elapsed: Duration,
+    completion: mpsc::SyncSender<()>,
     _pending_permit: PendingPermit,
     _frame_permit: BytePermit,
 }
@@ -1229,6 +1244,7 @@ fn reap_readers(readers: &mut Vec<thread::JoinHandle<()>>) {
 struct ReaderConfig {
     maximum: usize,
     io_timeout: Duration,
+    persistent_idle_timeout: Duration,
     server_timeout: Duration,
     maximum_candidate_fmas: u64,
 }
@@ -1500,7 +1516,6 @@ fn read_and_enqueue(
     metrics: Arc<RuntimeMetrics>,
     frame_admission: Arc<ByteAdmission>,
 ) {
-    let accepted_at = Instant::now();
     if let Err(error) = connection.set_read_timeout(Some(config.io_timeout)) {
         eprintln!("cannot configure TileMaxSim socket read timeout: {error}");
         return;
@@ -1509,10 +1524,19 @@ fn read_and_enqueue(
         eprintln!("cannot configure TileMaxSim socket write timeout: {error}");
         return;
     }
-    let (frame, frame_permit) =
-        match read_request(&mut connection, config.maximum, &frame_admission) {
+    let mut completed_requests = 0_u64;
+    loop {
+        let frame_read_started = Instant::now();
+        let (frame, frame_permit) = match read_request(
+            &mut connection,
+            config.maximum,
+            &frame_admission,
+        ) {
             Ok(frame) => frame,
             Err(error) => {
+                if completed_requests > 0 && is_idle_connection_end(&error) {
+                    return;
+                }
                 metrics.failed.fetch_add(1, Ordering::Relaxed);
                 metrics.frame_read_failures.fetch_add(1, Ordering::Relaxed);
                 write_response_nonfatal(
@@ -1522,148 +1546,215 @@ fn read_and_enqueue(
                 return;
             }
         };
-    let frame_read_elapsed = accepted_at.elapsed();
-    let version = header_version(&frame);
-    let request_id = header_request_id(&frame);
-    let parse_started = Instant::now();
-    let mut request = match protocol::parse(&frame) {
-        Ok(request) => request,
-        Err(error) => {
+        let frame_read_elapsed = frame_read_started.elapsed();
+        // A persistent connection may sit idle between frames. That idle time
+        // is not queue latency and must not consume the next request's
+        // scheduler deadline. Preserve the original end-to-end timing for the
+        // first frame, then start each reused request after its frame arrives.
+        let accepted_at = if completed_requests == 0 {
+            frame_read_started
+        } else {
+            Instant::now()
+        };
+        let version = header_version(&frame);
+        let request_id = header_request_id(&frame);
+        let parse_started = Instant::now();
+        let mut request = match protocol::parse(&frame) {
+            Ok(request) => request,
+            Err(error) => {
+                metrics.failed.fetch_add(1, Ordering::Relaxed);
+                metrics.invalid_requests.fetch_add(1, Ordering::Relaxed);
+                write_response_nonfatal(
+                    &mut connection,
+                    &protocol::failure(version, request_id, 1, &format!("{error:#}")),
+                );
+                return;
+            }
+        };
+        if !resolve_descriptor_catalog(&mut request, &metrics) {
+            metrics.failed.fetch_add(1, Ordering::Relaxed);
+            write_response_nonfatal(
+                &mut connection,
+                &protocol::failure(version, request_id, 4, "descriptor catalog miss"),
+            );
+            return;
+        }
+        if !resolve_descriptor_manifest(&mut request, &metrics) {
+            metrics.failed.fetch_add(1, Ordering::Relaxed);
+            write_response_nonfatal(
+                &mut connection,
+                &protocol::failure(version, request_id, 4, "descriptor manifest miss"),
+            );
+            return;
+        }
+        let parse_elapsed = parse_started.elapsed();
+        if request.candidates.iter().any(|candidate| {
+            candidate_fmas(request.query_rows, request.dimension, candidate.rows)
+                > config.maximum_candidate_fmas
+        }) {
             metrics.failed.fetch_add(1, Ordering::Relaxed);
             metrics.invalid_requests.fetch_add(1, Ordering::Relaxed);
             write_response_nonfatal(
                 &mut connection,
-                &protocol::failure(version, request_id, 1, &format!("{error:#}")),
+                &protocol::failure(
+                    version,
+                    request_id,
+                    1,
+                    "one candidate exceeds the configured CUDA kernel work limit",
+                ),
             );
             return;
         }
-    };
-    if !resolve_descriptor_catalog(&mut request, &metrics) {
-        metrics.failed.fetch_add(1, Ordering::Relaxed);
-        write_response_nonfatal(
-            &mut connection,
-            &protocol::failure(version, request_id, 4, "descriptor catalog miss"),
-        );
-        return;
-    }
-    if !resolve_descriptor_manifest(&mut request, &metrics) {
-        metrics.failed.fetch_add(1, Ordering::Relaxed);
-        write_response_nonfatal(
-            &mut connection,
-            &protocol::failure(version, request_id, 4, "descriptor manifest miss"),
-        );
-        return;
-    }
-    let parse_elapsed = parse_started.elapsed();
-    if request.candidates.iter().any(|candidate| {
-        candidate_fmas(request.query_rows, request.dimension, candidate.rows)
-            > config.maximum_candidate_fmas
-    }) {
-        metrics.failed.fetch_add(1, Ordering::Relaxed);
-        metrics.invalid_requests.fetch_add(1, Ordering::Relaxed);
-        write_response_nonfatal(
-            &mut connection,
-            &protocol::failure(
-                version,
-                request_id,
-                1,
-                "one candidate exceeds the configured CUDA kernel work limit",
-            ),
-        );
-        return;
-    }
-    let client_timeout = if request.timeout_ms == 0 {
-        config.server_timeout
-    } else {
-        Duration::from_millis(u64::from(request.timeout_ms)).min(config.server_timeout)
-    };
-    let deadline = accepted_at
-        .checked_add(client_timeout)
-        .unwrap_or(accepted_at);
-    if deadline <= Instant::now() {
-        metrics.timed_out.fetch_add(1, Ordering::Relaxed);
-        metrics
-            .timeout_before_enqueue
-            .fetch_add(1, Ordering::Relaxed);
-        write_response_nonfatal(
-            &mut connection,
-            &protocol::failure(
-                version,
-                request_id,
-                2,
-                "request deadline expired before enqueue",
-            ),
-        );
-        return;
-    }
-    let pending_permit = match pending_admission.try_acquire(&request.tenant) {
-        Ok(permit) => permit,
-        Err(AdmissionRejection::Global) => {
+        let client_timeout = if request.timeout_ms == 0 {
+            config.server_timeout
+        } else {
+            Duration::from_millis(u64::from(request.timeout_ms)).min(config.server_timeout)
+        };
+        let deadline = accepted_at
+            .checked_add(client_timeout)
+            .unwrap_or(accepted_at);
+        if deadline <= Instant::now() {
+            metrics.timed_out.fetch_add(1, Ordering::Relaxed);
             metrics
-                .rejected_queue_global
+                .timeout_before_enqueue
                 .fetch_add(1, Ordering::Relaxed);
-            write_response_nonfatal(
-                &mut connection,
-                &protocol::failure(version, request_id, 2, "TileMaxSim scheduler queue is full"),
-            );
-            return;
-        }
-        Err(AdmissionRejection::Tenant) => {
-            metrics.rejected_tenant.fetch_add(1, Ordering::Relaxed);
             write_response_nonfatal(
                 &mut connection,
                 &protocol::failure(
                     version,
                     request_id,
                     2,
-                    "tenant TileMaxSim queue limit exceeded",
+                    "request deadline expired before enqueue",
                 ),
             );
             return;
         }
-    };
-    match sender.try_send(Work {
-        request,
-        connection,
-        accepted_at,
-        deadline,
-        frame_read_elapsed,
-        parse_elapsed,
-        next_candidate: 0,
-        results: Vec::new(),
-        gpu_elapsed: Duration::ZERO,
-        _pending_permit: pending_permit,
-        _frame_permit: frame_permit,
-    }) {
-        Ok(()) => {}
-        Err(mpsc::TrySendError::Full(mut work)) => {
-            metrics
-                .rejected_queue_global
-                .fetch_add(1, Ordering::Relaxed);
-            write_response_nonfatal(
-                &mut work.connection,
-                &protocol::failure(
-                    work.request.protocol_version,
-                    work.request.request_id,
-                    2,
-                    "TileMaxSim scheduler queue is full",
-                ),
-            );
-        }
-        Err(mpsc::TrySendError::Disconnected(mut work)) => {
-            metrics.failed.fetch_add(1, Ordering::Relaxed);
-            metrics.scheduler_failures.fetch_add(1, Ordering::Relaxed);
-            write_response_nonfatal(
-                &mut work.connection,
-                &protocol::failure(
-                    work.request.protocol_version,
-                    work.request.request_id,
-                    3,
-                    "TileMaxSim scheduler is unavailable",
-                ),
-            );
+        let pending_permit = match pending_admission.try_acquire(&request.tenant) {
+            Ok(permit) => permit,
+            Err(AdmissionRejection::Global) => {
+                metrics
+                    .rejected_queue_global
+                    .fetch_add(1, Ordering::Relaxed);
+                write_response_nonfatal(
+                    &mut connection,
+                    &protocol::failure(
+                        version,
+                        request_id,
+                        2,
+                        "TileMaxSim scheduler queue is full",
+                    ),
+                );
+                return;
+            }
+            Err(AdmissionRejection::Tenant) => {
+                metrics.rejected_tenant.fetch_add(1, Ordering::Relaxed);
+                write_response_nonfatal(
+                    &mut connection,
+                    &protocol::failure(
+                        version,
+                        request_id,
+                        2,
+                        "tenant TileMaxSim queue limit exceeded",
+                    ),
+                );
+                return;
+            }
+        };
+        let response_connection = match connection.try_clone() {
+            Ok(connection) => connection,
+            Err(error) => {
+                metrics.failed.fetch_add(1, Ordering::Relaxed);
+                write_response_nonfatal(
+                    &mut connection,
+                    &protocol::failure(version, request_id, 3, &error.to_string()),
+                );
+                return;
+            }
+        };
+        let (completion, completed) = mpsc::sync_channel(1);
+        match sender.try_send(Work {
+            request,
+            connection: response_connection,
+            accepted_at,
+            deadline,
+            frame_read_elapsed,
+            parse_elapsed,
+            next_candidate: 0,
+            results: Vec::new(),
+            gpu_elapsed: Duration::ZERO,
+            completion,
+            _pending_permit: pending_permit,
+            _frame_permit: frame_permit,
+        }) {
+            Ok(()) => {
+                if completed.recv().is_err() {
+                    return;
+                }
+                completed_requests = completed_requests.saturating_add(1);
+            if !matches!(
+                version,
+                protocol::VERSION_PERSISTENT_SCOPED_CATALOG_SELECTION_REFERENCE
+                    | protocol::VERSION_PERSISTENT_CATALOG_SELECTION_REFERENCE
+            ) {
+                    return;
+                }
+                if connection
+                    .set_read_timeout(Some(config.persistent_idle_timeout))
+                    .is_err()
+                {
+                    return;
+                }
+            }
+            Err(mpsc::TrySendError::Full(mut work)) => {
+                metrics
+                    .rejected_queue_global
+                    .fetch_add(1, Ordering::Relaxed);
+                write_response_nonfatal(
+                    &mut work.connection,
+                    &protocol::failure(
+                        work.request.protocol_version,
+                        work.request.request_id,
+                        2,
+                        "TileMaxSim scheduler queue is full",
+                    ),
+                );
+                notify_completion(&work);
+                return;
+            }
+            Err(mpsc::TrySendError::Disconnected(mut work)) => {
+                metrics.failed.fetch_add(1, Ordering::Relaxed);
+                metrics.scheduler_failures.fetch_add(1, Ordering::Relaxed);
+                write_response_nonfatal(
+                    &mut work.connection,
+                    &protocol::failure(
+                        work.request.protocol_version,
+                        work.request.request_id,
+                        3,
+                        "TileMaxSim scheduler is unavailable",
+                    ),
+                );
+                notify_completion(&work);
+                return;
+            }
         }
     }
+}
+
+fn is_idle_connection_end(error: &anyhow::Error) -> bool {
+    error.downcast_ref::<std::io::Error>().is_some_and(|error| {
+        matches!(
+            error.kind(),
+            std::io::ErrorKind::UnexpectedEof
+                | std::io::ErrorKind::ConnectionReset
+                | std::io::ErrorKind::ConnectionAborted
+                | std::io::ErrorKind::TimedOut
+                | std::io::ErrorKind::WouldBlock
+        )
+    })
+}
+
+fn notify_completion(work: &Work) {
+    let _ = work.completion.try_send(());
 }
 
 fn run_scheduler(
@@ -1777,6 +1868,7 @@ fn run_scheduler(
                     "request deadline expired in scheduler queue",
                 ),
             );
+            notify_completion(&expired.payload);
         }
         metrics.update_scheduler_depth(queue.len());
         let Some(scheduled) = queue.pop(Instant::now()) else {
@@ -1838,6 +1930,7 @@ fn run_scheduler(
             if peer_disconnected(&scheduled.payload.connection) {
                 metrics.disconnected.fetch_add(1, Ordering::Relaxed);
                 metrics.observe_latency(scheduled.payload.accepted_at.elapsed(), Duration::ZERO);
+                notify_completion(&scheduled.payload);
                 continue;
             }
             let started = Instant::now();
@@ -1919,6 +2012,8 @@ fn run_scheduler(
                             if let Some(top_k) = work.request.top_k {
                                 if work.request.protocol_version
                                     == protocol::VERSION_SCOPED_CATALOG_SELECTION_REFERENCE
+                                    || work.request.protocol_version
+                                        == protocol::VERSION_PERSISTENT_SCOPED_CATALOG_SELECTION_REFERENCE
                                 {
                                     retain_ranked_scoped_top_k(
                                         &mut work.results,
@@ -1945,6 +2040,7 @@ fn run_scheduler(
                             // service supervisor can recreate the CUDA context.
                             metrics.ready.store(false, Ordering::Release);
                             write_response_nonfatal(&mut work.connection, &failure);
+                            notify_completion(&work);
                             metrics.observe_latency(work.accepted_at.elapsed(), work.gpu_elapsed);
                             return Err(anyhow!("fatal CUDA failure: {diagnostic}"));
                         }
@@ -1959,6 +2055,7 @@ fn run_scheduler(
                 .set_write_timeout(Some(config.socket_io_timeout))
                 .ok();
             write_response_nonfatal(&mut work.connection, &response);
+            notify_completion(&work);
             metrics.observe_latency(work.accepted_at.elapsed(), work.gpu_elapsed);
             println!(
                 "{}",
@@ -3604,6 +3701,12 @@ fn header_version(frame: &[u8]) -> u16 {
             protocol::VERSION_SCOPED_CATALOG_SELECTION_REFERENCE => {
                 protocol::VERSION_SCOPED_CATALOG_SELECTION_REFERENCE
             }
+            protocol::VERSION_PERSISTENT_SCOPED_CATALOG_SELECTION_REFERENCE => {
+                protocol::VERSION_PERSISTENT_SCOPED_CATALOG_SELECTION_REFERENCE
+            }
+            protocol::VERSION_PERSISTENT_CATALOG_SELECTION_REFERENCE => {
+                protocol::VERSION_PERSISTENT_CATALOG_SELECTION_REFERENCE
+            }
             _ => VERSION_EXTERNAL,
         }
     }
@@ -3830,7 +3933,7 @@ mod tests {
 
     #[test]
     fn error_responses_preserve_every_supported_external_protocol_version() {
-        for version in 2_u16..=12 {
+        for version in 2_u16..=14 {
             let mut frame = vec![0_u8; crate::protocol::HEADER_BYTES];
             frame[4..6].copy_from_slice(&version.to_le_bytes());
             assert_eq!(header_version(&frame), version);
