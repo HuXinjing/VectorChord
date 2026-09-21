@@ -21,14 +21,14 @@ use std::sync::{Arc, OnceLock};
 struct MissingTensor {
     candidate_index: usize,
     descriptor: Descriptor,
-    key: String,
+    key: Arc<str>,
     payload: Arc<[u8]>,
 }
 
 struct ResidentTensor {
     candidate_index: usize,
     device: usize,
-    key: String,
+    key: Arc<str>,
     offset: u64,
     rows: u32,
     transient: bool,
@@ -212,7 +212,7 @@ impl Engine {
             let mut uploads = (0..self.devices.len())
                 .map(|_| Vec::<(u64, &[u8])>::new())
                 .collect::<Vec<_>>();
-            let mut acquired = Vec::<(usize, String, bool)>::new();
+            let mut acquired = Vec::<(usize, Arc<str>, bool)>::new();
             for (descriptor, payload) in batch.iter().zip(&payloads) {
                 let key = gpu_cache_key(descriptor, ScoringProfile::ExactFp16, None);
                 if let Some((device, _)) =
@@ -244,7 +244,7 @@ impl Engine {
                     if let Admission::Admitted { offset, .. } =
                         self.devices[device].cache.admit_for_tenant(
                             "__resident__",
-                            key.clone(),
+                            key.to_string(),
                             payload.len(),
                             descriptor.rows,
                             descriptor.dimension,
@@ -328,7 +328,7 @@ impl Engine {
                 .ok_or_else(|| anyhow!("tensor {} is not resident", descriptor.digest))?;
             targets.push((device, key, original));
         }
-        let mut changed: Vec<(usize, String, bool)> = Vec::new();
+        let mut changed: Vec<(usize, Arc<str>, bool)> = Vec::new();
         for (device, key, original) in &targets {
             if *original == pinned {
                 continue;
@@ -431,7 +431,7 @@ impl Engine {
             .collect::<Vec<_>>();
         let mut missing_descriptors = Vec::new();
         let mut missing_indices = Vec::new();
-        let mut first_candidate_by_key = HashMap::<String, usize>::new();
+        let mut first_candidate_by_key = HashMap::<Arc<str>, usize>::new();
         let mut duplicate_candidates = Vec::<(usize, usize)>::new();
         for (index, descriptor) in candidates.iter().enumerate() {
             let key = gpu_cache_key(
@@ -562,7 +562,7 @@ impl Engine {
                     let device_index = (self.next_device + step) % self.devices.len();
                     let admission = self.devices[device_index].cache.admit_for_tenant(
                         &request.tenant,
-                        tensor.key.clone(),
+                        tensor.key.to_string(),
                         tensor.payload.len(),
                         tensor.descriptor.rows,
                         tensor.descriptor.dimension,
@@ -586,7 +586,7 @@ impl Engine {
                         if let Admission::Admitted { offset, .. } =
                             self.devices[device_index].cache.admit_for_tenant(
                                 &request.tenant,
-                                tensor.key.clone(),
+                                tensor.key.to_string(),
                                 tensor.payload.len(),
                                 tensor.descriptor.rows,
                                 tensor.descriptor.dimension,
@@ -1233,13 +1233,18 @@ fn gpu_cache_key(
     descriptor: &Descriptor,
     profile: ScoringProfile,
     quantization_contract: Option<&str>,
-) -> String {
-    format!(
+) -> Arc<str> {
+    if profile == ScoringProfile::RawFp8E4m3 && quantization_contract.is_none() {
+        return Arc::clone(descriptor.raw_fp8_cache_key.get_or_init(|| {
+            Arc::from(format!("{}:-:{}", profile.cache_tag(), cache_key(descriptor)))
+        }));
+    }
+    Arc::from(format!(
         "{}:{}:{}",
         profile.cache_tag(),
         quantization_contract.unwrap_or("-"),
         cache_key(descriptor)
-    )
+    ))
 }
 
 fn validate_entry(
@@ -1493,6 +1498,7 @@ mod tests {
             rows,
             dimension: 320,
             dtype: 2,
+            raw_fp8_cache_key: OnceLock::new(),
         }
     }
 
@@ -1607,5 +1613,8 @@ mod tests {
             gpu_cache_key(&descriptor, ScoringProfile::RawFp8E4m3, None),
             gpu_cache_key(&descriptor, ScoringProfile::Fp8E4m3, None)
         );
+        let first = gpu_cache_key(&descriptor, ScoringProfile::RawFp8E4m3, None);
+        let second = gpu_cache_key(&descriptor, ScoringProfile::RawFp8E4m3, None);
+        assert!(Arc::ptr_eq(&first, &second));
     }
 }

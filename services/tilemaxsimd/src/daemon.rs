@@ -3647,6 +3647,7 @@ fn load_resident_manifests(values: &[(String, PathBuf)]) -> Result<Vec<protocol:
                 rows: record.tensor_rows,
                 dimension: record.tensor_dim,
                 dtype,
+                raw_fp8_cache_key: OnceLock::new(),
             });
         }
     }
@@ -3676,7 +3677,7 @@ mod tests {
     use sha2::{Digest, Sha256};
     use std::io::{Read, Write};
     use std::sync::atomic::Ordering;
-    use std::sync::{Arc, Mutex, mpsc};
+    use std::sync::{Arc, Mutex, OnceLock, mpsc};
 
     fn catalog_request(registration: bool) -> Request {
         Request {
@@ -3696,8 +3697,8 @@ mod tests {
             query: vec![0; 8],
             candidates: Arc::new(if registration {
                 vec![
-                    Descriptor { candidate_id: 0, contract: "model-v1".into(), digest: "11".repeat(32), rows: 1, dimension: 2, dtype: 3 },
-                    Descriptor { candidate_id: 1, contract: "model-v1".into(), digest: "22".repeat(32), rows: 1, dimension: 2, dtype: 3 },
+                    Descriptor { candidate_id: 0, contract: "model-v1".into(), digest: "11".repeat(32), rows: 1, dimension: 2, dtype: 3, raw_fp8_cache_key: OnceLock::new() },
+                    Descriptor { candidate_id: 1, contract: "model-v1".into(), digest: "22".repeat(32), rows: 1, dimension: 2, dtype: 3, raw_fp8_cache_key: OnceLock::new() },
                 ]
             } else { vec![] }),
             candidate_start: 0,
@@ -3899,6 +3900,7 @@ mod tests {
             rows,
             dimension: 2,
             dtype: 2,
+            raw_fp8_cache_key: OnceLock::new(),
         };
         let candidates = vec![descriptor(60), descriptor(60), descriptor(60)];
         assert_eq!(quantum_end(&candidates, 0, 8, 100, 1_000, 5, 2), 1);

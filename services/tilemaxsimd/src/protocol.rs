@@ -10,7 +10,7 @@
 
 use anyhow::{Result, anyhow, bail};
 use std::collections::HashSet;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 pub const HEADER_BYTES: usize = 24;
 pub const VERSION_EXTERNAL: u16 = 2;
@@ -52,6 +52,8 @@ pub struct Descriptor {
     pub rows: u32,
     pub dimension: u32,
     pub dtype: u8,
+    #[serde(skip, default)]
+    pub raw_fp8_cache_key: OnceLock<Arc<str>>,
 }
 
 #[derive(Clone, Debug)]
@@ -550,6 +552,7 @@ pub fn parse(frame: &[u8]) -> Result<Request> {
                 } else {
                     storage_dtype
                 },
+                raw_fp8_cache_key: OnceLock::new(),
             });
             debug_assert!(public_id.is_some());
             continue;
@@ -587,6 +590,7 @@ pub fn parse(frame: &[u8]) -> Result<Request> {
                 } else {
                     storage_dtype
                 },
+                raw_fp8_cache_key: OnceLock::new(),
             });
             continue;
         }
@@ -631,6 +635,7 @@ pub fn parse(frame: &[u8]) -> Result<Request> {
             rows,
             dimension,
             dtype,
+            raw_fp8_cache_key: OnceLock::new(),
         });
     }
     reader.finish()?;

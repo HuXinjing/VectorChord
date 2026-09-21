@@ -608,6 +608,7 @@ mod tests {
             rows: 1,
             dimension: 2,
             dtype: 2,
+            raw_fp8_cache_key: std::sync::OnceLock::new(),
         };
 
         let resolved = store.resolve_many(&[descriptor], "tenant-a").unwrap();
