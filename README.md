@@ -354,8 +354,12 @@ The FMA quantum additionally bounds one non-preemptible CUDA launch by actual
 `query rows × document rows × dimension` work. A single candidate above that
 operator-configured limit is rejected instead of monopolizing a shared GPU.
 
-PostgreSQL sends protocol v3 scheduling metadata only when
-`vchordrq.maxsim_tenant` is set; otherwise it retains protocol v2 compatibility.
+Exact external reranking uses protocol v6 to submit the complete descriptor set
+as one logical request. The daemon owns cooperative GPU slicing and returns one
+deterministic global top-k, avoiding a TCP round trip for every legacy tensor-
+token batch. Protocols v2 through v5 remain accepted for rolling upgrades and
+older clients. Scheduling metadata carries the configured tenant, priority,
+and one end-to-end deadline.
 GBrain derives that tenant value from authenticated runtime context and may set
 `vchordrq.maxsim_priority` in the range -100 through 100. Priority changes
 latency ordering only and never bypasses PostgreSQL row visibility, ACL, source,

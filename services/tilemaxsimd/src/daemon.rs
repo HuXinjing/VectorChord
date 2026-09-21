@@ -31,8 +31,8 @@ use crate::backend_sdk::{BackendProvider, validate_provider};
 use crate::dispatch::{self, DispatchInput, DispatchThresholds, KernelKind};
 use crate::engine::{Engine, EngineStatus};
 use crate::protocol::{
-    self, HEADER_BYTES, VERSION_EXTERNAL, VERSION_PROFILED_EXTERNAL, VERSION_QUANTIZED_EXTERNAL,
-    VERSION_SCHEDULED_EXTERNAL,
+    self, HEADER_BYTES, VERSION_EXTERNAL, VERSION_LOGICAL_EXTERNAL, VERSION_PROFILED_EXTERNAL,
+    VERSION_QUANTIZED_EXTERNAL, VERSION_SCHEDULED_EXTERNAL,
 };
 use crate::quant::QuantizationRegistry;
 use crate::scheduler::{RequestQueue, Scheduled, SchedulerPolicy};
@@ -1611,6 +1611,15 @@ fn run_scheduler(
                             continue;
                         } else {
                             metrics.completed.fetch_add(1, Ordering::Relaxed);
+                            if let Some(top_k) = work.request.top_k {
+                                work.results.sort_unstable_by(|left, right| {
+                                    right
+                                        .1
+                                        .total_cmp(&left.1)
+                                        .then_with(|| left.0.cmp(&right.0))
+                                });
+                                work.results.truncate(top_k);
+                            }
                             Some(protocol::success(version, request_id, &work.results))
                         }
                     }
@@ -1702,6 +1711,7 @@ fn request_quantum(work: &Work, config: &SchedulerConfig) -> protocol::Request {
         dtype: work.request.dtype,
         scoring_profile: work.request.scoring_profile,
         quantization_contract: work.request.quantization_contract.clone(),
+        top_k: work.request.top_k,
         query: work.request.query.clone(),
         candidates: work.request.candidates[work.next_candidate..end].to_vec(),
     }
@@ -3130,6 +3140,7 @@ fn header_version(frame: &[u8]) -> u16 {
             VERSION_SCHEDULED_EXTERNAL => VERSION_SCHEDULED_EXTERNAL,
             VERSION_PROFILED_EXTERNAL => VERSION_PROFILED_EXTERNAL,
             VERSION_QUANTIZED_EXTERNAL => VERSION_QUANTIZED_EXTERNAL,
+            VERSION_LOGICAL_EXTERNAL => VERSION_LOGICAL_EXTERNAL,
             _ => VERSION_EXTERNAL,
         }
     }

@@ -30,6 +30,7 @@ const EXTERNAL_VERSION: u16 = 2;
 const SCHEDULED_EXTERNAL_VERSION: u16 = 3;
 const PROFILED_EXTERNAL_VERSION: u16 = 4;
 const QUANTIZED_EXTERNAL_VERSION: u16 = 5;
+const LOGICAL_EXTERNAL_VERSION: u16 = 6;
 const REQUEST_KIND: u16 = 1;
 const RESPONSE_KIND: u16 = 2;
 const HEADER_LEN: usize = 24;
@@ -192,6 +193,66 @@ impl<T> GpuExternalTileMaxsimBackend<T> {
 }
 
 impl<T: TileMaxsimTransport> GpuExternalTileMaxsimBackend<T> {
+    /// Submit a complete external descriptor set as one logical request. The
+    /// daemon performs bounded cooperative GPU slicing and global top-k, which
+    /// avoids one TCP round trip per client-side tensor-token batch.
+    pub(super) fn rerank_logical<S: CandidateTensorDescriptorSource>(
+        &mut self,
+        query: &[OwnedVector],
+        candidates: &mut dyn Iterator<Item = PageCandidate>,
+        source: &mut S,
+        top_k: usize,
+    ) -> Result<RerankResults, RerankError> {
+        let deadline = Instant::now()
+            .checked_add(self.timeout)
+            .ok_or_else(|| RerankError::Transport("logical request deadline overflow".into()))?;
+        let mut descriptors = Vec::new();
+        for candidate in candidates {
+            if let Some(descriptor) = source.fetch(candidate)? {
+                descriptors.push(descriptor);
+            }
+        }
+        if descriptors.is_empty() {
+            return Ok(RerankResults {
+                inner: BinaryHeap::new(),
+            });
+        }
+        if top_k == 0 {
+            return Err(RerankError::Configuration(
+                "logical top-k must be greater than zero",
+            ));
+        }
+        // A descriptor source may legitimately omit stale or unavailable
+        // candidates. Preserve the previous batched behavior by returning as
+        // many results as remain instead of rejecting the whole rerank.
+        let effective_top_k = top_k.min(descriptors.len());
+        let request_id = NEXT_REQUEST_ID.fetch_add(1, Ordering::Relaxed);
+        let encoded = encode_external_descriptors(
+            request_id,
+            &self.model_contract_id,
+            query,
+            &descriptors,
+            self.max_batch_tokens,
+            self.max_batch_bytes,
+            self.scheduling.as_ref(),
+            self.scoring_profile,
+            self.quantization_contract.as_deref(),
+            remaining_logical_timeout(deadline)?,
+            Some(effective_top_k),
+        )?;
+        let max_response_bytes = HEADER_LEN
+            .checked_add(8)
+            .and_then(|size| size.checked_add(effective_top_k.checked_mul(8)?))
+            .map(|size| size.max(HEADER_LEN + 8 + MAX_REMOTE_ERROR_BYTES))
+            .ok_or(RerankError::RequestTooLarge)?;
+        let response = self.transport.round_trip(
+            &encoded.frame,
+            remaining_logical_timeout(deadline)?,
+            max_response_bytes,
+        )?;
+        decode_response_for_version(&response, encoded.version, request_id, &encoded.heap_keys)
+    }
+
     #[cfg(test)]
     pub(super) fn rerank<S: CandidateTensorDescriptorSource>(
         &mut self,
@@ -259,6 +320,7 @@ impl<T: TileMaxsimTransport> GpuExternalTileMaxsimBackend<T> {
                 self.scoring_profile,
                 self.quantization_contract.as_deref(),
                 remaining,
+                None,
             )?;
             let max_response_bytes = HEADER_LEN
                 .checked_add(8)
@@ -322,6 +384,7 @@ fn encode_external_request<S: CandidateTensorDescriptorSource>(
         PostgresMaxsimScoringProfile::ExactFp16,
         None,
         timeout,
+        None,
     )
 }
 
@@ -336,6 +399,7 @@ fn encode_external_descriptors(
     scoring_profile: PostgresMaxsimScoringProfile,
     quantization_contract: Option<&str>,
     timeout: Duration,
+    logical_top_k: Option<usize>,
 ) -> Result<EncodedRequest, RerankError> {
     if model_contract_id.is_empty()
         || model_contract_id.len() > MAX_MODEL_CONTRACT_BYTES
@@ -383,8 +447,9 @@ fn encode_external_descriptors(
             "PQ/OPQ/RPQ requires a canonical qtc1 quantization contract",
         ));
     }
-    let profiled =
-        scheduling.is_some() || scoring_profile != PostgresMaxsimScoringProfile::ExactFp16;
+    let profiled = logical_top_k.is_some()
+        || scheduling.is_some()
+        || scoring_profile != PostgresMaxsimScoringProfile::ExactFp16;
     let tenant = scheduling.map_or("__default__", |value| value.tenant.as_str());
     let priority = scheduling.map_or(0, |value| value.priority);
     writer.zeros(HEADER_LEN)?;
@@ -402,17 +467,20 @@ fn encode_external_descriptors(
     }
     writer
         .u32(u32::try_from(model_contract_id.len()).map_err(|_| RerankError::RequestTooLarge)?)?;
-    if quantized {
-        writer.u32(69)?;
+    if quantized || logical_top_k.is_some() {
+        writer.u32(if quantized { 69 } else { 0 })?;
     }
-    let version = if profiled {
+    let version = if profiled || logical_top_k.is_some() {
         writer.i32(priority)?;
         writer.u32(
             u32::try_from(timeout.as_millis().clamp(1, 600_000))
                 .map_err(|_| RerankError::RequestTooLarge)?,
         )?;
         writer.u32(u32::try_from(tenant.len()).map_err(|_| RerankError::RequestTooLarge)?)?;
-        if quantized {
+        if let Some(top_k) = logical_top_k {
+            writer.u32(u32::try_from(top_k).map_err(|_| RerankError::RequestTooLarge)?)?;
+            LOGICAL_EXTERNAL_VERSION
+        } else if quantized {
             QUANTIZED_EXTERNAL_VERSION
         } else {
             PROFILED_EXTERNAL_VERSION
@@ -444,13 +512,13 @@ fn encode_external_descriptors(
         total_tokens = total_tokens
             .checked_add(descriptor.rows as usize)
             .ok_or(RerankError::RequestTooLarge)?;
-        if total_tokens > max_batch_tokens {
+        if logical_top_k.is_none() && total_tokens > max_batch_tokens {
             return Err(RerankError::RequestTooLarge);
         }
         declared_tensor_bytes = declared_tensor_bytes
             .checked_add(tensor_bytes(descriptor.rows, dimension, dtype)?)
             .ok_or(RerankError::RequestTooLarge)?;
-        if declared_tensor_bytes > max_batch_bytes {
+        if logical_top_k.is_none() && declared_tensor_bytes > max_batch_bytes {
             return Err(RerankError::RequestTooLarge);
         }
 
@@ -1504,6 +1572,32 @@ mod tests {
         delay: Duration,
     }
 
+    struct LogicalTransport {
+        observations: Rc<RefCell<Vec<(u16, u32, u32)>>>,
+    }
+
+    impl TileMaxsimTransport for LogicalTransport {
+        fn round_trip(
+            &mut self,
+            request: &[u8],
+            _timeout: Duration,
+            _max_response_bytes: usize,
+        ) -> Result<Vec<u8>, RerankError> {
+            let version = u16::from_le_bytes(request[4..6].try_into().unwrap());
+            let request_id = u64::from_le_bytes(request[8..16].try_into().unwrap());
+            let candidate_count = u32::from_le_bytes(request[32..36].try_into().unwrap());
+            let top_k = u32::from_le_bytes(request[60..64].try_into().unwrap());
+            self.observations
+                .borrow_mut()
+                .push((version, candidate_count, top_k));
+            Ok(success_response_with_version(
+                version,
+                request_id,
+                &[(candidate_count - 1, 0.75)],
+            ))
+        }
+    }
+
     impl TileMaxsimTransport for BatchingTransport {
         fn round_trip(
             &mut self,
@@ -1852,6 +1946,7 @@ mod tests {
             PostgresMaxsimScoringProfile::Pq,
             Some(&contract),
             Duration::from_secs(2),
+            None,
         )
         .unwrap();
         assert_eq!(encoded.version, QUANTIZED_EXTERNAL_VERSION);
@@ -1878,6 +1973,7 @@ mod tests {
                 PostgresMaxsimScoringProfile::Pq,
                 None,
                 Duration::from_secs(2),
+                None,
             ),
             Err(RerankError::Configuration(_))
         ));
@@ -2111,6 +2207,53 @@ mod tests {
             Err(RerankError::Transport(message)) if message == "logical request timed out"
         ));
         assert_eq!(observations.borrow().candidate_counts, vec![2]);
+    }
+
+    #[test]
+    fn logical_external_request_submits_all_descriptors_once_and_returns_top_k() {
+        let pages = [[0, 0, 1], [0, 0, 2], [0, 0, 3]];
+        let candidates = pages.map(|heap_key| PageCandidate {
+            approximate_distance: Distance::ZERO,
+            heap_key,
+        });
+        let mut candidate_iter = candidates.into_iter();
+        let mut source =
+            MockDescriptorSource(BTreeMap::from_iter(candidates.into_iter().enumerate().map(
+                |(index, candidate)| {
+                    (
+                        candidate.heap_key,
+                        external_descriptor(
+                            candidate,
+                            index as i64,
+                            &format!("object://immutable/logical-{index}"),
+                            900_000,
+                            2,
+                            ExternalTensorDtype::F32,
+                        ),
+                    )
+                },
+            )));
+        let observations = Rc::new(RefCell::new(Vec::new()));
+        let transport = LogicalTransport {
+            observations: Rc::clone(&observations),
+        };
+        let results = GpuExternalTileMaxsimBackend::new(
+            transport,
+            "contract@1".into(),
+            Duration::from_secs(1),
+            5,
+            4096,
+        )
+        .rerank_logical(&[vector(&[1.0, 0.0])], &mut candidate_iter, &mut source, 1)
+        .unwrap()
+        .collect::<Vec<_>>();
+
+        assert_eq!(
+            observations.borrow().as_slice(),
+            &[(LOGICAL_EXTERNAL_VERSION, 3, 1)]
+        );
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].heap_key, pages[2]);
     }
 
     #[test]

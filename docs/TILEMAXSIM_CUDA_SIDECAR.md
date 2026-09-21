@@ -208,10 +208,12 @@ admission.
 
 ## Batching, scheduling, and failure semantics
 
-- PostgreSQL splits one logical candidate set into protocol-bounded batches and
-  merges a deterministic global top-k.
-- All batches share the caller's one logical deadline; a new IPC round trip does
-  not refresh it.
+- Protocol v6 sends one logical external descriptor set. The daemon splits it
+  into bounded scheduling/GPU quanta and returns only the deterministic global
+  top-k. This removes serial per-batch TCP setup from the normal path.
+- Protocols v2 through v5 remain accepted during rolling upgrades. Legacy
+  client batches share one logical deadline; a new IPC round trip does not
+  refresh it.
 - Admission is bounded by connections, queued requests, per-scheduling-domain
   queue depth, and aggregate frame bytes.
 - Long batches re-enter the selected scheduler between candidate/token quanta.

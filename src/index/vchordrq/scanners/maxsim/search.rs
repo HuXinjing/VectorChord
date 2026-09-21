@@ -166,16 +166,17 @@ fn execute_external_search(
     let sidecar_timer = profile::ProfileTimer::start();
     let result_limit = top_k as usize;
     let mut best = BinaryHeap::with_capacity(result_limit.saturating_add(1));
-    backend.rerank_batches(&query_vectors, &mut candidate_iter, &mut source, |batch| {
-        for result in batch {
-            let public_id = public_ids.get(&result.heap_key).copied().ok_or_else(|| {
-                RerankError::Protocol("sidecar result has no visible public ID".into())
-            })?;
-            let row = (result.distance, public_id);
-            super::retain_top_k(&mut best, result_limit, row);
-        }
-        Ok(())
-    })?;
+    for result in backend.rerank_logical(
+        &query_vectors,
+        &mut candidate_iter,
+        &mut source,
+        result_limit,
+    )? {
+        let public_id = public_ids.get(&result.heap_key).copied().ok_or_else(|| {
+            RerankError::Protocol("sidecar result has no visible public ID".into())
+        })?;
+        super::retain_top_k(&mut best, result_limit, (result.distance, public_id));
+    }
     let mut rows = best.into_vec();
     let sidecar_elapsed = sidecar_timer.elapsed();
     profile::update(|profile| {

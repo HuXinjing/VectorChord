@@ -1486,6 +1486,7 @@ mod tests {
             dtype: 2,
             scoring_profile: ScoringProfile::ExactFp16,
             quantization_contract: None,
+            top_k: None,
             query: vec![0; 640],
             candidates: vec![descriptor(candidate_id, "same-content", 1)],
         };

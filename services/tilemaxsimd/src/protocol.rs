@@ -16,6 +16,11 @@ pub const VERSION_EXTERNAL: u16 = 2;
 pub const VERSION_SCHEDULED_EXTERNAL: u16 = 3;
 pub const VERSION_PROFILED_EXTERNAL: u16 = 4;
 pub const VERSION_QUANTIZED_EXTERNAL: u16 = 5;
+/// One logical rerank request. Candidate tensor payloads remain external, so
+/// the wire limit applies to descriptor metadata rather than the sum of the
+/// referenced tensor payloads. The daemon owns bounded GPU quantization and
+/// returns only the requested global top-k.
+pub const VERSION_LOGICAL_EXTERNAL: u16 = 6;
 const MAGIC: &[u8; 4] = b"VCTM";
 const REQUEST_KIND: u16 = 1;
 const RESPONSE_KIND: u16 = 2;
@@ -46,6 +51,7 @@ pub struct Request {
     pub dtype: u8,
     pub scoring_profile: ScoringProfile,
     pub quantization_contract: Option<String>,
+    pub top_k: Option<usize>,
     pub query: Vec<u8>,
     pub candidates: Vec<Descriptor>,
 }
@@ -200,9 +206,10 @@ pub fn parse(frame: &[u8]) -> Result<Request> {
             | VERSION_SCHEDULED_EXTERNAL
             | VERSION_PROFILED_EXTERNAL
             | VERSION_QUANTIZED_EXTERNAL
+            | VERSION_LOGICAL_EXTERNAL
     ) || kind != REQUEST_KIND
     {
-        bail!("Rust daemon requires TileMaxSim external protocol v2 through v5");
+        bail!("Rust daemon requires TileMaxSim external protocol v2 through v6");
     }
     if usize::try_from(body_bytes).ok() != Some(frame.len() - HEADER_BYTES) {
         bail!("request body length mismatch");
@@ -215,7 +222,7 @@ pub fn parse(frame: &[u8]) -> Result<Request> {
     let scoring = reader.u8()?;
     let scoring_profile = if matches!(
         version,
-        VERSION_PROFILED_EXTERNAL | VERSION_QUANTIZED_EXTERNAL
+        VERSION_PROFILED_EXTERNAL | VERSION_QUANTIZED_EXTERNAL | VERSION_LOGICAL_EXTERNAL
     ) {
         let profile = ScoringProfile::parse(reader.u8()?)?;
         if reader.u8()? != 0 {
@@ -229,7 +236,10 @@ pub fn parse(frame: &[u8]) -> Result<Request> {
         ScoringProfile::ExactFp16
     };
     let contract_bytes = reader.u32()? as usize;
-    let quantization_contract_bytes = if version == VERSION_QUANTIZED_EXTERNAL {
+    let quantization_contract_bytes = if matches!(
+        version,
+        VERSION_QUANTIZED_EXTERNAL | VERSION_LOGICAL_EXTERNAL
+    ) {
         reader.u32()? as usize
     } else {
         0
@@ -242,7 +252,10 @@ pub fn parse(frame: &[u8]) -> Result<Request> {
     }
     let (priority, timeout_ms, tenant_bytes) = if matches!(
         version,
-        VERSION_SCHEDULED_EXTERNAL | VERSION_PROFILED_EXTERNAL | VERSION_QUANTIZED_EXTERNAL
+        VERSION_SCHEDULED_EXTERNAL
+            | VERSION_PROFILED_EXTERNAL
+            | VERSION_QUANTIZED_EXTERNAL
+            | VERSION_LOGICAL_EXTERNAL
     ) {
         (reader.i32()?, reader.u32()?, reader.u32()? as usize)
     } else {
@@ -253,13 +266,29 @@ pub fn parse(frame: &[u8]) -> Result<Request> {
     }
     if matches!(
         version,
-        VERSION_SCHEDULED_EXTERNAL | VERSION_PROFILED_EXTERNAL | VERSION_QUANTIZED_EXTERNAL
+        VERSION_SCHEDULED_EXTERNAL
+            | VERSION_PROFILED_EXTERNAL
+            | VERSION_QUANTIZED_EXTERNAL
+            | VERSION_LOGICAL_EXTERNAL
     ) && !(1..=600_000).contains(&timeout_ms)
     {
         bail!("scheduler timeout must be between 1 and 600000 milliseconds");
     }
+    let top_k = if version == VERSION_LOGICAL_EXTERNAL {
+        let value = reader.u32()? as usize;
+        if value == 0 || value > candidate_count as usize {
+            bail!("logical top-k must be between 1 and candidate count");
+        }
+        Some(value)
+    } else {
+        None
+    };
     let contract = reader.text(contract_bytes, 512, "model contract")?;
-    let quantization_contract = if version == VERSION_QUANTIZED_EXTERNAL {
+    let quantization_contract = if matches!(
+        version,
+        VERSION_QUANTIZED_EXTERNAL | VERSION_LOGICAL_EXTERNAL
+    ) && quantization_contract_bytes > 0
+    {
         let value = reader.text(quantization_contract_bytes, 128, "quantization contract")?;
         if value.len() != 69
             || !value.starts_with("qtc1-")
@@ -280,7 +309,10 @@ pub fn parse(frame: &[u8]) -> Result<Request> {
     }
     let tenant = if matches!(
         version,
-        VERSION_SCHEDULED_EXTERNAL | VERSION_PROFILED_EXTERNAL | VERSION_QUANTIZED_EXTERNAL
+        VERSION_SCHEDULED_EXTERNAL
+            | VERSION_PROFILED_EXTERNAL
+            | VERSION_QUANTIZED_EXTERNAL
+            | VERSION_LOGICAL_EXTERNAL
     ) {
         reader.text(tenant_bytes, 256, "scheduler tenant")?
     } else {
@@ -321,7 +353,9 @@ pub fn parse(frame: &[u8]) -> Result<Request> {
         total_bytes = total_bytes
             .checked_add(bytes)
             .ok_or_else(|| anyhow!("byte overflow"))?;
-        if total_tokens > 1_000_000 || total_bytes > 1024 * 1024 * 1024 {
+        if version != VERSION_LOGICAL_EXTERNAL
+            && (total_tokens > 1_000_000 || total_bytes > 1024 * 1024 * 1024)
+        {
             bail!("request exceeds tensor limits");
         }
         candidates.push(Descriptor {
@@ -345,6 +379,7 @@ pub fn parse(frame: &[u8]) -> Result<Request> {
         dtype,
         scoring_profile,
         quantization_contract,
+        top_k,
         query,
         candidates,
     })
@@ -512,6 +547,50 @@ mod tests {
             request.quantization_contract.as_deref(),
             Some(contract.as_str())
         );
+    }
+
+    #[test]
+    fn logical_protocol_accepts_external_work_above_legacy_tensor_limits() {
+        let contract = "model@1";
+        let digest = "a".repeat(64);
+        let reference = format!("sha256://{digest}");
+        let checksum = format!("sha256:{digest}");
+        let mut body = Vec::new();
+        body.extend_from_slice(&320_u32.to_le_bytes());
+        body.extend_from_slice(&1_u32.to_le_bytes());
+        body.extend_from_slice(&2_u32.to_le_bytes());
+        body.push(2);
+        body.push(1);
+        body.push(1);
+        body.push(0);
+        body.extend_from_slice(&(contract.len() as u32).to_le_bytes());
+        body.extend_from_slice(&0_u32.to_le_bytes());
+        body.extend_from_slice(&0_i32.to_le_bytes());
+        body.extend_from_slice(&4_000_u32.to_le_bytes());
+        body.extend_from_slice(&6_u32.to_le_bytes());
+        body.extend_from_slice(&1_u32.to_le_bytes());
+        body.extend_from_slice(contract.as_bytes());
+        body.extend_from_slice(b"tenant");
+        body.extend_from_slice(&vec![0_u8; 640]);
+        for candidate_id in 0..2_u32 {
+            body.extend_from_slice(&candidate_id.to_le_bytes());
+            body.extend_from_slice(&900_000_u32.to_le_bytes());
+            body.extend_from_slice(&(reference.len() as u32).to_le_bytes());
+            body.extend_from_slice(&(checksum.len() as u32).to_le_bytes());
+            body.extend_from_slice(reference.as_bytes());
+            body.extend_from_slice(checksum.as_bytes());
+        }
+        let mut frame = Vec::new();
+        frame.extend_from_slice(MAGIC);
+        frame.extend_from_slice(&VERSION_LOGICAL_EXTERNAL.to_le_bytes());
+        frame.extend_from_slice(&REQUEST_KIND.to_le_bytes());
+        frame.extend_from_slice(&42_u64.to_le_bytes());
+        frame.extend_from_slice(&(body.len() as u64).to_le_bytes());
+        frame.extend_from_slice(&body);
+
+        let request = parse(&frame).unwrap();
+        assert_eq!(request.top_k, Some(1));
+        assert_eq!(request.candidates.len(), 2);
     }
 
     #[test]
