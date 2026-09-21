@@ -1532,6 +1532,7 @@ mod tests {
             candidates: Arc::new(vec![descriptor(candidate_id, "same-content", 1)]),
             manifest_digest: None,
             catalog_digest: None,
+            catalog_selection_digest: None,
             catalog_public_ids: Vec::new(),
             catalog_registration: false,
         };

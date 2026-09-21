@@ -1344,7 +1344,14 @@ fn descriptor_catalog_selection_key(catalog_key: &str, public_ids: &[i64]) -> St
     for public_id in public_ids {
         digest.update(public_id.to_le_bytes());
     }
-    format!("{catalog_key}\0{}", hex::encode(digest.finalize()))
+    descriptor_catalog_selection_digest_key(catalog_key, &digest.finalize().into())
+}
+
+fn descriptor_catalog_selection_digest_key(
+    catalog_key: &str,
+    selection_digest: &[u8; 32],
+) -> String {
+    format!("{catalog_key}\0{}", hex::encode(selection_digest))
 }
 
 fn resolve_descriptor_catalog(request: &mut protocol::Request, metrics: &RuntimeMetrics) -> bool {
@@ -1412,7 +1419,10 @@ fn resolve_descriptor_catalog(request: &mut protocol::Request, metrics: &Runtime
     let entry = cache
         .remove(position)
         .expect("descriptor catalog position came from the same cache");
-    let selection_key = descriptor_catalog_selection_key(&key, &request.catalog_public_ids);
+    let selection_key = request.catalog_selection_digest.as_ref().map_or_else(
+        || descriptor_catalog_selection_key(&key, &request.catalog_public_ids),
+        |selection_digest| descriptor_catalog_selection_digest_key(&key, selection_digest),
+    );
     let selections = DESCRIPTOR_CATALOG_SELECTIONS.get_or_init(|| Mutex::new(VecDeque::new()));
     let mut selection_cache = selections.lock().unwrap_or_else(|error| error.into_inner());
     if let Some(selection_position) = selection_cache
@@ -1435,6 +1445,13 @@ fn resolve_descriptor_catalog(request: &mut protocol::Request, metrics: &Runtime
             Ordering::Relaxed,
         );
         return true;
+    }
+    if request.catalog_selection_digest.is_some() {
+        cache.push_back(entry);
+        metrics
+            .descriptor_catalog_misses
+            .fetch_add(1, Ordering::Relaxed);
+        return false;
     }
     let mut resolved = Vec::with_capacity(request.catalog_public_ids.len());
     for (ordinal, public_id) in request.catalog_public_ids.iter().enumerate() {
@@ -2004,6 +2021,7 @@ fn request_quantum(work: &Work, config: &SchedulerConfig) -> protocol::Request {
         candidates: Arc::new(work.request.candidates[work.next_candidate..end].to_vec()),
         manifest_digest: work.request.manifest_digest,
         catalog_digest: work.request.catalog_digest,
+        catalog_selection_digest: work.request.catalog_selection_digest,
         catalog_public_ids: Vec::new(),
         catalog_registration: false,
     }
@@ -3529,6 +3547,9 @@ fn header_version(frame: &[u8]) -> u16 {
             protocol::VERSION_CATALOG_LOGICAL_EXTERNAL => {
                 protocol::VERSION_CATALOG_LOGICAL_EXTERNAL
             }
+            protocol::VERSION_CATALOG_SELECTION_REFERENCE => {
+                protocol::VERSION_CATALOG_SELECTION_REFERENCE
+            }
             _ => VERSION_EXTERNAL,
         }
     }
@@ -3650,6 +3671,7 @@ mod tests {
     use crate::engine::{DeviceStatus, EngineStatus};
     use crate::protocol::{Descriptor, Request, ScoringProfile, VERSION_CATALOG_LOGICAL_EXTERNAL};
     use crate::shard::HostCacheStatus;
+    use sha2::{Digest, Sha256};
     use std::io::{Read, Write};
     use std::sync::atomic::Ordering;
     use std::sync::{Arc, Mutex, mpsc};
@@ -3678,6 +3700,7 @@ mod tests {
             } else { vec![] }),
             manifest_digest: None,
             catalog_digest: Some([0x5a; 32]),
+            catalog_selection_digest: None,
             catalog_public_ids: vec![7, 9],
             catalog_registration: registration,
         }
@@ -3695,13 +3718,18 @@ mod tests {
         assert_eq!(first.candidates.iter().map(|item| item.candidate_id).collect::<Vec<_>>(), vec![0, 1]);
 
         let mut second = catalog_request(false);
+        let mut selection_digest = Sha256::new();
+        selection_digest.update(7_i64.to_le_bytes());
+        selection_digest.update(9_i64.to_le_bytes());
+        second.catalog_selection_digest = Some(selection_digest.finalize().into());
+        second.catalog_public_ids.clear();
         assert!(resolve_descriptor_catalog(&mut second, &metrics));
         assert!(Arc::ptr_eq(&first_candidates, &second.candidates));
     }
 
     #[test]
     fn error_responses_preserve_every_supported_external_protocol_version() {
-        for version in 2_u16..=9 {
+        for version in 2_u16..=11 {
             let mut frame = vec![0_u8; crate::protocol::HEADER_BYTES];
             frame[4..6].copy_from_slice(&version.to_le_bytes());
             assert_eq!(header_version(&frame), version);

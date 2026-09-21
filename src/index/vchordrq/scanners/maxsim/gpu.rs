@@ -37,6 +37,7 @@ const COMPACT_LOGICAL_EXTERNAL_VERSION: u16 = 7;
 const TYPED_COMPACT_LOGICAL_EXTERNAL_VERSION: u16 = 8;
 const MANIFEST_LOGICAL_EXTERNAL_VERSION: u16 = 9;
 const CATALOG_LOGICAL_EXTERNAL_VERSION: u16 = 10;
+const CATALOG_SELECTION_REFERENCE_VERSION: u16 = 11;
 const REQUEST_KIND: u16 = 1;
 const RESPONSE_KIND: u16 = 2;
 const HEADER_LEN: usize = 24;
@@ -296,6 +297,39 @@ impl<T: TileMaxsimTransport> GpuExternalTileMaxsimBackend<T> {
             storage_dtypes.insert(0, hint);
         }
         for storage_dtype in storage_dtypes {
+            let reference_request_id = NEXT_REQUEST_ID.fetch_add(1, Ordering::Relaxed);
+            let (reference_frame, reference_heap_keys) =
+                encode_raw_fp8_catalog_selection_reference(
+                    reference_request_id,
+                    &self.model_contract_id,
+                    query,
+                    &sorted_ids,
+                    self.max_batch_tokens,
+                    self.max_batch_bytes,
+                    self.scheduling.as_ref(),
+                    revision,
+                    self.timeout,
+                    top_k.min(sorted_ids.len()),
+                    storage_dtype,
+                )?;
+            let reference_response =
+                self.transport
+                    .round_trip(&reference_frame, self.timeout, max_response_bytes)?;
+            match decode_response_for_version(
+                &reference_response,
+                CATALOG_SELECTION_REFERENCE_VERSION,
+                reference_request_id,
+                &reference_heap_keys,
+                top_k.min(sorted_ids.len()),
+            ) {
+                Ok(results) => {
+                    remember_catalog_dtype(&dtype_hint_key, storage_dtype);
+                    return Ok(CatalogSelectionOutcome::Hit(results));
+                }
+                Err(RerankError::Remote(message)) if message == "descriptor catalog miss" => {}
+                Err(RerankError::Protocol(message)) if message == "unsupported version" => {}
+                Err(error) => return Err(error),
+            }
             let request_id = NEXT_REQUEST_ID.fetch_add(1, Ordering::Relaxed);
             let (frame, heap_keys) = encode_raw_fp8_catalog_selection(
                 request_id,
@@ -761,6 +795,110 @@ fn encode_raw_fp8_catalog_selection(
         .ok_or_else(|| RerankError::Protocol("invalid request length".into()))?;
     writer.patch_bytes(0, MAGIC);
     writer.patch_u16(4, CATALOG_LOGICAL_EXTERNAL_VERSION);
+    writer.patch_u16(6, REQUEST_KIND);
+    writer.patch_u64(8, request_id);
+    writer.patch_u64(
+        16,
+        u64::try_from(body_len).map_err(|_| RerankError::RequestTooLarge)?,
+    );
+    Ok((writer.finish(), heap_keys))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn encode_raw_fp8_catalog_selection_reference(
+    request_id: u64,
+    model_contract_id: &str,
+    query: &[OwnedVector],
+    public_ids: &[i64],
+    max_batch_tokens: usize,
+    max_batch_bytes: usize,
+    scheduling: Option<&TileMaxsimScheduling>,
+    revision: &str,
+    timeout: Duration,
+    top_k: usize,
+    storage_dtype: TensorDtype,
+) -> Result<(Vec<u8>, Vec<HeapKey>), RerankError> {
+    if model_contract_id.is_empty()
+        || model_contract_id.len() > MAX_MODEL_CONTRACT_BYTES
+        || model_contract_id.chars().any(char::is_control)
+    {
+        return Err(RerankError::InvalidDescriptor(
+            "model contract is empty, oversized, or contains control characters",
+        ));
+    }
+    if let Some(scheduling) = scheduling {
+        if scheduling.tenant.is_empty()
+            || scheduling.tenant.len() > MAX_TENANT_BYTES
+            || scheduling.tenant.chars().any(char::is_control)
+            || !(-100..=100).contains(&scheduling.priority)
+        {
+            return Err(RerankError::Configuration(
+                "TileMaxSim scheduler tenant or priority is invalid",
+            ));
+        }
+    }
+    let (query_dtype, dimension) = tensor_metadata(query)?;
+    let query_rows = u32::try_from(query.len()).map_err(|_| RerankError::RequestTooLarge)?;
+    if query.len() > max_batch_tokens
+        || tensor_bytes(query_rows, dimension, query_dtype)? > max_batch_bytes
+        || public_ids.is_empty()
+        || public_ids.len() > MAX_EXTERNAL_CANDIDATES_PER_BATCH
+    {
+        return Err(RerankError::RequestTooLarge);
+    }
+    let mut selection_digest = Sha256::new();
+    let mut heap_keys = Vec::with_capacity(public_ids.len());
+    let mut previous = 0_i64;
+    for (ordinal, public_id) in public_ids.iter().copied().enumerate() {
+        if public_id <= previous {
+            return Err(RerankError::InvalidDescriptor(
+                "catalog public IDs are not strictly increasing",
+            ));
+        }
+        selection_digest.update(public_id.to_le_bytes());
+        let ordinal = u32::try_from(ordinal).map_err(|_| RerankError::RequestTooLarge)?;
+        heap_keys.push([0, (ordinal >> 16) as u16, ordinal as u16]);
+        previous = public_id;
+    }
+    let tenant = scheduling.map_or("__default__", |value| value.tenant.as_str());
+    let priority = scheduling.map_or(0, |value| value.priority);
+    let mut writer = BoundedWriter::new(max_batch_bytes);
+    writer.zeros(HEADER_LEN)?;
+    writer.u32(dimension)?;
+    writer.u32(query_rows)?;
+    writer.u32(u32::try_from(public_ids.len()).map_err(|_| RerankError::RequestTooLarge)?)?;
+    writer.u8(query_dtype as u8)?;
+    writer.u8(1)?;
+    writer.u8(scoring_profile_code(
+        PostgresMaxsimScoringProfile::RawFp8E4m3,
+    ))?;
+    writer.u8(if query_dtype == storage_dtype {
+        0
+    } else {
+        storage_dtype as u8
+    })?;
+    writer
+        .u32(u32::try_from(model_contract_id.len()).map_err(|_| RerankError::RequestTooLarge)?)?;
+    writer.u32(0)?;
+    writer.i32(priority)?;
+    writer.u32(
+        u32::try_from(timeout.as_millis().clamp(1, 600_000))
+            .map_err(|_| RerankError::RequestTooLarge)?,
+    )?;
+    writer.u32(u32::try_from(tenant.len()).map_err(|_| RerankError::RequestTooLarge)?)?;
+    writer.u32(u32::try_from(top_k).map_err(|_| RerankError::RequestTooLarge)?)?;
+    writer.bytes(model_contract_id.as_bytes())?;
+    writer.bytes(tenant.as_bytes())?;
+    encode_tensor_values(&mut writer, query, query_dtype)?;
+    writer.u8(3)?;
+    writer.bytes(&Sha256::digest(revision.as_bytes()))?;
+    writer.bytes(&selection_digest.finalize())?;
+    let body_len = writer
+        .len()
+        .checked_sub(HEADER_LEN)
+        .ok_or_else(|| RerankError::Protocol("invalid request length".into()))?;
+    writer.patch_bytes(0, MAGIC);
+    writer.patch_u16(4, CATALOG_SELECTION_REFERENCE_VERSION);
     writer.patch_u16(6, REQUEST_KIND);
     writer.patch_u64(8, request_id);
     writer.patch_u64(
@@ -2175,6 +2313,21 @@ mod tests {
         calls: Rc<RefCell<Vec<(u16, u8, usize)>>>,
     }
 
+    fn catalog_frame_mode(request: &[u8]) -> u8 {
+        let dimension = u32::from_le_bytes(request[24..28].try_into().unwrap()) as usize;
+        let query_rows = u32::from_le_bytes(request[28..32].try_into().unwrap()) as usize;
+        let dtype = request[36];
+        let scalar_bytes = match dtype {
+            1 => 4,
+            2 => 2,
+            3 => 1,
+            _ => unreachable!(),
+        };
+        let contract_bytes = u32::from_le_bytes(request[40..44].try_into().unwrap()) as usize;
+        let tenant_bytes = u32::from_le_bytes(request[56..60].try_into().unwrap()) as usize;
+        request[64 + contract_bytes + tenant_bytes + query_rows * dimension * scalar_bytes]
+    }
+
     impl TileMaxsimTransport for CatalogProbeMissTransport {
         fn round_trip(
             &mut self,
@@ -2184,13 +2337,21 @@ mod tests {
         ) -> Result<Vec<u8>, RerankError> {
             let version = u16::from_le_bytes(request[4..6].try_into().unwrap());
             let request_id = u64::from_le_bytes(request[8..16].try_into().unwrap());
-            let mode = request[request.len() - 34];
+            let mode = catalog_frame_mode(request);
             self.calls.borrow_mut().push((version, mode, request.len()));
-            Ok(error_response_with_version(
-                version,
-                request_id,
-                "descriptor catalog miss",
-            ))
+            if self.calls.borrow().len() <= 2 {
+                Ok(error_response_with_version(
+                    version,
+                    request_id,
+                    "descriptor catalog miss",
+                ))
+            } else {
+                Ok(success_response_with_version(
+                    version,
+                    request_id,
+                    &[(0, 0.75)],
+                ))
+            }
         }
     }
 
@@ -2203,25 +2364,12 @@ mod tests {
         ) -> Result<Vec<u8>, RerankError> {
             let version = u16::from_le_bytes(request[4..6].try_into().unwrap());
             let request_id = u64::from_le_bytes(request[8..16].try_into().unwrap());
-            let mode_offset = request.len()
-                - if self.calls.borrow().len() == 1 {
-                    77
-                } else {
-                    34
-                };
-            let mode = request[mode_offset];
+            let mode = catalog_frame_mode(request);
             self.calls.borrow_mut().push((version, mode, request.len()));
-            if self.calls.borrow().len() == 1 {
-                return Ok(error_response_with_version(
-                    version,
-                    request_id,
-                    "descriptor catalog miss",
-                ));
-            }
-            Ok(success_response_with_version(
+            Ok(error_response_with_version(
                 version,
                 request_id,
-                &[(0, 0.75)],
+                "descriptor catalog miss",
             ))
         }
     }
@@ -3055,13 +3203,13 @@ mod tests {
         let calls = calls.borrow();
         assert_eq!(
             calls.iter().map(|call| call.0).collect::<Vec<_>>(),
-            vec![10, 10, 10]
+            vec![11, 10, 10, 11]
         );
         assert_eq!(
             calls.iter().map(|call| call.1).collect::<Vec<_>>(),
-            vec![1, 2, 1]
+            vec![3, 1, 2, 3]
         );
-        assert!(calls[0].2 < calls[1].2);
+        assert!(calls[0].2 < calls[1].2 && calls[1].2 < calls[2].2);
     }
 
     #[test]
@@ -3085,11 +3233,13 @@ mod tests {
             CatalogSelectionOutcome::Miss
         ));
         let calls = calls.borrow();
-        assert_eq!(calls.len(), 3);
-        assert!(
+        assert_eq!(calls.len(), 6);
+        assert_eq!(
             calls
                 .iter()
-                .all(|call| call.0 == CATALOG_LOGICAL_EXTERNAL_VERSION && call.1 == 1)
+                .map(|call| (call.0, call.1))
+                .collect::<Vec<_>>(),
+            vec![(11, 3), (10, 1), (11, 3), (10, 1), (11, 3), (10, 1)],
         );
     }
 
