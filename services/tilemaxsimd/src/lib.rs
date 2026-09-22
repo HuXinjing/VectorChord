@@ -15,6 +15,7 @@ pub mod metal;
 pub mod protocol;
 pub mod quant;
 pub mod scheduler;
+pub mod sdk;
 pub mod shard;
 #[cfg(feature = "backend-vulkan")]
 pub mod vulkan;
