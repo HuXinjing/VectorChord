@@ -14,7 +14,7 @@ use std::sync::{Arc, OnceLock};
 
 // Catalog protocol constants are owned by the shared client crate so the
 // daemon and every in-tree producer compile against one source of truth.
-pub use tilemaxsim_client::{
+pub use tilemaxsim_protocol::{
     HEADER_BYTES, VERSION_CATALOG_LOGICAL_EXTERNAL, VERSION_CATALOG_SELECTION_REFERENCE,
     VERSION_PERSISTENT_CATALOG_SELECTION_REFERENCE,
     VERSION_PERSISTENT_SCOPED_CATALOG_SELECTION_REFERENCE,

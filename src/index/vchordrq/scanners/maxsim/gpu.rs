@@ -25,8 +25,9 @@ use std::net::{TcpStream, ToSocketAddrs};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
-use tilemaxsim_client::{
-    CatalogRequest, ScoringProfile as WireScoringProfile, SdkError, TensorDtype as WireTensorDtype,
+use tilemaxsim_protocol::{
+    CatalogRequest, ProtocolError, ScoringProfile as WireScoringProfile,
+    TensorDtype as WireTensorDtype,
 };
 use vchordrq::types::OwnedVector;
 
@@ -40,15 +41,15 @@ const LOGICAL_EXTERNAL_VERSION: u16 = 6;
 const COMPACT_LOGICAL_EXTERNAL_VERSION: u16 = 7;
 const TYPED_COMPACT_LOGICAL_EXTERNAL_VERSION: u16 = 8;
 const MANIFEST_LOGICAL_EXTERNAL_VERSION: u16 = 9;
-const CATALOG_LOGICAL_EXTERNAL_VERSION: u16 = tilemaxsim_client::VERSION_CATALOG_LOGICAL_EXTERNAL;
+const CATALOG_LOGICAL_EXTERNAL_VERSION: u16 = tilemaxsim_protocol::VERSION_CATALOG_LOGICAL_EXTERNAL;
 const CATALOG_SELECTION_REFERENCE_VERSION: u16 =
-    tilemaxsim_client::VERSION_CATALOG_SELECTION_REFERENCE;
+    tilemaxsim_protocol::VERSION_CATALOG_SELECTION_REFERENCE;
 const SCOPED_CATALOG_SELECTION_REFERENCE_VERSION: u16 =
-    tilemaxsim_client::VERSION_SCOPED_CATALOG_SELECTION_REFERENCE;
+    tilemaxsim_protocol::VERSION_SCOPED_CATALOG_SELECTION_REFERENCE;
 const PERSISTENT_SCOPED_CATALOG_SELECTION_REFERENCE_VERSION: u16 =
-    tilemaxsim_client::VERSION_PERSISTENT_SCOPED_CATALOG_SELECTION_REFERENCE;
+    tilemaxsim_protocol::VERSION_PERSISTENT_SCOPED_CATALOG_SELECTION_REFERENCE;
 const PERSISTENT_CATALOG_SELECTION_REFERENCE_VERSION: u16 =
-    tilemaxsim_client::VERSION_PERSISTENT_CATALOG_SELECTION_REFERENCE;
+    tilemaxsim_protocol::VERSION_PERSISTENT_CATALOG_SELECTION_REFERENCE;
 const REQUEST_KIND: u16 = 1;
 const RESPONSE_KIND: u16 = 2;
 const HEADER_LEN: usize = 24;
@@ -869,13 +870,13 @@ fn wire_dtype(dtype: TensorDtype) -> WireTensorDtype {
     }
 }
 
-fn map_sdk_error(error: SdkError) -> RerankError {
+fn map_protocol_error(error: ProtocolError) -> RerankError {
     match error {
-        SdkError::InvalidRequest(message) => RerankError::InvalidDescriptor(message),
-        SdkError::InvalidResponse(message) => RerankError::Protocol(message.into()),
-        SdkError::CatalogMiss => RerankError::Remote("descriptor catalog miss".into()),
-        SdkError::ManifestMiss => RerankError::Remote("descriptor manifest miss".into()),
-        SdkError::Remote { message, .. } => RerankError::Remote(message),
+        ProtocolError::InvalidRequest(message) => RerankError::InvalidDescriptor(message),
+        ProtocolError::InvalidResponse(message) => RerankError::Protocol(message.into()),
+        ProtocolError::CatalogMiss => RerankError::Remote("descriptor catalog miss".into()),
+        ProtocolError::ManifestMiss => RerankError::Remote("descriptor manifest miss".into()),
+        ProtocolError::Remote { message, .. } => RerankError::Remote(message),
     }
 }
 
@@ -939,16 +940,16 @@ fn encode_raw_fp8_catalog_request(
         catalog_revision: revision,
     };
     let frame = if reference {
-        tilemaxsim_client::encode_catalog_selection_reference(
+        tilemaxsim_protocol::encode_catalog_selection_reference(
             &request,
             public_ids,
             scoped_public_ids,
             false,
         )
     } else {
-        tilemaxsim_client::encode_catalog_selection(&request, public_ids)
+        tilemaxsim_protocol::encode_catalog_selection(&request, public_ids)
     }
-    .map_err(map_sdk_error)?;
+    .map_err(map_protocol_error)?;
     if frame.len() > max_batch_bytes {
         return Err(RerankError::RequestTooLarge);
     }
@@ -1765,7 +1766,7 @@ fn decode_response_for_version(
     heap_keys: &[HeapKey],
     expected_result_count: usize,
 ) -> Result<RerankResults, RerankError> {
-    let response = tilemaxsim_client::decode_response(frame).map_err(map_sdk_error)?;
+    let response = tilemaxsim_protocol::decode_response(frame).map_err(map_protocol_error)?;
     if response.protocol_version != expected_version {
         return Err(RerankError::Protocol("unsupported version".into()));
     }
@@ -1802,7 +1803,7 @@ fn decode_scoped_response(
     expected_scoped: usize,
 ) -> Result<(RerankResults, RerankResults), RerankError> {
     const SCOPED_RESULT_TAG: u32 = 1 << 31;
-    let response = tilemaxsim_client::decode_response(frame).map_err(map_sdk_error)?;
+    let response = tilemaxsim_protocol::decode_response(frame).map_err(map_protocol_error)?;
     if response.protocol_version != SCOPED_CATALOG_SELECTION_REFERENCE_VERSION
         && response.protocol_version != PERSISTENT_SCOPED_CATALOG_SELECTION_REFERENCE_VERSION
     {

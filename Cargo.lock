@@ -1791,7 +1791,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "tilemaxsim-client"
+name = "tilemaxsim-protocol"
 version = "0.0.0"
 dependencies = [
  "sha2",
@@ -2014,7 +2014,7 @@ dependencies = [
  "serde",
  "sha2",
  "simd",
- "tilemaxsim-client",
+ "tilemaxsim-protocol",
  "toml 1.1.2+spec-1.1.0",
  "validator",
  "vchordg",

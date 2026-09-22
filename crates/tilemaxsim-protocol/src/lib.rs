@@ -1,8 +1,9 @@
 // This software is licensed under the repository's dual license model.
 
-//! Stable client-side builders for the TileMaxSim wire contract.
+//! Internal codecs and validators for the TileMaxSim wire contract.
 //!
-//! Applications should normally use VectorChord's SQL API. This module exists
+//! This is not a public application SDK. Applications should normally use
+//! VectorChord's SQL API. This crate exists
 //! for VectorChord components that must speak to `vchord-tilemaxsimd`; it keeps
 //! frame layout, catalog digests, response validation, and error classification
 //! out of callers.
@@ -95,7 +96,7 @@ pub struct ScoreResponse {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum SdkError {
+pub enum ProtocolError {
     InvalidRequest(&'static str),
     InvalidResponse(&'static str),
     CatalogMiss,
@@ -103,7 +104,7 @@ pub enum SdkError {
     Remote { status: u32, message: String },
 }
 
-impl fmt::Display for SdkError {
+impl fmt::Display for ProtocolError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::InvalidRequest(message) | Self::InvalidResponse(message) => {
@@ -118,13 +119,13 @@ impl fmt::Display for SdkError {
     }
 }
 
-impl std::error::Error for SdkError {}
+impl std::error::Error for ProtocolError {}
 
 pub fn catalog_digest(revision: &str) -> [u8; 32] {
     Sha256::digest(revision.as_bytes()).into()
 }
 
-pub fn selection_digest(public_ids: &[i64]) -> Result<[u8; 32], SdkError> {
+pub fn selection_digest(public_ids: &[i64]) -> Result<[u8; 32], ProtocolError> {
     validate_public_ids(public_ids)?;
     Ok(selection_digest_validated(public_ids))
 }
@@ -142,9 +143,9 @@ fn selection_digest_validated(public_ids: &[i64]) -> [u8; 32] {
 pub fn encode_catalog_registration(
     request: &CatalogRequest<'_>,
     descriptors: &[CatalogDescriptor],
-) -> Result<Vec<u8>, SdkError> {
+) -> Result<Vec<u8>, ProtocolError> {
     if descriptors.is_empty() || descriptors.len() > MAX_CANDIDATES {
-        return Err(SdkError::InvalidRequest(
+        return Err(ProtocolError::InvalidRequest(
             "catalog descriptors must be nonempty and bounded",
         ));
     }
@@ -156,7 +157,7 @@ pub fn encode_catalog_registration(
     frame.extend_from_slice(&catalog_digest(request.catalog_revision));
     for descriptor in descriptors {
         if descriptor.rows == 0 {
-            return Err(SdkError::InvalidRequest(
+            return Err(ProtocolError::InvalidRequest(
                 "catalog descriptor rows must be positive",
             ));
         }
@@ -177,7 +178,7 @@ pub fn encode_catalog_registration(
 pub fn encode_catalog_selection(
     request: &CatalogRequest<'_>,
     public_ids: &[i64],
-) -> Result<Vec<u8>, SdkError> {
+) -> Result<Vec<u8>, ProtocolError> {
     validate_public_ids(public_ids)?;
     validate_request(request, public_ids.len())?;
     let mut frame = common_prefix(request, public_ids.len())?;
@@ -200,7 +201,7 @@ pub fn encode_catalog_selection_reference(
     public_ids: &[i64],
     scoped_public_ids: Option<&[i64]>,
     persistent: bool,
-) -> Result<Vec<u8>, SdkError> {
+) -> Result<Vec<u8>, ProtocolError> {
     validate_public_ids(public_ids)?;
     validate_request(request, public_ids.len())?;
     let scoped = scoped_public_ids
@@ -227,9 +228,9 @@ pub fn encode_catalog_selection_reference(
     Ok(frame)
 }
 
-pub fn decode_response(frame: &[u8]) -> Result<ScoreResponse, SdkError> {
+pub fn decode_response(frame: &[u8]) -> Result<ScoreResponse, ProtocolError> {
     if frame.len() < HEADER_BYTES || &frame[..4] != MAGIC {
-        return Err(SdkError::InvalidResponse(
+        return Err(ProtocolError::InvalidResponse(
             "invalid TileMaxSim response header",
         ));
     }
@@ -237,44 +238,46 @@ pub fn decode_response(frame: &[u8]) -> Result<ScoreResponse, SdkError> {
     let kind = u16::from_le_bytes(frame[6..8].try_into().unwrap());
     let request_id = u64::from_le_bytes(frame[8..16].try_into().unwrap());
     let body_len = usize::try_from(u64::from_le_bytes(frame[16..24].try_into().unwrap()))
-        .map_err(|_| SdkError::InvalidResponse("TileMaxSim response is too large"))?;
+        .map_err(|_| ProtocolError::InvalidResponse("TileMaxSim response is too large"))?;
     if kind != RESPONSE_KIND
         || body_len > MAX_RESPONSE_BYTES
         || body_len != frame.len() - HEADER_BYTES
     {
-        return Err(SdkError::InvalidResponse(
+        return Err(ProtocolError::InvalidResponse(
             "invalid TileMaxSim response length or kind",
         ));
     }
     if body_len < 8 {
-        return Err(SdkError::InvalidResponse("truncated TileMaxSim response"));
+        return Err(ProtocolError::InvalidResponse(
+            "truncated TileMaxSim response",
+        ));
     }
     let status = u32::from_le_bytes(frame[24..28].try_into().unwrap());
     let count = u32::from_le_bytes(frame[28..32].try_into().unwrap()) as usize;
     if status != 0 {
         if count > MAX_REMOTE_ERROR_BYTES || count > body_len - 8 {
-            return Err(SdkError::InvalidResponse(
+            return Err(ProtocolError::InvalidResponse(
                 "truncated TileMaxSim error response",
             ));
         }
         let message = std::str::from_utf8(&frame[32..32 + count])
-            .map_err(|_| SdkError::InvalidResponse("TileMaxSim error is not UTF-8"))?
+            .map_err(|_| ProtocolError::InvalidResponse("TileMaxSim error is not UTF-8"))?
             .to_owned();
         return Err(match message.as_str() {
-            "descriptor catalog miss" => SdkError::CatalogMiss,
-            "descriptor manifest miss" => SdkError::ManifestMiss,
-            _ => SdkError::Remote { status, message },
+            "descriptor catalog miss" => ProtocolError::CatalogMiss,
+            "descriptor manifest miss" => ProtocolError::ManifestMiss,
+            _ => ProtocolError::Remote { status, message },
         });
     }
     let expected = 8_usize
         .checked_add(
             count
                 .checked_mul(8)
-                .ok_or(SdkError::InvalidResponse("score count overflow"))?,
+                .ok_or(ProtocolError::InvalidResponse("score count overflow"))?,
         )
-        .ok_or(SdkError::InvalidResponse("score count overflow"))?;
+        .ok_or(ProtocolError::InvalidResponse("score count overflow"))?;
     if body_len != expected {
-        return Err(SdkError::InvalidResponse(
+        return Err(ProtocolError::InvalidResponse(
             "TileMaxSim score count disagrees with response length",
         ));
     }
@@ -283,7 +286,7 @@ pub fn decode_response(frame: &[u8]) -> Result<ScoreResponse, SdkError> {
         let candidate_id = u32::from_le_bytes(bytes[..4].try_into().unwrap());
         let similarity = f32::from_le_bytes(bytes[4..].try_into().unwrap());
         if !similarity.is_finite() {
-            return Err(SdkError::InvalidResponse(
+            return Err(ProtocolError::InvalidResponse(
                 "TileMaxSim returned a non-finite score",
             ));
         }
@@ -302,7 +305,7 @@ pub fn decode_response(frame: &[u8]) -> Result<ScoreResponse, SdkError> {
 fn common_prefix(
     request: &CatalogRequest<'_>,
     candidate_count: usize,
-) -> Result<Vec<u8>, SdkError> {
+) -> Result<Vec<u8>, ProtocolError> {
     let quantization = request.quantization_contract.unwrap_or("");
     let capacity = HEADER_BYTES
         .checked_add(request.query.len())
@@ -310,7 +313,7 @@ fn common_prefix(
         .and_then(|value| value.checked_add(request.tenant.len()))
         .and_then(|value| value.checked_add(quantization.len()))
         .and_then(|value| value.checked_add(128))
-        .ok_or(SdkError::InvalidRequest("request size overflow"))?;
+        .ok_or(ProtocolError::InvalidRequest("request size overflow"))?;
     let mut frame = Vec::with_capacity(capacity);
     frame.resize(HEADER_BYTES, 0);
     frame.extend_from_slice(&request.dimension.to_le_bytes());
@@ -337,11 +340,11 @@ fn common_prefix(
     Ok(frame)
 }
 
-fn finish_frame(frame: &mut [u8], version: u16, request_id: u64) -> Result<(), SdkError> {
+fn finish_frame(frame: &mut [u8], version: u16, request_id: u64) -> Result<(), ProtocolError> {
     let body_len = frame
         .len()
         .checked_sub(HEADER_BYTES)
-        .ok_or(SdkError::InvalidRequest("request length underflow"))?;
+        .ok_or(ProtocolError::InvalidRequest("request length underflow"))?;
     frame[..4].copy_from_slice(MAGIC);
     frame[4..6].copy_from_slice(&version.to_le_bytes());
     frame[6..8].copy_from_slice(&REQUEST_KIND.to_le_bytes());
@@ -350,9 +353,12 @@ fn finish_frame(frame: &mut [u8], version: u16, request_id: u64) -> Result<(), S
     Ok(())
 }
 
-fn validate_request(request: &CatalogRequest<'_>, candidate_count: usize) -> Result<(), SdkError> {
+fn validate_request(
+    request: &CatalogRequest<'_>,
+    candidate_count: usize,
+) -> Result<(), ProtocolError> {
     if candidate_count == 0 || candidate_count > MAX_CANDIDATES {
-        return Err(SdkError::InvalidRequest(
+        return Err(ProtocolError::InvalidRequest(
             "candidate set must be nonempty and bounded",
         ));
     }
@@ -363,24 +369,26 @@ fn validate_request(request: &CatalogRequest<'_>, candidate_count: usize) -> Res
     )?;
     validate_text(request.tenant, MAX_TENANT_BYTES, "tenant is invalid")?;
     if !(-100..=100).contains(&request.priority) || !(1..=600_000).contains(&request.timeout_ms) {
-        return Err(SdkError::InvalidRequest(
+        return Err(ProtocolError::InvalidRequest(
             "scheduler priority or timeout is invalid",
         ));
     }
     if request.query_rows == 0 || request.dimension == 0 || request.dimension > 60_000 {
-        return Err(SdkError::InvalidRequest("query tensor shape is invalid"));
+        return Err(ProtocolError::InvalidRequest(
+            "query tensor shape is invalid",
+        ));
     }
     let expected = (request.query_rows as usize)
         .checked_mul(request.dimension as usize)
         .and_then(|value| value.checked_mul(request.query_dtype.scalar_bytes()))
-        .ok_or(SdkError::InvalidRequest("query tensor size overflow"))?;
+        .ok_or(ProtocolError::InvalidRequest("query tensor size overflow"))?;
     if request.query.len() != expected {
-        return Err(SdkError::InvalidRequest(
+        return Err(ProtocolError::InvalidRequest(
             "query payload disagrees with its shape and dtype",
         ));
     }
     if request.top_k == 0 || request.top_k > candidate_count || request.top_k > u32::MAX as usize {
-        return Err(SdkError::InvalidRequest(
+        return Err(ProtocolError::InvalidRequest(
             "top_k must be between one and candidate count",
         ));
     }
@@ -389,7 +397,7 @@ fn validate_request(request: &CatalogRequest<'_>, candidate_count: usize) -> Res
         ScoringProfile::Pq | ScoringProfile::OpqRpq
     );
     if pq != request.quantization_contract.is_some() {
-        return Err(SdkError::InvalidRequest(
+        return Err(ProtocolError::InvalidRequest(
             "PQ profiles require exactly one quantization contract",
         ));
     }
@@ -400,27 +408,29 @@ fn validate_request(request: &CatalogRequest<'_>, candidate_count: usize) -> Res
                 .bytes()
                 .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase()))
     {
-        return Err(SdkError::InvalidRequest("quantization contract is invalid"));
+        return Err(ProtocolError::InvalidRequest(
+            "quantization contract is invalid",
+        ));
     }
     if request.catalog_revision.is_empty() {
-        return Err(SdkError::InvalidRequest(
+        return Err(ProtocolError::InvalidRequest(
             "catalog revision must not be empty",
         ));
     }
     Ok(())
 }
 
-fn validate_text(value: &str, maximum: usize, message: &'static str) -> Result<(), SdkError> {
+fn validate_text(value: &str, maximum: usize, message: &'static str) -> Result<(), ProtocolError> {
     if value.is_empty() || value.len() > maximum || value.chars().any(char::is_control) {
-        Err(SdkError::InvalidRequest(message))
+        Err(ProtocolError::InvalidRequest(message))
     } else {
         Ok(())
     }
 }
 
-fn validate_public_ids(public_ids: &[i64]) -> Result<(), SdkError> {
+fn validate_public_ids(public_ids: &[i64]) -> Result<(), ProtocolError> {
     if public_ids.is_empty() || public_ids.len() > MAX_CANDIDATES {
-        return Err(SdkError::InvalidRequest(
+        return Err(ProtocolError::InvalidRequest(
             "catalog public IDs must be nonempty and bounded",
         ));
     }
@@ -432,19 +442,19 @@ fn validate_public_ids(public_ids: &[i64]) -> Result<(), SdkError> {
         })
         .is_none()
     {
-        return Err(SdkError::InvalidRequest(
+        return Err(ProtocolError::InvalidRequest(
             "catalog public IDs must be positive and strictly increasing",
         ));
     }
     Ok(())
 }
 
-fn scoped_ordinals(public_ids: &[i64], scoped: &[i64]) -> Result<Vec<u32>, SdkError> {
+fn scoped_ordinals(public_ids: &[i64], scoped: &[i64]) -> Result<Vec<u32>, ProtocolError> {
     validate_public_ids(scoped)?;
     let mut result = Vec::with_capacity(scoped.len());
     for public_id in scoped {
         let ordinal = public_ids.binary_search(public_id).map_err(|_| {
-            SdkError::InvalidRequest("scoped public IDs must be a subset of candidates")
+            ProtocolError::InvalidRequest("scoped public IDs must be a subset of candidates")
         })?;
         result.push(ordinal as u32);
     }
@@ -454,13 +464,13 @@ fn scoped_ordinals(public_ids: &[i64], scoped: &[i64]) -> Result<Vec<u32>, SdkEr
 fn encode_delta_values(
     frame: &mut Vec<u8>,
     values: impl IntoIterator<Item = u64>,
-) -> Result<(), SdkError> {
+) -> Result<(), ProtocolError> {
     let mut previous = 0_u64;
     for current in values {
         let mut delta = current
             .checked_sub(previous)
             .filter(|value| *value > 0)
-            .ok_or(SdkError::InvalidRequest(
+            .ok_or(ProtocolError::InvalidRequest(
                 "delta values must be positive and strictly increasing",
             ))?;
         while delta >= 0x80 {
@@ -515,12 +525,12 @@ mod tests {
         let query = [0_u8; 8];
         assert!(matches!(
             encode_catalog_selection(&request(&query), &[20, 11]),
-            Err(SdkError::InvalidRequest(_))
+            Err(ProtocolError::InvalidRequest(_))
         ));
         let short = [0_u8; 6];
         assert!(matches!(
             encode_catalog_selection(&request(&short), &[11, 20]),
-            Err(SdkError::InvalidRequest(_))
+            Err(ProtocolError::InvalidRequest(_))
         ));
     }
 
@@ -555,6 +565,6 @@ mod tests {
         miss.extend_from_slice(&(message.len() as u32).to_le_bytes());
         miss.extend_from_slice(message);
         miss[16..24].copy_from_slice(&((8 + message.len()) as u64).to_le_bytes());
-        assert_eq!(decode_response(&miss), Err(SdkError::CatalogMiss));
+        assert_eq!(decode_response(&miss), Err(ProtocolError::CatalogMiss));
     }
 }

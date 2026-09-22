@@ -1,5 +1,5 @@
 [package]
-name = "tilemaxsim-client"
+name = "tilemaxsim-protocol"
 version.workspace = true
 edition.workspace = true
 publish = false

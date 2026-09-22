@@ -33,7 +33,7 @@ simd = { path = "./crates/simd" }
 vchordg = { path = "./crates/vchordg" }
 vchordrq = { path = "./crates/vchordrq" }
 vector = { path = "./crates/vector" }
-tilemaxsim-client = { path = "./crates/tilemaxsim-client" }
+tilemaxsim-protocol = { path = "./crates/tilemaxsim-protocol" }
 
 arrayvec = "0.7.6"
 bumpalo.workspace = true

@@ -1,11 +1,12 @@
-# TileMaxSim Rust SDK
+# TileMaxSim Internal Protocol Library
 
-`tilemaxsim-client` is the supported Rust boundary for components that must
-communicate with the native TileMaxSim daemon. Applications that only query
-VectorChord should continue to use the SQL API; they should not construct daemon
-frames themselves.
+`tilemaxsim-protocol` is the supported Rust boundary for components that must
+communicate with the native TileMaxSim daemon. This is an internal implementation
+boundary, not a public application SDK. Applications that only query VectorChord
+should continue to use the SQL API; they should not construct daemon frames
+themselves.
 
-The SDK currently owns the latency-sensitive catalog protocol:
+The protocol library currently owns the latency-sensitive catalog protocol:
 
 - v10 additive catalog registration and explicit public-ID selection;
 - v11/v14 global selection references;
@@ -18,16 +19,16 @@ The SDK currently owns the latency-sensitive catalog protocol:
 The intended miss path is deterministic:
 
 1. Send a persistent v14 selection reference (or v13 for dual-scope search).
-2. On `SdkError::CatalogMiss`, send a v10 catalog registration.
+2. On `ProtocolError::CatalogMiss`, send a v10 catalog registration.
 3. Send a v10 explicit selection to populate the bounded selection cache.
 4. Retry the v14/v13 reference on the reusable connection.
 
-Callers supply canonical tensor bytes. The SDK validates shape, dtype, scheduler
-bounds, sorted positive public IDs, scoped subset membership, top-k, and
-quantization-contract compatibility before producing a frame.
+Callers supply canonical tensor bytes. The protocol library validates shape,
+dtype, scheduler bounds, sorted positive public IDs, scoped subset membership,
+top-k, and quantization-contract compatibility before producing a frame.
 
 ```rust
-use tilemaxsim_client::{
+use tilemaxsim_protocol::{
     encode_catalog_selection_reference, CatalogRequest, ScoringProfile,
     TensorDtype,
 };
@@ -57,7 +58,7 @@ let frame = encode_catalog_selection_reference(
 )?;
 ```
 
-`tilemaxsim-client` is an accelerator-independent workspace crate shared by the
+`tilemaxsim-protocol` is an accelerator-independent workspace crate shared by the
 PostgreSQL extension and daemon. The daemon parser is exercised directly by an
 interoperability test. Protocol changes must update that test in the same
 commit; duplicating frame layouts in downstream applications is unsupported.
