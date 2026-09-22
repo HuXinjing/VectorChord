@@ -1,0 +1,11 @@
+[package]
+name = "tilemaxsim-client"
+version.workspace = true
+edition.workspace = true
+publish = false
+
+[dependencies]
+sha2 = "0.10"
+
+[lints]
+workspace = true

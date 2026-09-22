@@ -25,6 +25,9 @@ use std::net::{TcpStream, ToSocketAddrs};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
+use tilemaxsim_client::{
+    CatalogRequest, ScoringProfile as WireScoringProfile, SdkError, TensorDtype as WireTensorDtype,
+};
 use vchordrq::types::OwnedVector;
 
 const MAGIC: &[u8; 4] = b"VCTM";
@@ -37,11 +40,15 @@ const LOGICAL_EXTERNAL_VERSION: u16 = 6;
 const COMPACT_LOGICAL_EXTERNAL_VERSION: u16 = 7;
 const TYPED_COMPACT_LOGICAL_EXTERNAL_VERSION: u16 = 8;
 const MANIFEST_LOGICAL_EXTERNAL_VERSION: u16 = 9;
-const CATALOG_LOGICAL_EXTERNAL_VERSION: u16 = 10;
-const CATALOG_SELECTION_REFERENCE_VERSION: u16 = 11;
-const SCOPED_CATALOG_SELECTION_REFERENCE_VERSION: u16 = 12;
-const PERSISTENT_SCOPED_CATALOG_SELECTION_REFERENCE_VERSION: u16 = 13;
-const PERSISTENT_CATALOG_SELECTION_REFERENCE_VERSION: u16 = 14;
+const CATALOG_LOGICAL_EXTERNAL_VERSION: u16 = tilemaxsim_client::VERSION_CATALOG_LOGICAL_EXTERNAL;
+const CATALOG_SELECTION_REFERENCE_VERSION: u16 =
+    tilemaxsim_client::VERSION_CATALOG_SELECTION_REFERENCE;
+const SCOPED_CATALOG_SELECTION_REFERENCE_VERSION: u16 =
+    tilemaxsim_client::VERSION_SCOPED_CATALOG_SELECTION_REFERENCE;
+const PERSISTENT_SCOPED_CATALOG_SELECTION_REFERENCE_VERSION: u16 =
+    tilemaxsim_client::VERSION_PERSISTENT_SCOPED_CATALOG_SELECTION_REFERENCE;
+const PERSISTENT_CATALOG_SELECTION_REFERENCE_VERSION: u16 =
+    tilemaxsim_client::VERSION_PERSISTENT_CATALOG_SELECTION_REFERENCE;
 const REQUEST_KIND: u16 = 1;
 const RESPONSE_KIND: u16 = 2;
 const HEADER_LEN: usize = 24;
@@ -854,6 +861,100 @@ fn manifest_reference(encoded: &EncodedRequest) -> Result<Vec<u8>, RerankError> 
     Ok(frame)
 }
 
+fn wire_dtype(dtype: TensorDtype) -> WireTensorDtype {
+    match dtype {
+        TensorDtype::F32 => WireTensorDtype::Float32,
+        TensorDtype::F16 => WireTensorDtype::Float16,
+        TensorDtype::Fp8E4m3 => WireTensorDtype::Fp8E4m3,
+    }
+}
+
+fn map_sdk_error(error: SdkError) -> RerankError {
+    match error {
+        SdkError::InvalidRequest(message) => RerankError::InvalidDescriptor(message),
+        SdkError::InvalidResponse(message) => RerankError::Protocol(message.into()),
+        SdkError::CatalogMiss => RerankError::Remote("descriptor catalog miss".into()),
+        SdkError::ManifestMiss => RerankError::Remote("descriptor manifest miss".into()),
+        SdkError::Remote { message, .. } => RerankError::Remote(message),
+    }
+}
+
+fn catalog_heap_keys(public_ids: &[i64]) -> Result<Vec<HeapKey>, RerankError> {
+    public_ids
+        .iter()
+        .enumerate()
+        .map(|(ordinal, _)| {
+            let ordinal = u32::try_from(ordinal).map_err(|_| RerankError::RequestTooLarge)?;
+            Ok([0, (ordinal >> 16) as u16, ordinal as u16])
+        })
+        .collect()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn encode_raw_fp8_catalog_request(
+    request_id: u64,
+    model_contract_id: &str,
+    query: &[OwnedVector],
+    public_ids: &[i64],
+    scoped_public_ids: Option<&[i64]>,
+    max_batch_tokens: usize,
+    max_batch_bytes: usize,
+    scheduling: Option<&TileMaxsimScheduling>,
+    revision: &str,
+    timeout: Duration,
+    top_k: usize,
+    storage_dtype: TensorDtype,
+    reference: bool,
+) -> Result<(Vec<u8>, Vec<HeapKey>), RerankError> {
+    let (query_dtype, dimension) = tensor_metadata(query)?;
+    if query.len() > max_batch_tokens {
+        return Err(RerankError::RequestTooLarge);
+    }
+    let query_rows = u32::try_from(query.len()).map_err(|_| RerankError::RequestTooLarge)?;
+    let query_size = tensor_bytes(query_rows, dimension, query_dtype)?;
+    if query_size > max_batch_bytes {
+        return Err(RerankError::RequestTooLarge);
+    }
+    let mut query_payload = BoundedWriter::new(query_size);
+    encode_tensor_values(&mut query_payload, query, query_dtype)?;
+    let query_payload = query_payload.finish();
+    let tenant = scheduling.map_or("__default__", |value| value.tenant.as_str());
+    let priority = scheduling.map_or(0, |value| value.priority);
+    let timeout_ms = u32::try_from(timeout.as_millis().clamp(1, 600_000))
+        .map_err(|_| RerankError::RequestTooLarge)?;
+    let request = CatalogRequest {
+        request_id,
+        model_contract: model_contract_id,
+        tenant,
+        priority,
+        timeout_ms,
+        query_rows,
+        dimension,
+        query_dtype: wire_dtype(query_dtype),
+        candidate_dtype: wire_dtype(storage_dtype),
+        scoring_profile: WireScoringProfile::Fp8E4m3Raw,
+        quantization_contract: None,
+        top_k,
+        query: &query_payload,
+        catalog_revision: revision,
+    };
+    let frame = if reference {
+        tilemaxsim_client::encode_catalog_selection_reference(
+            &request,
+            public_ids,
+            scoped_public_ids,
+            false,
+        )
+    } else {
+        tilemaxsim_client::encode_catalog_selection(&request, public_ids)
+    }
+    .map_err(map_sdk_error)?;
+    if frame.len() > max_batch_bytes {
+        return Err(RerankError::RequestTooLarge);
+    }
+    Ok((frame, catalog_heap_keys(public_ids)?))
+}
+
 #[allow(clippy::too_many_arguments)]
 fn encode_raw_fp8_catalog_selection(
     request_id: u64,
@@ -868,99 +969,21 @@ fn encode_raw_fp8_catalog_selection(
     top_k: usize,
     storage_dtype: TensorDtype,
 ) -> Result<(Vec<u8>, Vec<HeapKey>), RerankError> {
-    if model_contract_id.is_empty()
-        || model_contract_id.len() > MAX_MODEL_CONTRACT_BYTES
-        || model_contract_id.chars().any(char::is_control)
-    {
-        return Err(RerankError::InvalidDescriptor(
-            "model contract is empty, oversized, or contains control characters",
-        ));
-    }
-    if let Some(scheduling) = scheduling {
-        if scheduling.tenant.is_empty()
-            || scheduling.tenant.len() > MAX_TENANT_BYTES
-            || scheduling.tenant.chars().any(char::is_control)
-            || !(-100..=100).contains(&scheduling.priority)
-        {
-            return Err(RerankError::Configuration(
-                "TileMaxSim scheduler tenant or priority is invalid",
-            ));
-        }
-    }
-    let (query_dtype, dimension) = tensor_metadata(query)?;
-    let query_rows = u32::try_from(query.len()).map_err(|_| RerankError::RequestTooLarge)?;
-    if query.len() > max_batch_tokens
-        || tensor_bytes(query_rows, dimension, query_dtype)? > max_batch_bytes
-        || public_ids.len() > MAX_EXTERNAL_CANDIDATES_PER_BATCH
-    {
-        return Err(RerankError::RequestTooLarge);
-    }
-    let tenant = scheduling.map_or("__default__", |value| value.tenant.as_str());
-    let priority = scheduling.map_or(0, |value| value.priority);
-    let mut writer = BoundedWriter::new(max_batch_bytes);
-    writer.zeros(HEADER_LEN)?;
-    writer.u32(dimension)?;
-    writer.u32(query_rows)?;
-    writer.u32(u32::try_from(public_ids.len()).map_err(|_| RerankError::RequestTooLarge)?)?;
-    writer.u8(query_dtype as u8)?;
-    writer.u8(1)?;
-    writer.u8(scoring_profile_code(
-        PostgresMaxsimScoringProfile::RawFp8E4m3,
-    ))?;
-    writer.u8(if query_dtype == storage_dtype {
-        0
-    } else {
-        storage_dtype as u8
-    })?;
-    writer
-        .u32(u32::try_from(model_contract_id.len()).map_err(|_| RerankError::RequestTooLarge)?)?;
-    writer.u32(0)?;
-    writer.i32(priority)?;
-    writer.u32(
-        u32::try_from(timeout.as_millis().clamp(1, 600_000))
-            .map_err(|_| RerankError::RequestTooLarge)?,
-    )?;
-    writer.u32(u32::try_from(tenant.len()).map_err(|_| RerankError::RequestTooLarge)?)?;
-    writer.u32(u32::try_from(top_k).map_err(|_| RerankError::RequestTooLarge)?)?;
-    writer.bytes(model_contract_id.as_bytes())?;
-    writer.bytes(tenant.as_bytes())?;
-    encode_tensor_values(&mut writer, query, query_dtype)?;
-    writer.u8(1)?;
-    writer.bytes(&Sha256::digest(revision.as_bytes()))?;
-    let mut previous = 0_u64;
-    let mut heap_keys = Vec::with_capacity(public_ids.len());
-    for (ordinal, public_id) in public_ids.iter().copied().enumerate() {
-        let current = u64::try_from(public_id)
-            .map_err(|_| RerankError::InvalidDescriptor("catalog public ID is not positive"))?;
-        let delta = current
-            .checked_sub(previous)
-            .filter(|value| *value > 0)
-            .ok_or(RerankError::InvalidDescriptor(
-                "catalog public IDs are not strictly increasing",
-            ))?;
-        let mut remaining = delta;
-        while remaining >= 0x80 {
-            writer.u8((remaining as u8 & 0x7f) | 0x80)?;
-            remaining >>= 7;
-        }
-        writer.u8(remaining as u8)?;
-        let ordinal = u32::try_from(ordinal).map_err(|_| RerankError::RequestTooLarge)?;
-        heap_keys.push([0, (ordinal >> 16) as u16, ordinal as u16]);
-        previous = current;
-    }
-    let body_len = writer
-        .len()
-        .checked_sub(HEADER_LEN)
-        .ok_or_else(|| RerankError::Protocol("invalid request length".into()))?;
-    writer.patch_bytes(0, MAGIC);
-    writer.patch_u16(4, CATALOG_LOGICAL_EXTERNAL_VERSION);
-    writer.patch_u16(6, REQUEST_KIND);
-    writer.patch_u64(8, request_id);
-    writer.patch_u64(
-        16,
-        u64::try_from(body_len).map_err(|_| RerankError::RequestTooLarge)?,
-    );
-    Ok((writer.finish(), heap_keys))
+    encode_raw_fp8_catalog_request(
+        request_id,
+        model_contract_id,
+        query,
+        public_ids,
+        None,
+        max_batch_tokens,
+        max_batch_bytes,
+        scheduling,
+        revision,
+        timeout,
+        top_k,
+        storage_dtype,
+        false,
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -977,94 +1000,21 @@ fn encode_raw_fp8_catalog_selection_reference(
     top_k: usize,
     storage_dtype: TensorDtype,
 ) -> Result<(Vec<u8>, Vec<HeapKey>), RerankError> {
-    if model_contract_id.is_empty()
-        || model_contract_id.len() > MAX_MODEL_CONTRACT_BYTES
-        || model_contract_id.chars().any(char::is_control)
-    {
-        return Err(RerankError::InvalidDescriptor(
-            "model contract is empty, oversized, or contains control characters",
-        ));
-    }
-    if let Some(scheduling) = scheduling {
-        if scheduling.tenant.is_empty()
-            || scheduling.tenant.len() > MAX_TENANT_BYTES
-            || scheduling.tenant.chars().any(char::is_control)
-            || !(-100..=100).contains(&scheduling.priority)
-        {
-            return Err(RerankError::Configuration(
-                "TileMaxSim scheduler tenant or priority is invalid",
-            ));
-        }
-    }
-    let (query_dtype, dimension) = tensor_metadata(query)?;
-    let query_rows = u32::try_from(query.len()).map_err(|_| RerankError::RequestTooLarge)?;
-    if query.len() > max_batch_tokens
-        || tensor_bytes(query_rows, dimension, query_dtype)? > max_batch_bytes
-        || public_ids.is_empty()
-        || public_ids.len() > MAX_EXTERNAL_CANDIDATES_PER_BATCH
-    {
-        return Err(RerankError::RequestTooLarge);
-    }
-    let mut selection_digest = Sha256::new();
-    let mut heap_keys = Vec::with_capacity(public_ids.len());
-    let mut previous = 0_i64;
-    for (ordinal, public_id) in public_ids.iter().copied().enumerate() {
-        if public_id <= previous {
-            return Err(RerankError::InvalidDescriptor(
-                "catalog public IDs are not strictly increasing",
-            ));
-        }
-        selection_digest.update(public_id.to_le_bytes());
-        let ordinal = u32::try_from(ordinal).map_err(|_| RerankError::RequestTooLarge)?;
-        heap_keys.push([0, (ordinal >> 16) as u16, ordinal as u16]);
-        previous = public_id;
-    }
-    let tenant = scheduling.map_or("__default__", |value| value.tenant.as_str());
-    let priority = scheduling.map_or(0, |value| value.priority);
-    let mut writer = BoundedWriter::new(max_batch_bytes);
-    writer.zeros(HEADER_LEN)?;
-    writer.u32(dimension)?;
-    writer.u32(query_rows)?;
-    writer.u32(u32::try_from(public_ids.len()).map_err(|_| RerankError::RequestTooLarge)?)?;
-    writer.u8(query_dtype as u8)?;
-    writer.u8(1)?;
-    writer.u8(scoring_profile_code(
-        PostgresMaxsimScoringProfile::RawFp8E4m3,
-    ))?;
-    writer.u8(if query_dtype == storage_dtype {
-        0
-    } else {
-        storage_dtype as u8
-    })?;
-    writer
-        .u32(u32::try_from(model_contract_id.len()).map_err(|_| RerankError::RequestTooLarge)?)?;
-    writer.u32(0)?;
-    writer.i32(priority)?;
-    writer.u32(
-        u32::try_from(timeout.as_millis().clamp(1, 600_000))
-            .map_err(|_| RerankError::RequestTooLarge)?,
-    )?;
-    writer.u32(u32::try_from(tenant.len()).map_err(|_| RerankError::RequestTooLarge)?)?;
-    writer.u32(u32::try_from(top_k).map_err(|_| RerankError::RequestTooLarge)?)?;
-    writer.bytes(model_contract_id.as_bytes())?;
-    writer.bytes(tenant.as_bytes())?;
-    encode_tensor_values(&mut writer, query, query_dtype)?;
-    writer.u8(3)?;
-    writer.bytes(&Sha256::digest(revision.as_bytes()))?;
-    writer.bytes(&selection_digest.finalize())?;
-    let body_len = writer
-        .len()
-        .checked_sub(HEADER_LEN)
-        .ok_or_else(|| RerankError::Protocol("invalid request length".into()))?;
-    writer.patch_bytes(0, MAGIC);
-    writer.patch_u16(4, CATALOG_SELECTION_REFERENCE_VERSION);
-    writer.patch_u16(6, REQUEST_KIND);
-    writer.patch_u64(8, request_id);
-    writer.patch_u64(
-        16,
-        u64::try_from(body_len).map_err(|_| RerankError::RequestTooLarge)?,
-    );
-    Ok((writer.finish(), heap_keys))
+    encode_raw_fp8_catalog_request(
+        request_id,
+        model_contract_id,
+        query,
+        public_ids,
+        None,
+        max_batch_tokens,
+        max_batch_bytes,
+        scheduling,
+        revision,
+        timeout,
+        top_k,
+        storage_dtype,
+        true,
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1082,11 +1032,12 @@ fn encode_raw_fp8_scoped_catalog_selection_reference(
     top_k: usize,
     storage_dtype: TensorDtype,
 ) -> Result<(Vec<u8>, Vec<HeapKey>), RerankError> {
-    let (mut frame, heap_keys) = encode_raw_fp8_catalog_selection_reference(
+    encode_raw_fp8_catalog_request(
         request_id,
         model_contract_id,
         query,
         public_ids,
+        Some(scoped_public_ids),
         max_batch_tokens,
         max_batch_bytes,
         scheduling,
@@ -1094,64 +1045,8 @@ fn encode_raw_fp8_scoped_catalog_selection_reference(
         timeout,
         top_k,
         storage_dtype,
-    )?;
-    let mut ordinals = Vec::with_capacity(scoped_public_ids.len());
-    for public_id in scoped_public_ids {
-        let ordinal = public_ids.binary_search(public_id).map_err(|_| {
-            RerankError::InvalidDescriptor(
-                "scoped catalog public IDs must be a subset of the candidate set",
-            )
-        })?;
-        ordinals.push(u32::try_from(ordinal).map_err(|_| RerankError::RequestTooLarge)?);
-    }
-    ordinals.sort_unstable();
-    ordinals.dedup();
-    if ordinals.is_empty() {
-        return Err(RerankError::InvalidDescriptor(
-            "scoped catalog public IDs must not be empty",
-        ));
-    }
-    // v11 ends after the two catalog digests. v12 changes only the mode byte
-    // and appends a compact, delta-varint ordinal subset.
-    let mode_offset = frame
-        .len()
-        .checked_sub(65)
-        .ok_or(RerankError::RequestTooLarge)?;
-    if frame.get(mode_offset).copied() != Some(3) {
-        return Err(RerankError::Protocol(
-            "invalid catalog selection reference layout".into(),
-        ));
-    }
-    frame[mode_offset] = 4;
-    frame.extend_from_slice(
-        &u32::try_from(ordinals.len())
-            .map_err(|_| RerankError::RequestTooLarge)?
-            .to_le_bytes(),
-    );
-    let mut previous_plus_one = 0_u64;
-    for ordinal in ordinals {
-        let current_plus_one = u64::from(ordinal) + 1;
-        let mut delta = current_plus_one
-            .checked_sub(previous_plus_one)
-            .filter(|value| *value > 0)
-            .ok_or(RerankError::InvalidDescriptor(
-                "scoped catalog ordinals are not strictly increasing",
-            ))?;
-        while delta >= 0x80 {
-            frame.push((delta as u8 & 0x7f) | 0x80);
-            delta >>= 7;
-        }
-        frame.push(delta as u8);
-        previous_plus_one = current_plus_one;
-    }
-    if frame.len() > max_batch_bytes {
-        return Err(RerankError::RequestTooLarge);
-    }
-    frame[4..6].copy_from_slice(&SCOPED_CATALOG_SELECTION_REFERENCE_VERSION.to_le_bytes());
-    let body_len =
-        u64::try_from(frame.len() - HEADER_LEN).map_err(|_| RerankError::RequestTooLarge)?;
-    frame[16..24].copy_from_slice(&body_len.to_le_bytes());
-    Ok((frame, heap_keys))
+        true,
+    )
 }
 
 fn catalog_frames(
@@ -1870,45 +1765,20 @@ fn decode_response_for_version(
     heap_keys: &[HeapKey],
     expected_result_count: usize,
 ) -> Result<RerankResults, RerankError> {
-    let mut cursor = Cursor::new(frame);
-    if cursor.bytes(4)? != MAGIC {
-        return Err(RerankError::Protocol("invalid magic".into()));
-    }
-    if cursor.u16()? != expected_version {
+    let response = tilemaxsim_client::decode_response(frame).map_err(map_sdk_error)?;
+    if response.protocol_version != expected_version {
         return Err(RerankError::Protocol("unsupported version".into()));
     }
-    if cursor.u16()? != RESPONSE_KIND {
-        return Err(RerankError::Protocol("unexpected message kind".into()));
-    }
-    if cursor.u64()? != request_id {
+    if response.request_id != request_id {
         return Err(RerankError::Protocol("request ID mismatch".into()));
     }
-    let body_len = usize::try_from(cursor.u64()?)
-        .map_err(|_| RerankError::Protocol("response body is too large".into()))?;
-    if body_len != frame.len().saturating_sub(HEADER_LEN) {
-        return Err(RerankError::Protocol("response length mismatch".into()));
-    }
-    let status = cursor.u32()?;
-    if status != 0 {
-        let length = usize::try_from(cursor.u32()?)
-            .map_err(|_| RerankError::Protocol("remote error is too large".into()))?;
-        if length > MAX_REMOTE_ERROR_BYTES {
-            return Err(RerankError::Protocol("remote error is too large".into()));
-        }
-        let message = std::str::from_utf8(cursor.bytes(length)?)
-            .map_err(|_| RerankError::Protocol("remote error is not UTF-8".into()))?;
-        cursor.finish()?;
-        return Err(RerankError::Remote(message.into()));
-    }
-    let result_count = usize::try_from(cursor.u32()?)
-        .map_err(|_| RerankError::Protocol("result count is too large".into()))?;
-    if result_count != expected_result_count || expected_result_count > heap_keys.len() {
+    if response.scores.len() != expected_result_count || expected_result_count > heap_keys.len() {
         return Err(RerankError::Protocol("partial result set".into()));
     }
     let mut seen = vec![false; heap_keys.len()];
     let mut results = BinaryHeap::new();
-    for _ in 0..result_count {
-        let candidate_id = usize::try_from(cursor.u32()?)
+    for score in response.scores {
+        let candidate_id = usize::try_from(score.candidate_id)
             .map_err(|_| RerankError::Protocol("candidate ID is too large".into()))?;
         let Some(heap_key) = heap_keys.get(candidate_id).copied() else {
             return Err(RerankError::Protocol("unknown candidate ID".into()));
@@ -1916,14 +1786,11 @@ fn decode_response_for_version(
         if std::mem::replace(&mut seen[candidate_id], true) {
             return Err(RerankError::Protocol("duplicate candidate ID".into()));
         }
-        let similarity = f32::from_bits(cursor.u32()?);
-        if !similarity.is_finite() {
-            return Err(RerankError::Protocol("non-finite similarity".into()));
-        }
-        let distance = Distance::from_f32(-similarity);
-        results.push((Reverse(distance), Reverse(heap_key)));
+        results.push((
+            Reverse(Distance::from_f32(-score.similarity)),
+            Reverse(heap_key),
+        ));
     }
-    cursor.finish()?;
     Ok(RerankResults { inner: results })
 }
 
@@ -1935,46 +1802,25 @@ fn decode_scoped_response(
     expected_scoped: usize,
 ) -> Result<(RerankResults, RerankResults), RerankError> {
     const SCOPED_RESULT_TAG: u32 = 1 << 31;
-    let mut cursor = Cursor::new(frame);
-    if cursor.bytes(4)? != MAGIC
-        || cursor.u16()? != SCOPED_CATALOG_SELECTION_REFERENCE_VERSION
-        || cursor.u16()? != RESPONSE_KIND
+    let response = tilemaxsim_client::decode_response(frame).map_err(map_sdk_error)?;
+    if response.protocol_version != SCOPED_CATALOG_SELECTION_REFERENCE_VERSION
+        && response.protocol_version != PERSISTENT_SCOPED_CATALOG_SELECTION_REFERENCE_VERSION
     {
         return Err(RerankError::Protocol("unsupported version".into()));
     }
-    if cursor.u64()? != request_id {
+    if response.request_id != request_id {
         return Err(RerankError::Protocol("request ID mismatch".into()));
     }
-    let body_len = usize::try_from(cursor.u64()?)
-        .map_err(|_| RerankError::Protocol("response body is too large".into()))?;
-    if body_len != frame.len().saturating_sub(HEADER_LEN) {
-        return Err(RerankError::Protocol("response length mismatch".into()));
-    }
-    let status = cursor.u32()?;
-    if status != 0 {
-        let length = usize::try_from(cursor.u32()?)
-            .map_err(|_| RerankError::Protocol("remote error is too large".into()))?;
-        if length > MAX_REMOTE_ERROR_BYTES {
-            return Err(RerankError::Protocol("remote error is too large".into()));
-        }
-        let message = std::str::from_utf8(cursor.bytes(length)?)
-            .map_err(|_| RerankError::Protocol("remote error is not UTF-8".into()))?;
-        cursor.finish()?;
-        return Err(RerankError::Remote(message.into()));
-    }
-    let result_count = usize::try_from(cursor.u32()?)
-        .map_err(|_| RerankError::Protocol("result count is too large".into()))?;
-    if result_count != expected_global.saturating_add(expected_scoped) {
+    if response.scores.len() != expected_global.saturating_add(expected_scoped) {
         return Err(RerankError::Protocol("partial scoped result set".into()));
     }
     let mut seen_global = vec![false; heap_keys.len()];
     let mut seen_scoped = vec![false; heap_keys.len()];
     let mut global = BinaryHeap::new();
     let mut scoped = BinaryHeap::new();
-    for _ in 0..result_count {
-        let tagged_id = cursor.u32()?;
-        let is_scoped = tagged_id & SCOPED_RESULT_TAG != 0;
-        let candidate_id = usize::try_from(tagged_id & !SCOPED_RESULT_TAG)
+    for score in response.scores {
+        let is_scoped = score.candidate_id & SCOPED_RESULT_TAG != 0;
+        let candidate_id = usize::try_from(score.candidate_id & !SCOPED_RESULT_TAG)
             .map_err(|_| RerankError::Protocol("candidate ID is too large".into()))?;
         let Some(heap_key) = heap_keys.get(candidate_id).copied() else {
             return Err(RerankError::Protocol("unknown candidate ID".into()));
@@ -1987,20 +1833,14 @@ fn decode_scoped_response(
         if std::mem::replace(&mut seen[candidate_id], true) {
             return Err(RerankError::Protocol("duplicate candidate ID".into()));
         }
-        let similarity = f32::from_bits(cursor.u32()?);
-        if !similarity.is_finite() {
-            return Err(RerankError::Protocol("non-finite similarity".into()));
-        }
-        let entry = (Reverse(Distance::from_f32(-similarity)), Reverse(heap_key));
-        if is_scoped {
-            scoped.push(entry);
-        } else {
-            global.push(entry);
-        }
+        let target = if is_scoped { &mut scoped } else { &mut global };
+        target.push((
+            Reverse(Distance::from_f32(-score.similarity)),
+            Reverse(heap_key),
+        ));
     }
-    cursor.finish()?;
     if global.len() != expected_global || scoped.len() != expected_scoped {
-        return Err(RerankError::Protocol("mis-tagged scoped result set".into()));
+        return Err(RerankError::Protocol("partial scoped result set".into()));
     }
     Ok((
         RerankResults { inner: global },
@@ -2083,49 +1923,6 @@ impl BoundedWriter {
 
     fn finish(self) -> Vec<u8> {
         self.bytes
-    }
-}
-
-struct Cursor<'a> {
-    bytes: &'a [u8],
-    offset: usize,
-}
-
-impl<'a> Cursor<'a> {
-    fn new(bytes: &'a [u8]) -> Self {
-        Self { bytes, offset: 0 }
-    }
-
-    fn bytes(&mut self, count: usize) -> Result<&'a [u8], RerankError> {
-        let end = self
-            .offset
-            .checked_add(count)
-            .ok_or_else(|| RerankError::Protocol("message offset overflow".into()))?;
-        let bytes = self
-            .bytes
-            .get(self.offset..end)
-            .ok_or_else(|| RerankError::Protocol("truncated message".into()))?;
-        self.offset = end;
-        Ok(bytes)
-    }
-
-    fn u16(&mut self) -> Result<u16, RerankError> {
-        Ok(u16::from_le_bytes(self.bytes(2)?.try_into().unwrap()))
-    }
-
-    fn u32(&mut self) -> Result<u32, RerankError> {
-        Ok(u32::from_le_bytes(self.bytes(4)?.try_into().unwrap()))
-    }
-
-    fn u64(&mut self) -> Result<u64, RerankError> {
-        Ok(u64::from_le_bytes(self.bytes(8)?.try_into().unwrap()))
-    }
-
-    fn finish(self) -> Result<(), RerankError> {
-        if self.offset != self.bytes.len() {
-            return Err(RerankError::Protocol("trailing response bytes".into()));
-        }
-        Ok(())
     }
 }
 

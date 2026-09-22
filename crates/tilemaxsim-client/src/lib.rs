@@ -7,12 +7,12 @@
 //! frame layout, catalog digests, response validation, and error classification
 //! out of callers.
 
-use crate::protocol::{
-    HEADER_BYTES, VERSION_CATALOG_LOGICAL_EXTERNAL, VERSION_CATALOG_SELECTION_REFERENCE,
-    VERSION_PERSISTENT_CATALOG_SELECTION_REFERENCE,
-    VERSION_PERSISTENT_SCOPED_CATALOG_SELECTION_REFERENCE,
-    VERSION_SCOPED_CATALOG_SELECTION_REFERENCE,
-};
+pub const HEADER_BYTES: usize = 24;
+pub const VERSION_CATALOG_LOGICAL_EXTERNAL: u16 = 10;
+pub const VERSION_CATALOG_SELECTION_REFERENCE: u16 = 11;
+pub const VERSION_SCOPED_CATALOG_SELECTION_REFERENCE: u16 = 12;
+pub const VERSION_PERSISTENT_SCOPED_CATALOG_SELECTION_REFERENCE: u16 = 13;
+pub const VERSION_PERSISTENT_CATALOG_SELECTION_REFERENCE: u16 = 14;
 use sha2::{Digest, Sha256};
 use std::fmt;
 
@@ -23,6 +23,7 @@ const MAX_CANDIDATES: usize = 65_536;
 const MAX_MODEL_CONTRACT_BYTES: usize = 512;
 const MAX_TENANT_BYTES: usize = 256;
 const MAX_RESPONSE_BYTES: usize = 64 * 1024 * 1024;
+const MAX_REMOTE_ERROR_BYTES: usize = 64 * 1024;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
@@ -247,7 +248,7 @@ pub fn decode_response(frame: &[u8]) -> Result<ScoreResponse, SdkError> {
     let status = u32::from_le_bytes(frame[24..28].try_into().unwrap());
     let count = u32::from_le_bytes(frame[28..32].try_into().unwrap()) as usize;
     if status != 0 {
-        if count > body_len - 8 {
+        if count > MAX_REMOTE_ERROR_BYTES || count > body_len - 8 {
             return Err(SdkError::InvalidResponse(
                 "truncated TileMaxSim error response",
             ));
@@ -471,7 +472,6 @@ fn encode_delta_values(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::protocol;
 
     fn request<'a>(query: &'a [u8]) -> CatalogRequest<'a> {
         CatalogRequest {
@@ -493,76 +493,21 @@ mod tests {
     }
 
     #[test]
-    fn sdk_catalog_frames_are_accepted_by_the_daemon_parser() {
+    fn encodes_all_catalog_selection_forms() {
         let query = [0_u8; 8];
         let request = request(&query);
         let ids = [11, 20, 42];
-
         let explicit = encode_catalog_selection(&request, &ids).unwrap();
-        let parsed = protocol::parse(&explicit).unwrap();
-        assert_eq!(parsed.protocol_version, VERSION_CATALOG_LOGICAL_EXTERNAL);
-        assert_eq!(parsed.catalog_public_ids, ids);
-
-        let reference =
+        assert_eq!(u16::from_le_bytes(explicit[4..6].try_into().unwrap()), 10);
+        let global = encode_catalog_selection_reference(&request, &ids, None, true).unwrap();
+        assert_eq!(u16::from_le_bytes(global[4..6].try_into().unwrap()), 14);
+        let scoped =
             encode_catalog_selection_reference(&request, &ids, Some(&[20, 42]), true).unwrap();
-        let parsed = protocol::parse(&reference).unwrap();
-        assert_eq!(
-            parsed.protocol_version,
-            VERSION_PERSISTENT_SCOPED_CATALOG_SELECTION_REFERENCE
-        );
-        assert_eq!(parsed.scoped_candidate_ordinals, [1, 2]);
-        assert_eq!(
-            parsed.catalog_selection_digest,
-            Some(selection_digest(&ids).unwrap())
-        );
+        assert_eq!(u16::from_le_bytes(scoped[4..6].try_into().unwrap()), 13);
     }
 
     #[test]
-    fn sdk_registration_frame_is_accepted_by_the_daemon_parser() {
-        let query = [0_u8; 8];
-        let request = request(&query);
-        let descriptors = [
-            CatalogDescriptor {
-                public_id: 11,
-                rows: 3,
-                digest: [0xaa; 32],
-            },
-            CatalogDescriptor {
-                public_id: 20,
-                rows: 4,
-                digest: [0xbb; 32],
-            },
-        ];
-        let parsed =
-            protocol::parse(&encode_catalog_registration(&request, &descriptors).unwrap()).unwrap();
-        assert!(parsed.catalog_registration);
-        assert_eq!(parsed.catalog_public_ids, [11, 20]);
-        assert_eq!(parsed.candidates.len(), 2);
-        assert_eq!(parsed.candidates[0].digest, hex::encode([0xaa; 32]));
-    }
-
-    #[test]
-    fn response_decoder_accepts_partial_top_k_and_classifies_catalog_miss() {
-        let response = protocol::success(
-            VERSION_PERSISTENT_CATALOG_SELECTION_REFERENCE,
-            41,
-            &[(7, 0.9), (3, 0.8)],
-        );
-        let decoded = decode_response(&response).unwrap();
-        assert_eq!(decoded.scores.len(), 2);
-        assert_eq!(decoded.scores[0].candidate_id, 7);
-
-        let miss = protocol::failure(
-            VERSION_PERSISTENT_CATALOG_SELECTION_REFERENCE,
-            41,
-            4,
-            "descriptor catalog miss",
-        );
-        assert_eq!(decode_response(&miss), Err(SdkError::CatalogMiss));
-    }
-
-    #[test]
-    fn sdk_rejects_unsorted_ids_and_wrong_query_lengths() {
+    fn rejects_invalid_shape_and_unsorted_ids() {
         let query = [0_u8; 8];
         assert!(matches!(
             encode_catalog_selection(&request(&query), &[20, 11]),
@@ -573,5 +518,39 @@ mod tests {
             encode_catalog_selection(&request(&short), &[11, 20]),
             Err(SdkError::InvalidRequest(_))
         ));
+    }
+
+    #[test]
+    fn decodes_partial_top_k_and_typed_misses() {
+        let mut response = vec![0_u8; HEADER_BYTES];
+        response[..4].copy_from_slice(MAGIC);
+        response[4..6].copy_from_slice(&14_u16.to_le_bytes());
+        response[6..8].copy_from_slice(&RESPONSE_KIND.to_le_bytes());
+        response[8..16].copy_from_slice(&41_u64.to_le_bytes());
+        response.extend_from_slice(&0_u32.to_le_bytes());
+        response.extend_from_slice(&1_u32.to_le_bytes());
+        response.extend_from_slice(&7_u32.to_le_bytes());
+        response.extend_from_slice(&0.9_f32.to_le_bytes());
+        response[16..24].copy_from_slice(&16_u64.to_le_bytes());
+        let decoded = decode_response(&response).unwrap();
+        assert_eq!(
+            decoded.scores,
+            [Score {
+                candidate_id: 7,
+                similarity: 0.9
+            }]
+        );
+
+        let message = b"descriptor catalog miss";
+        let mut miss = vec![0_u8; HEADER_BYTES];
+        miss[..4].copy_from_slice(MAGIC);
+        miss[4..6].copy_from_slice(&14_u16.to_le_bytes());
+        miss[6..8].copy_from_slice(&RESPONSE_KIND.to_le_bytes());
+        miss[8..16].copy_from_slice(&41_u64.to_le_bytes());
+        miss.extend_from_slice(&4_u32.to_le_bytes());
+        miss.extend_from_slice(&(message.len() as u32).to_le_bytes());
+        miss.extend_from_slice(message);
+        miss[16..24].copy_from_slice(&((8 + message.len()) as u64).to_le_bytes());
+        assert_eq!(decode_response(&miss), Err(SdkError::CatalogMiss));
     }
 }

@@ -1016,6 +1016,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "tilemaxsim-client"
+version = "0.0.0"
+dependencies = [
+ "sha2",
+]
+
+[[package]]
 name = "tilemaxsimd"
 version = "0.1.0"
 dependencies = [
@@ -1028,6 +1035,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "tilemaxsim-client",
  "wgpu",
 ]
 

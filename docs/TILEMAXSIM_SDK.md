@@ -1,6 +1,6 @@
 # TileMaxSim Rust SDK
 
-`tilemaxsimd::sdk` is the supported Rust boundary for components that must
+`tilemaxsim-client` is the supported Rust boundary for components that must
 communicate with the native TileMaxSim daemon. Applications that only query
 VectorChord should continue to use the SQL API; they should not construct daemon
 frames themselves.
@@ -27,7 +27,7 @@ bounds, sorted positive public IDs, scoped subset membership, top-k, and
 quantization-contract compatibility before producing a frame.
 
 ```rust
-use tilemaxsimd::sdk::{
+use tilemaxsim_client::{
     encode_catalog_selection_reference, CatalogRequest, ScoringProfile,
     TensorDtype,
 };
@@ -57,6 +57,7 @@ let frame = encode_catalog_selection_reference(
 )?;
 ```
 
-The daemon parser is used directly by the SDK interoperability tests. Protocol
-changes must update those tests in the same commit; duplicating new frame layouts
-in downstream applications is not supported.
+`tilemaxsim-client` is an accelerator-independent workspace crate shared by the
+PostgreSQL extension and daemon. The daemon parser is exercised directly by an
+interoperability test. Protocol changes must update that test in the same
+commit; duplicating frame layouts in downstream applications is unsupported.

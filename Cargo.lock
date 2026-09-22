@@ -1791,6 +1791,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "tilemaxsim-client"
+version = "0.0.0"
+dependencies = [
+ "sha2",
+]
+
+[[package]]
 name = "tinystr"
 version = "0.8.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2007,6 +2014,7 @@ dependencies = [
  "serde",
  "sha2",
  "simd",
+ "tilemaxsim-client",
  "toml 1.1.2+spec-1.1.0",
  "validator",
  "vchordg",

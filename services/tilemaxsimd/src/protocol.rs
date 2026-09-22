@@ -12,7 +12,14 @@ use anyhow::{Result, anyhow, bail};
 use std::collections::HashSet;
 use std::sync::{Arc, OnceLock};
 
-pub const HEADER_BYTES: usize = 24;
+// Catalog protocol constants are owned by the shared client crate so the
+// daemon and every in-tree producer compile against one source of truth.
+pub use tilemaxsim_client::{
+    HEADER_BYTES, VERSION_CATALOG_LOGICAL_EXTERNAL, VERSION_CATALOG_SELECTION_REFERENCE,
+    VERSION_PERSISTENT_CATALOG_SELECTION_REFERENCE,
+    VERSION_PERSISTENT_SCOPED_CATALOG_SELECTION_REFERENCE,
+    VERSION_SCOPED_CATALOG_SELECTION_REFERENCE,
+};
 pub const VERSION_EXTERNAL: u16 = 2;
 pub const VERSION_SCHEDULED_EXTERNAL: u16 = 3;
 pub const VERSION_PROFILED_EXTERNAL: u16 = 4;
@@ -33,23 +40,6 @@ pub const VERSION_TYPED_COMPACT_LOGICAL_EXTERNAL: u16 = 8;
 /// SHA-256 digest of the canonical compact descriptor list; the daemon resolves
 /// the list from its bounded manifest cache.
 pub const VERSION_MANIFEST_LOGICAL_EXTERNAL: u16 = 9;
-/// Versioned descriptor catalog. Registration frames merge stable public IDs
-/// into one immutable revision; selection frames carry only delta-varint IDs.
-pub const VERSION_CATALOG_LOGICAL_EXTERNAL: u16 = 10;
-/// Candidate-set reference within a versioned descriptor catalog. The frame
-/// carries only catalog and selection digests; v10 remains the registration
-/// and explicit-selection fallback used after a bounded cache miss.
-pub const VERSION_CATALOG_SELECTION_REFERENCE: u16 = 11;
-/// Candidate-set reference with one additive ordinal scope. The daemon scores
-/// the catalog selection once and returns independent global and scoped top-k
-/// windows; scoped response candidate IDs carry the high-bit tag.
-pub const VERSION_SCOPED_CATALOG_SELECTION_REFERENCE: u16 = 12;
-/// Persistent-connection form of v12. The frame layout and response payload
-/// are unchanged; a client may send the next frame after reading the complete
-/// response instead of paying another transport handshake.
-pub const VERSION_PERSISTENT_SCOPED_CATALOG_SELECTION_REFERENCE: u16 = 13;
-/// Persistent-connection form of v11 for global-only catalog selections.
-pub const VERSION_PERSISTENT_CATALOG_SELECTION_REFERENCE: u16 = 14;
 const MAGIC: &[u8; 4] = b"VCTM";
 const REQUEST_KIND: u16 = 1;
 const RESPONSE_KIND: u16 = 2;
