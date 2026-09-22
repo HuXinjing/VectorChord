@@ -434,18 +434,19 @@ impl Engine {
                     .collect()
             })
             .collect();
-        self.resident_selection_plans.push_back(ResidentSelectionPlan {
-            candidates: Arc::clone(&request.candidates),
-            candidate_start: request.candidate_start,
-            candidate_end: request.candidate_end,
-            chunks,
-            duplicate_candidates: duplicate_candidates.to_vec(),
-            device_generations: self
-                .devices
-                .iter()
-                .map(|device| device.cache.generation())
-                .collect(),
-        });
+        self.resident_selection_plans
+            .push_back(ResidentSelectionPlan {
+                candidates: Arc::clone(&request.candidates),
+                candidate_start: request.candidate_start,
+                candidate_end: request.candidate_end,
+                chunks,
+                duplicate_candidates: duplicate_candidates.to_vec(),
+                device_generations: self
+                    .devices
+                    .iter()
+                    .map(|device| device.cache.generation())
+                    .collect(),
+            });
         self.coalesce_resident_selection_plans(request);
         while self.resident_selection_plans.len() > MAX_RESIDENT_SELECTION_PLANS {
             self.resident_selection_plans.pop_front();
@@ -528,14 +529,15 @@ impl Engine {
                 && plan.candidate_start == start
                 && plan.candidate_end == cursor)
         });
-        self.resident_selection_plans.push_back(ResidentSelectionPlan {
-            candidates: Arc::clone(&request.candidates),
-            candidate_start: start,
-            candidate_end: cursor,
-            chunks,
-            duplicate_candidates,
-            device_generations: generations,
-        });
+        self.resident_selection_plans
+            .push_back(ResidentSelectionPlan {
+                candidates: Arc::clone(&request.candidates),
+                candidate_start: start,
+                candidate_end: cursor,
+                chunks,
+                duplicate_candidates,
+                device_generations: generations,
+            });
     }
 
     pub fn score(&mut self, request: &Request) -> Result<Vec<(u32, f32)>> {
@@ -1474,7 +1476,11 @@ fn gpu_cache_key(
 ) -> Arc<str> {
     if profile == ScoringProfile::RawFp8E4m3 && quantization_contract.is_none() {
         return Arc::clone(descriptor.raw_fp8_cache_key.get_or_init(|| {
-            Arc::from(format!("{}:-:{}", profile.cache_tag(), cache_key(descriptor)))
+            Arc::from(format!(
+                "{}:-:{}",
+                profile.cache_tag(),
+                cache_key(descriptor)
+            ))
         }));
     }
     Arc::from(format!(
@@ -1766,16 +1772,15 @@ mod tests {
             descriptor(4, "d", 1),
         ]);
         let other_candidates = Arc::new((*candidates).clone());
-        let plan = |candidates: &Arc<Vec<Descriptor>>, start, end, generation| {
-            ResidentSelectionPlan {
+        let plan =
+            |candidates: &Arc<Vec<Descriptor>>, start, end, generation| ResidentSelectionPlan {
                 candidates: Arc::clone(candidates),
                 candidate_start: start,
                 candidate_end: end,
                 chunks: Vec::new(),
                 duplicate_candidates: Vec::new(),
                 device_generations: vec![generation],
-            }
-        };
+            };
         let plans = VecDeque::from([
             plan(&candidates, 0, 2, 7),
             plan(&candidates, 0, 1, 7),

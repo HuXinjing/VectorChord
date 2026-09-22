@@ -211,9 +211,7 @@ impl TinyLfu {
             // four full SipHash passes over a potentially long content key.
             // SplitMix64's finalizer derives those positions from one keyed
             // hash without weakening the cache's collision isolation.
-            let mut mixed = hash.wrapping_add(
-                (row as u64 + 1).wrapping_mul(0x9e37_79b9_7f4a_7c15),
-            );
+            let mut mixed = hash.wrapping_add((row as u64 + 1).wrapping_mul(0x9e37_79b9_7f4a_7c15));
             mixed = (mixed ^ (mixed >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
             mixed = (mixed ^ (mixed >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
             (mixed ^ (mixed >> 31)) as usize % self.width

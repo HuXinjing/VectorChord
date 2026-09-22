@@ -1527,25 +1527,22 @@ fn read_and_enqueue(
     let mut completed_requests = 0_u64;
     loop {
         let frame_read_started = Instant::now();
-        let (frame, frame_permit) = match read_request(
-            &mut connection,
-            config.maximum,
-            &frame_admission,
-        ) {
-            Ok(frame) => frame,
-            Err(error) => {
-                if completed_requests > 0 && is_idle_connection_end(&error) {
+        let (frame, frame_permit) =
+            match read_request(&mut connection, config.maximum, &frame_admission) {
+                Ok(frame) => frame,
+                Err(error) => {
+                    if completed_requests > 0 && is_idle_connection_end(&error) {
+                        return;
+                    }
+                    metrics.failed.fetch_add(1, Ordering::Relaxed);
+                    metrics.frame_read_failures.fetch_add(1, Ordering::Relaxed);
+                    write_response_nonfatal(
+                        &mut connection,
+                        &protocol::failure(VERSION_EXTERNAL, 0, 1, &format!("{error:#}")),
+                    );
                     return;
                 }
-                metrics.failed.fetch_add(1, Ordering::Relaxed);
-                metrics.frame_read_failures.fetch_add(1, Ordering::Relaxed);
-                write_response_nonfatal(
-                    &mut connection,
-                    &protocol::failure(VERSION_EXTERNAL, 0, 1, &format!("{error:#}")),
-                );
-                return;
-            }
-        };
+            };
         let frame_read_elapsed = frame_read_started.elapsed();
         // A persistent connection may sit idle between frames. That idle time
         // is not queue latency and must not consume the next request's
@@ -1691,11 +1688,11 @@ fn read_and_enqueue(
                     return;
                 }
                 completed_requests = completed_requests.saturating_add(1);
-            if !matches!(
-                version,
-                protocol::VERSION_PERSISTENT_SCOPED_CATALOG_SELECTION_REFERENCE
-                    | protocol::VERSION_PERSISTENT_CATALOG_SELECTION_REFERENCE
-            ) {
+                if !matches!(
+                    version,
+                    protocol::VERSION_PERSISTENT_SCOPED_CATALOG_SELECTION_REFERENCE
+                        | protocol::VERSION_PERSISTENT_CATALOG_SELECTION_REFERENCE
+                ) {
                     return;
                 }
                 if connection
@@ -2114,9 +2111,11 @@ fn retain_ranked_scoped_top_k(
     retain_ranked_top_k(results, top_k);
     retain_ranked_top_k(&mut scoped, top_k);
     results.reserve(scoped.len());
-    results.extend(scoped.into_iter().map(|(candidate_id, similarity)| {
-        (candidate_id | SCOPED_RESULT_TAG, similarity)
-    }));
+    results.extend(
+        scoped
+            .into_iter()
+            .map(|(candidate_id, similarity)| (candidate_id | SCOPED_RESULT_TAG, similarity)),
+    );
 }
 
 fn works_are_batch_compatible(left: &Work, right: &Work, minimum_overlap_milli: u16) -> bool {
@@ -3834,8 +3833,7 @@ mod tests {
         candidate_fmas, handle_status_connection, header_version, is_fatal_cuda_diagnostic,
         kib_to_bytes, quantum_end, read_management_request, render_metrics,
         resolve_descriptor_catalog, resolve_descriptor_manifest, resolve_quantum_candidates,
-        retain_ranked_scoped_top_k, retain_ranked_top_k,
-        tenant_hash,
+        retain_ranked_scoped_top_k, retain_ranked_top_k, tenant_hash,
     };
     #[cfg(feature = "backend-cpu")]
     use crate::backend::{AcceleratorBackend, BackendKind};
@@ -3867,10 +3865,28 @@ mod tests {
             query: vec![0; 8],
             candidates: Arc::new(if registration {
                 vec![
-                    Descriptor { candidate_id: 0, contract: "model-v1".into(), digest: "11".repeat(32), rows: 1, dimension: 2, dtype: 3, raw_fp8_cache_key: OnceLock::new() },
-                    Descriptor { candidate_id: 1, contract: "model-v1".into(), digest: "22".repeat(32), rows: 1, dimension: 2, dtype: 3, raw_fp8_cache_key: OnceLock::new() },
+                    Descriptor {
+                        candidate_id: 0,
+                        contract: "model-v1".into(),
+                        digest: "11".repeat(32),
+                        rows: 1,
+                        dimension: 2,
+                        dtype: 3,
+                        raw_fp8_cache_key: OnceLock::new(),
+                    },
+                    Descriptor {
+                        candidate_id: 1,
+                        contract: "model-v1".into(),
+                        digest: "22".repeat(32),
+                        rows: 1,
+                        dimension: 2,
+                        dtype: 3,
+                        raw_fp8_cache_key: OnceLock::new(),
+                    },
                 ]
-            } else { vec![] }),
+            } else {
+                vec![]
+            }),
             candidate_start: 0,
             candidate_end: if registration { 2 } else { 0 },
             manifest_digest: None,
@@ -3891,7 +3907,14 @@ mod tests {
         let mut first = catalog_request(false);
         assert!(resolve_descriptor_catalog(&mut first, &metrics));
         let first_candidates = Arc::clone(&first.candidates);
-        assert_eq!(first.candidates.iter().map(|item| item.candidate_id).collect::<Vec<_>>(), vec![0, 1]);
+        assert_eq!(
+            first
+                .candidates
+                .iter()
+                .map(|item| item.candidate_id)
+                .collect::<Vec<_>>(),
+            vec![0, 1]
+        );
 
         let mut second = catalog_request(false);
         let mut selection_digest = Sha256::new();
@@ -3919,17 +3942,14 @@ mod tests {
 
     #[test]
     fn ranked_top_k_matches_full_score_and_id_ordering() {
-        let input: Vec<(u32, f32)> = vec![
-            (9, 0.2),
-            (4, 0.9),
-            (7, 0.5),
-            (2, 0.9),
-            (8, -0.1),
-            (1, 0.5),
-        ];
+        let input: Vec<(u32, f32)> =
+            vec![(9, 0.2), (4, 0.9), (7, 0.5), (2, 0.9), (8, -0.1), (1, 0.5)];
         let mut expected = input.clone();
         expected.sort_unstable_by(|left, right| {
-            right.1.total_cmp(&left.1).then_with(|| left.0.cmp(&right.0))
+            right
+                .1
+                .total_cmp(&left.1)
+                .then_with(|| left.0.cmp(&right.0))
         });
         expected.truncate(4);
         let mut actual = input;
@@ -3941,7 +3961,15 @@ mod tests {
     fn scoped_top_k_returns_two_independently_ranked_tagged_windows() {
         let mut input = vec![(0, 0.2), (1, 0.9), (2, 0.8), (3, 0.7), (4, 0.6)];
         retain_ranked_scoped_top_k(&mut input, 2, &[0, 3, 4]);
-        assert_eq!(input, vec![(1, 0.9), (2, 0.8), (3 | (1 << 31), 0.7), (4 | (1 << 31), 0.6)]);
+        assert_eq!(
+            input,
+            vec![
+                (1, 0.9),
+                (2, 0.8),
+                (3 | (1 << 31), 0.7),
+                (4 | (1 << 31), 0.6)
+            ]
+        );
     }
 
     #[test]

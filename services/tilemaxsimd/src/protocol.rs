@@ -503,92 +503,91 @@ pub fn parse(frame: &[u8]) -> Result<Request> {
         catalog_registration,
         mut catalog_public_ids,
         scoped_candidate_ordinals,
-    ) =
-        if version == VERSION_CATALOG_LOGICAL_EXTERNAL {
-            let mode = reader.u8()?;
-            if !matches!(mode, 1 | 2) {
-                bail!("invalid descriptor catalog frame mode");
-            }
-            let digest = reader.take(32)?.try_into().unwrap();
-            let mut public_ids = Vec::with_capacity(candidate_count as usize);
-            if mode == 1 {
-                let mut previous = 0_u64;
-                for _ in 0..candidate_count {
-                    let delta = reader.varint_u64()?;
-                    if delta == 0 {
-                        bail!("catalog public IDs must be strictly increasing");
-                    }
-                    let current = previous
-                        .checked_add(delta)
-                        .ok_or_else(|| anyhow!("catalog public ID overflow"))?;
-                    if current > i64::MAX as u64 {
-                        bail!("catalog public ID overflow");
-                    }
-                    public_ids.push(current as i64);
-                    previous = current;
+    ) = if version == VERSION_CATALOG_LOGICAL_EXTERNAL {
+        let mode = reader.u8()?;
+        if !matches!(mode, 1 | 2) {
+            bail!("invalid descriptor catalog frame mode");
+        }
+        let digest = reader.take(32)?.try_into().unwrap();
+        let mut public_ids = Vec::with_capacity(candidate_count as usize);
+        if mode == 1 {
+            let mut previous = 0_u64;
+            for _ in 0..candidate_count {
+                let delta = reader.varint_u64()?;
+                if delta == 0 {
+                    bail!("catalog public IDs must be strictly increasing");
                 }
+                let current = previous
+                    .checked_add(delta)
+                    .ok_or_else(|| anyhow!("catalog public ID overflow"))?;
+                if current > i64::MAX as u64 {
+                    bail!("catalog public ID overflow");
+                }
+                public_ids.push(current as i64);
+                previous = current;
             }
-            (Some(digest), None, mode == 2, public_ids, Vec::new())
-        } else if matches!(
+        }
+        (Some(digest), None, mode == 2, public_ids, Vec::new())
+    } else if matches!(
+        version,
+        VERSION_CATALOG_SELECTION_REFERENCE
+            | VERSION_SCOPED_CATALOG_SELECTION_REFERENCE
+            | VERSION_PERSISTENT_SCOPED_CATALOG_SELECTION_REFERENCE
+            | VERSION_PERSISTENT_CATALOG_SELECTION_REFERENCE
+    ) {
+        let expected_mode = if matches!(
             version,
-            VERSION_CATALOG_SELECTION_REFERENCE
-                | VERSION_SCOPED_CATALOG_SELECTION_REFERENCE
+            VERSION_SCOPED_CATALOG_SELECTION_REFERENCE
                 | VERSION_PERSISTENT_SCOPED_CATALOG_SELECTION_REFERENCE
-                | VERSION_PERSISTENT_CATALOG_SELECTION_REFERENCE
         ) {
-            let expected_mode = if matches!(
-                version,
-                VERSION_SCOPED_CATALOG_SELECTION_REFERENCE
-                    | VERSION_PERSISTENT_SCOPED_CATALOG_SELECTION_REFERENCE
-            ) {
-                4
-            } else {
-                3
-            };
-            if reader.u8()? != expected_mode {
-                bail!("invalid descriptor catalog selection reference mode");
-            }
-            let catalog_digest = reader.take(32)?.try_into().unwrap();
-            let selection_digest = reader.take(32)?.try_into().unwrap();
-            let mut scoped_ordinals = Vec::new();
-            if matches!(
-                version,
-                VERSION_SCOPED_CATALOG_SELECTION_REFERENCE
-                    | VERSION_PERSISTENT_SCOPED_CATALOG_SELECTION_REFERENCE
-            ) {
-                let scoped_count = reader.u32()? as usize;
-                if scoped_count == 0 || scoped_count > candidate_count as usize {
-                    bail!("scoped candidate count must be between 1 and candidate count");
-                }
-                let mut previous_plus_one = 0_u64;
-                for _ in 0..scoped_count {
-                    let delta = reader.varint_u64()?;
-                    if delta == 0 {
-                        bail!("scoped candidate ordinals must be strictly increasing");
-                    }
-                    let current_plus_one = previous_plus_one
-                        .checked_add(delta)
-                        .ok_or_else(|| anyhow!("scoped candidate ordinal overflow"))?;
-                    let ordinal = current_plus_one
-                        .checked_sub(1)
-                        .ok_or_else(|| anyhow!("scoped candidate ordinal overflow"))?;
-                    if ordinal >= u64::from(candidate_count) {
-                        bail!("scoped candidate ordinal is outside the candidate set");
-                    }
-                    scoped_ordinals.push(ordinal as u32);
-                    previous_plus_one = current_plus_one;
-                }
-            }
-            (
-                Some(catalog_digest),
-                Some(selection_digest),
-                false,
-                Vec::new(),
-                scoped_ordinals,
-            )
+            4
         } else {
-            (None, None, false, Vec::new(), Vec::new())
+            3
         };
+        if reader.u8()? != expected_mode {
+            bail!("invalid descriptor catalog selection reference mode");
+        }
+        let catalog_digest = reader.take(32)?.try_into().unwrap();
+        let selection_digest = reader.take(32)?.try_into().unwrap();
+        let mut scoped_ordinals = Vec::new();
+        if matches!(
+            version,
+            VERSION_SCOPED_CATALOG_SELECTION_REFERENCE
+                | VERSION_PERSISTENT_SCOPED_CATALOG_SELECTION_REFERENCE
+        ) {
+            let scoped_count = reader.u32()? as usize;
+            if scoped_count == 0 || scoped_count > candidate_count as usize {
+                bail!("scoped candidate count must be between 1 and candidate count");
+            }
+            let mut previous_plus_one = 0_u64;
+            for _ in 0..scoped_count {
+                let delta = reader.varint_u64()?;
+                if delta == 0 {
+                    bail!("scoped candidate ordinals must be strictly increasing");
+                }
+                let current_plus_one = previous_plus_one
+                    .checked_add(delta)
+                    .ok_or_else(|| anyhow!("scoped candidate ordinal overflow"))?;
+                let ordinal = current_plus_one
+                    .checked_sub(1)
+                    .ok_or_else(|| anyhow!("scoped candidate ordinal overflow"))?;
+                if ordinal >= u64::from(candidate_count) {
+                    bail!("scoped candidate ordinal is outside the candidate set");
+                }
+                scoped_ordinals.push(ordinal as u32);
+                previous_plus_one = current_plus_one;
+            }
+        }
+        (
+            Some(catalog_digest),
+            Some(selection_digest),
+            false,
+            Vec::new(),
+            scoped_ordinals,
+        )
+    } else {
+        (None, None, false, Vec::new(), Vec::new())
+    };
     let mut total_tokens = query_rows as usize;
     let mut total_bytes = query_bytes;
     let mut candidate_ids = HashSet::new();
@@ -1144,8 +1143,7 @@ mod tests {
         assert!(request.catalog_public_ids.is_empty());
         assert!(request.candidates.is_empty());
 
-        frame[4..6]
-            .copy_from_slice(&VERSION_PERSISTENT_CATALOG_SELECTION_REFERENCE.to_le_bytes());
+        frame[4..6].copy_from_slice(&VERSION_PERSISTENT_CATALOG_SELECTION_REFERENCE.to_le_bytes());
         let persistent = parse(&frame).unwrap();
         assert_eq!(
             persistent.protocol_version,
@@ -1192,9 +1190,8 @@ mod tests {
         assert_eq!(request.scoped_candidate_ordinals, vec![0, 4, 300]);
         assert!(request.candidates.is_empty());
 
-        frame[4..6].copy_from_slice(
-            &VERSION_PERSISTENT_SCOPED_CATALOG_SELECTION_REFERENCE.to_le_bytes(),
-        );
+        frame[4..6]
+            .copy_from_slice(&VERSION_PERSISTENT_SCOPED_CATALOG_SELECTION_REFERENCE.to_le_bytes());
         let persistent = parse(&frame).unwrap();
         assert_eq!(
             persistent.protocol_version,
