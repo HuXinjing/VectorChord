@@ -446,9 +446,96 @@ impl Engine {
                 .map(|device| device.cache.generation())
                 .collect(),
         });
+        self.coalesce_resident_selection_plans(request);
         while self.resident_selection_plans.len() > MAX_RESIDENT_SELECTION_PLANS {
             self.resident_selection_plans.pop_front();
         }
+    }
+
+    /// Return the largest already-validated resident interval beginning at
+    /// `candidate_start`.  The scheduler may safely score that interval as one
+    /// quantum because the plan was built only after every tensor was found in
+    /// L0 and is invalidated by any structural cache generation change.
+    pub fn cached_resident_selection_end(
+        &self,
+        request: &Request,
+        candidate_start: usize,
+    ) -> Option<usize> {
+        if request.scoring_profile != ScoringProfile::RawFp8E4m3
+            || request.quantization_contract.is_some()
+        {
+            return None;
+        }
+        let generations = self
+            .devices
+            .iter()
+            .map(|device| device.cache.generation())
+            .collect::<Vec<_>>();
+        self.resident_selection_plans
+            .iter()
+            .filter(|plan| {
+                Arc::ptr_eq(&plan.candidates, &request.candidates)
+                    && plan.candidate_start == candidate_start
+                    && plan.device_generations == generations
+            })
+            .map(|plan| plan.candidate_end)
+            .max()
+    }
+
+    fn coalesce_resident_selection_plans(&mut self, request: &Request) {
+        if request.scoring_profile != ScoringProfile::RawFp8E4m3
+            || request.quantization_contract.is_some()
+        {
+            return;
+        }
+        let generations = self
+            .devices
+            .iter()
+            .map(|device| device.cache.generation())
+            .collect::<Vec<_>>();
+        let selected = contiguous_resident_plan_indices(
+            &self.resident_selection_plans,
+            &request.candidates,
+            &generations,
+        );
+        if selected.len() < 2 {
+            return;
+        }
+        let start = self.resident_selection_plans[selected[0]].candidate_start;
+        let cursor = self.resident_selection_plans[*selected.last().unwrap()].candidate_end;
+
+        let mut chunks = (0..self.devices.len())
+            .map(|_| Vec::<ResidentTensor>::new())
+            .collect::<Vec<_>>();
+        let mut duplicate_candidates = Vec::new();
+        for index in selected {
+            let plan = &self.resident_selection_plans[index];
+            let offset = plan.candidate_start - start;
+            for (target, source) in chunks.iter_mut().zip(&plan.chunks) {
+                target.extend(source.iter().cloned().map(|mut tensor| {
+                    tensor.candidate_index += offset;
+                    tensor
+                }));
+            }
+            duplicate_candidates.extend(
+                plan.duplicate_candidates
+                    .iter()
+                    .map(|(duplicate, first)| (duplicate + offset, first + offset)),
+            );
+        }
+        self.resident_selection_plans.retain(|plan| {
+            !(Arc::ptr_eq(&plan.candidates, &request.candidates)
+                && plan.candidate_start == start
+                && plan.candidate_end == cursor)
+        });
+        self.resident_selection_plans.push_back(ResidentSelectionPlan {
+            candidates: Arc::clone(&request.candidates),
+            candidate_start: start,
+            candidate_end: cursor,
+            chunks,
+            duplicate_candidates,
+            device_generations: generations,
+        });
     }
 
     pub fn score(&mut self, request: &Request) -> Result<Vec<(u32, f32)>> {
@@ -1277,6 +1364,41 @@ impl Engine {
     }
 }
 
+fn contiguous_resident_plan_indices(
+    plans: &VecDeque<ResidentSelectionPlan>,
+    candidates: &Arc<Vec<Descriptor>>,
+    generations: &[u64],
+) -> Vec<usize> {
+    let Some(mut cursor) = plans
+        .iter()
+        .filter(|plan| {
+            Arc::ptr_eq(&plan.candidates, candidates) && plan.device_generations == generations
+        })
+        .map(|plan| plan.candidate_start)
+        .min()
+    else {
+        return Vec::new();
+    };
+    let mut selected = Vec::new();
+    while let Some((index, plan)) = plans
+        .iter()
+        .enumerate()
+        .filter(|(_, plan)| {
+            Arc::ptr_eq(&plan.candidates, candidates)
+                && plan.candidate_start == cursor
+                && plan.device_generations == generations
+        })
+        .max_by_key(|(_, plan)| plan.candidate_end)
+    {
+        if plan.candidate_end <= cursor {
+            break;
+        }
+        cursor = plan.candidate_end;
+        selected.push(index);
+    }
+    selected
+}
+
 fn common_recommended_quantum(
     buckets_by_device: &[Vec<crate::dispatch::TensorCalibrationBucket>],
 ) -> Option<usize> {
@@ -1633,6 +1755,40 @@ mod tests {
         assert_eq!(unique[0].candidate_id, 1);
         assert_eq!(unique[1].candidate_id, 3);
         assert_eq!(unique[2].candidate_id, 4);
+    }
+
+    #[test]
+    fn resident_plan_coalescing_uses_longest_contiguous_current_generation() {
+        let candidates = Arc::new(vec![
+            descriptor(1, "a", 1),
+            descriptor(2, "b", 1),
+            descriptor(3, "c", 1),
+            descriptor(4, "d", 1),
+        ]);
+        let other_candidates = Arc::new((*candidates).clone());
+        let plan = |candidates: &Arc<Vec<Descriptor>>, start, end, generation| {
+            ResidentSelectionPlan {
+                candidates: Arc::clone(candidates),
+                candidate_start: start,
+                candidate_end: end,
+                chunks: Vec::new(),
+                duplicate_candidates: Vec::new(),
+                device_generations: vec![generation],
+            }
+        };
+        let plans = VecDeque::from([
+            plan(&candidates, 0, 2, 7),
+            plan(&candidates, 0, 1, 7),
+            plan(&candidates, 2, 4, 7),
+            plan(&other_candidates, 0, 4, 7),
+            plan(&candidates, 4, 5, 6),
+        ]);
+
+        assert_eq!(
+            contiguous_resident_plan_indices(&plans, &candidates, &[7]),
+            vec![0, 2]
+        );
+        assert!(contiguous_resident_plan_indices(&plans, &candidates, &[8]).is_empty());
     }
 
     #[test]

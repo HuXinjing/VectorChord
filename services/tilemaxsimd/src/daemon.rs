@@ -1896,6 +1896,12 @@ fn run_scheduler(
             u64::try_from(microbatch.len()).unwrap_or(u64::MAX),
         );
         metrics.update_scheduler_depth(queue.len());
+        let quantums = microbatch
+            .iter()
+            .map(|scheduled| {
+                request_quantum_with_resident_plan(&scheduled.payload, &config, &engine)
+            })
+            .collect::<Vec<_>>();
         let mut fused_results = HashMap::new();
         if microbatch.len() > 1
             && microbatch.iter().all(|scheduled| {
@@ -1903,10 +1909,6 @@ fn run_scheduler(
                     && !peer_disconnected(&scheduled.payload.connection)
             })
         {
-            let quantums = microbatch
-                .iter()
-                .map(|scheduled| request_quantum(&scheduled.payload, &config))
-                .collect::<Vec<_>>();
             let fused_started = Instant::now();
             metrics.gpu_active.store(1, Ordering::Relaxed);
             let fused = engine.score_resident_batch(&quantums);
@@ -1926,7 +1928,7 @@ fn run_scheduler(
                 }
             }
         }
-        for scheduled in microbatch {
+        for (scheduled, quantum) in microbatch.into_iter().zip(quantums) {
             if peer_disconnected(&scheduled.payload.connection) {
                 metrics.disconnected.fetch_add(1, Ordering::Relaxed);
                 metrics.observe_latency(scheduled.payload.accepted_at.elapsed(), Duration::ZERO);
@@ -1951,8 +1953,7 @@ fn run_scheduler(
                     "request deadline expired before execution",
                 ))
             } else {
-                let end = next_quantum_end(&work, &config);
-                let quantum = request_quantum(&work, &config);
+                let end = quantum.candidate_end;
                 let quantum_started = Instant::now();
                 metrics.gpu_quantums.fetch_add(1, Ordering::Relaxed);
                 saturating_atomic_add(
@@ -2146,8 +2147,20 @@ fn works_are_batch_compatible(left: &Work, right: &Work, minimum_overlap_milli: 
     shared.saturating_mul(1000) / denominator >= usize::from(minimum_overlap_milli)
 }
 
-fn request_quantum(work: &Work, config: &SchedulerConfig) -> protocol::Request {
-    let end = next_quantum_end(work, config);
+fn request_quantum_with_resident_plan(
+    work: &Work,
+    config: &SchedulerConfig,
+    engine: &Engine,
+) -> protocol::Request {
+    let default_end = next_quantum_end(work, config);
+    let end = engine
+        .cached_resident_selection_end(&work.request, work.next_candidate)
+        .filter(|end| *end > default_end && *end <= work.request.candidates.len())
+        .unwrap_or(default_end);
+    request_quantum_to_end(work, end)
+}
+
+fn request_quantum_to_end(work: &Work, end: usize) -> protocol::Request {
     protocol::Request {
         protocol_version: work.request.protocol_version,
         request_id: work.request.request_id,
