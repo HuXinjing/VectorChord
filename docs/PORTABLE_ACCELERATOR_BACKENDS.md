@@ -198,6 +198,14 @@ query and rotation stage before LUT generation instead of being recomputed for
 every centroid, reducing the rotation arithmetic by the centroid count while
 preserving the persisted quantization contract.
 
+The calibrated queries-per-warp value is an upper bound, not a fixed runtime
+shape. The tile launcher selects 1, 4 or 8 queries per warp according to the
+current total query rows, capped by that calibrated value. In particular, an
+eight-row online query uses one query per warp so all eight warps perform dot
+products; the larger calibration shape may still select eight queries per warp
+to maximize document-row decode reuse. This changes only work assignment and
+preserves the scoring and quantization contracts.
+
 Quantization is not advertised as an unconditional resident-kernel speedup.
 On the same RTX 4090 with 512 resident candidates, 32 query rows and dimension
 320, exact FP16 measured about 0.110 ms, INT8 0.118 ms and FP8 0.119 ms. For an

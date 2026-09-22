@@ -928,7 +928,16 @@ static void launch_multiquery_tile(
     uint32_t dimension, const uint64_t *document_offsets,
     const uint32_t *document_rows, size_t count, float *maxima,
     size_t shared_bytes, uint8_t scoring_profile) {
-  const uint32_t queries_per_warp = gpu->tile_queries_per_warp;
+  // Startup calibration uses a deliberately large query batch to compare
+  // reuse strategies.  Applying its 8-queries-per-warp winner unchanged to a
+  // common eight-row online query activates only one of this kernel's eight
+  // warps.  Select the smallest calibrated variant that can cover the current
+  // query in one tile so all warps receive useful dot-product work while each
+  // document row is still decoded only once.
+  const uint32_t shape_queries_per_warp =
+      total_query_rows <= 8 ? 1 : total_query_rows <= 32 ? 4 : 8;
+  const uint32_t queries_per_warp =
+      std::min(gpu->tile_queries_per_warp, shape_queries_per_warp);
   const uint32_t query_tile_rows = 8 * queries_per_warp;
   const size_t tasks = count *
       ((static_cast<size_t>(total_query_rows) + query_tile_rows - 1) /
