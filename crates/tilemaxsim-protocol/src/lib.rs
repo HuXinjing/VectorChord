@@ -255,7 +255,7 @@ pub fn decode_response(frame: &[u8]) -> Result<ScoreResponse, ProtocolError> {
     let status = u32::from_le_bytes(frame[24..28].try_into().unwrap());
     let count = u32::from_le_bytes(frame[28..32].try_into().unwrap()) as usize;
     if status != 0 {
-        if count > MAX_REMOTE_ERROR_BYTES || count > body_len - 8 {
+        if count > MAX_REMOTE_ERROR_BYTES || count != body_len - 8 {
             return Err(ProtocolError::InvalidResponse(
                 "truncated TileMaxSim error response",
             ));
@@ -566,5 +566,12 @@ mod tests {
         miss.extend_from_slice(message);
         miss[16..24].copy_from_slice(&((8 + message.len()) as u64).to_le_bytes());
         assert_eq!(decode_response(&miss), Err(ProtocolError::CatalogMiss));
+
+        miss.push(0);
+        miss[16..24].copy_from_slice(&((9 + message.len()) as u64).to_le_bytes());
+        assert!(matches!(
+            decode_response(&miss),
+            Err(ProtocolError::InvalidResponse(_))
+        ));
     }
 }
