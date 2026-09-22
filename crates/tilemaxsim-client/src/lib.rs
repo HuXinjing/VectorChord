@@ -126,11 +126,15 @@ pub fn catalog_digest(revision: &str) -> [u8; 32] {
 
 pub fn selection_digest(public_ids: &[i64]) -> Result<[u8; 32], SdkError> {
     validate_public_ids(public_ids)?;
+    Ok(selection_digest_validated(public_ids))
+}
+
+fn selection_digest_validated(public_ids: &[i64]) -> [u8; 32] {
     let mut digest = Sha256::new();
     for public_id in public_ids {
         digest.update(public_id.to_le_bytes());
     }
-    Ok(digest.finalize().into())
+    digest.finalize().into()
 }
 
 /// Encode a v10 catalog registration. Registration is additive for one
@@ -211,7 +215,7 @@ pub fn encode_catalog_selection_reference(
     let mut frame = common_prefix(request, public_ids.len())?;
     frame.push(if scoped.is_some() { 4 } else { 3 });
     frame.extend_from_slice(&catalog_digest(request.catalog_revision));
-    frame.extend_from_slice(&selection_digest(public_ids)?);
+    frame.extend_from_slice(&selection_digest_validated(public_ids));
     if let Some(ordinals) = scoped {
         frame.extend_from_slice(&(ordinals.len() as u32).to_le_bytes());
         encode_delta_values(
