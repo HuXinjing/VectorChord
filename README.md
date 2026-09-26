@@ -10,6 +10,22 @@ This fork extends VectorChord's `vchordrq` index with exact late-interaction
 TileMaxSim retrieval. It is intended for applications that store one array of
 token vectors per document and need PostgreSQL-native multi-vector search.
 
+## TileMaxSim cache readiness
+
+The TileMaxSim management listener exposes
+`GET /v1/cache/readiness/{tenant_hash}/{catalog_digest}`. `tenant_hash` is the
+first eight bytes of SHA-256 over the scheduler tenant, encoded as lowercase
+hexadecimal. `catalog_digest` is the lowercase hexadecimal SHA-256 digest of the catalog
+revision string sent in the scoring protocol. The JSON `state` is `unknown`
+until a successful request for that catalog has been observed, `warming` if
+that request's exact candidate set was not fully GPU-resident at completion,
+and `warmed` if it was. A subsequent cache eviction or loss of cache entries
+invalidates the observation back to `unknown`. The response includes the
+observed selection digest, candidate count, and observation time so callers
+can reject a different selection or stale observation. This is a snapshot,
+not a latency guarantee; `/healthz` continues to report request readiness
+independently of cache temperature.
+
 ## What this fork adds
 
 - Exact TileMaxSim reranking on CPU, plus an optional CUDA sidecar backend.

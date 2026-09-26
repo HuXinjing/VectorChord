@@ -945,6 +945,20 @@ struct Work {
     _frame_permit: BytePermit,
 }
 
+#[derive(Clone)]
+struct CacheReadinessObservation {
+    tenant_hash: String,
+    catalog_digest: [u8; 32],
+    selection_digest: Option<[u8; 32]>,
+    candidate_count: usize,
+    resident: bool,
+    evictions: u64,
+    entries: usize,
+    observed_unix_ms: u128,
+}
+
+const MAX_CACHE_READINESS_OBSERVATIONS: usize = 128;
+
 struct SchedulerConfig {
     policy: SchedulerPolicy,
     priority_aging: Duration,
@@ -1021,6 +1035,7 @@ struct RuntimeMetrics {
     total_latency_us: AtomicU64,
     gpu_latency_us: AtomicU64,
     engine: Mutex<EngineStatus>,
+    cache_readiness: Mutex<VecDeque<CacheReadinessObservation>>,
 }
 
 impl RuntimeMetrics {
@@ -1044,6 +1059,75 @@ impl RuntimeMetrics {
             .engine
             .lock()
             .unwrap_or_else(|error| error.into_inner()) = status;
+    }
+
+    fn observe_cache_readiness(
+        &self,
+        request: &protocol::Request,
+        resident: bool,
+        status: &EngineStatus,
+    ) {
+        let Some(catalog_digest) = request.catalog_digest else {
+            return;
+        };
+        let tenant_hash = tenant_hash(&request.tenant);
+        let evictions = status.devices.iter().map(|device| device.evictions).sum();
+        let entries = status.devices.iter().map(|device| device.entries).sum();
+        let mut observations = self
+            .cache_readiness
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if let Some(index) = observations.iter().position(|item| {
+            item.catalog_digest == catalog_digest && item.tenant_hash == tenant_hash
+        }) {
+            observations.remove(index);
+        }
+        if observations.len() >= MAX_CACHE_READINESS_OBSERVATIONS {
+            observations.pop_front();
+        }
+        observations.push_back(CacheReadinessObservation {
+            tenant_hash,
+            catalog_digest,
+            selection_digest: request.catalog_selection_digest,
+            candidate_count: request.candidate_slice().len(),
+            resident,
+            evictions,
+            entries,
+            observed_unix_ms: unix_time_ms(),
+        });
+    }
+
+    fn cache_readiness(&self, tenant_hash: &str, catalog_digest: [u8; 32]) -> serde_json::Value {
+        let observation = self
+            .cache_readiness
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .iter()
+            .find(|item| item.catalog_digest == catalog_digest && item.tenant_hash == tenant_hash)
+            .cloned();
+        let status = self
+            .engine
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let current_evictions: u64 = status.devices.iter().map(|device| device.evictions).sum();
+        let current_entries: usize = status.devices.iter().map(|device| device.entries).sum();
+        let state = match &observation {
+            None => "unknown",
+            Some(item) if current_evictions > item.evictions || current_entries < item.entries => {
+                "unknown"
+            }
+            Some(item) if item.resident => "warmed",
+            Some(_) => "warming",
+        };
+        serde_json::json!({
+            "api_version": "tilemaxsim.cache-readiness.v1",
+            "tenant_hash": tenant_hash,
+            "catalog_digest": hex::encode(catalog_digest),
+            "state": state,
+            "selection_digest": observation.as_ref().and_then(|item| item.selection_digest.map(hex::encode)),
+            "candidate_count": observation.as_ref().map(|item| item.candidate_count),
+            "observed_at_unix_ms": observation.as_ref().map(|item| item.observed_unix_ms),
+        })
     }
 
     fn update_scheduler_depth(&self, depth: usize) {
@@ -2007,6 +2091,12 @@ fn run_scheduler(
                             continue;
                         } else {
                             metrics.completed.fetch_add(1, Ordering::Relaxed);
+                            let status = engine.status_snapshot();
+                            metrics.observe_cache_readiness(
+                                &work.request,
+                                engine.candidates_resident(&work.request),
+                                &status,
+                            );
                             if let Some(top_k) = work.request.top_k {
                                 if work.request.protocol_version
                                     == protocol::VERSION_SCOPED_CATALOG_SELECTION_REFERENCE
@@ -2638,6 +2728,25 @@ fn handle_status_connection(
             "text/plain; version=0.0.4",
             render_metrics(metrics),
         )
+    } else if request.method == "GET" && request.path.starts_with("/v1/cache/readiness/") {
+        let suffix = &request.path["/v1/cache/readiness/".len()..];
+        let (tenant, digest) = suffix.split_once('/').unwrap_or(("", ""));
+        match hex::decode(digest)
+            .ok()
+            .and_then(|bytes| bytes.try_into().ok())
+            .filter(|_: &[u8; 32]| tenant.len() == 16 && tenant.bytes().all(|byte| byte.is_ascii_hexdigit()))
+        {
+            Some(digest) => (
+                "200 OK",
+                "application/json",
+                metrics.cache_readiness(tenant, digest).to_string(),
+            ),
+            None => (
+                "400 Bad Request",
+                "application/json",
+                serde_json::json!({"error": "expected a 16-character tenant hash and 32-byte catalog digest"}).to_string(),
+            ),
+        }
     } else if request.method == "GET" && request.path == "/v1/config" {
         ("200 OK", "application/json", config.to_string())
     } else if request.method == "GET" && request.path == "/v1/cache" {
@@ -3899,6 +4008,35 @@ mod tests {
     }
 
     #[test]
+    fn cache_readiness_is_revision_scoped_and_fails_closed_after_loss() {
+        let metrics = RuntimeMetrics::default();
+        let request = catalog_request(true);
+        let digest = request.catalog_digest.unwrap();
+        let tenant = super::tenant_hash(&request.tenant);
+        assert_eq!(metrics.cache_readiness(&tenant, digest)["state"], "unknown");
+        metrics.observe_cache_readiness(&request, false, &EngineStatus::default());
+        assert_eq!(metrics.cache_readiness(&tenant, digest)["state"], "warming");
+        metrics.observe_cache_readiness(&request, true, &EngineStatus::default());
+        assert_eq!(metrics.cache_readiness(&tenant, digest)["state"], "warmed");
+        assert_eq!(
+            metrics.cache_readiness("0000000000000000", digest)["state"],
+            "unknown"
+        );
+        assert_eq!(
+            metrics.cache_readiness(&tenant, [0x5b; 32])["state"],
+            "unknown"
+        );
+        metrics
+            .cache_readiness
+            .lock()
+            .unwrap()
+            .back_mut()
+            .unwrap()
+            .entries = 1;
+        assert_eq!(metrics.cache_readiness(&tenant, digest)["state"], "unknown");
+    }
+
+    #[test]
     fn repeated_catalog_selection_reuses_the_resolved_descriptor_vector() {
         let metrics = RuntimeMetrics::default();
         let mut registration = catalog_request(true);
@@ -4050,6 +4188,23 @@ mod tests {
         let response = String::from_utf8(config_request.response).unwrap();
         assert!(response.starts_with("HTTP/1.1 200 OK"));
         assert!(response.contains("tilemaxsim.management.v1"));
+
+        let mut readiness_request = StatusExchange::new(&format!(
+            "GET /v1/cache/readiness/{}/{} HTTP/1.1\r\n\r\n",
+            "0000000000000000",
+            "5a".repeat(32),
+        ));
+        handle_status_connection(
+            &mut readiness_request,
+            &metrics,
+            &config,
+            &admin,
+            &operations,
+            false,
+        );
+        let response = String::from_utf8(readiness_request.response).unwrap();
+        assert!(response.starts_with("HTTP/1.1 200 OK"));
+        assert!(response.contains("\"state\":\"unknown\""));
 
         let mut remote_reload = StatusExchange::new("POST /v1/reload HTTP/1.1\r\n\r\n");
         handle_status_connection(

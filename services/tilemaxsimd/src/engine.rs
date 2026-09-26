@@ -1364,6 +1364,23 @@ impl Engine {
             "batch_read_bytes": status.batch_read_bytes,
         })
     }
+
+    /// Whether every descriptor in this exact request is currently GPU-resident.
+    /// This is a snapshot, not a promise that an LRU entry cannot be evicted later.
+    pub fn candidates_resident(&self, request: &Request) -> bool {
+        let candidates = request.candidate_slice();
+        !candidates.is_empty()
+            && candidates.iter().all(|descriptor| {
+                let key = gpu_cache_key(
+                    descriptor,
+                    request.scoring_profile,
+                    request.quantization_contract.as_deref(),
+                );
+                self.devices
+                    .iter()
+                    .any(|device| device.cache.contains(&key))
+            })
+    }
 }
 
 fn contiguous_resident_plan_indices(
