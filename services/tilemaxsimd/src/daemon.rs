@@ -1071,6 +1071,20 @@ impl RuntimeMetrics {
             return;
         };
         let tenant_hash = tenant_hash(&request.tenant);
+        let selection_digest = request.catalog_selection_digest.or_else(|| {
+            let candidates = request.candidate_slice();
+            if candidates.is_empty() {
+                return None;
+            }
+            let mut digest = Sha256::new();
+            for descriptor in candidates {
+                digest.update(descriptor.digest.as_bytes());
+                digest.update(descriptor.rows.to_le_bytes());
+                digest.update(descriptor.dimension.to_le_bytes());
+                digest.update([descriptor.dtype]);
+            }
+            Some(digest.finalize().into())
+        });
         let evictions = status.devices.iter().map(|device| device.evictions).sum();
         let entries = status.devices.iter().map(|device| device.entries).sum();
         let mut observations = self
@@ -1088,7 +1102,7 @@ impl RuntimeMetrics {
         observations.push_back(CacheReadinessObservation {
             tenant_hash,
             catalog_digest,
-            selection_digest: request.catalog_selection_digest,
+            selection_digest,
             candidate_count: request.candidate_slice().len(),
             resident,
             evictions,
@@ -4016,8 +4030,17 @@ mod tests {
         assert_eq!(metrics.cache_readiness(&tenant, digest)["state"], "unknown");
         metrics.observe_cache_readiness(&request, false, &EngineStatus::default());
         assert_eq!(metrics.cache_readiness(&tenant, digest)["state"], "warming");
+        let selection = metrics.cache_readiness(&tenant, digest)["selection_digest"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        assert_eq!(selection.len(), 64);
         metrics.observe_cache_readiness(&request, true, &EngineStatus::default());
         assert_eq!(metrics.cache_readiness(&tenant, digest)["state"], "warmed");
+        assert_eq!(
+            metrics.cache_readiness(&tenant, digest)["selection_digest"],
+            selection
+        );
         assert_eq!(
             metrics.cache_readiness("0000000000000000", digest)["state"],
             "unknown"

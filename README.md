@@ -21,8 +21,11 @@ until a successful request for that catalog has been observed, `warming` if
 that request's exact candidate set was not fully GPU-resident at completion,
 and `warmed` if it was. A subsequent cache eviction or loss of cache entries
 invalidates the observation back to `unknown`. The response includes the
-observed selection digest, candidate count, and observation time so callers
-can reject a different selection or stale observation. This is a snapshot,
+observed selection digest (derived from descriptors when the request protocol
+does not provide one), candidate count, and observation time so callers can
+reject a different selection or stale observation. The state describes the
+last completed selection for this tenant and catalog, not every possible
+filtered selection. This is a snapshot,
 not a latency guarantee; `/healthz` continues to report request readiness
 independently of cache temperature.
 
