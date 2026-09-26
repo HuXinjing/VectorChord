@@ -958,6 +958,7 @@ struct CacheReadinessObservation {
 }
 
 const MAX_CACHE_READINESS_OBSERVATIONS: usize = 128;
+const CACHE_READINESS_OBSERVATION_TTL_MS: u128 = 300_000;
 
 struct SchedulerConfig {
     policy: SchedulerPolicy,
@@ -1127,6 +1128,12 @@ impl RuntimeMetrics {
         let current_entries: usize = status.devices.iter().map(|device| device.entries).sum();
         let state = match &observation {
             None => "unknown",
+            Some(item)
+                if unix_time_ms().saturating_sub(item.observed_unix_ms)
+                    > CACHE_READINESS_OBSERVATION_TTL_MS =>
+            {
+                "unknown"
+            }
             Some(item) if current_evictions > item.evictions || current_entries < item.entries => {
                 "unknown"
             }
@@ -2036,6 +2043,13 @@ fn run_scheduler(
             let version = work.request.protocol_version;
             let tenant = work.request.tenant.clone();
             let priority = work.request.priority;
+            if work.next_candidate == 0
+                && work.deadline > started
+                && let Some(digest) = work.request.catalog_digest
+                && metrics.cache_readiness(&tenant_hash(&tenant), digest)["state"] != "warmed"
+            {
+                metrics.observe_cache_readiness(&work.request, false, &engine.status_snapshot());
+            }
             let response = if work.deadline <= started {
                 metrics.timed_out.fetch_add(1, Ordering::Relaxed);
                 metrics
@@ -4041,6 +4055,15 @@ mod tests {
             metrics.cache_readiness(&tenant, digest)["selection_digest"],
             selection
         );
+        metrics
+            .cache_readiness
+            .lock()
+            .unwrap()
+            .back_mut()
+            .unwrap()
+            .observed_unix_ms = 0;
+        assert_eq!(metrics.cache_readiness(&tenant, digest)["state"], "unknown");
+        metrics.observe_cache_readiness(&request, true, &EngineStatus::default());
         assert_eq!(
             metrics.cache_readiness("0000000000000000", digest)["state"],
             "unknown"

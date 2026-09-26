@@ -17,15 +17,15 @@ The TileMaxSim management listener exposes
 first eight bytes of SHA-256 over the scheduler tenant, encoded as lowercase
 hexadecimal. `catalog_digest` is the lowercase hexadecimal SHA-256 digest of the catalog
 revision string sent in the scoring protocol. The JSON `state` is `unknown`
-until a successful request for that catalog has been observed, `warming` if
-that request's exact candidate set was not fully GPU-resident at completion,
+before a request for that catalog is observed, `warming` while its first
+request is scoring or if its exact candidate set was not fully GPU-resident at completion,
 and `warmed` if it was. A subsequent cache eviction or loss of cache entries
 invalidates the observation back to `unknown`. The response includes the
 observed selection digest (derived from descriptors when the request protocol
 does not provide one), candidate count, and observation time so callers can
 reject a different selection or stale observation. The state describes the
-last completed selection for this tenant and catalog, not every possible
-filtered selection. This is a snapshot,
+last observed selection for this tenant and catalog, not every possible
+filtered selection. Observations expire after five minutes. This is a snapshot,
 not a latency guarantee; `/healthz` continues to report request readiness
 independently of cache temperature.
 
