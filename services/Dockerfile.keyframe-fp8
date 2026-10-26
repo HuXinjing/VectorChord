@@ -1,0 +1,4 @@
+FROM vectorchord-tilemaxsimd:cache-readiness-d6fc42c
+COPY --chmod=755 tilemaxsimd /usr/local/bin/tilemaxsimd
+COPY --chmod=755 tilemaxsimctl /usr/local/bin/tilemaxsimctl
+RUN /usr/local/bin/tilemaxsimd --help >/dev/null && /usr/local/bin/tilemaxsimctl --help >/dev/null
