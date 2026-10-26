@@ -564,6 +564,7 @@ fn tensor_bytes(rows: u32, dimension: u32, dtype: u8) -> Result<usize> {
     let scalar = match dtype {
         1 => 4,
         2 => 2,
+        3 => 1,
         _ => bail!("unsupported tensor dtype"),
     };
     (rows as usize)
@@ -587,6 +588,45 @@ pub fn cache_key(descriptor: &Descriptor) -> String {
 mod tests {
     use super::*;
     use std::fs;
+
+    #[test]
+    fn tensor_length_matches_all_protocol_storage_types() {
+        assert_eq!(tensor_bytes(3, 5, 1).unwrap(), 60);
+        assert_eq!(tensor_bytes(3, 5, 2).unwrap(), 30);
+        assert_eq!(tensor_bytes(3, 5, 3).unwrap(), 15);
+        assert!(tensor_bytes(3, 5, 4).is_err());
+    }
+
+    #[test]
+    fn raw_fp8_objects_resolve_and_reject_incorrect_shape() {
+        let root = std::env::temp_dir().join(format!(
+            "tilemaxsim-raw-fp8-object-store-{}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let payload = [0x38_u8, 0x00, 0xb8, 0x30];
+        let digest = hex::encode(Sha256::digest(payload));
+        let directory = root.join("objects").join(&digest[..2]);
+        fs::create_dir_all(&directory).unwrap();
+        fs::write(directory.join(format!("{digest}.tensor")), payload).unwrap();
+        let mut store =
+            ShardStore::open(&[("model@1".to_owned(), root.clone())], 1024, 100, false).unwrap();
+        let descriptor = || Descriptor {
+            candidate_id: 1,
+            contract: "model@1".to_owned(),
+            digest: digest.clone(),
+            rows: 2,
+            dimension: 2,
+            dtype: 3,
+            raw_fp8_cache_key: std::sync::OnceLock::new(),
+        };
+        let mut invalid = descriptor();
+        invalid.rows = 3;
+        assert!(store.resolve_many(&[invalid], "tenant-a").is_err());
+        let resolved = store.resolve_many(&[descriptor()], "tenant-a").unwrap();
+        assert_eq!(&*resolved[0], &payload);
+        fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn content_addressed_objects_are_visible_without_index_reload() {
