@@ -1859,6 +1859,22 @@ fn notify_completion(work: &Work) {
     let _ = work.completion.try_send(());
 }
 
+type FusedScores = Option<(Vec<(u32, f32)>, Duration)>;
+
+fn bind_fused_scores(
+    request_count: usize,
+    scores: Vec<Vec<(u32, f32)>>,
+    elapsed: Duration,
+) -> Result<Vec<FusedScores>> {
+    if scores.len() != request_count {
+        bail!("accelerator returned the wrong microbatch request count");
+    }
+    Ok(scores
+        .into_iter()
+        .map(|scores| Some((scores, elapsed)))
+        .collect())
+}
+
 fn run_scheduler(
     mut engine: Engine,
     receiver: mpsc::Receiver<Work>,
@@ -2004,7 +2020,9 @@ fn run_scheduler(
                 request_quantum_with_resident_plan(&scheduled.payload, &config, &engine)
             })
             .collect::<Vec<_>>();
-        let mut fused_results = HashMap::new();
+        // Wire request IDs are connection scoped. Preserve every batch slot,
+        // including results whose peer disconnects or deadline expires.
+        let mut fused_results = vec![None; microbatch.len()];
         if microbatch.len() > 1
             && microbatch.iter().all(|scheduled| {
                 scheduled.payload.deadline > Instant::now()
@@ -2025,12 +2043,12 @@ fn run_scheduler(
                     &metrics.gpu_fused_requests,
                     u64::try_from(results.len()).unwrap_or(u64::MAX),
                 );
-                for (request, scores) in quantums.iter().zip(results) {
-                    fused_results.insert(request.request_id, (scores, elapsed));
-                }
+                fused_results = bind_fused_scores(quantums.len(), results, elapsed)?;
             }
         }
-        for (scheduled, quantum) in microbatch.into_iter().zip(quantums) {
+        for ((scheduled, quantum), fused_result) in
+            microbatch.into_iter().zip(quantums).zip(fused_results)
+        {
             if peer_disconnected(&scheduled.payload.connection) {
                 metrics.disconnected.fetch_add(1, Ordering::Relaxed);
                 metrics.observe_latency(scheduled.payload.accepted_at.elapsed(), Duration::ZERO);
@@ -2077,16 +2095,16 @@ fn run_scheduler(
                         .map(|candidate| u64::from(candidate.rows))
                         .sum(),
                 );
-                let (score_result, measured_elapsed) =
-                    if let Some((scores, elapsed)) = fused_results.remove(&request_id) {
-                        (Ok(scores), Some(elapsed))
-                    } else {
-                        metrics.gpu_active.store(1, Ordering::Relaxed);
-                        let result = engine.score(&quantum);
-                        metrics.gpu_active.store(0, Ordering::Relaxed);
-                        metrics.update_engine(engine.status_snapshot());
-                        (result, None)
-                    };
+                let (score_result, measured_elapsed) = if let Some((scores, elapsed)) = fused_result
+                {
+                    (Ok(scores), Some(elapsed))
+                } else {
+                    metrics.gpu_active.store(1, Ordering::Relaxed);
+                    let result = engine.score(&quantum);
+                    metrics.gpu_active.store(0, Ordering::Relaxed);
+                    metrics.update_engine(engine.status_snapshot());
+                    (result, None)
+                };
                 match score_result {
                     Ok(results) => {
                         work.gpu_elapsed +=
@@ -3963,6 +3981,34 @@ fn load_resident_manifests(values: &[(String, PathBuf)]) -> Result<Vec<protocol:
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn microbatch_scores_follow_slots_when_connections_reuse_wire_ids() {
+        let elapsed = std::time::Duration::from_micros(13);
+        for wire_ids in [[7, 11, 19], [7, 7, 7]] {
+            let scores = vec![vec![(0, -2.0)], vec![(0, 3.0)], vec![(0, 5.0)]];
+            let slots = super::bind_fused_scores(wire_ids.len(), scores.clone(), elapsed).unwrap();
+            let bound = wire_ids.into_iter().zip(slots).collect::<Vec<_>>();
+            assert_eq!(bound[0].1.as_ref().unwrap().0, scores[0]);
+            assert_eq!(bound[1].1.as_ref().unwrap().0, scores[1]);
+            assert_eq!(bound[2].1.as_ref().unwrap().0, scores[2]);
+            // Dropping the first delivery (disconnect/deadline) must not shift
+            // the remaining results or fall back to a duplicate wire ID.
+            let remaining = bound
+                .into_iter()
+                .skip(1)
+                .map(|(_, result)| result.unwrap().0)
+                .collect::<Vec<_>>();
+            assert_eq!(remaining, scores[1..]);
+        }
+    }
+
+    #[test]
+    fn microbatch_score_count_mismatch_fails_closed() {
+        let elapsed = std::time::Duration::ZERO;
+        assert!(super::bind_fused_scores(2, vec![vec![(0, 1.0)]], elapsed).is_err());
+        assert!(super::bind_fused_scores(1, vec![vec![], vec![]], elapsed).is_err());
+    }
+
     #[cfg(feature = "backend-cpu")]
     use super::verify_backends;
     use super::{
