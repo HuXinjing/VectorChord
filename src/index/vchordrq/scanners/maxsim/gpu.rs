@@ -48,6 +48,7 @@ const SCOPED_CATALOG_SELECTION_REFERENCE_VERSION: u16 =
     tilemaxsim_protocol::VERSION_SCOPED_CATALOG_SELECTION_REFERENCE;
 const PERSISTENT_SCOPED_CATALOG_SELECTION_REFERENCE_VERSION: u16 =
     tilemaxsim_protocol::VERSION_PERSISTENT_SCOPED_CATALOG_SELECTION_REFERENCE;
+#[cfg(test)]
 const PERSISTENT_CATALOG_SELECTION_REFERENCE_VERSION: u16 =
     tilemaxsim_protocol::VERSION_PERSISTENT_CATALOG_SELECTION_REFERENCE;
 const REQUEST_KIND: u16 = 1;
@@ -2677,6 +2678,82 @@ mod tests {
                     u16::from_le_bytes(response[4..6].try_into().unwrap()),
                     version
                 );
+            }
+            server.join().unwrap();
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn catalog_and_manifest_reconnect_after_idle_close() {
+        for version in [
+            MANIFEST_LOGICAL_EXTERNAL_VERSION,
+            CATALOG_LOGICAL_EXTERNAL_VERSION,
+        ] {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let endpoint = format!("tcp://{}", listener.local_addr().unwrap());
+            let server = thread::spawn(move || {
+                for id in [101, 102] {
+                    let (mut stream, _) = listener.accept().unwrap();
+                    let (received, request_id) = read_transport_test_frame(&mut stream);
+                    assert_eq!(
+                        received,
+                        tilemaxsim_protocol::persistent_version(version).unwrap()
+                    );
+                    assert_eq!(request_id, id);
+                    write_transport_test_response(&mut stream, received, request_id);
+                    // The server closes the socket after this successful response.
+                }
+            });
+            let mut transport = UnixSocketTransport::new(endpoint);
+            for id in [101, 102] {
+                transport
+                    .round_trip(
+                        &transport_test_frame(version, id),
+                        Duration::from_secs(2),
+                        HEADER_LEN + 8,
+                    )
+                    .unwrap();
+            }
+            server.join().unwrap();
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn catalog_and_manifest_remember_legacy_negotiation() {
+        for version in [
+            MANIFEST_LOGICAL_EXTERNAL_VERSION,
+            CATALOG_LOGICAL_EXTERNAL_VERSION,
+        ] {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let endpoint = format!("tcp://{}", listener.local_addr().unwrap());
+            let server = thread::spawn(move || {
+                let mut versions = Vec::new();
+                for reply_version in [EXTERNAL_VERSION, version, version] {
+                    let (mut stream, _) = listener.accept().unwrap();
+                    let (received, id) = read_transport_test_frame(&mut stream);
+                    versions.push(received);
+                    write_transport_test_response(&mut stream, reply_version, id);
+                }
+                assert_eq!(
+                    versions,
+                    vec![
+                        tilemaxsim_protocol::persistent_version(version).unwrap(),
+                        version,
+                        version
+                    ]
+                );
+            });
+            let mut transport = UnixSocketTransport::new(endpoint);
+            for id in [111, 112] {
+                transport
+                    .round_trip(
+                        &transport_test_frame(version, id),
+                        Duration::from_secs(2),
+                        HEADER_LEN + 8,
+                    )
+                    .unwrap();
             }
             server.join().unwrap();
         }
