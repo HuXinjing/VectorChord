@@ -37,8 +37,44 @@ struct ResidentTensor {
 }
 
 const MAX_RESIDENT_SELECTION_PLANS: usize = 64;
+const MAX_PREPARED_SELECTION_BYTES: usize = 64 * 1024 * 1024;
+
+#[derive(Clone, PartialEq, Eq)]
+struct ResidentPlanIdentity {
+    tenant: String,
+    model_contract: String,
+    profile: ScoringProfile,
+    quantization_contract: Option<String>,
+    dimension: u32,
+    query_dtype: u8,
+    candidate_dtype: u8,
+}
+impl ResidentPlanIdentity {
+    fn of(request: &Request) -> Self {
+        Self {
+            tenant: request.tenant.clone(),
+            model_contract: request.model_contract.clone(),
+            profile: request.scoring_profile,
+            quantization_contract: request.quantization_contract.clone(),
+            dimension: request.dimension,
+            query_dtype: request.dtype,
+            candidate_dtype: request.candidate_dtype,
+        }
+    }
+    fn matches(&self, request: &Request) -> bool {
+        self.tenant == request.tenant
+            && self.model_contract == request.model_contract
+            && self.profile == request.scoring_profile
+            && self.quantization_contract == request.quantization_contract
+            && self.dimension == request.dimension
+            && self.query_dtype == request.dtype
+            && self.candidate_dtype == request.candidate_dtype
+    }
+}
 
 struct ResidentSelectionPlan {
+    identity: ResidentPlanIdentity,
+    candidate_bytes: usize,
     candidates: Arc<Vec<Descriptor>>,
     candidate_start: usize,
     candidate_end: usize,
@@ -92,6 +128,10 @@ pub struct Engine {
     quantization_registry: Option<QuantizationRegistry>,
     resident_selection_plans: VecDeque<ResidentSelectionPlan>,
     residency_proofs_enabled: bool,
+    prepared_candidates_enabled: bool,
+    prepared_plan_hits: u64,
+    prepared_plan_misses: u64,
+    prepared_plan_bytes: usize,
     residency_proofs: Mutex<ResidencyProofs>,
 }
 
@@ -219,11 +259,18 @@ impl Engine {
             quantization_registry,
             resident_selection_plans: VecDeque::new(),
             residency_proofs_enabled: false,
+            prepared_candidates_enabled: std::env::var("TILEMAXSIM_PREPARED_CANDIDATES").as_deref()
+                == Ok("1"),
+            prepared_plan_hits: 0,
+            prepared_plan_misses: 0,
+            prepared_plan_bytes: 0,
             residency_proofs: Mutex::new(ResidencyProofs::default()),
         })
     }
 
     pub fn reload_shards(&mut self) -> Result<()> {
+        self.resident_selection_plans.clear();
+        self.prepared_plan_bytes = 0;
         self.residency_proofs
             .get_mut()
             .unwrap_or_else(|e| e.into_inner())
@@ -409,6 +456,102 @@ impl Engine {
         device.gpu.request_tensor_probe()
     }
 
+    fn prepared_selection_eligible(&self, request: &Request) -> bool {
+        request.quantization_contract.is_none()
+            && (request.scoring_profile == ScoringProfile::RawFp8E4m3
+                || self.prepared_candidates_enabled
+                    && request.scoring_profile == ScoringProfile::ExactFp16)
+    }
+
+    pub fn set_prepared_candidates_enabled(&mut self, enabled: bool) {
+        self.prepared_candidates_enabled = enabled;
+        self.resident_selection_plans.clear();
+        self.prepared_plan_hits = 0;
+        self.prepared_plan_misses = 0;
+        self.prepared_plan_bytes = 0;
+    }
+
+    fn plan_candidate_bytes(&self, request: &Request) -> usize {
+        self.resident_selection_plans
+            .iter()
+            .find(|plan| Arc::ptr_eq(&plan.candidates, &request.candidates))
+            .map_or_else(
+                || {
+                    request
+                        .candidates
+                        .capacity()
+                        .saturating_mul(size_of::<Descriptor>())
+                        .saturating_add(
+                            request
+                                .candidates
+                                .iter()
+                                .map(|d| {
+                                    d.contract
+                                        .capacity()
+                                        .saturating_add(d.digest.capacity())
+                                        .saturating_add(
+                                            d.raw_fp8_cache_key.get().map_or(0, |key| key.len()),
+                                        )
+                                })
+                                .sum::<usize>(),
+                        )
+                },
+                |plan| plan.candidate_bytes,
+            )
+    }
+
+    fn prepared_selection_bytes(&self) -> usize {
+        let mut candidates = HashSet::new();
+        self.resident_selection_plans
+            .iter()
+            .fold(0usize, |total, plan| {
+                let shared = if candidates.insert(Arc::as_ptr(&plan.candidates)) {
+                    plan.candidate_bytes
+                } else {
+                    0
+                };
+                total
+                    .saturating_add(shared)
+                    .saturating_add(size_of::<ResidentSelectionPlan>())
+                    .saturating_add(plan.identity.tenant.capacity())
+                    .saturating_add(plan.identity.model_contract.capacity())
+                    .saturating_add(
+                        plan.identity
+                            .quantization_contract
+                            .as_ref()
+                            .map_or(0, String::capacity),
+                    )
+                    .saturating_add(
+                        plan.device_generations
+                            .capacity()
+                            .saturating_mul(size_of::<u64>()),
+                    )
+                    .saturating_add(
+                        plan.duplicate_candidates
+                            .capacity()
+                            .saturating_mul(size_of::<(usize, usize)>()),
+                    )
+                    .saturating_add(
+                        plan.chunks
+                            .capacity()
+                            .saturating_mul(size_of::<Vec<ResidentTensor>>()),
+                    )
+                    .saturating_add(
+                        plan.chunks
+                            .iter()
+                            .map(|chunk| {
+                                chunk
+                                    .capacity()
+                                    .saturating_mul(size_of::<ResidentTensor>())
+                                    .saturating_add(
+                                        chunk.iter().map(|tensor| tensor.key.len()).sum::<usize>(),
+                                    )
+                            })
+                            .sum::<usize>(),
+                    )
+            })
+    }
+
     fn score_cached_resident_selection(
         &mut self,
         request: &Request,
@@ -420,10 +563,19 @@ impl Engine {
             .collect::<Vec<_>>();
         let position = self.resident_selection_plans.iter().position(|plan| {
             Arc::ptr_eq(&plan.candidates, &request.candidates)
+                && plan.identity.matches(request)
                 && plan.candidate_start == request.candidate_start
                 && plan.candidate_end == request.candidate_end
                 && plan.device_generations == generations
-        })?;
+        });
+        if self.prepared_candidates_enabled {
+            if position.is_some() {
+                self.prepared_plan_hits = self.prepared_plan_hits.saturating_add(1);
+            } else {
+                self.prepared_plan_misses = self.prepared_plan_misses.saturating_add(1);
+            }
+        }
+        let position = position?;
         let plan = self
             .resident_selection_plans
             .remove(position)
@@ -455,8 +607,10 @@ impl Engine {
         chunks: &[Vec<ResidentTensor>],
         duplicate_candidates: &[(usize, usize)],
     ) {
+        let candidate_bytes = self.plan_candidate_bytes(request);
         self.resident_selection_plans.retain(|plan| {
             !(Arc::ptr_eq(&plan.candidates, &request.candidates)
+                && plan.identity.matches(request)
                 && plan.candidate_start == request.candidate_start
                 && plan.candidate_end == request.candidate_end)
         });
@@ -474,13 +628,31 @@ impl Engine {
                     .collect()
             })
             .collect();
+        let mut chunks: Vec<Vec<ResidentTensor>> = chunks;
+        let mut duplicate_candidates = duplicate_candidates.to_vec();
+        if self.prepared_candidates_enabled {
+            let mut seen = HashMap::<Arc<str>, usize>::new();
+            for chunk in &mut chunks {
+                chunk.retain(|tensor| {
+                    if let Some(&original) = seen.get(&tensor.key) {
+                        duplicate_candidates.push((tensor.candidate_index, original));
+                        false
+                    } else {
+                        seen.insert(Arc::clone(&tensor.key), tensor.candidate_index);
+                        true
+                    }
+                });
+            }
+        }
         self.resident_selection_plans
             .push_back(ResidentSelectionPlan {
+                identity: ResidentPlanIdentity::of(request),
+                candidate_bytes,
                 candidates: Arc::clone(&request.candidates),
                 candidate_start: request.candidate_start,
                 candidate_end: request.candidate_end,
                 chunks,
-                duplicate_candidates: duplicate_candidates.to_vec(),
+                duplicate_candidates,
                 device_generations: self
                     .devices
                     .iter()
@@ -488,8 +660,14 @@ impl Engine {
                     .collect(),
             });
         self.coalesce_resident_selection_plans(request);
-        while self.resident_selection_plans.len() > MAX_RESIDENT_SELECTION_PLANS {
+        while self.resident_selection_plans.len() > MAX_RESIDENT_SELECTION_PLANS
+            || self.prepared_candidates_enabled
+                && self.prepared_selection_bytes() > MAX_PREPARED_SELECTION_BYTES
+        {
             self.resident_selection_plans.pop_front();
+        }
+        if self.prepared_candidates_enabled {
+            self.prepared_plan_bytes = self.prepared_selection_bytes();
         }
     }
 
@@ -516,6 +694,7 @@ impl Engine {
             .iter()
             .filter(|plan| {
                 Arc::ptr_eq(&plan.candidates, &request.candidates)
+                    && plan.identity.matches(request)
                     && plan.candidate_start == candidate_start
                     && plan.device_generations == generations
             })
@@ -534,14 +713,12 @@ impl Engine {
             .iter()
             .map(|device| device.cache.generation())
             .collect::<Vec<_>>();
-        let selected = contiguous_resident_plan_indices(
-            &self.resident_selection_plans,
-            &request.candidates,
-            &generations,
-        );
+        let selected =
+            contiguous_resident_plan_indices(&self.resident_selection_plans, request, &generations);
         if selected.len() < 2 {
             return;
         }
+        let candidate_bytes = self.resident_selection_plans[selected[0]].candidate_bytes;
         let start = self.resident_selection_plans[selected[0]].candidate_start;
         let cursor = self.resident_selection_plans[*selected.last().unwrap()].candidate_end;
 
@@ -566,11 +743,14 @@ impl Engine {
         }
         self.resident_selection_plans.retain(|plan| {
             !(Arc::ptr_eq(&plan.candidates, &request.candidates)
+                && plan.identity.matches(request)
                 && plan.candidate_start == start
                 && plan.candidate_end == cursor)
         });
         self.resident_selection_plans
             .push_back(ResidentSelectionPlan {
+                identity: ResidentPlanIdentity::of(request),
+                candidate_bytes,
                 candidates: Arc::clone(&request.candidates),
                 candidate_start: start,
                 candidate_end: cursor,
@@ -650,8 +830,7 @@ impl Engine {
         if candidates.is_empty() {
             return Ok(Vec::new());
         }
-        if request.scoring_profile == ScoringProfile::RawFp8E4m3
-            && request.quantization_contract.is_none()
+        if self.prepared_selection_eligible(request)
             && let Some(result) = self.score_cached_resident_selection(request)
         {
             return result;
@@ -713,8 +892,7 @@ impl Engine {
         let hit_result =
             self.score_devices(request, active_quantizer.as_ref(), &hit_chunks, &mut scores);
         if missing_descriptors.is_empty()
-            && request.scoring_profile == ScoringProfile::RawFp8E4m3
-            && request.quantization_contract.is_none()
+            && self.prepared_selection_eligible(request)
             && hit_result.is_ok()
         {
             self.remember_resident_selection(request, &hit_chunks, &duplicate_candidates);
@@ -930,16 +1108,22 @@ impl Engine {
             return Ok(None);
         }
         if requests.iter().skip(1).any(|request| {
-            request.dimension != leader.dimension
+            request.tenant != leader.tenant
+                || request.model_contract != leader.model_contract
+                || request.dimension != leader.dimension
                 || request.dtype != leader.dtype
                 || request.scoring_profile != leader.scoring_profile
                 || request.quantization_contract != leader.quantization_contract
                 || request.candidate_slice().len() != leader.candidate_slice().len()
-                || request
-                    .candidate_slice()
-                    .iter()
-                    .zip(leader.candidate_slice().iter())
-                    .any(|(left, right)| cache_key(left) != cache_key(right))
+                || (!(self.prepared_candidates_enabled
+                    && Arc::ptr_eq(&request.candidates, &leader.candidates)
+                    && request.candidate_start == leader.candidate_start
+                    && request.candidate_end == leader.candidate_end)
+                    && request
+                        .candidate_slice()
+                        .iter()
+                        .zip(leader.candidate_slice().iter())
+                        .any(|(left, right)| cache_key(left) != cache_key(right)))
         }) {
             return Ok(None);
         }
@@ -979,44 +1163,107 @@ impl Engine {
             query_offsets.push(total_rows);
             queries.extend_from_slice(&request.query);
         }
-        let mut chunks = (0..self.devices.len())
-            .map(|_| Vec::<ResidentTensor>::new())
+        let generations = self
+            .devices
+            .iter()
+            .map(|device| device.cache.generation())
             .collect::<Vec<_>>();
-        for (candidate_index, descriptor) in leader.candidate_slice().iter().enumerate() {
-            let key = gpu_cache_key(
-                descriptor,
-                leader.scoring_profile,
-                leader.quantization_contract.as_deref(),
-            );
-            let Some(device_index) = self
-                .devices
-                .iter()
-                .position(|device| device.cache.contains(&key))
-            else {
-                self.release_chunks(&chunks)?;
-                return Ok(None);
-            };
-            let entry = self.devices[device_index]
-                .cache
-                .get(&key)
-                .expect("resident batch cache hit disappeared");
-            chunks[device_index].push(ResidentTensor {
-                candidate_index,
-                device: device_index,
-                key,
-                offset: entry.offset,
-                rows: entry.rows,
-                transient: false,
-                newly_admitted: false,
-            });
-            if let Err(error) = validate_entry(
-                descriptor,
-                &entry,
-                leader.scoring_profile,
-                active_quantizer.as_ref(),
-            ) {
-                self.release_chunks(&chunks)?;
-                return Err(error);
+        let cached_plan = (self.prepared_candidates_enabled
+            && self.prepared_selection_eligible(leader))
+        .then(|| {
+            self.resident_selection_plans.iter().position(|plan| {
+                Arc::ptr_eq(&plan.candidates, &leader.candidates)
+                    && plan.identity.matches(leader)
+                    && plan.candidate_start == leader.candidate_start
+                    && plan.candidate_end == leader.candidate_end
+                    && plan.device_generations == generations
+            })
+        })
+        .flatten()
+        .map(|position| self.resident_selection_plans.remove(position).unwrap());
+        if self.prepared_candidates_enabled && self.prepared_selection_eligible(leader) {
+            if cached_plan.is_some() {
+                self.prepared_plan_hits = self.prepared_plan_hits.saturating_add(1);
+            } else {
+                self.prepared_plan_misses = self.prepared_plan_misses.saturating_add(1);
+            }
+        }
+        let mut chunks = cached_plan.as_ref().map_or_else(
+            || {
+                (0..self.devices.len())
+                    .map(|_| Vec::<ResidentTensor>::new())
+                    .collect::<Vec<_>>()
+            },
+            |plan| plan.chunks.clone(),
+        );
+        let duplicate_candidates = cached_plan
+            .as_ref()
+            .map(|plan| plan.duplicate_candidates.clone())
+            .unwrap_or_default();
+        if cached_plan.is_some() {
+            // Single-request scoring deduplicates equal tensors; the existing
+            // batch path records one cache access and native result per logical
+            // candidate. Expand the immutable map so that policy stays intact.
+            if !duplicate_candidates.is_empty() {
+                let mut originals = vec![None; leader.candidate_slice().len()];
+                for (device, chunk) in chunks.iter().enumerate() {
+                    for (index, tensor) in chunk.iter().enumerate() {
+                        originals[tensor.candidate_index] = Some((device, index));
+                    }
+                }
+                for &(duplicate, original) in &duplicate_candidates {
+                    let (device, index) = originals[original]
+                        .expect("validated duplicate refers to a resident original");
+                    let mut tensor = chunks[device][index].clone();
+                    tensor.candidate_index = duplicate;
+                    chunks[device].push(tensor);
+                }
+            }
+            for (device, chunk) in self.devices.iter_mut().zip(&chunks) {
+                for tensor in chunk {
+                    device
+                        .cache
+                        .touch_resident(&tensor.key)
+                        .map_err(|message| anyhow!(message))?;
+                }
+            }
+        } else {
+            for (candidate_index, descriptor) in leader.candidate_slice().iter().enumerate() {
+                let key = gpu_cache_key(
+                    descriptor,
+                    leader.scoring_profile,
+                    leader.quantization_contract.as_deref(),
+                );
+                let Some(device_index) = self
+                    .devices
+                    .iter()
+                    .position(|device| device.cache.contains(&key))
+                else {
+                    self.release_chunks(&chunks)?;
+                    return Ok(None);
+                };
+                let entry = self.devices[device_index]
+                    .cache
+                    .get(&key)
+                    .expect("resident batch cache hit disappeared");
+                chunks[device_index].push(ResidentTensor {
+                    candidate_index,
+                    device: device_index,
+                    key,
+                    offset: entry.offset,
+                    rows: entry.rows,
+                    transient: false,
+                    newly_admitted: false,
+                });
+                if let Err(error) = validate_entry(
+                    descriptor,
+                    &entry,
+                    leader.scoring_profile,
+                    active_quantizer.as_ref(),
+                ) {
+                    self.release_chunks(&chunks)?;
+                    return Err(error);
+                }
             }
         }
         let mut scores = vec![vec![None; leader.candidate_slice().len()]; requests.len()];
@@ -1094,7 +1341,20 @@ impl Engine {
             }
             Ok(())
         })();
-        let cleanup = self.release_chunks(&chunks);
+        let cleanup = if let Some(plan) = cached_plan {
+            // No cache admission or eviction can interleave this synchronous
+            // call. The generation was checked before using these offsets.
+            self.resident_selection_plans.push_back(plan);
+            Ok(())
+        } else {
+            if self.prepared_candidates_enabled
+                && result.is_ok()
+                && self.prepared_selection_eligible(leader)
+            {
+                self.remember_resident_selection(leader, &chunks, &[]);
+            }
+            self.release_chunks(&chunks)
+        };
         result?;
         cleanup?;
         Ok(Some(attach_candidate_ids(requests, scores)?))
@@ -1402,6 +1662,13 @@ impl Engine {
             "host_admission_rejections": status.host.admission_rejections,
             "batch_read_calls": status.batch_read_calls,
             "batch_read_bytes": status.batch_read_bytes,
+            "prepared_candidates": self.prepared_candidates_enabled.then(|| serde_json::json!({
+                "hits": self.prepared_plan_hits,
+                "misses": self.prepared_plan_misses,
+                "plans": self.resident_selection_plans.len(),
+                "estimated_bytes": self.prepared_plan_bytes,
+                "max_bytes": MAX_PREPARED_SELECTION_BYTES,
+            })),
         })
     }
 
@@ -1484,13 +1751,15 @@ impl Engine {
 
 fn contiguous_resident_plan_indices(
     plans: &VecDeque<ResidentSelectionPlan>,
-    candidates: &Arc<Vec<Descriptor>>,
+    request: &Request,
     generations: &[u64],
 ) -> Vec<usize> {
     let Some(mut cursor) = plans
         .iter()
         .filter(|plan| {
-            Arc::ptr_eq(&plan.candidates, candidates) && plan.device_generations == generations
+            Arc::ptr_eq(&plan.candidates, &request.candidates)
+                && plan.identity.matches(request)
+                && plan.device_generations == generations
         })
         .map(|plan| plan.candidate_start)
         .min()
@@ -1502,7 +1771,8 @@ fn contiguous_resident_plan_indices(
         .iter()
         .enumerate()
         .filter(|(_, plan)| {
-            Arc::ptr_eq(&plan.candidates, candidates)
+            Arc::ptr_eq(&plan.candidates, &request.candidates)
+                && plan.identity.matches(request)
                 && plan.candidate_start == cursor
                 && plan.device_generations == generations
         })
@@ -1869,7 +2139,6 @@ mod tests {
         engine.residency_proofs_enabled = true;
         (engine, ProofTestRoot(root))
     }
-    #[cfg(feature = "backend-cpu")]
     fn proof_request() -> Request {
         Request {
             protocol_version: 5,
@@ -1976,6 +2245,250 @@ mod tests {
         assert_eq!(engine.residency_proof_stats(), Some((0, 2)));
     }
 
+    #[cfg(feature = "backend-cpu")]
+    struct PreparedBatchTestBackend {
+        inner: Box<dyn AcceleratorBackend>,
+        info: DeviceInfo,
+    }
+    #[cfg(feature = "backend-cpu")]
+    impl AcceleratorBackend for PreparedBatchTestBackend {
+        fn info(&self) -> &DeviceInfo {
+            &self.info
+        }
+        fn tensor_bytes(&self) -> usize {
+            self.inner.tensor_bytes()
+        }
+        fn adaptive_status(&self) -> crate::backend::AdaptiveStatus {
+            self.inner.adaptive_status()
+        }
+        fn ensure_quantizer(
+            &mut self,
+            id: &str,
+            payload: &[u8],
+            dimension: u32,
+            stages: u16,
+            subspaces: u16,
+            centroids: u16,
+            rotation_mask: u16,
+        ) -> Result<()> {
+            self.inner.ensure_quantizer(
+                id,
+                payload,
+                dimension,
+                stages,
+                subspaces,
+                centroids,
+                rotation_mask,
+            )
+        }
+        fn retain_quantizers(&mut self, active: &HashSet<String>) {
+            self.inner.retain_quantizers(active);
+        }
+        fn upload_batch(&mut self, items: &[(u64, &[u8])]) -> Result<()> {
+            self.inner.upload_batch(items)
+        }
+        fn score(
+            &mut self,
+            query: &[u8],
+            rows: u32,
+            dimension: u32,
+            dtype: u8,
+            profile: u8,
+            offsets: &[u64],
+            document_rows: &[u32],
+        ) -> Result<Vec<f32>> {
+            self.inner.score(
+                query,
+                rows,
+                dimension,
+                dtype,
+                profile,
+                offsets,
+                document_rows,
+            )
+        }
+        fn score_pq(
+            &mut self,
+            id: &str,
+            query: &[u8],
+            rows: u32,
+            dtype: u8,
+            offsets: &[u64],
+            document_rows: &[u32],
+        ) -> Result<Vec<f32>> {
+            self.inner
+                .score_pq(id, query, rows, dtype, offsets, document_rows)
+        }
+        fn score_batch(
+            &mut self,
+            query: &[u8],
+            query_offsets: &[u32],
+            dimension: u32,
+            dtype: u8,
+            profile: u8,
+            offsets: &[u64],
+            document_rows: &[u32],
+        ) -> Result<Vec<Vec<f32>>> {
+            self.inner.score_batch(
+                query,
+                query_offsets,
+                dimension,
+                dtype,
+                profile,
+                offsets,
+                document_rows,
+            )
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "backend-cpu")]
+    fn prepared_batch_reuses_mapping_and_keeps_duplicates_and_error_leases_correct() {
+        let (mut engine, _root) = proof_engine();
+        engine.set_prepared_candidates_enabled(true);
+        let mut info = engine.devices[0].gpu.info().clone();
+        info.capabilities.fused_multiquery = true;
+        let inner = std::mem::replace(
+            &mut engine.devices[0].gpu,
+            Box::new(crate::cpu::CpuBackend::create(0, 16384, 8192).unwrap()),
+        );
+        engine.devices[0].gpu = Box::new(PreparedBatchTestBackend { inner, info });
+        let mut request = proof_request();
+        let duplicate = Descriptor {
+            candidate_id: 2,
+            ..request.candidates[0].clone()
+        };
+        Arc::make_mut(&mut request.candidates).push(duplicate);
+        request.candidate_end = 2;
+        let key = admit_proof_tensor(&mut engine, &request, true);
+        let baseline = engine.score(&request).unwrap();
+        assert_eq!(baseline, vec![(1, 0.0), (2, 0.0)]);
+        assert_eq!(
+            engine
+                .resident_selection_plans
+                .front()
+                .unwrap()
+                .duplicate_candidates,
+            vec![(1, 0)]
+        );
+        let batch = vec![request.clone(), request.clone()];
+        let hits = engine.devices[0].cache.hits;
+        assert_eq!(
+            engine.score_resident_batch(&batch).unwrap().unwrap(),
+            vec![baseline.clone(), baseline.clone()]
+        );
+        assert_eq!(engine.devices[0].cache.entry(&key).unwrap().references, 0);
+        assert_eq!(engine.devices[0].cache.hits, hits + 2);
+        let mut invalid = batch.clone();
+        invalid[0].query.clear();
+        assert!(engine.score_resident_batch(&invalid).is_err());
+        assert_eq!(engine.devices[0].cache.entry(&key).unwrap().references, 0);
+        assert_eq!(
+            engine.score_resident_batch(&batch).unwrap().unwrap(),
+            vec![baseline.clone(), baseline]
+        );
+        let mut different_tenant = batch.clone();
+        different_tenant[1].tenant = "another-tenant".into();
+        assert!(
+            engine
+                .score_resident_batch(&different_tenant)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "backend-cpu")]
+    fn prepared_fp16_reuses_only_validated_selection_and_preserves_cache_accounting() {
+        let (mut engine, _root) = proof_engine();
+        engine.set_prepared_candidates_enabled(true);
+        let request = proof_request();
+        let key = admit_proof_tensor(&mut engine, &request, true);
+        let first = engine.score(&request).unwrap();
+        assert_eq!(engine.resident_selection_plans.len(), 1);
+        assert_eq!(engine.devices[0].cache.entry(&key).unwrap().references, 0);
+        let hits = engine.devices[0].cache.hits;
+        assert_eq!(engine.score(&request).unwrap(), first);
+        assert_eq!(engine.devices[0].cache.hits, hits + 1);
+        assert_eq!(engine.devices[0].cache.entry(&key).unwrap().references, 0);
+        // FP16 reuses preparation, never the raw-FP8 quantum coalescing policy.
+        assert_eq!(engine.cached_resident_selection_end(&request, 0), None);
+        engine.reload_shards().unwrap();
+        assert!(engine.resident_selection_plans.is_empty());
+        assert_eq!(engine.score(&request).unwrap(), first);
+    }
+
+    #[test]
+    #[cfg(feature = "backend-cpu")]
+    fn prepared_fp16_identity_slice_and_generation_fail_closed() {
+        let (mut engine, _root) = proof_engine();
+        engine.set_prepared_candidates_enabled(true);
+        let request = proof_request();
+        let key = admit_proof_tensor(&mut engine, &request, true);
+        engine.score(&request).unwrap();
+        for kind in 0..9 {
+            let mut changed = request.clone();
+            match kind {
+                0 => changed.tenant = "another-tenant".into(),
+                1 => changed.model_contract = "another-contract".into(),
+                2 => changed.scoring_profile = ScoringProfile::RawFp8E4m3,
+                3 => changed.quantization_contract = Some("another-quantizer".into()),
+                4 => changed.dimension += 1,
+                5 => changed.dtype = 1,
+                6 => changed.candidate_dtype = 1,
+                7 => changed.candidates = Arc::new((*request.candidates).clone()),
+                _ => changed.candidate_end = 0,
+            }
+            let plan = engine.resident_selection_plans.front().unwrap();
+            assert!(
+                !plan.identity.matches(&changed)
+                    || !Arc::ptr_eq(&plan.candidates, &changed.candidates)
+                    || plan.candidate_start != changed.candidate_start
+                    || plan.candidate_end != changed.candidate_end,
+                "scope {kind}"
+            );
+            assert!(
+                engine.score_cached_resident_selection(&changed).is_none(),
+                "scope {kind}"
+            );
+        }
+        engine.devices[0].cache.remove(&key).unwrap();
+        assert!(engine.score_cached_resident_selection(&request).is_none());
+        admit_proof_tensor(&mut engine, &request, true);
+        assert!(engine.score_cached_resident_selection(&request).is_none());
+        assert_eq!(engine.score(&request).unwrap(), vec![(1, 0.0)]);
+    }
+
+    #[test]
+    #[cfg(feature = "backend-cpu")]
+    fn prepared_selection_error_recovery_leaves_no_cache_leases() {
+        let (mut engine, _root) = proof_engine();
+        engine.set_prepared_candidates_enabled(true);
+        let request = proof_request();
+        let key = admit_proof_tensor(&mut engine, &request, true);
+        let first = engine.score(&request).unwrap();
+        let mut invalid = request.clone();
+        invalid.query.clear();
+        assert!(engine.score(&invalid).is_err());
+        assert_eq!(engine.devices[0].cache.entry(&key).unwrap().references, 0);
+        assert_eq!(engine.score(&request).unwrap(), first);
+        assert_eq!(engine.devices[0].cache.entry(&key).unwrap().references, 0);
+    }
+
+    #[test]
+    #[cfg(feature = "backend-cpu")]
+    fn prepared_selection_memory_includes_retained_descriptor_storage() {
+        let (mut engine, _root) = proof_engine();
+        engine.set_prepared_candidates_enabled(true);
+        let mut request = proof_request();
+        // Capacity is retained even when a descriptor string is empty.
+        Arc::make_mut(&mut request.candidates)[0].contract =
+            String::with_capacity(MAX_PREPARED_SELECTION_BYTES);
+        engine.remember_resident_selection(&request, &[Vec::new()], &[]);
+        assert!(engine.resident_selection_plans.is_empty());
+        assert_eq!(engine.prepared_selection_bytes(), 0);
+    }
+
     #[test]
     fn automatic_quantum_requires_a_useful_bucket_on_every_device() {
         let devices = vec![
@@ -2029,8 +2542,14 @@ mod tests {
             descriptor(4, "d", 1),
         ]);
         let other_candidates = Arc::new((*candidates).clone());
+        let mut request = proof_request();
+        request.candidates = Arc::clone(&candidates);
+        request.candidate_end = candidates.len();
+        request.scoring_profile = ScoringProfile::RawFp8E4m3;
         let plan =
             |candidates: &Arc<Vec<Descriptor>>, start, end, generation| ResidentSelectionPlan {
+                identity: ResidentPlanIdentity::of(&request),
+                candidate_bytes: 0,
                 candidates: Arc::clone(candidates),
                 candidate_start: start,
                 candidate_end: end,
@@ -2047,10 +2566,10 @@ mod tests {
         ]);
 
         assert_eq!(
-            contiguous_resident_plan_indices(&plans, &candidates, &[7]),
+            contiguous_resident_plan_indices(&plans, &request, &[7]),
             vec![0, 2]
         );
-        assert!(contiguous_resident_plan_indices(&plans, &candidates, &[8]).is_empty());
+        assert!(contiguous_resident_plan_indices(&plans, &request, &[8]).is_empty());
     }
 
     #[test]

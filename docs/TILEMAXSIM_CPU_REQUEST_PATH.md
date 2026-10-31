@@ -35,3 +35,28 @@ The request log's `protocol_version` identifies negotiated persistent frames.
 Do not infer complete application throughput, cold-data performance, or relevance
 quality from a hot scorer-only benchmark. Encoding precomputation is not part of
 this change.
+
+## Opt-in exact-FP16 prepared resident selections
+
+`TILEMAXSIM_PREPARED_CANDIDATES=1` enables preparation reuse for exact-FP16
+single-query and fused scoring in the daemon. It does not change PostgreSQL
+visibility checks, descriptor loading, wire precision, scoring kernels, or the
+scheduler's candidate/token/FMA quantum limits. The default remains disabled.
+
+A reusable plan is keyed by the immutable candidate `Arc`, the exact selected
+interval, tenant, model contract, profile, quantization contract, query and
+candidate dtypes, dimension, and every device cache generation. Plans are built
+only after full residency and descriptor validation, and a structural cache
+change or shard reload prevents reuse. Cached scoring still updates TinyLFU and
+hit counters; batch scoring preserves the original per-logical-candidate cache
+access policy even if the preparation originated from deduplicated single-query
+scoring. A synchronous engine call owns the arena while a checked plan is used;
+these plans are not asynchronous GPU leases.
+
+The cache is bounded to 64 plans and, when enabled, an estimated 64 MiB including
+retained descriptor storage and prepared metadata. Repeated references to the
+same candidate `Arc` count its storage once. `status_json` request cache snapshots
+include `prepared_candidates` with hits, misses, plan count and estimated bytes.
+The existing raw-FP8 preparation/coalescing behavior remains available; FP16 never
+uses its enlarged-quantum path. Warmup must complete GPU admission and then
+populate the exact intervals before steady-state comparisons.
