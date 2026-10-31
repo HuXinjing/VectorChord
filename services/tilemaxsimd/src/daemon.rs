@@ -236,6 +236,9 @@ struct Args {
     max_tenant_queued_requests: usize,
     #[arg(long, default_value_t = 5000)]
     socket_io_timeout_ms: u64,
+    /// Reuse positive, generation-scoped readiness observations.
+    #[arg(long)]
+    resident_readiness_proofs: bool,
     /// Idle lifetime of a negotiated persistent scoring connection after a response.
     #[arg(long, default_value_t = 60_000)]
     persistent_idle_timeout_ms: u64,
@@ -512,6 +515,7 @@ where
             "max_inflight_request_gb": args.max_inflight_request_gb as f64 / GIB as f64,
             "socket_io_timeout_ms": args.socket_io_timeout_ms,
             "persistent_idle_timeout_ms": args.persistent_idle_timeout_ms,
+            "resident_readiness_proofs": args.resident_readiness_proofs,
             "request_timeout_ms": args.request_timeout_ms,
         },
         "scheduler": {
@@ -553,6 +557,7 @@ where
             "forced_kernel_selection": false,
         }
     }));
+    engine.set_residency_proofs_enabled(args.resident_readiness_proofs);
     metrics.update_engine(engine.status_snapshot());
     install_signal_handlers()?;
     let ready_cache = engine.status_json();

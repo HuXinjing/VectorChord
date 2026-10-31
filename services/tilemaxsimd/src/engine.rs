@@ -16,7 +16,7 @@ use crate::shard::{HostCacheStatus, ShardStore, cache_key};
 use anyhow::{Result, anyhow, bail};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::mem::size_of;
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 struct MissingTensor {
     candidate_index: usize,
@@ -54,12 +54,45 @@ struct DeviceState {
     h2d_bytes: u64,
 }
 
+// Positive-only observation proof. It neither pins tensors nor skips score-time
+// validation. Arc identity and every structural cache generation must still match.
+struct ResidencyProof {
+    candidates: Weak<Vec<Descriptor>>,
+    start: usize,
+    end: usize,
+    tenant: String,
+    model_contract: String,
+    profile: ScoringProfile,
+    quantization_contract: Option<String>,
+    generations: Vec<u64>,
+}
+impl ResidencyProof {
+    fn matches(&self, request: &Request, generations: &[u64]) -> bool {
+        Weak::ptr_eq(&self.candidates, &Arc::downgrade(&request.candidates))
+            && self.start == request.candidate_start
+            && self.end == request.candidate_end
+            && self.tenant == request.tenant
+            && self.model_contract == request.model_contract
+            && self.profile == request.scoring_profile
+            && self.quantization_contract == request.quantization_contract
+            && self.generations == generations
+    }
+}
+#[derive(Default)]
+struct ResidencyProofs {
+    entries: VecDeque<ResidencyProof>,
+    hits: u64,
+    checks: u64,
+}
+
 pub struct Engine {
     devices: Vec<DeviceState>,
     store: ShardStore,
     next_device: usize,
     quantization_registry: Option<QuantizationRegistry>,
     resident_selection_plans: VecDeque<ResidentSelectionPlan>,
+    residency_proofs_enabled: bool,
+    residency_proofs: Mutex<ResidencyProofs>,
 }
 
 type BatchedCandidateScores = Vec<Vec<(u32, f32)>>;
@@ -185,10 +218,17 @@ impl Engine {
             next_device: 0,
             quantization_registry,
             resident_selection_plans: VecDeque::new(),
+            residency_proofs_enabled: false,
+            residency_proofs: Mutex::new(ResidencyProofs::default()),
         })
     }
 
     pub fn reload_shards(&mut self) -> Result<()> {
+        self.residency_proofs
+            .get_mut()
+            .unwrap_or_else(|e| e.into_inner())
+            .entries
+            .clear();
         self.store.reload()
     }
 
@@ -1368,8 +1408,32 @@ impl Engine {
     /// Whether every descriptor in this exact request is currently GPU-resident.
     /// This is a snapshot, not a promise that an LRU entry cannot be evicted later.
     pub fn candidates_resident(&self, request: &Request) -> bool {
+        let generations = if self.residency_proofs_enabled {
+            self.devices
+                .iter()
+                .map(|d| d.cache.generation())
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
+        let mut proofs = self.residency_proofs_enabled.then(|| {
+            self.residency_proofs
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+        });
+        if let Some(proofs) = proofs.as_mut() {
+            if proofs
+                .entries
+                .iter()
+                .any(|p| p.matches(request, &generations))
+            {
+                proofs.hits = proofs.hits.saturating_add(1);
+                return true;
+            }
+            proofs.checks = proofs.checks.saturating_add(1);
+        }
         let candidates = request.candidate_slice();
-        !candidates.is_empty()
+        let resident = !candidates.is_empty()
             && candidates.iter().all(|descriptor| {
                 let key = gpu_cache_key(
                     descriptor,
@@ -1379,7 +1443,42 @@ impl Engine {
                 self.devices
                     .iter()
                     .any(|device| device.cache.contains(&key))
-            })
+            });
+        if resident && let Some(proofs) = proofs.as_mut() {
+            if proofs.entries.len() >= MAX_RESIDENT_SELECTION_PLANS {
+                proofs.entries.pop_front();
+            }
+            proofs.entries.push_back(ResidencyProof {
+                candidates: Arc::downgrade(&request.candidates),
+                start: request.candidate_start,
+                end: request.candidate_end,
+                tenant: request.tenant.clone(),
+                model_contract: request.model_contract.clone(),
+                profile: request.scoring_profile,
+                quantization_contract: request.quantization_contract.clone(),
+                generations,
+            });
+        }
+        resident
+    }
+
+    pub fn set_residency_proofs_enabled(&mut self, enabled: bool) {
+        self.residency_proofs_enabled = enabled;
+        self.residency_proofs
+            .get_mut()
+            .unwrap_or_else(|error| error.into_inner())
+            .entries
+            .clear();
+    }
+
+    pub fn residency_proof_stats(&self) -> Option<(u64, u64)> {
+        self.residency_proofs_enabled.then(|| {
+            let p = self
+                .residency_proofs
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            (p.hits, p.checks)
+        })
     }
 }
 
@@ -1734,6 +1833,147 @@ mod tests {
             threshold_query_rows: if useful { 64 } else { u32::MAX },
             ..Default::default()
         }
+    }
+
+    #[cfg(feature = "backend-cpu")]
+    struct ProofTestRoot(std::path::PathBuf);
+    #[cfg(feature = "backend-cpu")]
+    impl Drop for ProofTestRoot {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+    #[cfg(feature = "backend-cpu")]
+    fn proof_engine() -> (Engine, ProofTestRoot) {
+        let root = std::env::temp_dir().join(format!(
+            "residency-proof-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir(&root).unwrap();
+        let store =
+            ShardStore::open(&[("contract-a".into(), root.clone())], 1024, 100, false).unwrap();
+        let mut engine = Engine::new(
+            vec![crate::cpu::CpuBackend::create(0, 16384, 8192).unwrap()],
+            256,
+            store,
+            100,
+            100,
+            &HashMap::new(),
+            None,
+        )
+        .unwrap();
+        engine.residency_proofs_enabled = true;
+        (engine, ProofTestRoot(root))
+    }
+    #[cfg(feature = "backend-cpu")]
+    fn proof_request() -> Request {
+        Request {
+            protocol_version: 5,
+            request_id: 1,
+            tenant: "tenant-a".into(),
+            model_contract: "contract-a".into(),
+            priority: 0,
+            timeout_ms: 1000,
+            query_rows: 1,
+            dimension: 320,
+            dtype: 2,
+            candidate_dtype: 2,
+            scoring_profile: ScoringProfile::ExactFp16,
+            quantization_contract: None,
+            top_k: None,
+            query: vec![0; 640],
+            candidates: Arc::new(vec![descriptor(1, "content-a", 1)]),
+            candidate_start: 0,
+            candidate_end: 1,
+            manifest_digest: None,
+            catalog_digest: None,
+            catalog_selection_digest: None,
+            catalog_public_ids: Vec::new(),
+            catalog_registration: false,
+            scoped_candidate_ordinals: Vec::new(),
+        }
+    }
+    #[cfg(feature = "backend-cpu")]
+    fn admit_proof_tensor(engine: &mut Engine, request: &Request, ready: bool) -> String {
+        let key = gpu_cache_key(&request.candidates[0], request.scoring_profile, None).to_string();
+        assert!(matches!(
+            engine.devices[0]
+                .cache
+                .admit(key.clone(), 640, 1, 320, 2, false, true),
+            Admission::Admitted { .. }
+        ));
+        if ready {
+            engine.devices[0].cache.mark_ready(&key).unwrap();
+        }
+        engine.devices[0].cache.release(&key).unwrap();
+        key
+    }
+    #[test]
+    #[cfg(feature = "backend-cpu")]
+    fn residency_proof_never_caches_loading_or_absent_entries() {
+        let (mut engine, _root) = proof_engine();
+        let request = proof_request();
+        let key = admit_proof_tensor(&mut engine, &request, false);
+        assert!(!engine.candidates_resident(&request));
+        assert!(!engine.candidates_resident(&request));
+        let generation = engine.devices[0].cache.generation();
+        engine.devices[0].cache.mark_ready(&key).unwrap();
+        assert_eq!(engine.devices[0].cache.generation(), generation);
+        assert!(engine.candidates_resident(&request));
+        assert!(engine.candidates_resident(&request));
+        assert_eq!(engine.residency_proof_stats(), Some((1, 3)));
+        engine.devices[0].cache.remove(&key).unwrap();
+        assert!(!engine.candidates_resident(&request));
+        admit_proof_tensor(&mut engine, &request, true);
+        assert!(engine.candidates_resident(&request));
+        assert_eq!(engine.residency_proof_stats(), Some((1, 5)));
+    }
+    #[test]
+    #[cfg(feature = "backend-cpu")]
+    fn residency_proof_scopes_identity_contract_and_reload() {
+        let (mut engine, _root) = proof_engine();
+        let request = proof_request();
+        admit_proof_tensor(&mut engine, &request, true);
+        assert!(engine.candidates_resident(&request));
+        let original = engine
+            .residency_proofs
+            .lock()
+            .unwrap()
+            .entries
+            .pop_front()
+            .unwrap();
+        let generations = vec![engine.devices[0].cache.generation()];
+        assert!(original.matches(&request, &generations));
+        for kind in 0..7 {
+            let mut changed = request.clone();
+            match kind {
+                0 => changed.tenant = "tenant-b".into(),
+                1 => changed.model_contract = "contract-b".into(),
+                2 => changed.scoring_profile = ScoringProfile::Int8,
+                3 => changed.quantization_contract = Some("quantizer-b".into()),
+                4 => changed.candidates = Arc::new((*request.candidates).clone()),
+                5 => changed.candidate_end = 0,
+                _ => {
+                    Arc::make_mut(&mut changed.candidates)[0].rows += 1;
+                }
+            }
+            assert!(!original.matches(&changed, &generations), "scope {kind}");
+        }
+        assert!(!original.matches(&request, &[generations[0] + 1]));
+        engine
+            .residency_proofs
+            .lock()
+            .unwrap()
+            .entries
+            .push_back(original);
+        engine.reload_shards().unwrap();
+        assert!(engine.residency_proofs.lock().unwrap().entries.is_empty());
+        assert!(engine.candidates_resident(&request));
+        assert_eq!(engine.residency_proof_stats(), Some((0, 2)));
     }
 
     #[test]
