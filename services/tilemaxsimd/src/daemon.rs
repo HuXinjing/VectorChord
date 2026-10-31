@@ -239,6 +239,9 @@ struct Args {
     /// Reuse positive, generation-scoped readiness observations.
     #[arg(long)]
     resident_readiness_proofs: bool,
+    /// Deduct time already spent ready from the microbatch collection window.
+    #[arg(long)]
+    prepared_batch_window: bool,
     /// Idle lifetime of a negotiated persistent scoring connection after a response.
     #[arg(long, default_value_t = 60_000)]
     persistent_idle_timeout_ms: u64,
@@ -515,6 +518,7 @@ where
             "max_inflight_request_gb": args.max_inflight_request_gb as f64 / GIB as f64,
             "socket_io_timeout_ms": args.socket_io_timeout_ms,
             "persistent_idle_timeout_ms": args.persistent_idle_timeout_ms,
+            "prepared_batch_window": args.prepared_batch_window,
             "resident_readiness_proofs": args.resident_readiness_proofs,
             "request_timeout_ms": args.request_timeout_ms,
         },
@@ -585,6 +589,8 @@ where
         quantum_tokens: args.scheduler_quantum_tokens,
         quantum_fmas: args.scheduler_quantum_fmas,
         max_microbatch_requests: args.scheduler_max_microbatch_requests,
+        max_ingress_drain: args.max_queued_requests,
+        prepared_batch_window: args.prepared_batch_window,
         min_shared_candidates_milli: args.scheduler_min_shared_candidates_milli,
         socket_io_timeout: Duration::from_millis(args.socket_io_timeout_ms),
         tenant_weights,
@@ -936,6 +942,7 @@ struct Work {
     connection: ClientStream,
     accepted_at: Instant,
     deadline: Instant,
+    ready_at: Instant,
     frame_read_elapsed: Duration,
     parse_elapsed: Duration,
     next_candidate: usize,
@@ -970,6 +977,8 @@ struct SchedulerConfig {
     quantum_tokens: u64,
     quantum_fmas: u64,
     max_microbatch_requests: usize,
+    max_ingress_drain: usize,
+    prepared_batch_window: bool,
     min_shared_candidates_milli: u16,
     socket_io_timeout: Duration,
     tenant_weights: std::collections::HashMap<String, f64>,
@@ -1776,6 +1785,7 @@ fn read_and_enqueue(
         };
         let (completion, completed) = mpsc::sync_channel(1);
         match sender.try_send(Work {
+            ready_at: Instant::now(),
             request,
             connection: response_connection,
             accepted_at,
@@ -1872,6 +1882,10 @@ fn bind_fused_scores(
         .collect())
 }
 
+fn prepared_batch_deadline(ready: Instant, deadline: Instant, window: Duration) -> Instant {
+    ready.checked_add(window).unwrap_or(deadline).min(deadline)
+}
+
 fn run_scheduler(
     mut engine: Engine,
     receiver: mpsc::Receiver<Work>,
@@ -1941,6 +1955,19 @@ fn run_scheduler(
                 Err(mpsc::RecvTimeoutError::Disconnected) => channel_open = false,
             }
         }
+        if config.prepared_batch_window && channel_open {
+            // Keep control-plane progress bounded and preserve queue fairness.
+            for _ in 0..config.max_ingress_drain {
+                match receiver.try_recv() {
+                    Ok(work) => enqueue_work(&mut queue, work, &config, &metrics),
+                    Err(mpsc::TryRecvError::Empty) => break,
+                    Err(mpsc::TryRecvError::Disconnected) => {
+                        channel_open = false;
+                        break;
+                    }
+                }
+            }
+        }
         // Only a newly admitted normal-priority request may pay the batching
         // window. High-priority traffic and requeued long requests proceed
         // immediately at their next cooperative quantum boundary.
@@ -1952,7 +1979,12 @@ fn run_scheduler(
                 .unwrap_or(0)
                 <= 0;
         if may_wait_for_batch {
-            let batching_deadline = Instant::now() + config.batch_window;
+            let batching_deadline = if config.prepared_batch_window {
+                let work = &queue.iter().next().expect("one queued request").payload;
+                prepared_batch_deadline(work.ready_at, work.deadline, config.batch_window)
+            } else {
+                Instant::now() + config.batch_window
+            };
             loop {
                 let remaining = batching_deadline.saturating_duration_since(Instant::now());
                 if remaining.is_zero() {
@@ -3958,6 +3990,29 @@ fn load_resident_manifests(values: &[(String, PathBuf)]) -> Result<Vec<protocol:
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn prepared_batch_window_uses_only_remaining_budget_and_caps_deadline() {
+        use std::time::{Duration, Instant};
+        let now = Instant::now();
+        let deadline = now + Duration::from_secs(1);
+        assert_eq!(
+            super::prepared_batch_deadline(
+                now - Duration::from_millis(5),
+                deadline,
+                Duration::from_millis(2)
+            ),
+            now - Duration::from_millis(3)
+        );
+        assert_eq!(
+            super::prepared_batch_deadline(now, deadline, Duration::from_millis(2)),
+            now + Duration::from_millis(2)
+        );
+        let short = now + Duration::from_micros(50);
+        assert_eq!(
+            super::prepared_batch_deadline(now, short, Duration::from_millis(2)),
+            short
+        );
+    }
     #[test]
     fn microbatch_scores_follow_slots_when_connections_reuse_wire_ids() {
         let elapsed = std::time::Duration::from_micros(13);
