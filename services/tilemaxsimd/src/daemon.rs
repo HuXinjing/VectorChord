@@ -4872,3 +4872,7 @@ mod tests {
         assert!(!output.contains("tenant-a"));
     }
 }
+
+#[cfg(all(test, feature = "backend-cpu"))]
+#[path = "daemon_batch_lifecycle_tests.rs"]
+mod batch_lifecycle_tests;
