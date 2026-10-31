@@ -242,6 +242,9 @@ struct Args {
     /// Deduct time already spent ready from the microbatch collection window.
     #[arg(long)]
     prepared_batch_window: bool,
+    /// Emit a full cache snapshot every N request logs; basic request logs remain.
+    #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u64).range(1..))]
+    cache_log_interval: u64,
     /// Idle lifetime of a negotiated persistent scoring connection after a response.
     #[arg(long, default_value_t = 60_000)]
     persistent_idle_timeout_ms: u64,
@@ -520,6 +523,7 @@ where
             "persistent_idle_timeout_ms": args.persistent_idle_timeout_ms,
             "prepared_batch_window": args.prepared_batch_window,
             "resident_readiness_proofs": args.resident_readiness_proofs,
+            "cache_log_interval": args.cache_log_interval,
             "request_timeout_ms": args.request_timeout_ms,
         },
         "scheduler": {
@@ -591,6 +595,7 @@ where
         max_microbatch_requests: args.scheduler_max_microbatch_requests,
         max_ingress_drain: args.max_queued_requests,
         prepared_batch_window: args.prepared_batch_window,
+        cache_log_interval: args.cache_log_interval,
         min_shared_candidates_milli: args.scheduler_min_shared_candidates_milli,
         socket_io_timeout: Duration::from_millis(args.socket_io_timeout_ms),
         tenant_weights,
@@ -979,6 +984,7 @@ struct SchedulerConfig {
     max_microbatch_requests: usize,
     max_ingress_drain: usize,
     prepared_batch_window: bool,
+    cache_log_interval: u64,
     min_shared_candidates_milli: u16,
     socket_io_timeout: Duration,
     tenant_weights: std::collections::HashMap<String, f64>,
@@ -1901,6 +1907,7 @@ fn run_scheduler(
         config.priority_band,
         config.tenant_weights.clone(),
     );
+    let mut cache_log_sequence = 0u64;
     let mut channel_open = true;
     while channel_open || !queue.is_empty() {
         for command in admin_receiver.try_iter() {
@@ -2220,6 +2227,10 @@ fn run_scheduler(
             write_response_nonfatal(&mut work.connection, &response);
             notify_completion(&work);
             metrics.observe_latency(work.accepted_at.elapsed(), work.gpu_elapsed);
+            cache_log_sequence = cache_log_sequence.wrapping_add(1);
+            let cache_snapshot_sampled = cache_log_sequence
+                .wrapping_sub(1)
+                .is_multiple_of(config.cache_log_interval);
             println!(
                 "{}",
                 serde_json::json!({
@@ -2240,7 +2251,8 @@ fn run_scheduler(
                         .saturating_sub(work.frame_read_elapsed)
                         .saturating_sub(work.parse_elapsed).as_secs_f64() * 1000.0,
                     "queue_depth": queue.len(),
-                    "cache": engine.status_json(),
+                    "cache_snapshot_sampled": cache_snapshot_sampled,
+                    "cache": if cache_snapshot_sampled { engine.status_json() } else { serde_json::Value::Null },
                 })
             );
         }
