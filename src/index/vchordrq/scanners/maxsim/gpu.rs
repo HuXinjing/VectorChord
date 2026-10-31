@@ -1954,26 +1954,20 @@ impl TileMaxsimTransport for UnixSocketTransport {
         let request_version = request
             .get(4..6)
             .map(|bytes| u16::from_le_bytes(bytes.try_into().unwrap()));
-        let persistent_version = match request_version {
-            Some(CATALOG_SELECTION_REFERENCE_VERSION) => {
-                Some(PERSISTENT_CATALOG_SELECTION_REFERENCE_VERSION)
-            }
-            Some(SCOPED_CATALOG_SELECTION_REFERENCE_VERSION) => {
-                Some(PERSISTENT_SCOPED_CATALOG_SELECTION_REFERENCE_VERSION)
-            }
-            _ => None,
-        };
+        let persistent_version = request_version.and_then(tilemaxsim_protocol::persistent_version);
         if let Some(persistent_version) = persistent_version
             && persistent_capability(&self.endpoint, persistent_version) != Some(false)
         {
             let mut persistent_request = request.to_vec();
             persistent_request[4..6].copy_from_slice(&persistent_version.to_le_bytes());
-            let (mut stream, reused) = take_persistent_transport(&self.endpoint)
-                .map(|stream| (stream, true))
-                .unwrap_or((
+            // Do not eagerly connect while a validated pooled socket exists.
+            let (mut stream, reused) = match take_persistent_transport(&self.endpoint) {
+                Some(stream) => (stream, true),
+                None => (
                     connect_endpoint_interruptible(&self.endpoint, deadline)?,
                     false,
-                ));
+                ),
+            };
             let response = match exchange_frame(
                 &mut stream,
                 &persistent_request,
@@ -2643,6 +2637,49 @@ mod tests {
                 SCOPED_CATALOG_SELECTION_REFERENCE_VERSION,
             ]
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn catalog_and_manifest_reuse_without_speculative_connections() {
+        for version in [
+            MANIFEST_LOGICAL_EXTERNAL_VERSION,
+            CATALOG_LOGICAL_EXTERNAL_VERSION,
+        ] {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let endpoint = format!("tcp://{}", listener.local_addr().unwrap());
+            let server = thread::spawn(move || {
+                let (mut stream, _) = listener.accept().unwrap();
+                for id in [91, 92] {
+                    let (received, request_id) = read_transport_test_frame(&mut stream);
+                    assert_eq!(
+                        received,
+                        tilemaxsim_protocol::persistent_version(version).unwrap()
+                    );
+                    assert_eq!(request_id, id);
+                    write_transport_test_response(&mut stream, received, request_id);
+                }
+                listener.set_nonblocking(true).unwrap();
+                assert!(
+                    matches!(listener.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock)
+                );
+            });
+            let mut transport = UnixSocketTransport::new(endpoint);
+            for id in [91, 92] {
+                let response = transport
+                    .round_trip(
+                        &transport_test_frame(version, id),
+                        Duration::from_secs(2),
+                        HEADER_LEN + 8,
+                    )
+                    .unwrap();
+                assert_eq!(
+                    u16::from_le_bytes(response[4..6].try_into().unwrap()),
+                    version
+                );
+            }
+            server.join().unwrap();
+        }
     }
 
     struct MockTensorSource(BTreeMap<HeapKey, Vec<OwnedVector>>);

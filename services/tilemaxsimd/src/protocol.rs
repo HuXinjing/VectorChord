@@ -274,7 +274,17 @@ pub fn parse(frame: &[u8]) -> Result<Request> {
     if &frame[..4] != MAGIC {
         bail!("invalid protocol magic");
     }
-    let version = u16::from_le_bytes(frame[4..6].try_into().unwrap());
+    let wire_version = u16::from_le_bytes(frame[4..6].try_into().unwrap());
+    // Decode the identical legacy payload without duplicating its validation.
+    let version = match wire_version {
+        tilemaxsim_protocol::VERSION_PERSISTENT_CATALOG_LOGICAL_EXTERNAL => {
+            VERSION_CATALOG_LOGICAL_EXTERNAL
+        }
+        tilemaxsim_protocol::VERSION_PERSISTENT_MANIFEST_LOGICAL_EXTERNAL => {
+            VERSION_MANIFEST_LOGICAL_EXTERNAL
+        }
+        _ => wire_version,
+    };
     let kind = u16::from_le_bytes(frame[6..8].try_into().unwrap());
     let request_id = u64::from_le_bytes(frame[8..16].try_into().unwrap());
     let body_bytes = u64::from_le_bytes(frame[16..24].try_into().unwrap());
@@ -295,7 +305,7 @@ pub fn parse(frame: &[u8]) -> Result<Request> {
             | VERSION_PERSISTENT_CATALOG_SELECTION_REFERENCE
     ) || kind != REQUEST_KIND
     {
-        bail!("Rust daemon requires TileMaxSim external protocol v2 through v14");
+        bail!("Rust daemon requires TileMaxSim external protocol v2 through v16");
     }
     if usize::try_from(body_bytes).ok() != Some(frame.len() - HEADER_BYTES) {
         bail!("request body length mismatch");
@@ -724,7 +734,7 @@ pub fn parse(frame: &[u8]) -> Result<Request> {
     let candidates = Arc::new(candidates);
     let candidate_end = candidates.len();
     Ok(Request {
-        protocol_version: version,
+        protocol_version: wire_version,
         request_id,
         tenant,
         model_contract: contract,
@@ -1061,6 +1071,19 @@ mod tests {
         assert_eq!(request.candidate_dtype, 3);
         assert!(request.candidates.is_empty());
         assert_eq!(request.manifest_digest, Some([0xcd; 32]));
+        frame[4..6].copy_from_slice(
+            &tilemaxsim_protocol::VERSION_PERSISTENT_MANIFEST_LOGICAL_EXTERNAL.to_le_bytes(),
+        );
+        let persistent = parse(&frame).unwrap();
+        assert_eq!(
+            persistent.protocol_version,
+            tilemaxsim_protocol::VERSION_PERSISTENT_MANIFEST_LOGICAL_EXTERNAL
+        );
+        assert_eq!(persistent.manifest_digest, request.manifest_digest);
+        assert_eq!(persistent.top_k, request.top_k);
+        assert_eq!(persistent.query, request.query);
+        frame.push(0);
+        assert!(parse(&frame).is_err());
     }
 
     #[test]
@@ -1094,6 +1117,20 @@ mod tests {
         let request = parse(&frame).unwrap();
         assert_eq!(request.catalog_digest, Some([0xcd; 32]));
         assert_eq!(request.catalog_public_ids, vec![7, 10, 310]);
+        frame[4..6].copy_from_slice(
+            &tilemaxsim_protocol::VERSION_PERSISTENT_CATALOG_LOGICAL_EXTERNAL.to_le_bytes(),
+        );
+        let persistent = parse(&frame).unwrap();
+        assert_eq!(
+            persistent.protocol_version,
+            tilemaxsim_protocol::VERSION_PERSISTENT_CATALOG_LOGICAL_EXTERNAL
+        );
+        assert_eq!(persistent.catalog_public_ids, request.catalog_public_ids);
+        assert_eq!(persistent.catalog_digest, request.catalog_digest);
+        assert_eq!(persistent.top_k, request.top_k);
+        assert_eq!(persistent.query, request.query);
+        frame.push(0);
+        assert!(parse(&frame).is_err());
         assert!(!request.catalog_registration);
         assert!(request.candidates.is_empty());
     }

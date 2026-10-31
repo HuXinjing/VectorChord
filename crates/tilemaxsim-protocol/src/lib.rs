@@ -17,6 +17,36 @@ pub const VERSION_PERSISTENT_CATALOG_SELECTION_REFERENCE: u16 = 14;
 use sha2::{Digest, Sha256};
 use std::fmt;
 
+/// Persistent equivalents preserve the complete v10 catalog/v9 manifest payload.
+pub const VERSION_PERSISTENT_CATALOG_LOGICAL_EXTERNAL: u16 = 15;
+pub const VERSION_PERSISTENT_MANIFEST_LOGICAL_EXTERNAL: u16 = 16;
+
+pub fn persistent_version(version: u16) -> Option<u16> {
+    match version {
+        VERSION_CATALOG_LOGICAL_EXTERNAL => Some(VERSION_PERSISTENT_CATALOG_LOGICAL_EXTERNAL),
+        9 => Some(VERSION_PERSISTENT_MANIFEST_LOGICAL_EXTERNAL),
+        VERSION_CATALOG_SELECTION_REFERENCE => Some(VERSION_PERSISTENT_CATALOG_SELECTION_REFERENCE),
+        VERSION_SCOPED_CATALOG_SELECTION_REFERENCE => {
+            Some(VERSION_PERSISTENT_SCOPED_CATALOG_SELECTION_REFERENCE)
+        }
+        _ => None,
+    }
+}
+pub fn one_shot_version(version: u16) -> u16 {
+    match version {
+        VERSION_PERSISTENT_CATALOG_LOGICAL_EXTERNAL => VERSION_CATALOG_LOGICAL_EXTERNAL,
+        VERSION_PERSISTENT_MANIFEST_LOGICAL_EXTERNAL => 9,
+        VERSION_PERSISTENT_CATALOG_SELECTION_REFERENCE => VERSION_CATALOG_SELECTION_REFERENCE,
+        VERSION_PERSISTENT_SCOPED_CATALOG_SELECTION_REFERENCE => {
+            VERSION_SCOPED_CATALOG_SELECTION_REFERENCE
+        }
+        _ => version,
+    }
+}
+pub fn is_persistent_version(version: u16) -> bool {
+    one_shot_version(version) != version
+}
+
 const MAGIC: &[u8; 4] = b"VCTM";
 const REQUEST_KIND: u16 = 1;
 const RESPONSE_KIND: u16 = 2;

@@ -30,11 +30,7 @@ use crate::backend::{AcceleratorBackend, ConformanceReport, run_conformance_prob
 use crate::backend_sdk::{BackendProvider, validate_provider};
 use crate::dispatch::{self, DispatchInput, DispatchThresholds, KernelKind};
 use crate::engine::{Engine, EngineStatus};
-use crate::protocol::{
-    self, HEADER_BYTES, VERSION_COMPACT_LOGICAL_EXTERNAL, VERSION_EXTERNAL,
-    VERSION_LOGICAL_EXTERNAL, VERSION_PROFILED_EXTERNAL, VERSION_QUANTIZED_EXTERNAL,
-    VERSION_SCHEDULED_EXTERNAL,
-};
+use crate::protocol::{self, HEADER_BYTES, VERSION_EXTERNAL};
 use crate::quant::QuantizationRegistry;
 use crate::scheduler::{RequestQueue, Scheduled, SchedulerPolicy};
 use crate::shard::ShardStore;
@@ -1793,11 +1789,7 @@ fn read_and_enqueue(
                     return;
                 }
                 completed_requests = completed_requests.saturating_add(1);
-                if !matches!(
-                    version,
-                    protocol::VERSION_PERSISTENT_SCOPED_CATALOG_SELECTION_REFERENCE
-                        | protocol::VERSION_PERSISTENT_CATALOG_SELECTION_REFERENCE
-                ) {
+                if !tilemaxsim_protocol::is_persistent_version(version) {
                     return;
                 }
                 if connection
@@ -2195,6 +2187,7 @@ fn run_scheduler(
                 "{}",
                 serde_json::json!({
                     "event": "tilemaxsim_rust_request",
+                    "protocol_version": version,
                     "request_id": request_id,
                     "candidate_count": work.request.candidates.len(),
                     "top_k": work.request.top_k,
@@ -3847,34 +3840,13 @@ fn header_version(frame: &[u8]) -> u16 {
     if frame.len() < HEADER_BYTES {
         VERSION_EXTERNAL
     } else {
-        match u16::from_le_bytes(frame[4..6].try_into().unwrap()) {
-            VERSION_SCHEDULED_EXTERNAL => VERSION_SCHEDULED_EXTERNAL,
-            VERSION_PROFILED_EXTERNAL => VERSION_PROFILED_EXTERNAL,
-            VERSION_QUANTIZED_EXTERNAL => VERSION_QUANTIZED_EXTERNAL,
-            VERSION_LOGICAL_EXTERNAL => VERSION_LOGICAL_EXTERNAL,
-            VERSION_COMPACT_LOGICAL_EXTERNAL => VERSION_COMPACT_LOGICAL_EXTERNAL,
-            protocol::VERSION_TYPED_COMPACT_LOGICAL_EXTERNAL => {
-                protocol::VERSION_TYPED_COMPACT_LOGICAL_EXTERNAL
-            }
-            protocol::VERSION_MANIFEST_LOGICAL_EXTERNAL => {
-                protocol::VERSION_MANIFEST_LOGICAL_EXTERNAL
-            }
-            protocol::VERSION_CATALOG_LOGICAL_EXTERNAL => {
-                protocol::VERSION_CATALOG_LOGICAL_EXTERNAL
-            }
-            protocol::VERSION_CATALOG_SELECTION_REFERENCE => {
-                protocol::VERSION_CATALOG_SELECTION_REFERENCE
-            }
-            protocol::VERSION_SCOPED_CATALOG_SELECTION_REFERENCE => {
-                protocol::VERSION_SCOPED_CATALOG_SELECTION_REFERENCE
-            }
-            protocol::VERSION_PERSISTENT_SCOPED_CATALOG_SELECTION_REFERENCE => {
-                protocol::VERSION_PERSISTENT_SCOPED_CATALOG_SELECTION_REFERENCE
-            }
-            protocol::VERSION_PERSISTENT_CATALOG_SELECTION_REFERENCE => {
-                protocol::VERSION_PERSISTENT_CATALOG_SELECTION_REFERENCE
-            }
-            _ => VERSION_EXTERNAL,
+        let version = u16::from_le_bytes(frame[4..6].try_into().unwrap());
+        if (VERSION_EXTERNAL..=tilemaxsim_protocol::VERSION_PERSISTENT_MANIFEST_LOGICAL_EXTERNAL)
+            .contains(&version)
+        {
+            version
+        } else {
+            VERSION_EXTERNAL
         }
     }
 }
@@ -4204,7 +4176,7 @@ mod tests {
 
     #[test]
     fn error_responses_preserve_every_supported_external_protocol_version() {
-        for version in 2_u16..=14 {
+        for version in 2_u16..=16 {
             let mut frame = vec![0_u8; crate::protocol::HEADER_BYTES];
             frame[4..6].copy_from_slice(&version.to_le_bytes());
             assert_eq!(header_version(&frame), version);
