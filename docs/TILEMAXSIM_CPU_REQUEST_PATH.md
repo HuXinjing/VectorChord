@@ -63,3 +63,48 @@ include `prepared_candidates` with hits, misses, plan count and estimated bytes.
 The existing raw-FP8 preparation/coalescing behavior remains available; FP16 never
 uses its enlarged-quantum path. Warmup must complete GPU admission and then
 populate the exact intervals before steady-state comparisons.
+
+## Validated host-policy combination (2026-10-31)
+
+The dev scorer release branch includes exact-FP16 preparation reuse and exact
+quantum batching. To enable the measured combination, retain the deployment's
+existing arguments and add both of the following:
+
+```text
+environment: TILEMAXSIM_PREPARED_CANDIDATES=1
+argument: --exact-quantum-batching
+```
+
+Both remain opt-in. Removing the environment setting and the argument restores
+the previous host policies. This release does not modify CUDA kernels,
+PostgreSQL extension code, scoring precision, tenant boundaries, or database
+schema. Rebuild and deploy the scorer to use these changes; updating a database
+image alone does not activate them. No service was deployed by merging this
+change.
+
+The isolated source-API comparison used 45,601 candidates, eight concurrent
+requests, three blocks of 24 queries per path, an independent database snapshot,
+and a shared H200. Initial baseline versus the host combination:
+
+| Path | Baseline P95 | Host P95 | Baseline requests/s | Host requests/s |
+| --- | ---: | ---: | ---: | ---: |
+| Recall | 4.431 s | 2.603 s | 2.483 | 3.875 |
+| Retrieval including model reranking | 9.908 s | 9.587 s | 1.124 | 1.195 |
+
+Interleaved original-policy recall controls ranged from 3.725 to 4.217 seconds
+P95 and 2.148 to 2.368 requests/s. Model reranking and other full-path stages
+varied substantially; a stable full-path tail-latency improvement is not proven.
+The timings include the local NeoBrain/PostgreSQL path and the remote scorer
+network round trip, not just GPU execution. Query encodings were not byte-frozen
+across arms. These observations do not establish exclusive-GPU throughput,
+hardware saturation, or maximum production concurrency.
+
+The host combination preserved candidate coverage and passed the original
+numerical tolerance against the original GPU scorer. Near-tied scores can still
+change ordering; tolerance acceptance is not strict ranking equality. The
+average fused batch became smaller, while successful use of preselected peers
+improved. Do not attribute the gain to fewer GPU calls or larger batches.
+
+Experimental Tensor matrix-layout and warp-reduction variants are deliberately
+excluded from this release: the business-path comparison did not establish an
+additional stable gain, and matrix layout regressed on longer synthetic queries.
