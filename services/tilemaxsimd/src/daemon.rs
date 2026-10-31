@@ -242,6 +242,9 @@ struct Args {
     /// Deduct time already spent ready from the microbatch collection window.
     #[arg(long)]
     prepared_batch_window: bool,
+    /// Form batches from exact current candidate prefixes instead of approximate overlap.
+    #[arg(long)]
+    exact_quantum_batching: bool,
     /// Emit a full cache snapshot every N request logs; basic request logs remain.
     #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u64).range(1..))]
     cache_log_interval: u64,
@@ -522,6 +525,7 @@ where
             "socket_io_timeout_ms": args.socket_io_timeout_ms,
             "persistent_idle_timeout_ms": args.persistent_idle_timeout_ms,
             "prepared_batch_window": args.prepared_batch_window,
+            "exact_quantum_batching": args.exact_quantum_batching,
             "resident_readiness_proofs": args.resident_readiness_proofs,
             "cache_log_interval": args.cache_log_interval,
             "request_timeout_ms": args.request_timeout_ms,
@@ -595,6 +599,7 @@ where
         max_microbatch_requests: args.scheduler_max_microbatch_requests,
         max_ingress_drain: args.max_queued_requests,
         prepared_batch_window: args.prepared_batch_window,
+        exact_quantum_batching: args.exact_quantum_batching,
         cache_log_interval: args.cache_log_interval,
         min_shared_candidates_milli: args.scheduler_min_shared_candidates_milli,
         socket_io_timeout: Duration::from_millis(args.socket_io_timeout_ms),
@@ -984,6 +989,7 @@ struct SchedulerConfig {
     max_microbatch_requests: usize,
     max_ingress_drain: usize,
     prepared_batch_window: bool,
+    exact_quantum_batching: bool,
     cache_log_interval: u64,
     min_shared_candidates_milli: u16,
     socket_io_timeout: Duration,
@@ -992,6 +998,10 @@ struct SchedulerConfig {
 
 #[derive(Default)]
 struct RuntimeMetrics {
+    exact_batch_pairs: AtomicU64,
+    exact_batch_candidates: AtomicU64,
+    exact_batch_prefix_shrinks: AtomicU64,
+    exact_batch_blocked_next: AtomicU64,
     ready: AtomicBool,
     draining: AtomicBool,
     max_connections: usize,
@@ -2028,19 +2038,82 @@ fn run_scheduler(
         let Some(scheduled) = queue.pop(Instant::now()) else {
             continue;
         };
+        let mut quantums = vec![request_quantum_with_resident_plan(
+            &scheduled.payload,
+            &config,
+            &engine,
+        )];
         let mut microbatch = vec![scheduled];
         while microbatch.len() < config.max_microbatch_requests {
             let leader = &microbatch[0].payload;
-            let Some(next) = queue.pop_if(Instant::now(), |candidate| {
-                works_are_batch_compatible(
-                    leader,
-                    &candidate.payload,
-                    config.min_shared_candidates_milli,
-                )
+            let now = Instant::now();
+            let mut exact_next = None;
+            let mut common_prefix = None;
+            let Some(next) = queue.pop_if(now, |candidate| {
+                if !config.exact_quantum_batching {
+                    return works_are_batch_compatible(
+                        leader,
+                        &candidate.payload,
+                        config.min_shared_candidates_milli,
+                    );
+                }
+                // Never skip the policy winner for GPU reuse. An expired,
+                // disconnected or incompatible winner blocks this batch.
+                if !work_can_batch(leader, now)
+                    || !work_can_batch(&candidate.payload, now)
+                    || config.min_shared_candidates_milli > 1000
+                {
+                    return false;
+                }
+                let quantum =
+                    request_quantum_with_resident_plan(&candidate.payload, &config, &engine);
+                let Some(prefix) = exact_quantum_prefix(&quantums[0], &quantum) else {
+                    return false;
+                };
+                common_prefix = Some(prefix);
+                exact_next = Some(quantum);
+                true
             }) else {
+                if config.exact_quantum_batching && !queue.is_empty() {
+                    metrics
+                        .exact_batch_blocked_next
+                        .fetch_add(1, Ordering::Relaxed);
+                }
                 break;
             };
+            if let (Some(quantum), Some(prefix)) = (exact_next, common_prefix) {
+                quantums.push(quantum);
+                for quantum in &mut quantums {
+                    if quantum.candidate_end - quantum.candidate_start > prefix {
+                        metrics
+                            .exact_batch_prefix_shrinks
+                            .fetch_add(1, Ordering::Relaxed);
+                    }
+                    quantum.candidate_end = quantum.candidate_start + prefix;
+                }
+            } else {
+                quantums.push(request_quantum_with_resident_plan(
+                    &next.payload,
+                    &config,
+                    &engine,
+                ));
+            }
             microbatch.push(next);
+        }
+        if config.exact_quantum_batching {
+            // Prefix alignment never enlarges admitted work. Refund removed FMA
+            // service before the next scheduler decision, preserving tenant weights.
+            for (scheduled, quantum) in microbatch.iter_mut().zip(&quantums) {
+                queue.reconcile_cost(scheduled, quantum_work(quantum));
+            }
+            if microbatch.len() > 1 {
+                let pairs = u64::try_from(microbatch.len() - 1).unwrap_or(u64::MAX);
+                saturating_atomic_add(&metrics.exact_batch_pairs, pairs);
+                saturating_atomic_add(
+                    &metrics.exact_batch_candidates,
+                    pairs.saturating_mul(quantums[0].candidate_slice().len() as u64),
+                );
+            }
         }
         metrics
             .scheduler_microbatches
@@ -2050,12 +2123,6 @@ fn run_scheduler(
             u64::try_from(microbatch.len()).unwrap_or(u64::MAX),
         );
         metrics.update_scheduler_depth(queue.len());
-        let quantums = microbatch
-            .iter()
-            .map(|scheduled| {
-                request_quantum_with_resident_plan(&scheduled.payload, &config, &engine)
-            })
-            .collect::<Vec<_>>();
         // Wire request IDs are connection scoped. Preserve every batch slot,
         // including results whose peer disconnects or deadline expires.
         let mut fused_results = vec![None; microbatch.len()];
@@ -2324,6 +2391,60 @@ fn works_are_batch_compatible(left: &Work, right: &Work, minimum_overlap_milli: 
     shared.saturating_mul(1000) / denominator >= usize::from(minimum_overlap_milli)
 }
 
+fn work_can_batch(work: &Work, now: Instant) -> bool {
+    work.deadline > now && !peer_disconnected(&work.connection)
+}
+
+/// Shrink only to a common current prefix, never beyond either admitted
+/// quantum. Public IDs may differ: the engine attaches each request's IDs to
+/// its own slot after scoring the same tensor sequence.
+fn exact_quantum_prefix(left: &protocol::Request, right: &protocol::Request) -> Option<usize> {
+    if left.tenant != right.tenant
+        || left.priority != right.priority
+        || left.model_contract != right.model_contract
+        || left.dimension != right.dimension
+        || left.dtype != right.dtype
+        || left.candidate_dtype != right.candidate_dtype
+        || left.scoring_profile != right.scoring_profile
+        || left.quantization_contract != right.quantization_contract
+    {
+        return None;
+    }
+    let prefix = left
+        .candidate_slice()
+        .len()
+        .min(right.candidate_slice().len());
+    if prefix == 0 {
+        return None;
+    }
+    if Arc::ptr_eq(&left.candidates, &right.candidates)
+        && left.candidate_start == right.candidate_start
+    {
+        return Some(prefix);
+    }
+    left.candidate_slice()
+        .iter()
+        .zip(right.candidate_slice())
+        .take(prefix)
+        .all(|(a, b)| {
+            a.contract == b.contract
+                && a.digest == b.digest
+                && a.rows == b.rows
+                && a.dimension == b.dimension
+                && a.dtype == b.dtype
+        })
+        .then_some(prefix)
+}
+
+fn quantum_work(quantum: &protocol::Request) -> u64 {
+    quantum
+        .candidate_slice()
+        .iter()
+        .map(|candidate| candidate_fmas(quantum.query_rows, quantum.dimension, candidate.rows))
+        .fold(0_u64, u64::saturating_add)
+        .max(1)
+}
+
 fn request_quantum_with_resident_plan(
     work: &Work,
     config: &SchedulerConfig,
@@ -2378,7 +2499,11 @@ fn enqueue_work(
     config: &SchedulerConfig,
     metrics: &RuntimeMetrics,
 ) {
-    observe_batch_opportunity(queue, &work, metrics);
+    // Exact mode records admitted-prefix metrics instead of scanning every
+    // full candidate set purely for shadow opportunity telemetry.
+    if !config.exact_quantum_batching {
+        observe_batch_opportunity(queue, &work, metrics);
+    }
     match work.request.priority.cmp(&0) {
         std::cmp::Ordering::Less => metrics
             .admitted_priority_negative
@@ -3386,6 +3511,32 @@ fn render_metrics(metrics: &RuntimeMetrics) -> String {
         metrics.document_rows_scored.load(Ordering::Relaxed)
     )
     .unwrap();
+    for (name, help, value) in [
+        (
+            "pairs",
+            "Policy-selected exact-prefix pairs admitted to microbatches.",
+            metrics.exact_batch_pairs.load(Ordering::Relaxed),
+        ),
+        (
+            "candidates",
+            "Shared current candidates across admitted exact-prefix pairs.",
+            metrics.exact_batch_candidates.load(Ordering::Relaxed),
+        ),
+        (
+            "prefix_shrinks",
+            "Selected quanta shortened to a common exact prefix.",
+            metrics.exact_batch_prefix_shrinks.load(Ordering::Relaxed),
+        ),
+        (
+            "blocked_next",
+            "Exact batching stopped by the next policy-selected request.",
+            metrics.exact_batch_blocked_next.load(Ordering::Relaxed),
+        ),
+    ] {
+        writeln!(output, "# HELP tilemaxsim_exact_batch_{name}_total {help}").unwrap();
+        writeln!(output, "# TYPE tilemaxsim_exact_batch_{name}_total counter").unwrap();
+        writeln!(output, "tilemaxsim_exact_batch_{name}_total {value}").unwrap();
+    }
     writeln!(output, "# HELP tilemaxsim_batch_compatible_pairs_total Same-tenant queued request pairs compatible for microbatching.").unwrap();
     writeln!(
         output,
@@ -4123,6 +4274,197 @@ mod tests {
             catalog_registration: registration,
             scoped_candidate_ordinals: Vec::new(),
         }
+    }
+
+    fn batch_request(rows: &[u32], query_rows: u32) -> Request {
+        let mut request = catalog_request(true);
+        request.dtype = 2;
+        request.candidate_dtype = 2;
+        request.scoring_profile = ScoringProfile::ExactFp16;
+        request.query_rows = query_rows;
+        request.query = vec![0; query_rows as usize * request.dimension as usize * 2];
+        request.candidates = Arc::new(
+            rows.iter()
+                .enumerate()
+                .map(|(i, rows)| Descriptor {
+                    candidate_id: i as u32,
+                    contract: request.model_contract.clone(),
+                    digest: format!("{:064x}", i + 1),
+                    rows: *rows,
+                    dimension: request.dimension,
+                    dtype: 2,
+                    raw_fp8_cache_key: OnceLock::new(),
+                })
+                .collect(),
+        );
+        request.candidate_end = rows.len();
+        request
+    }
+
+    #[test]
+    fn exact_batch_prefix_uses_current_aligned_arc_interval() {
+        let left = batch_request(&[3, 5, 7, 11], 2);
+        let mut right = left.clone();
+        right.query_rows = 9;
+        right.query = vec![0; 36];
+        right.candidate_end = 2;
+        assert_eq!(super::exact_quantum_prefix(&left, &right), Some(2));
+        right.candidate_start = 1;
+        assert_eq!(super::exact_quantum_prefix(&left, &right), None);
+        right.candidate_start = 0;
+        right.candidate_end = 0;
+        assert_eq!(super::exact_quantum_prefix(&left, &right), None);
+    }
+
+    #[test]
+    fn exact_batch_prefix_accepts_independent_descriptors_and_preserves_public_ids() {
+        let left = batch_request(&[13, 17, 19], 1);
+        let mut right = left.clone();
+        let mut independent = (*left.candidates).clone();
+        for descriptor in &mut independent {
+            descriptor.candidate_id += 20;
+        }
+        right.candidates = Arc::new(independent);
+        right.request_id = left.request_id;
+        assert!(!Arc::ptr_eq(&left.candidates, &right.candidates));
+        assert_eq!(super::exact_quantum_prefix(&left, &right), Some(3));
+        let bound = super::bind_fused_scores(
+            2,
+            vec![vec![(0, 1.0)], vec![(20, 1.0)]],
+            std::time::Duration::ZERO,
+        )
+        .unwrap();
+        assert_eq!(bound[0].as_ref().unwrap().0[0].0, 0);
+        assert_eq!(bound[1].as_ref().unwrap().0[0].0, 20);
+    }
+
+    #[test]
+    fn exact_batch_prefix_rejects_overlap_without_identical_current_sequence() {
+        let left = batch_request(&[13, 17, 19], 1);
+        let mut right = left.clone();
+        let mut descriptors = (*right.candidates).clone();
+        descriptors.swap(0, 1);
+        right.candidates = Arc::new(descriptors);
+        assert_eq!(super::exact_quantum_prefix(&left, &right), None);
+        right.candidate_start = 1;
+        right.candidate_end = 2;
+        assert_eq!(super::exact_quantum_prefix(&left, &right), Some(1));
+    }
+
+    #[test]
+    fn exact_batch_prefix_preserves_tenant_priority_and_contract_boundaries() {
+        let left = batch_request(&[3, 5], 2);
+        for field in 0..8 {
+            let mut right = left.clone();
+            match field {
+                0 => right.tenant.push_str("-other"),
+                1 => right.priority += 1,
+                2 => right.model_contract.push_str("-other"),
+                3 => right.dimension += 1,
+                4 => right.dtype = 1,
+                5 => right.candidate_dtype = 3,
+                6 => right.scoring_profile = ScoringProfile::RawFp8E4m3,
+                7 => right.quantization_contract = Some("contract-v2".into()),
+                _ => unreachable!(),
+            }
+            assert_eq!(
+                super::exact_quantum_prefix(&left, &right),
+                None,
+                "field {field}"
+            );
+        }
+    }
+
+    #[test]
+    fn exact_batch_prefix_checks_all_tensor_identity_fields_for_distinct_arcs() {
+        let left = batch_request(&[3, 5], 2);
+        for field in 0..5 {
+            let mut right = left.clone();
+            let mut descriptors = (*right.candidates).clone();
+            let candidate = &mut descriptors[0];
+            match field {
+                0 => candidate.contract.push_str("-other"),
+                1 => candidate.digest = "ee".repeat(32),
+                2 => candidate.rows += 1,
+                3 => candidate.dimension += 1,
+                4 => candidate.dtype = 1,
+                _ => unreachable!(),
+            }
+            right.candidates = Arc::new(descriptors);
+            assert_eq!(
+                super::exact_quantum_prefix(&left, &right),
+                None,
+                "field {field}"
+            );
+        }
+    }
+
+    #[test]
+    fn exact_prefix_alignment_never_exceeds_query_specific_fma_budget() {
+        let mut left = batch_request(&[8, 8, 8], 1);
+        let mut right = left.clone();
+        right.query_rows = 4;
+        left.candidate_end = super::quantum_end(
+            &left.candidates,
+            0,
+            3,
+            u64::MAX,
+            100,
+            left.query_rows,
+            left.dimension,
+        );
+        right.candidate_end = super::quantum_end(
+            &right.candidates,
+            0,
+            3,
+            u64::MAX,
+            100,
+            right.query_rows,
+            right.dimension,
+        );
+        assert_eq!(left.candidate_end, 3);
+        assert_eq!(right.candidate_end, 1);
+        let prefix = super::exact_quantum_prefix(&left, &right).unwrap();
+        left.candidate_end = prefix;
+        right.candidate_end = prefix;
+        assert_eq!(super::quantum_work(&left), 16);
+        assert_eq!(super::quantum_work(&right), 64);
+        assert!(super::quantum_work(&left) <= 100);
+        assert!(super::quantum_work(&right) <= 100);
+        assert_eq!(left.candidate_slice().len(), right.candidate_slice().len());
+    }
+
+    #[test]
+    fn disconnected_or_expired_work_cannot_join_an_exact_batch() {
+        let metrics = Arc::new(RuntimeMetrics::default());
+        let pending = Arc::new(PendingAdmission::new(2, 2, Arc::clone(&metrics)));
+        let bytes = Arc::new(ByteAdmission::new(100, metrics));
+        let (local, remote) = std::os::unix::net::UnixStream::pair().unwrap();
+        let request = batch_request(&[3, 5], 1);
+        let permit = pending.try_acquire(&request.tenant).unwrap();
+        let (completion, _receiver) = mpsc::sync_channel(1);
+        let now = std::time::Instant::now();
+        let mut work = super::Work {
+            request,
+            connection: super::ClientStream::Unix(local),
+            accepted_at: now,
+            deadline: now + std::time::Duration::from_secs(1),
+            ready_at: now,
+            frame_read_elapsed: std::time::Duration::ZERO,
+            parse_elapsed: std::time::Duration::ZERO,
+            next_candidate: 0,
+            results: vec![],
+            gpu_elapsed: std::time::Duration::ZERO,
+            completion,
+            _pending_permit: permit,
+            _frame_permit: bytes.try_acquire(1).unwrap(),
+        };
+        assert!(super::work_can_batch(&work, now));
+        work.deadline = now;
+        assert!(!super::work_can_batch(&work, now));
+        work.deadline = now + std::time::Duration::from_secs(1);
+        drop(remote);
+        assert!(!super::work_can_batch(&work, now));
     }
 
     #[test]

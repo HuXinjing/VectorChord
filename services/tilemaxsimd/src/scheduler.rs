@@ -192,6 +192,20 @@ impl<T> RequestQueue<T> {
         Some(item)
     }
 
+    /// Reconcile a popped item's service after batch alignment shortened its
+    /// legal execution quantum. The policy selection itself is not revisited.
+    pub fn reconcile_cost(&mut self, item: &mut Scheduled<T>, actual_cost: u64) {
+        let actual_cost = actual_cost.max(1);
+        let weight = self.weights.get(&item.tenant).copied().unwrap_or(1.0);
+        let runtime = self.virtual_runtime.entry(item.tenant.clone()).or_default();
+        if actual_cost >= item.cost {
+            *runtime += (actual_cost - item.cost) as f64 / weight;
+        } else {
+            *runtime = (*runtime - (item.cost - actual_cost) as f64 / weight).max(0.0);
+        }
+        item.cost = actual_cost;
+    }
+
     fn effective_priority(&self, item: &Scheduled<T>, now: Instant) -> i32 {
         if self.aging.is_zero() {
             return item.priority;
@@ -387,5 +401,48 @@ mod tests {
         queue.push(item("b", 0, 1, now, 2));
         assert_eq!(queue.drain_expired(now).len(), 1);
         assert_eq!(queue.pop(now).unwrap().payload, 2);
+    }
+    #[test]
+    fn shortened_quantum_refunds_service_without_skipping_another_tenant() {
+        let now = Instant::now();
+        let mut queue = RequestQueue::new(
+            SchedulerPolicy::FairPriority,
+            Duration::ZERO,
+            0,
+            HashMap::new(),
+        );
+        queue.push(item("a", 0, 100, now, 1));
+        queue.push(item("a", 0, 100, now, 2));
+        queue.push(item("b", 0, 10, now, 3));
+        queue.push(item("b", 0, 10, now, 4));
+        let mut first = queue.pop(now).unwrap();
+        queue.reconcile_cost(&mut first, 1);
+        assert!(queue.pop_if(now, |next| next.tenant == "a").is_none());
+        assert_eq!(queue.pop(now).unwrap().payload, 3);
+        assert_eq!(queue.pop(now).unwrap().payload, 2);
+        assert_eq!(queue.pop(now).unwrap().payload, 4);
+    }
+
+    #[test]
+    fn shortened_service_preserves_weights_and_reconciliation_is_idempotent() {
+        let now = Instant::now();
+        let mut queue = RequestQueue::new(
+            SchedulerPolicy::Fair,
+            Duration::ZERO,
+            0,
+            HashMap::from([("a".to_string(), 2.0)]),
+        );
+        queue.push(item("a", 0, 100, now, 1));
+        queue.push(item("b", 0, 3, now, 2));
+        queue.push(item("a", 0, 100, now, 3));
+        queue.push(item("b", 0, 3, now, 4));
+        let mut first = queue.pop(now).unwrap();
+        queue.reconcile_cost(&mut first, 4);
+        queue.reconcile_cost(&mut first, 4);
+        assert_eq!(queue.pop(now).unwrap().payload, 2);
+        assert_eq!(queue.pop(now).unwrap().payload, 3);
+        assert_eq!(queue.pop(now).unwrap().payload, 4);
+        queue.reconcile_cost(&mut first, 0);
+        assert_eq!(first.cost, 1);
     }
 }
