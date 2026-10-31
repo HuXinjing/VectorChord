@@ -292,10 +292,43 @@ impl<T> GpuExternalTileMaxsimBackend<T> {
 }
 
 impl<T: TileMaxsimTransport> GpuExternalTileMaxsimBackend<T> {
-    /// Probe a warm raw-FP8 descriptor catalog without reading descriptor rows
+    /// A fresh SQL backend registers through the established slow path once.
+    /// Do not add speculative network probes to a cold FP16 request.
+    pub(super) fn catalog_probe_available(
+        &self,
+        query: &[OwnedVector],
+    ) -> Result<bool, RerankError> {
+        let Some(revision) = self.catalog_revision.as_deref() else {
+            return Ok(false);
+        };
+        if self.scoring_profile == PostgresMaxsimScoringProfile::ExactFp16 {
+            return Ok(catalog_dtype_hint(&self.catalog_hint_key(query, revision)?).is_some());
+        }
+        Ok(self.scoring_profile == PostgresMaxsimScoringProfile::RawFp8E4m3)
+    }
+
+    fn catalog_hint_key(
+        &self,
+        query: &[OwnedVector],
+        revision: &str,
+    ) -> Result<String, RerankError> {
+        let (_, dimension) = tensor_metadata(query)?;
+        Ok(format!(
+            "{}\0{}\0{}\0{}\0{}",
+            self.model_contract_id,
+            self.scheduling
+                .as_ref()
+                .map_or("__default__", |value| value.tenant.as_str()),
+            scoring_profile_code(self.scoring_profile),
+            dimension,
+            revision
+        ))
+    }
+
+    /// Probe a warm precision-specific descriptor catalog without loading metadata
     /// from PostgreSQL. A miss deliberately returns before materialization so
     /// the caller can load descriptors only for the registration slow path.
-    pub(super) fn rerank_raw_fp8_catalog(
+    pub(super) fn rerank_catalog(
         &mut self,
         query: &[OwnedVector],
         public_ids: &[i64],
@@ -304,7 +337,13 @@ impl<T: TileMaxsimTransport> GpuExternalTileMaxsimBackend<T> {
         let Some(revision) = self.catalog_revision.as_deref() else {
             return Ok(CatalogSelectionOutcome::Unsupported);
         };
-        if self.scoring_profile != PostgresMaxsimScoringProfile::RawFp8E4m3 {
+        if !matches!(
+            self.scoring_profile,
+            PostgresMaxsimScoringProfile::RawFp8E4m3 | PostgresMaxsimScoringProfile::ExactFp16
+        ) {
+            return Ok(CatalogSelectionOutcome::Unsupported);
+        }
+        if !self.catalog_probe_available(query)? {
             return Ok(CatalogSelectionOutcome::Unsupported);
         }
         if public_ids.is_empty() {
@@ -343,23 +382,34 @@ impl<T: TileMaxsimTransport> GpuExternalTileMaxsimBackend<T> {
         // Probe those bounded protocol-defined dtypes before touching the
         // descriptor relation. Mixed-dtype candidate sets fail all probes and
         // deliberately fall back to the materializing registration path.
-        let storage_dtypes = self.catalog_storage_dtypes(&dtype_hint_key);
+        let storage_dtypes = if self.scoring_profile == PostgresMaxsimScoringProfile::ExactFp16 {
+            // This dtype was read from the current SQL snapshot. If the
+            // population is mixed, the complete-ID selection misses and the
+            // established descriptor validator remains the fallback.
+            vec![
+                self.catalog_storage_dtype
+                    .or_else(|| catalog_dtype_hint(&dtype_hint_key))
+                    .unwrap_or(TensorDtype::F16),
+            ]
+        } else {
+            self.catalog_storage_dtypes(&dtype_hint_key)
+        };
         for storage_dtype in storage_dtypes {
             let reference_request_id = NEXT_REQUEST_ID.fetch_add(1, Ordering::Relaxed);
-            let (reference_frame, reference_heap_keys) =
-                encode_raw_fp8_catalog_selection_reference(
-                    reference_request_id,
-                    &self.model_contract_id,
-                    query,
-                    &sorted_ids,
-                    self.max_batch_tokens,
-                    self.max_batch_bytes,
-                    self.scheduling.as_ref(),
-                    revision,
-                    self.timeout,
-                    top_k.min(sorted_ids.len()),
-                    storage_dtype,
-                )?;
+            let (reference_frame, reference_heap_keys) = encode_catalog_selection_reference(
+                reference_request_id,
+                &self.model_contract_id,
+                query,
+                &sorted_ids,
+                self.max_batch_tokens,
+                self.max_batch_bytes,
+                self.scheduling.as_ref(),
+                revision,
+                self.timeout,
+                top_k.min(sorted_ids.len()),
+                storage_dtype,
+                self.scoring_profile,
+            )?;
             let reference_response =
                 self.transport
                     .round_trip(&reference_frame, self.timeout, max_response_bytes)?;
@@ -379,7 +429,7 @@ impl<T: TileMaxsimTransport> GpuExternalTileMaxsimBackend<T> {
                 Err(error) => return Err(error),
             }
             let request_id = NEXT_REQUEST_ID.fetch_add(1, Ordering::Relaxed);
-            let (frame, heap_keys) = encode_raw_fp8_catalog_selection(
+            let (frame, heap_keys) = encode_catalog_selection(
                 request_id,
                 &self.model_contract_id,
                 query,
@@ -391,6 +441,7 @@ impl<T: TileMaxsimTransport> GpuExternalTileMaxsimBackend<T> {
                 self.timeout,
                 top_k.min(sorted_ids.len()),
                 storage_dtype,
+                self.scoring_profile,
             )?;
             let response = self
                 .transport
@@ -419,7 +470,7 @@ impl<T: TileMaxsimTransport> GpuExternalTileMaxsimBackend<T> {
     /// Score one catalog selection once while retaining two independent
     /// windows in the daemon. This avoids both a second GPU request and the
     /// full-score response previously needed to derive an additive scope.
-    pub(super) fn rerank_raw_fp8_catalog_scoped(
+    pub(super) fn rerank_catalog_scoped(
         &mut self,
         query: &[OwnedVector],
         public_ids: &[i64],
@@ -486,7 +537,7 @@ impl<T: TileMaxsimTransport> GpuExternalTileMaxsimBackend<T> {
         for storage_dtype in storage_dtypes {
             let encode_timer = profile::ProfileTimer::start();
             let request_id = NEXT_REQUEST_ID.fetch_add(1, Ordering::Relaxed);
-            let (frame, heap_keys) = encode_raw_fp8_scoped_catalog_selection_reference(
+            let (frame, heap_keys) = encode_scoped_catalog_selection_reference(
                 request_id,
                 &self.model_contract_id,
                 query,
@@ -499,6 +550,7 @@ impl<T: TileMaxsimTransport> GpuExternalTileMaxsimBackend<T> {
                 self.timeout,
                 expected_global,
                 storage_dtype,
+                self.scoring_profile,
             )?;
             profile::update(|entry| {
                 entry.sidecar_encode_us += profile::duration_us(encode_timer.elapsed());
@@ -617,6 +669,7 @@ impl<T: TileMaxsimTransport> GpuExternalTileMaxsimBackend<T> {
                 .map(|size| size.max(HEADER_LEN + 8 + MAX_REMOTE_ERROR_BYTES))
                 .ok_or(RerankError::RequestTooLarge)?;
             if let Some(revision) = self.catalog_revision.as_deref() {
+                let dtype_hint_key = self.catalog_hint_key(query, revision)?;
                 let (reference, registration) = catalog_frames(&encoded, &group, revision)?;
                 let response = self.transport.round_trip(
                     &reference,
@@ -654,6 +707,14 @@ impl<T: TileMaxsimTransport> GpuExternalTileMaxsimBackend<T> {
                         )?,
                     other => other?,
                 };
+                if response.get(4..6) == Some(&CATALOG_LOGICAL_EXTERNAL_VERSION.to_le_bytes()) {
+                    let dtype = match group[0].dtype {
+                        ExternalTensorDtype::F16 => TensorDtype::F16,
+                        ExternalTensorDtype::F32 => TensorDtype::F32,
+                        ExternalTensorDtype::Fp8E4m3 => TensorDtype::Fp8E4m3,
+                    };
+                    remember_catalog_dtype(&dtype_hint_key, dtype);
+                }
                 merged.extend(decoded.inner);
                 continue;
             }
@@ -893,7 +954,7 @@ fn catalog_heap_keys(public_ids: &[i64]) -> Result<Vec<HeapKey>, RerankError> {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn encode_raw_fp8_catalog_request(
+fn encode_catalog_request(
     request_id: u64,
     model_contract_id: &str,
     query: &[OwnedVector],
@@ -906,6 +967,7 @@ fn encode_raw_fp8_catalog_request(
     timeout: Duration,
     top_k: usize,
     storage_dtype: TensorDtype,
+    scoring_profile: PostgresMaxsimScoringProfile,
     reference: bool,
 ) -> Result<(Vec<u8>, Vec<HeapKey>), RerankError> {
     let (query_dtype, dimension) = tensor_metadata(query)?;
@@ -934,7 +996,15 @@ fn encode_raw_fp8_catalog_request(
         dimension,
         query_dtype: wire_dtype(query_dtype),
         candidate_dtype: wire_dtype(storage_dtype),
-        scoring_profile: WireScoringProfile::Fp8E4m3Raw,
+        scoring_profile: match scoring_profile {
+            PostgresMaxsimScoringProfile::ExactFp16 => WireScoringProfile::ExactFp16,
+            PostgresMaxsimScoringProfile::RawFp8E4m3 => WireScoringProfile::Fp8E4m3Raw,
+            _ => {
+                return Err(RerankError::Configuration(
+                    "unsupported catalog scoring profile",
+                ));
+            }
+        },
         quantization_contract: None,
         top_k,
         query: &query_payload,
@@ -958,7 +1028,7 @@ fn encode_raw_fp8_catalog_request(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn encode_raw_fp8_catalog_selection(
+fn encode_catalog_selection(
     request_id: u64,
     model_contract_id: &str,
     query: &[OwnedVector],
@@ -970,8 +1040,9 @@ fn encode_raw_fp8_catalog_selection(
     timeout: Duration,
     top_k: usize,
     storage_dtype: TensorDtype,
+    scoring_profile: PostgresMaxsimScoringProfile,
 ) -> Result<(Vec<u8>, Vec<HeapKey>), RerankError> {
-    encode_raw_fp8_catalog_request(
+    encode_catalog_request(
         request_id,
         model_contract_id,
         query,
@@ -984,12 +1055,13 @@ fn encode_raw_fp8_catalog_selection(
         timeout,
         top_k,
         storage_dtype,
+        scoring_profile,
         false,
     )
 }
 
 #[allow(clippy::too_many_arguments)]
-fn encode_raw_fp8_catalog_selection_reference(
+fn encode_catalog_selection_reference(
     request_id: u64,
     model_contract_id: &str,
     query: &[OwnedVector],
@@ -1001,8 +1073,9 @@ fn encode_raw_fp8_catalog_selection_reference(
     timeout: Duration,
     top_k: usize,
     storage_dtype: TensorDtype,
+    scoring_profile: PostgresMaxsimScoringProfile,
 ) -> Result<(Vec<u8>, Vec<HeapKey>), RerankError> {
-    encode_raw_fp8_catalog_request(
+    encode_catalog_request(
         request_id,
         model_contract_id,
         query,
@@ -1015,12 +1088,13 @@ fn encode_raw_fp8_catalog_selection_reference(
         timeout,
         top_k,
         storage_dtype,
+        scoring_profile,
         true,
     )
 }
 
 #[allow(clippy::too_many_arguments)]
-fn encode_raw_fp8_scoped_catalog_selection_reference(
+fn encode_scoped_catalog_selection_reference(
     request_id: u64,
     model_contract_id: &str,
     query: &[OwnedVector],
@@ -1033,8 +1107,9 @@ fn encode_raw_fp8_scoped_catalog_selection_reference(
     timeout: Duration,
     top_k: usize,
     storage_dtype: TensorDtype,
+    scoring_profile: PostgresMaxsimScoringProfile,
 ) -> Result<(Vec<u8>, Vec<HeapKey>), RerankError> {
-    encode_raw_fp8_catalog_request(
+    encode_catalog_request(
         request_id,
         model_contract_id,
         query,
@@ -1047,6 +1122,7 @@ fn encode_raw_fp8_scoped_catalog_selection_reference(
         timeout,
         top_k,
         storage_dtype,
+        scoring_profile,
         true,
     )
 }
@@ -3756,7 +3832,7 @@ mod tests {
         .with_catalog_revision(Some("revision-17".into()));
         assert!(matches!(
             backend
-                .rerank_raw_fp8_catalog(&[vector(&[1.0, 0.0])], &[7, 10], 1)
+                .rerank_catalog(&[vector(&[1.0, 0.0])], &[7, 10], 1)
                 .unwrap(),
             CatalogSelectionOutcome::Miss
         ));
@@ -3769,6 +3845,71 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![(11, 3), (10, 1), (11, 3), (10, 1), (11, 3), (10, 1)],
         );
+    }
+
+    #[test]
+    fn catalog_selection_retains_fp16_precision_and_revision_identity() {
+        for profile in [
+            PostgresMaxsimScoringProfile::ExactFp16,
+            PostgresMaxsimScoringProfile::RawFp8E4m3,
+        ] {
+            let (frame, keys) = encode_catalog_selection_reference(
+                91,
+                "contract@2",
+                &[half_vector(&[1.0, 0.0])],
+                &[7, 10],
+                100,
+                4096,
+                None,
+                "revision-19",
+                Duration::from_secs(1),
+                1,
+                TensorDtype::F16,
+                profile,
+            )
+            .unwrap();
+            assert_eq!(frame[38], scoring_profile_code(profile));
+            assert_eq!(keys.len(), 2);
+            let (other, _) = encode_catalog_selection_reference(
+                91,
+                "contract@2",
+                &[half_vector(&[1.0, 0.0])],
+                &[7, 10],
+                100,
+                4096,
+                None,
+                "revision-20",
+                Duration::from_secs(1),
+                1,
+                TensorDtype::F16,
+                profile,
+            )
+            .unwrap();
+            assert_ne!(frame, other);
+        }
+    }
+
+    #[test]
+    fn cold_fp16_catalog_uses_registration_without_speculative_probes() {
+        let calls = Rc::new(RefCell::new(Vec::new()));
+        let mut backend = GpuExternalTileMaxsimBackend::new(
+            CatalogMissTransport {
+                calls: Rc::clone(&calls),
+            },
+            "contract@2".into(),
+            Duration::from_secs(1),
+            100,
+            4096,
+        )
+        .with_scoring_profile(PostgresMaxsimScoringProfile::ExactFp16)
+        .with_catalog_revision(Some("revision-19".into()));
+        assert!(matches!(
+            backend
+                .rerank_catalog(&[half_vector(&[1.0, 0.0])], &[7, 10], 1)
+                .unwrap(),
+            CatalogSelectionOutcome::Unsupported
+        ));
+        assert_eq!(calls.borrow().len(), 0);
     }
 
     #[test]

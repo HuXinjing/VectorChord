@@ -21,7 +21,7 @@ use super::profile;
 use super::rerank::{RerankError, RerankResults};
 use crate::datatype::memory_halfvec::HalfvecInput;
 use crate::datatype::memory_vector::VectorInput;
-use crate::index::gucs::{self, PostgresMaxsimBackend};
+use crate::index::gucs::{self, PostgresMaxsimBackend, PostgresMaxsimScoringProfile};
 use distance::Distance;
 use pgrx::datum::{Array, DatumWithOid, FromDatum, IntoDatum};
 use pgrx::iter::TableIterator;
@@ -254,11 +254,22 @@ fn execute_rerank(
     }
     let sidecar_timer = profile::ProfileTimer::start();
     let result_limit = top_k as usize;
-    let mut sorted_candidate_ids = candidate_ids.clone();
+    // A catalog revision replaces descriptor transport, never current SQL
+    // visibility. Read IDs through the same source/descriptor join under this
+    // snapshot and role before probing a resident FP16 catalog.
+    let mut sorted_candidate_ids = if matches!(
+        gucs::vchordrq_maxsim_scoring_profile(),
+        PostgresMaxsimScoringProfile::ExactFp16
+    ) && backend.catalog_probe_available(&query)?
+    {
+        load_visible_public_ids(&binding, &candidate_ids)?
+    } else {
+        candidate_ids.clone()
+    };
     sorted_candidate_ids.sort_unstable();
     let fast_public_ids = public_id_map(&sorted_candidate_ids)?;
     let (results, public_ids) =
-        match backend.rerank_raw_fp8_catalog(&query, &sorted_candidate_ids, result_limit)? {
+        match backend.rerank_catalog(&query, &sorted_candidate_ids, result_limit)? {
             CatalogSelectionOutcome::Hit(results) => {
                 profile::update(|profile| {
                     profile.visible_candidates = fast_public_ids.len() as u64;
@@ -385,14 +396,22 @@ fn execute_rerank_scoped(
         backend = backend.with_scheduling(tenant, gucs::vchordrq_maxsim_priority());
     }
     let sidecar_timer = profile::ProfileTimer::start();
-    let mut sorted_candidate_ids = candidate_ids.clone();
+    let mut sorted_candidate_ids = if matches!(
+        gucs::vchordrq_maxsim_scoring_profile(),
+        PostgresMaxsimScoringProfile::ExactFp16
+    ) && backend.catalog_probe_available(&query)?
+    {
+        load_visible_public_ids(&binding, &candidate_ids)?
+    } else {
+        candidate_ids.clone()
+    };
     sorted_candidate_ids.sort_unstable();
     let fast_public_ids = public_id_map(&sorted_candidate_ids)?;
     let window = top_k as usize;
     let mut sorted_scoped_ids = scoped_candidate_ids.clone();
     sorted_scoped_ids.sort_unstable();
     sorted_scoped_ids.dedup();
-    let (global, scoped) = match backend.rerank_raw_fp8_catalog_scoped(
+    let (global, scoped) = match backend.rerank_catalog_scoped(
         &query,
         &sorted_candidate_ids,
         &sorted_scoped_ids,
@@ -424,34 +443,33 @@ fn execute_rerank_scoped(
             // Rolling-upgrade and cold-catalog fallback: preserve exact
             // semantics with the legacy full-score path until v12 is warm.
             let result_limit = sorted_candidate_ids.len();
-            let (results, public_ids) = match backend.rerank_raw_fp8_catalog(
-                &query,
-                &sorted_candidate_ids,
-                result_limit,
-            )? {
-                CatalogSelectionOutcome::Hit(results) => (results, fast_public_ids),
-                CatalogSelectionOutcome::Miss | CatalogSelectionOutcome::Unsupported => {
-                    let descriptor_timer = profile::ProfileTimer::start();
-                    let (mut source, public_ids) =
-                        load_visible_descriptors(&binding, &candidate_ids)?;
-                    let mut candidates = public_ids.keys().copied().map(|heap_key| PageCandidate {
-                        approximate_distance: Distance::ZERO,
-                        heap_key,
-                    });
-                    profile::update(|profile| {
-                        profile.descriptor_us += profile::duration_us(descriptor_timer.elapsed());
-                        profile.visible_candidates = public_ids.len() as u64;
-                        profile.descriptors = public_ids.len() as u64;
-                    });
-                    let results = backend.rerank_logical(
-                        &query,
-                        &mut candidates,
-                        &mut source,
-                        result_limit,
-                    )?;
-                    (results, public_ids)
-                }
-            };
+            let (results, public_ids) =
+                match backend.rerank_catalog(&query, &sorted_candidate_ids, result_limit)? {
+                    CatalogSelectionOutcome::Hit(results) => (results, fast_public_ids),
+                    CatalogSelectionOutcome::Miss | CatalogSelectionOutcome::Unsupported => {
+                        let descriptor_timer = profile::ProfileTimer::start();
+                        let (mut source, public_ids) =
+                            load_visible_descriptors(&binding, &candidate_ids)?;
+                        let mut candidates =
+                            public_ids.keys().copied().map(|heap_key| PageCandidate {
+                                approximate_distance: Distance::ZERO,
+                                heap_key,
+                            });
+                        profile::update(|profile| {
+                            profile.descriptor_us +=
+                                profile::duration_us(descriptor_timer.elapsed());
+                            profile.visible_candidates = public_ids.len() as u64;
+                            profile.descriptors = public_ids.len() as u64;
+                        });
+                        let results = backend.rerank_logical(
+                            &query,
+                            &mut candidates,
+                            &mut source,
+                            result_limit,
+                        )?;
+                        (results, public_ids)
+                    }
+                };
             let scoped_set = sorted_scoped_ids.into_iter().collect::<HashSet<_>>();
             let mut global = BinaryHeap::with_capacity(window.saturating_add(1));
             let mut scoped = BinaryHeap::with_capacity(window.saturating_add(1));
@@ -563,6 +581,41 @@ fn preflight_descriptor_access(binding: &TileMaxsimSourceBinding) -> Result<(), 
             .select(query.as_str(), Some(1), &[])
             .map(|_| ())
             .map_err(registry_error)
+    })
+}
+
+fn load_visible_public_ids(
+    binding: &TileMaxsimSourceBinding,
+    candidate_ids: &[i64],
+) -> Result<Vec<i64>, RerankError> {
+    // PostgreSQL prunes unused tensor metadata from this projection. Keep both
+    // relations in the join so row-level policies and missing descriptors
+    // cannot be bypassed by a warmed daemon catalog.
+    let query = format!(
+        "SELECT visible.public_id FROM ({}) AS visible",
+        descriptor_query(binding, false)?
+    );
+    pgrx::spi::Spi::connect(|client| {
+        let int8_array_oid = unsafe { pgrx::pg_sys::get_array_type(pgrx::pg_sys::INT8OID) };
+        let prepared = client
+            .prepare(
+                query.as_str(),
+                &[
+                    pgrx::pg_sys::PgOid::from(int8_array_oid),
+                    pgrx::pg_sys::PgOid::from(pgrx::pg_sys::TEXTOID),
+                ],
+            )
+            .map_err(registry_error)?;
+        let args: [DatumWithOid<'_>; 2] = [
+            candidate_ids.to_vec().into(),
+            binding.model_contract_id.clone().into(),
+        ];
+        let rows = client
+            .select(&prepared, Some(candidate_ids.len() as _), &args)
+            .map_err(registry_error)?;
+        rows.into_iter()
+            .map(|row| required_heap_column::<i64>(&row, "public_id"))
+            .collect()
     })
 }
 
