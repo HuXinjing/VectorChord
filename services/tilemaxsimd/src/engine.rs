@@ -38,6 +38,8 @@ struct ResidentTensor {
 
 const MAX_RESIDENT_SELECTION_PLANS: usize = 64;
 const MAX_PREPARED_SELECTION_BYTES: usize = 64 * 1024 * 1024;
+// Arc control counts and alignment, excluding allocator-internal bookkeeping.
+const PREPARED_ARC_OVERHEAD: usize = 4 * size_of::<usize>();
 
 #[derive(Clone, PartialEq, Eq)]
 struct ResidentPlanIdentity {
@@ -270,7 +272,11 @@ impl Engine {
 
     pub fn reload_shards(&mut self) -> Result<()> {
         self.resident_selection_plans.clear();
-        self.prepared_plan_bytes = 0;
+        self.prepared_plan_bytes = if self.prepared_candidates_enabled {
+            self.prepared_selection_bytes()
+        } else {
+            0
+        };
         self.residency_proofs
             .get_mut()
             .unwrap_or_else(|e| e.into_inner())
@@ -468,7 +474,11 @@ impl Engine {
         self.resident_selection_plans.clear();
         self.prepared_plan_hits = 0;
         self.prepared_plan_misses = 0;
-        self.prepared_plan_bytes = 0;
+        self.prepared_plan_bytes = if enabled {
+            self.prepared_selection_bytes()
+        } else {
+            0
+        };
     }
 
     fn plan_candidate_bytes(&self, request: &Request) -> usize {
@@ -481,6 +491,8 @@ impl Engine {
                         .candidates
                         .capacity()
                         .saturating_mul(size_of::<Descriptor>())
+                        .saturating_add(size_of::<Vec<Descriptor>>())
+                        .saturating_add(PREPARED_ARC_OVERHEAD)
                         .saturating_add(
                             request
                                 .candidates
@@ -489,9 +501,9 @@ impl Engine {
                                     d.contract
                                         .capacity()
                                         .saturating_add(d.digest.capacity())
-                                        .saturating_add(
-                                            d.raw_fp8_cache_key.get().map_or(0, |key| key.len()),
-                                        )
+                                        // A shared Arc may lazily initialize keys on
+                                        // other slices after this plan is inserted.
+                                        .saturating_add(prepared_raw_key_reservation(d))
                                 })
                                 .sum::<usize>(),
                         )
@@ -502,9 +514,11 @@ impl Engine {
 
     fn prepared_selection_bytes(&self) -> usize {
         let mut candidates = HashSet::new();
-        self.resident_selection_plans
-            .iter()
-            .fold(0usize, |total, plan| {
+        self.resident_selection_plans.iter().fold(
+            self.resident_selection_plans
+                .capacity()
+                .saturating_mul(size_of::<ResidentSelectionPlan>()),
+            |total, plan| {
                 let shared = if candidates.insert(Arc::as_ptr(&plan.candidates)) {
                     plan.candidate_bytes
                 } else {
@@ -512,7 +526,6 @@ impl Engine {
                 };
                 total
                     .saturating_add(shared)
-                    .saturating_add(size_of::<ResidentSelectionPlan>())
                     .saturating_add(plan.identity.tenant.capacity())
                     .saturating_add(plan.identity.model_contract.capacity())
                     .saturating_add(
@@ -544,12 +557,21 @@ impl Engine {
                                     .capacity()
                                     .saturating_mul(size_of::<ResidentTensor>())
                                     .saturating_add(
-                                        chunk.iter().map(|tensor| tensor.key.len()).sum::<usize>(),
+                                        chunk
+                                            .iter()
+                                            .map(|tensor| {
+                                                tensor
+                                                    .key
+                                                    .len()
+                                                    .saturating_add(PREPARED_ARC_OVERHEAD)
+                                            })
+                                            .sum::<usize>(),
                                     )
                             })
                             .sum::<usize>(),
                     )
-            })
+            },
+        )
     }
 
     fn score_cached_resident_selection(
@@ -1855,6 +1877,26 @@ fn finalize_scores(
         .collect()
 }
 
+fn prepared_raw_key_reservation(descriptor: &Descriptor) -> usize {
+    // cache_key contains four separators plus decimal u32/u32/u8 fields;
+    // reserve their maximum digit widths without formatting or initializing it.
+    let maximum_payload = ScoringProfile::RawFp8E4m3
+        .cache_tag()
+        .len()
+        .saturating_add(3)
+        .saturating_add(descriptor.contract.len())
+        .saturating_add(descriptor.digest.len())
+        .saturating_add(4 + 10 + 10 + 3);
+    maximum_payload
+        .max(
+            descriptor
+                .raw_fp8_cache_key
+                .get()
+                .map_or(0, |key| key.len()),
+        )
+        .saturating_add(PREPARED_ARC_OVERHEAD)
+}
+
 fn gpu_cache_key(
     descriptor: &Descriptor,
     profile: ScoringProfile,
@@ -2477,6 +2519,96 @@ mod tests {
 
     #[test]
     #[cfg(feature = "backend-cpu")]
+    fn prepared_selection_holds_arc_only_until_bounded_plan_eviction() {
+        let (mut engine, _root) = proof_engine();
+        engine.set_prepared_candidates_enabled(true);
+        let request = proof_request();
+        let identity = Arc::downgrade(&request.candidates);
+        admit_proof_tensor(&mut engine, &request, true);
+        engine.score(&request).unwrap();
+        drop(request);
+        assert!(identity.upgrade().is_some());
+        for id in 0..MAX_RESIDENT_SELECTION_PLANS {
+            let mut other = proof_request();
+            Arc::make_mut(&mut other.candidates)[0].candidate_id = id as u32 + 10;
+            engine.score(&other).unwrap();
+        }
+        assert_eq!(
+            engine.resident_selection_plans.len(),
+            MAX_RESIDENT_SELECTION_PLANS
+        );
+        assert!(engine.prepared_selection_bytes() <= MAX_PREPARED_SELECTION_BYTES);
+        assert!(identity.upgrade().is_none());
+    }
+
+    #[test]
+    #[cfg(feature = "backend-cpu")]
+    fn prepared_fp16_keeps_partial_interval_and_logical_ids_separate() {
+        let (mut engine, _root) = proof_engine();
+        engine.set_prepared_candidates_enabled(true);
+        let mut request = proof_request();
+        for id in [2, 3] {
+            let duplicate = Descriptor {
+                candidate_id: id,
+                ..request.candidates[0].clone()
+            };
+            Arc::make_mut(&mut request.candidates).push(duplicate);
+        }
+        request.candidate_end = 3;
+        admit_proof_tensor(&mut engine, &request, true);
+        assert_eq!(
+            engine.score(&request).unwrap(),
+            vec![(1, 0.0), (2, 0.0), (3, 0.0)]
+        );
+        let mut partial = request.clone();
+        partial.candidate_start = 1;
+        assert!(engine.score_cached_resident_selection(&partial).is_none());
+        assert_eq!(engine.score(&partial).unwrap(), vec![(2, 0.0), (3, 0.0)]);
+        assert_eq!(engine.score(&partial).unwrap(), vec![(2, 0.0), (3, 0.0)]);
+        assert_eq!(engine.resident_selection_plans.len(), 2);
+        assert_eq!(engine.cached_resident_selection_end(&partial, 1), None);
+    }
+
+    #[test]
+    #[cfg(feature = "backend-cpu")]
+    fn prepared_selection_reserves_late_raw_keys_for_other_shared_slices() {
+        let (mut engine, _root) = proof_engine();
+        engine.set_prepared_candidates_enabled(true);
+        let mut request = proof_request();
+        Arc::make_mut(&mut request.candidates).extend([
+            descriptor(2, "future-b", u32::MAX),
+            descriptor(3, "future-c", 10),
+        ]);
+        // Only the first slice is scored/validated. Its plan retains the full
+        // immutable Arc, including OnceLocks belonging to untouched slices.
+        admit_proof_tensor(&mut engine, &request, true);
+        engine.score(&request).unwrap();
+        let reserved = engine.plan_candidate_bytes(&request);
+        let bytes_before = engine.prepared_selection_bytes();
+        for descriptor in request.candidates.iter() {
+            let key = gpu_cache_key(descriptor, ScoringProfile::RawFp8E4m3, None);
+            assert!(prepared_raw_key_reservation(descriptor) >= key.len() + PREPARED_ARC_OVERHEAD);
+        }
+        assert_eq!(engine.plan_candidate_bytes(&request), reserved);
+        assert_eq!(engine.prepared_selection_bytes(), bytes_before);
+        let actual = request.candidates.capacity() * size_of::<Descriptor>()
+            + size_of::<Vec<Descriptor>>()
+            + PREPARED_ARC_OVERHEAD
+            + request
+                .candidates
+                .iter()
+                .map(|descriptor| {
+                    descriptor.contract.capacity()
+                        + descriptor.digest.capacity()
+                        + descriptor.raw_fp8_cache_key.get().unwrap().len()
+                        + PREPARED_ARC_OVERHEAD
+                })
+                .sum::<usize>();
+        assert!(reserved >= actual);
+    }
+
+    #[test]
+    #[cfg(feature = "backend-cpu")]
     fn prepared_selection_memory_includes_retained_descriptor_storage() {
         let (mut engine, _root) = proof_engine();
         engine.set_prepared_candidates_enabled(true);
@@ -2486,7 +2618,12 @@ mod tests {
             String::with_capacity(MAX_PREPARED_SELECTION_BYTES);
         engine.remember_resident_selection(&request, &[Vec::new()], &[]);
         assert!(engine.resident_selection_plans.is_empty());
-        assert_eq!(engine.prepared_selection_bytes(), 0);
+        // VecDeque backing storage may remain; the oversized Arc does not.
+        assert_eq!(
+            engine.prepared_selection_bytes(),
+            engine.resident_selection_plans.capacity() * size_of::<ResidentSelectionPlan>()
+        );
+        assert!(engine.prepared_selection_bytes() <= MAX_PREPARED_SELECTION_BYTES);
     }
 
     #[test]

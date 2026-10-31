@@ -55,7 +55,10 @@ these plans are not asynchronous GPU leases.
 
 The cache is bounded to 64 plans and, when enabled, an estimated 64 MiB including
 retained descriptor storage and prepared metadata. Repeated references to the
-same candidate `Arc` count its storage once. `status_json` request cache snapshots
+same candidate `Arc` count its storage once. The estimate reserves lazy raw-FP8
+key storage for every descriptor up front, including currently untouched slices,
+and includes shared-allocation headers and retained deque capacity. Allocator
+internal bookkeeping is outside this estimate. `status_json` request cache snapshots
 include `prepared_candidates` with hits, misses, plan count and estimated bytes.
 The existing raw-FP8 preparation/coalescing behavior remains available; FP16 never
 uses its enlarged-quantum path. Warmup must complete GPU admission and then
