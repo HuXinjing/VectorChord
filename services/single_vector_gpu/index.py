@@ -14,6 +14,7 @@ class Contract:
     tenant: str
     model: str
     generation: str
+    scope: str = ""
 
 
 def validated(values: np.ndarray, dimensions: int | None = None) -> np.ndarray:

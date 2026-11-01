@@ -77,6 +77,24 @@ class DispatchTest(unittest.TestCase):
         self.assertEqual([h.result.result(2)["backend"] for h in handles], ["gpu"]*3)
         self.assertEqual(self.calls[-1][2], 3)
 
+    def test_equivalent_rpc_policies_batch_despite_expiry_clock_conversion_jitter(self):
+        router = self.router()
+        policies = [Policy(2.1, "calibrated-environment", time.monotonic()+30+i*.000001,
+                           collect_seconds=.01) for i in range(3)]
+        handles = [self.query(router, policy=policy) for policy in policies]
+        self.assertEqual([h.result.result(2)["backend"] for h in handles], ["gpu"]*3)
+        self.assertEqual(self.calls[-1][2], 3)
+
+    def test_equivalent_policy_group_preserves_each_requests_expiration(self):
+        router = self.router()
+        policies = [Policy(2.1, "calibrated-environment", time.monotonic()+30,
+                           collect_seconds=.01) for _ in range(2)]
+        policies.append(Policy(2.1, "calibrated-environment", time.monotonic()-1,
+                               collect_seconds=.01))
+        handles = [self.query(router, policy=policy) for policy in policies]
+        self.assertEqual([h.result.result(2)["backend"] for h in handles], ["cpu"]*3)
+        self.assertEqual(self.calls, [])
+
     def test_sources_models_and_tenants_are_never_unioned(self):
         router = self.router()
         handles = [self.query(router, sources=[source]) for source in [1, 2, 1, 2]]

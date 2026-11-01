@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from collections import deque
 from concurrent.futures import Future, ThreadPoolExecutor
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 import math
 import threading
@@ -39,6 +40,7 @@ class Policy:
     max_batch: int = 256
     max_pending: int = 1024
     max_pending_per_tenant: int = 64
+    force_gpu: bool = False
 
     def __post_init__(self):
         if (not math.isfinite(self.crossover) or self.crossover < 1 or not self.calibration
@@ -50,7 +52,7 @@ class Policy:
     @property
     def threshold(self) -> int:
         # Strictly exceed the measured crossover times the requested margin.
-        return math.floor(self.crossover * self.margin) + 1
+        return 1 if self.force_gpu else math.floor(self.crossover * self.margin) + 1
 
 
 @dataclass(frozen=True)
@@ -82,7 +84,7 @@ class SnapshotCatalog:
         if memory_limit_bytes < 1: raise ValueError("invalid_snapshot_budget")
         self.limit = memory_limit_bytes
         self._lock = threading.RLock()
-        self._active: dict[tuple[str, str], _Version] = {}
+        self._active: dict[tuple[str, str, str], _Version] = {}
         self._retired: list[_Version] = []
 
     def publish(self, snapshot: Snapshot, verify_revision: Callable[[], None]):
@@ -92,7 +94,7 @@ class SnapshotCatalog:
             raise ValueError("invalid_snapshot")
         with self._lock:
             verify_revision()
-            key = (snapshot.contract.tenant, snapshot.contract.model)
+            key = (snapshot.contract.tenant, snapshot.contract.model, snapshot.contract.scope)
             previous = self._active.get(key)
             # Publication is immutable; the same generation cannot be redefined.
             if previous and previous.snapshot.contract == snapshot.contract:
@@ -109,14 +111,26 @@ class SnapshotCatalog:
         version.active = False
         if version.readers: self._retired.append(version)
 
-    def invalidate(self, tenant: str, model: str):
+    def invalidate(self, tenant: str, model: str, scope: str | None = None):
         with self._lock:
-            previous = self._active.pop((tenant, model), None)
-            if previous: self._retire(previous)
+            for key in list(self._active):
+                if key[:2] == (tenant, model) and (scope is None or key[2] == scope):
+                    self._retire(self._active.pop(key))
+
+    def prune(self):
+        with self._lock:
+            for key in list(self._active):
+                if self._active[key].snapshot.expires_at <= time.monotonic():
+                    self._retire(self._active.pop(key))
+
+    @property
+    def resident_bytes(self):
+        with self._lock:
+            return sum(v.snapshot.resident_bytes for v in [*self._active.values(), *self._retired])
 
     def acquire(self, contract: Contract, sources: tuple[int, ...], calibration: str):
         with self._lock:
-            value = self._active.get((contract.tenant, contract.model))
+            value = self._active.get((contract.tenant, contract.model, contract.scope))
             if (value is None or value.snapshot.contract != contract
                 or value.snapshot.calibration != calibration
                 or value.snapshot.expires_at <= time.monotonic()
@@ -160,6 +174,7 @@ class _Request:
     lease: Lease
     handle: Handle
     arrived: float
+    policy: Policy
     started: bool = False
 
     def check(self):
@@ -201,8 +216,19 @@ class Dispatcher:
         self._scheduler = threading.Thread(target=self._run, name="vector-dispatch", daemon=True)
         self._scheduler.start()
 
+    @contextmanager
+    def cohort(self):
+        """Enqueue an already-authorized bounded wire batch atomically.
+
+        No encoding/GPU/database write transaction may run in this context.
+        Individual authority callbacks still run; use a shared batch proof.
+        """
+        with self._condition:
+            yield
+
     def submit(self, vector, *, contract: Contract, sources: list[int], k: int,
-               deadline: float, authorize: Callable[[], None], cpu: Callable[[], object]) -> Handle:
+               deadline: float, authorize: Callable[[], None], cpu: Callable[[], object],
+               policy: Policy | None = None) -> Handle:
         raw = np.asarray(vector)
         if raw.ndim != 1 or not 1 <= len(raw) <= 65536:
             raise ValueError("invalid_dispatch_dimensions")
@@ -215,8 +241,13 @@ class Dispatcher:
         authorize()
         lease = self.admission.acquire(contract.tenant, deadline)
         handle = Handle()
-        request = _Request(value, contract, allowed, k, deadline, authorize, cpu, lease, handle, time.monotonic())
-        key = (contract, allowed, k, len(value))
+        policy = policy or self.policy
+        request = _Request(value, contract, allowed, k, deadline, authorize, cpu, lease, handle, time.monotonic(), policy)
+        # Expiry is checked per request, not part of the policy identity:
+        # converting the same database expiry to monotonic time varies by RPC.
+        identity = (policy.crossover, policy.calibration, policy.margin,
+                    policy.collect_seconds, policy.max_batch, policy.force_gpu)
+        key = (contract, allowed, k, len(value), identity)
         try:
             with self._condition:
                 if self._closed: raise RuntimeError("dispatcher_closed")
@@ -281,7 +312,11 @@ class Dispatcher:
                 except BaseException as error: self._finish(request, error=error)
                 else: valid.append(request)
             if not valid: return
-            if len(valid) < self.policy.threshold:
+            if any(r.policy.expires_at <= time.monotonic() for r in valid):
+                for request in valid: self._cpu.submit(self._cpu_one, request, "policy_expired")
+                return
+            peers = len({getattr(r.lease, 'capacity_key', id(r.lease)) for r in valid})
+            if peers < valid[0].policy.threshold and not valid[0].policy.force_gpu:
                 for request in valid: self._cpu.submit(self._cpu_one, request, "batch_shrank")
                 return
             if not self.catalog.current(version):
@@ -317,16 +352,18 @@ class Dispatcher:
                     self._condition.wait(); continue
                 # Dict insertion order rotates serviced groups to the end.
                 key, group = next(iter(self._groups.items()))
-                delay = group[0].arrived + self.policy.collect_seconds - time.monotonic()
+                delay = group[0].arrived + group[0].policy.collect_seconds - time.monotonic()
                 if delay > 0:
                     self._condition.wait(delay); continue
-                requests = [group.popleft() for _ in range(min(len(group), self.policy.max_batch))]
+                requests = [group.popleft() for _ in range(min(len(group), self.policy.max_batch, group[0].policy.max_batch))]
                 del self._groups[key]
                 if group: self._groups[key] = group
             first = requests[0]
-            eligible = (len(requests) >= self.policy.threshold
-                        and self.policy.expires_at > time.monotonic() >= self._gpu_retry_at)
-            version = self.catalog.acquire(first.contract, first.sources, self.policy.calibration) if eligible else None
+            peers = len({getattr(r.lease, 'capacity_key', id(r.lease)) for r in requests})
+            eligible = ((peers >= first.policy.threshold or first.policy.force_gpu)
+                        and all(r.policy.expires_at > time.monotonic() for r in requests)
+                        and time.monotonic() >= self._gpu_retry_at)
+            version = self.catalog.acquire(first.contract, first.sources, first.policy.calibration) if eligible else None
             if version and self._gpu_slot.acquire(blocking=False):
                 self._gpu.submit(self._gpu_batch, requests, version)
             else:

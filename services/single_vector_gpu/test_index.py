@@ -70,6 +70,10 @@ class IndexTest(unittest.TestCase):
         for value in [b"", b"\xff\xff\xff\xff", b"\x01\x00\x00\x00"]:
             with self.assertRaises(ValueError): unpack(value)
 
+    def test_binary_header_rejects_duplicate_fields_nonfinite_json_and_non_utf8(self):
+        for header in [b'{"rows":1,"rows":2}',b'{"rows":NaN}',b'{"label":"\xff"}']:
+            with self.assertRaises(ValueError):unpack(len(header).to_bytes(4,'little')+header)
+
     def test_loopback_api_auth_scope_and_binary_result(self):
         server = ThreadingHTTPServer(("127.0.0.1", 0), handler(self.index, "a" * 64))
         worker = threading.Thread(target=server.serve_forever, daemon=True); worker.start()

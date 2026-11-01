@@ -21,13 +21,20 @@ def packet(metadata: dict, payload: bytes) -> bytes:
     return struct.pack("<I", len(header)) + header + payload
 
 
-def unpack(data: bytes) -> tuple[dict, memoryview]:
+def unpack(data: bytes, max_header: int = 8192) -> tuple[dict, memoryview]:
     if len(data) < 4:
         raise ValueError("truncated_packet")
     size = struct.unpack_from("<I", data)[0]
-    if size > 8192 or len(data) < size + 4:
+    if size > max_header or len(data) < size + 4:
         raise ValueError("invalid_header")
-    header = json.loads(data[4:size+4])
+    def unique(pairs):
+        value = {}
+        for key, item in pairs:
+            if key in value: raise ValueError("duplicate_header_field")
+            value[key] = item
+        return value
+    def invalid_constant(_): raise ValueError("invalid_json_number")
+    header = json.loads(data[4:size+4].decode("utf-8"), object_pairs_hook=unique, parse_constant=invalid_constant)
     if not isinstance(header, dict):
         raise ValueError("invalid_header")
     return header, memoryview(data)[size+4:]
