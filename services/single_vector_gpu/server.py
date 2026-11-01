@@ -38,6 +38,9 @@ def handler(index: SingleVectorIndex, token: str, max_queries: int = 100_000):
 
     class Handler(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
+        # Headers and the binary result are separate writes. A persistent
+        # request must not wait for TCP's small-packet acknowledgement timer.
+        disable_nagle_algorithm = True
 
         def log_message(self, *_):
             pass
