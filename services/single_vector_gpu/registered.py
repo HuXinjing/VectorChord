@@ -78,25 +78,32 @@ class Proof:
     """One child reference per parent. Releasing a timed-out parent cannot free
     its weighted capacity until all real GPU child work has ended.
     """
-    def __init__(self, pool, manifest, epoch, parents, group):
+    def __init__(self, pool, manifest, epoch, parents, group, minimum_weight=0):
         self.pool, self.manifest, self.epoch = pool, manifest, epoch
         self.parents = sorted(set(parents))
         self.children = [str(uuid.uuid4()) for _ in self.parents]
         self.group = group
         self._lock = threading.RLock()
         self._valid_until = 0.
+        checked_at = time.monotonic()
         with pool.connection() as conn, conn.transaction():
-            if conn.execute(EPOCH_SQL, (manifest.definition["sources"],)).fetchone()[0] != epoch:
-                raise RuntimeError("snapshot_changed")
-            owned = conn.execute("""SELECT bool_and(COALESCE(knowledge_vector_gpu_borrow(child,parent,%s,%s),false))
+            row = conn.execute("""WITH authority AS MATERIALIZED (
+              SELECT COALESCE(jsonb_object_agg(source_id,units),'{}'::jsonb)::text AS epoch FROM (
+               SELECT source_id,sum(units)::text AS units FROM knowledge_vector_gpu_changes
+               WHERE source_id=ANY(%s::text[]) GROUP BY source_id) witnesses
+            ), borrowed AS MATERIALIZED (
+              SELECT bool_and(COALESCE(knowledge_vector_gpu_borrow(child,parent,%s,%s),false)) AS owned
               FROM (SELECT child,parent FROM unnest(%s::text[],%s::text[])AS tickets(child,parent)
-                    ORDER BY parent) ordered""",
-              (manifest.identity,group,self.children,self.parents)).fetchone()[0]
-            if owned is not True: raise PermissionError("lease_not_owned")
-        try: self.check(force=True)
-        except Exception:
-            self.release()
-            raise
+                    ORDER BY parent) ordered WHERE (SELECT epoch FROM authority)=%s
+            ) SELECT authority.epoch,borrowed.owned,
+              (SELECT EXTRACT(epoch FROM min(expires_at)-clock_timestamp()) FROM retrieval_capacity_leases WHERE token=ANY(%s::text[])),
+              (SELECT sum(weight) FROM retrieval_capacity_leases WHERE token=ANY(%s::text[]))
+              FROM authority CROSS JOIN borrowed""",
+              (manifest.definition["sources"],manifest.identity,group,self.children,self.parents,epoch,self.parents,self.parents)).fetchone()
+            if row[0] != epoch: raise RuntimeError("snapshot_changed")
+            if row[1] is not True: raise PermissionError("lease_not_owned")
+            if int(row[3] or 0) < minimum_weight: raise PermissionError("calibration_capacity")
+            self._valid_until = checked_at+max(0,min(.05,float(row[2] or 0)))
 
     def check(self, force=False):
         with self._lock:
@@ -119,7 +126,9 @@ class Proof:
             self._valid_until = checked_at+max(0,min(.05,float(row[1] or 0)))
 
     def release(self):
-        with self.pool.connection() as conn, conn.transaction():
+        # The SQL-standard function is one atomic server statement; an extra
+        # client BEGIN/COMMIT adds round trips without a wider atomic boundary.
+        with self.pool.connection() as conn:
             conn.execute("SELECT knowledge_vector_gpu_release(%s::text[],%s::text[])", (self.children,self.parents))
 
 
@@ -276,7 +285,9 @@ class Broker:
             self.stop.wait(2)
 
     def _score(self, snapshot, values, k, sources):
-        ids, scores, _ = snapshot.backend.search(values, k, contract=snapshot.contract, allowed_sources=sources)
+        ids, scores, metrics = snapshot.backend.search(values, k, contract=snapshot.contract, allowed_sources=sources)
+        if self.config.get("profile_timings",False):
+            print(json.dumps({"event":"vector_score_timing",**metrics}),flush=True)
         return [[{"id": int(identity), "score": float(score)} for identity, score in zip(row, scored)
                 if identity >= 0] for row, scored in zip(ids, scores)]
 
@@ -299,13 +310,9 @@ class Broker:
         result = {"version": 1, "manifestId": manifest.identity, "epoch": metadata["epoch"], "runtime": self.runtime,
                   "results": [{"backend": "cpu"} for _ in values]}
         if policy is None or not self.prepare(manifest, metadata["epoch"]): return result
-        proof = Proof(self.pool, manifest, metadata["epoch"], metadata["leases"], self.config["resource_group"])
+        proof = Proof(self.pool, manifest, metadata["epoch"], metadata["leases"], self.config["resource_group"],len(values) if force else 0)
         handles = []
         try:
-            if force:
-                with self.pool.connection() as conn:
-                    weight = conn.execute("SELECT sum(weight) FROM retrieval_capacity_leases WHERE token=ANY(%s::text[])", (proof.parents,)).fetchone()[0]
-                if int(weight or 0) < len(values): raise PermissionError("calibration_capacity")
             with self.dispatch.cohort():
                 for vector, parent in zip(values, metadata["leases"]):
                     self.admission.local.proof, self.admission.local.parent = proof, parent
