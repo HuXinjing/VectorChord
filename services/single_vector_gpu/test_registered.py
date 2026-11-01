@@ -25,7 +25,7 @@ class RegisteredTest(unittest.TestCase):
     def setUp(self):
         self.config = json.loads(Path(CONFIG).read_text())
         self.source = "gpu-fixture-"+uuid.uuid4().hex[:12]
-        self.owner = psycopg.connect(self.config["admin"], autocommit=True, application_name="neobrain-schema-writer-v160")
+        self.owner = psycopg.connect(self.config["admin"], autocommit=True, application_name="neobrain-schema-writer-v161")
         self.owner.execute("INSERT INTO sources(id,name)VALUES(%s,%s)", (self.source,self.source))
         page = self.owner.execute("INSERT INTO pages(source_id,slug,type,title)VALUES(%s,'fixture','document','Fixture')RETURNING id", (self.source,)).fetchone()[0]
         vector = '['+','.join(['1']+['0']*1535)+']'
@@ -66,9 +66,11 @@ class RegisteredTest(unittest.TestCase):
         self.assertEqual(self.owner.execute('SELECT count(*) FROM knowledge_vector_gpu_borrows WHERE parent_token=%s',(self.token,)).fetchone()[0],0)
 
     def test_reader_cannot_read_document_text_or_mutate_native_vectors(self):
-        with psycopg.connect(self.config['database'],autocommit=True, application_name="neobrain-schema-writer-v160")as reader:
+        with psycopg.connect(self.config['database'],autocommit=True, application_name="neobrain-schema-writer-v161")as reader:
             with self.assertRaises(psycopg.errors.InsufficientPrivilege):reader.execute('SELECT chunk_text FROM content_chunks')
             with self.assertRaises(psycopg.errors.InsufficientPrivilege):reader.execute('DELETE FROM content_chunks')
+            with self.assertRaises(psycopg.errors.InsufficientPrivilege):
+                reader.execute("SELECT public.neobrain_retrieval_capacity_claim('forbidden','tenant',ARRAY['new-token'],1,1,1,1000,false,true)")
 
     def test_old_or_foreign_parent_is_not_borrowable(self):
         for sql in ["UPDATE retrieval_capacity_leases SET gpu_borrowable=false WHERE token=%s",
@@ -124,14 +126,14 @@ class RegisteredTest(unittest.TestCase):
 
     def test_witnesses_see_out_of_order_commits_and_compaction_preserves_epoch(self):
         before=self.owner.execute(EPOCH_SQL,([self.source],)).fetchone()[0]
-        with psycopg.connect(self.config['admin'], application_name="neobrain-schema-writer-v160")as first,psycopg.connect(self.config['admin'], application_name="neobrain-schema-writer-v160")as second:
+        with psycopg.connect(self.config['admin'], application_name="neobrain-schema-writer-v161")as first,psycopg.connect(self.config['admin'], application_name="neobrain-schema-writer-v161")as second:
             for conn in [first,second]:conn.execute('INSERT INTO knowledge_vector_gpu_changes VALUES(%s,txid_current(),1)',(self.source,))
             second.commit()
             middle=self.owner.execute(EPOCH_SQL,([self.source],)).fetchone()[0]
             first.commit()
         after=self.owner.execute(EPOCH_SQL,([self.source],)).fetchone()[0]
         self.assertNotEqual(before,middle);self.assertNotEqual(middle,after)
-        with psycopg.connect(self.config['database'],autocommit=True, application_name="neobrain-schema-writer-v160")as reader:reader.execute('SELECT knowledge_vector_gpu_compact()')
+        with psycopg.connect(self.config['database'],autocommit=True, application_name="neobrain-schema-writer-v161")as reader:reader.execute('SELECT knowledge_vector_gpu_compact()')
         self.assertEqual(self.owner.execute(EPOCH_SQL,([self.source],)).fetchone()[0],after)
 
 

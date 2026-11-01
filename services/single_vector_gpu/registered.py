@@ -52,7 +52,7 @@ class Pool:
         try:
             try: conn = self.idle.get_nowait()
             except queue.Empty: conn = psycopg.connect(self.database, autocommit=True, connect_timeout=3,
-                application_name="neobrain-schema-writer-v160",
+                application_name="neobrain-schema-writer-v161",
                 options="-c statement_timeout=3000 -c lock_timeout=1000 -c idle_in_transaction_session_timeout=10000")
             yield conn
         finally:

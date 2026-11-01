@@ -5,7 +5,7 @@ an optional candidate scorer. The separate experimental `server` is not the
 production integration endpoint. Python configuration must be mode 0600 and
 owned by the runtime UID.
 
-The broker accepts planner manifests registered by NeoBrain schema 160, reads
+The broker accepts planner manifests registered by NeoBrain schema 161, reads
 vectors through a dedicated restricted PostgreSQL role, and borrows already
 admitted tenant leases. It does not call an encoder, accept SQL in HTTP, grant
 new tenant quota, or replace final PostgreSQL evidence/ranking checks.
@@ -19,7 +19,7 @@ Snapshots, pending batches, loader work and resident bytes are bounded. A
 cohort uses a short ownership receipt that never outlives its parents; final
 HTTP delivery forces a fresh ownership and epoch check. Cancellation cannot
 free borrowed capacity before actual work finishes. Database connections
-carry schema writer version 160; the service must be upgraded with the schema,
+carry schema writer version 161; the service must be upgraded with the schema,
 not allowed to bypass an upgrade fence.
 
 Use the optional Containerfile with build context `services`, a pinned PyTorch
