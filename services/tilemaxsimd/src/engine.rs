@@ -172,6 +172,9 @@ pub struct DeviceStatus {
     pub tensor_circuit_open: bool,
     pub tensor_suppressed_bucket_count: u32,
     pub tensor_request_fallbacks: u64,
+    pub hopper_fused_enabled: bool,
+    pub hopper_fused_calls: u64,
+    pub hopper_fused_declines: u64,
     pub tensor_capacity_fallbacks: u64,
     pub tensor_device_fallbacks: u64,
     pub tensor_circuit_state: String,
@@ -1606,6 +1609,9 @@ impl Engine {
                     tensor_circuit_open: adaptive.tensor_circuit_open,
                     tensor_suppressed_bucket_count: adaptive.tensor_suppressed_bucket_count,
                     tensor_request_fallbacks: adaptive.tensor_request_fallbacks,
+                    hopper_fused_enabled: adaptive.hopper_fused_enabled,
+                    hopper_fused_calls: adaptive.hopper_fused_calls,
+                    hopper_fused_declines: adaptive.hopper_fused_declines,
                     tensor_capacity_fallbacks: adaptive.tensor_capacity_fallbacks,
                     tensor_device_fallbacks: adaptive.tensor_device_fallbacks,
                     tensor_circuit_state: adaptive.tensor_circuit_state,
@@ -1629,7 +1635,7 @@ impl Engine {
             .devices
             .iter()
             .map(|device| {
-                serde_json::json!({
+                let mut value = serde_json::json!({
                     "index": device.slot,
                     "device": device.device,
                     "backend": device.backend,
@@ -1669,7 +1675,11 @@ impl Engine {
                     "gpu_admission_rejections": device.admission_rejections,
                     "h2d_batches": device.h2d_batches,
                     "h2d_bytes": device.h2d_bytes,
-                })
+                });
+                value["hopper_fused_enabled"] = device.hopper_fused_enabled.into();
+                value["hopper_fused_calls"] = device.hopper_fused_calls.into();
+                value["hopper_fused_declines"] = device.hopper_fused_declines.into();
+                value
             })
             .collect::<Vec<_>>();
         serde_json::json!({

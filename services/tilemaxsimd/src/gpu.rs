@@ -18,6 +18,14 @@ use std::ffi::{CStr, c_char, c_int, c_uchar, c_void};
 use std::ptr::NonNull;
 use std::time::{Duration, Instant};
 
+fn hopper_fused_enabled(value: Option<&str>) -> Result<bool> {
+    match value {
+        None | Some("0") => Ok(false),
+        Some("1") => Ok(true),
+        _ => bail!("TILEMAXSIM_HOPPER_FUSED must be 0 or 1"),
+    }
+}
+
 const TENSOR_BUCKET_BASE_COOLDOWN: Duration = Duration::from_secs(60);
 const TENSOR_BUCKET_MAX_COOLDOWN: Duration = Duration::from_secs(30 * 60);
 const TENSOR_DEVICE_BASE_COOLDOWN: Duration = Duration::from_secs(30);
@@ -284,6 +292,21 @@ unsafe extern "C" {
         error: *mut c_char,
         error_capacity: usize,
     ) -> c_int;
+    fn vctm_gpu_score_batch_hopper(
+        gpu: *mut NativeGpu,
+        queries: *const c_uchar,
+        query_bytes: usize,
+        query_offsets: *const u32,
+        request_count: u32,
+        total_query_rows: u32,
+        dimension: u32,
+        document_offsets: *const u64,
+        document_rows: *const u32,
+        count: usize,
+        output: *mut f32,
+        error: *mut c_char,
+        error_capacity: usize,
+    ) -> c_int;
     fn vctm_gpu_score_pq(
         gpu: *mut NativeGpu,
         quantizer: *const NativeQuantizer,
@@ -320,7 +343,11 @@ pub struct Gpu {
     native: NonNull<NativeGpu>,
     device: i32,
     tensor_bytes: usize,
+    workspace_bytes: usize,
     quantizers: HashMap<String, NonNull<NativeQuantizer>>,
+    hopper_fused_enabled: bool,
+    hopper_fused_calls: u64,
+    hopper_fused_declines: u64,
     tensor_threshold_rows: u32,
     tensor_calibration_buckets: Vec<TensorCalibrationBucket>,
     tensor_bucket_backoffs: HashMap<TensorBucketKey, ExponentialBackoff>,
@@ -347,6 +374,8 @@ unsafe impl Send for Gpu {}
 
 impl Gpu {
     pub fn create(device: i32, total_bytes: usize, workspace_bytes: usize) -> Result<Self> {
+        let enable_hopper =
+            hopper_fused_enabled(std::env::var("TILEMAXSIM_HOPPER_FUSED").ok().as_deref())?;
         let mut native = std::ptr::null_mut();
         let mut error = [0_i8; 512];
         // SAFETY: the C API writes one opaque pointer and a bounded error string.
@@ -428,7 +457,11 @@ impl Gpu {
             native,
             device,
             tensor_bytes,
+            workspace_bytes,
             quantizers: HashMap::new(),
+            hopper_fused_enabled: false,
+            hopper_fused_calls: 0,
+            hopper_fused_declines: 0,
             tensor_threshold_rows,
             tensor_calibration_buckets: Vec::new(),
             tensor_bucket_backoffs: HashMap::new(),
@@ -514,6 +547,16 @@ impl Gpu {
             Some(unsafe { vctm_gpu_pinned_control_staging(gpu.native.as_ptr()) != 0 });
         gpu.info.double_buffered_tile =
             Some(unsafe { vctm_gpu_double_buffered_tile(gpu.native.as_ptr()) != 0 });
+        if enable_hopper && major != 9 {
+            bail!("TILEMAXSIM_HOPPER_FUSED requires an SM90 Hopper device");
+        }
+        gpu.hopper_fused_enabled = enable_hopper;
+        if enable_hopper {
+            eprintln!(
+                "{}",
+                serde_json::json!({"event":"tilemaxsim_hopper_fused_enabled","device":device,"graph":false})
+            );
+        }
         Ok(gpu)
     }
 
@@ -542,6 +585,9 @@ impl Gpu {
 
     pub fn adaptive_status(&self) -> AdaptiveStatus {
         AdaptiveStatus {
+            hopper_fused_enabled: self.hopper_fused_enabled,
+            hopper_fused_calls: self.hopper_fused_calls,
+            hopper_fused_declines: self.hopper_fused_declines,
             tensor_threshold_rows: self.tensor_threshold_rows,
             calibration_complete: self.calibration_complete,
             batch_vector_calls: self.batch_warp_calls,
@@ -818,6 +864,20 @@ impl Gpu {
         document_offsets: &[u64],
         document_rows: &[u32],
     ) -> Result<Vec<Vec<f32>>> {
+        if self.hopper_fused_enabled
+            && self.tensor_device_backoff.phase == CircuitPhase::Closed
+            && dtype == 2
+            && scoring_profile == 1
+            && let Some(scores) = self.try_hopper_fused(
+                queries,
+                query_offsets,
+                dimension,
+                document_offsets,
+                document_rows,
+            )?
+        {
+            return Ok(scores);
+        }
         let total_rows = *query_offsets.last().unwrap_or(&0);
         let now = Instant::now();
         let (device_permitted, device_transition) = self.tensor_device_backoff.permit(now);
@@ -1046,6 +1106,84 @@ impl Gpu {
             document_rows,
             scoring_profile,
         )?)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn try_hopper_fused(
+        &mut self,
+        queries: &[u8],
+        offsets: &[u32],
+        dimension: u32,
+        document_offsets: &[u64],
+        document_rows: &[u32],
+    ) -> Result<Option<Vec<Vec<f32>>>> {
+        if offsets.len() < 3
+            || document_offsets.is_empty()
+            || document_offsets.len() != document_rows.len()
+        {
+            bail!("invalid Hopper scoring batch descriptors");
+        }
+        let requests = offsets.len() - 1;
+        let requests_u32 = u32::try_from(requests)?;
+        let values = requests
+            .checked_mul(document_offsets.len())
+            .ok_or_else(|| anyhow!("Hopper output shape overflow"))?;
+        if values
+            .checked_mul(std::mem::size_of::<f32>())
+            .is_none_or(|bytes| bytes > self.workspace_bytes)
+        {
+            self.hopper_fused_declines = self.hopper_fused_declines.saturating_add(1);
+            return Ok(None);
+        }
+        let mut output = vec![0.0_f32; values];
+        let mut error = [0_i8; 512];
+        // SAFETY: all host slices and the exclusively owned arena remain live
+        // through this synchronous call, including its error-path stream drain.
+        let status = unsafe {
+            vctm_gpu_score_batch_hopper(
+                self.native.as_ptr(),
+                queries.as_ptr(),
+                queries.len(),
+                offsets.as_ptr(),
+                requests_u32,
+                *offsets.last().unwrap(),
+                dimension,
+                document_offsets.as_ptr(),
+                document_rows.as_ptr(),
+                document_offsets.len(),
+                output.as_mut_ptr(),
+                error.as_mut_ptr(),
+                error.len(),
+            )
+        };
+        match status {
+            0 => {
+                if output.iter().any(|value| !value.is_finite()) {
+                    bail!("Hopper scoring returned a non-finite result");
+                }
+                self.hopper_fused_calls = self.hopper_fused_calls.saturating_add(1);
+                Ok(Some(
+                    output
+                        .chunks(document_offsets.len())
+                        .map(<[f32]>::to_vec)
+                        .collect(),
+                ))
+            }
+            // These statuses are guaranteed to occur before GPU submission.
+            1 | 2 => {
+                self.hopper_fused_declines = self.hopper_fused_declines.saturating_add(1);
+                Ok(None)
+            }
+            // Never retry a submitted operation through another scorer.
+            _ => {
+                self.hopper_fused_enabled = false;
+                eprintln!(
+                    "{}",
+                    serde_json::json!({"event":"tilemaxsim_hopper_fused_disabled_after_error","device":self.device})
+                );
+                bail!("Hopper scoring failed: {}", native_error(&error))
+            }
+        }
     }
 
     fn calibrate_kernel_thresholds(&mut self) {
@@ -2111,6 +2249,113 @@ fn native_error(buffer: &[c_char]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hopper_policy_is_explicit_and_rejects_unknown_modes() {
+        assert!(!hopper_fused_enabled(None).unwrap());
+        assert!(!hopper_fused_enabled(Some("0")).unwrap());
+        assert!(hopper_fused_enabled(Some("1")).unwrap());
+        assert!(hopper_fused_enabled(Some("auto")).is_err());
+    }
+
+    #[test]
+    #[ignore = "requires assigned Hopper GPU"]
+    fn hopper_fused_matches_reference_and_preserves_decline_recovery() {
+        let mut gpu = Gpu::create(0, 128 << 20, 32 << 20).unwrap();
+        assert_eq!(gpu.info.architecture, "sm_90");
+        for dimension in [64, 320] {
+            let rows = [1, 31, 64, 65, 129, 747];
+            let mut offsets = Vec::new();
+            let mut cursor = 256_u64;
+            let mut docs = Vec::new();
+            for &n in &rows {
+                offsets.push(cursor);
+                let data = (0..n * dimension)
+                    .flat_map(|i| {
+                        // Signed exactly representable FP16 values, independent
+                        // of any benchmark question or expected answer.
+                        let bits = if i % 3 == 0 { 0xac00_u16 } else { 0x2c00_u16 };
+                        bits.to_le_bytes()
+                    })
+                    .collect::<Vec<_>>();
+                cursor += (data.len() as u64).div_ceil(256) * 256;
+                docs.push(data);
+            }
+            gpu.upload_batch(
+                &offsets
+                    .iter()
+                    .zip(&docs)
+                    .map(|(o, d)| (*o, d.as_slice()))
+                    .collect::<Vec<_>>(),
+            )
+            .unwrap();
+            let boundaries = [0, 1, 6, 23, 88];
+            let queries = (0..88 * dimension)
+                .flat_map(|i| if i % 5 == 0 { 0xac00_u16 } else { 0x2c00_u16 }.to_le_bytes())
+                .collect::<Vec<_>>();
+            let reference = gpu
+                .score_batch_native(
+                    false,
+                    &queries,
+                    &boundaries,
+                    dimension,
+                    2,
+                    &offsets,
+                    &rows,
+                    1,
+                )
+                .unwrap();
+            let actual = gpu
+                .try_hopper_fused(&queries, &boundaries, dimension, &offsets, &rows)
+                .unwrap()
+                .unwrap();
+            assert!(batch_scores_close(&reference, &actual));
+            // A changed candidate mapping must not reuse old addresses.
+            offsets.reverse();
+            let changed = gpu
+                .score_batch_native(
+                    false,
+                    &queries,
+                    &boundaries,
+                    dimension,
+                    2,
+                    &offsets,
+                    &rows.iter().rev().copied().collect::<Vec<_>>(),
+                    1,
+                )
+                .unwrap();
+            let actual = gpu
+                .try_hopper_fused(
+                    &queries,
+                    &boundaries,
+                    dimension,
+                    &offsets,
+                    &rows.iter().rev().copied().collect::<Vec<_>>(),
+                )
+                .unwrap()
+                .unwrap();
+            assert!(batch_scores_close(&changed, &actual));
+            let bad = offsets.iter().map(|o| o + 1).collect::<Vec<_>>();
+            assert!(
+                gpu.try_hopper_fused(&queries, &boundaries, dimension, &bad, &rows)
+                    .unwrap()
+                    .is_none()
+            );
+            assert!(
+                gpu.try_hopper_fused(
+                    &queries,
+                    &boundaries,
+                    dimension,
+                    &offsets,
+                    &rows.iter().rev().copied().collect::<Vec<_>>()
+                )
+                .unwrap()
+                .is_some()
+            );
+        }
+        assert!(gpu.hopper_fused_calls >= 6);
+        assert_eq!(gpu.hopper_fused_declines, 2);
+    }
 
     #[test]
     fn native_tensor_failures_have_stable_recovery_classes() {

@@ -22,6 +22,8 @@
 #include <limits>
 #include <map>
 #include <vector>
+#include "hopper_maxsim.cuh"
+#include <dlfcn.h>
 
 struct VctmGpu {
   int device;
@@ -51,6 +53,13 @@ struct VctmGpu {
   std::vector<void *> tensor_c_pointers;
   std::vector<uint32_t> tensor_candidate_indexes;
   size_t tensor_chunk_candidates;
+  // Descriptor metadata only, never permission/residency or score caching.
+  std::vector<uint64_t> hopper_offsets;
+  std::vector<uint32_t> hopper_rows, hopper_ids;
+  std::vector<CUtensorMap> hopper_maps;
+  uint32_t hopper_dimension=0;
+  bool hopper_configured=false;
+
 };
 
 struct VctmQuantizer {
@@ -1272,6 +1281,113 @@ extern "C" int vctm_gpu_score_batch_tensor(
     return 3;
   }
   return 0;
+}
+
+
+// Status 1/2 is a pre-submission decline; status 3 is a synchronized device
+// failure and MUST NOT trigger a second scoring attempt in the caller.
+extern "C" int vctm_gpu_score_batch_hopper(
+    VctmGpu *gpu,const unsigned char *queries,size_t query_bytes,
+    const uint32_t *query_offsets,uint32_t requests,uint32_t query_rows,
+    uint32_t dimension,const uint64_t *offsets,const uint32_t *rows,size_t count,
+    float *output,char *error,size_t capacity) {
+#if !defined(VCTM_HAS_SM90A)
+  return fail(error,capacity,"Hopper WGMMA image is unavailable");
+#else
+  if(!gpu||!queries||!query_offsets||!offsets||!rows||!output||requests<2||
+     !query_rows||requests>query_rows||query_rows>65535U*128||!dimension||dimension%64||
+     dimension>INT32_MAX||!count||count>65536||query_offsets[0]||query_offsets[requests]!=query_rows||gpu->compute_major!=9)
+    return fail(error,capacity,"unsupported Hopper MaxSim shape");
+  for(uint32_t i=0;i<requests;i++)if(query_offsets[i]>=query_offsets[i+1])
+    return fail(error,capacity,"invalid Hopper query boundaries");
+  size_t values=0,bytes=0,score_values=0,score_bytes=0;
+  if(!checked_mul(query_rows,dimension,&values)||!checked_mul(values,sizeof(half),&bytes)||bytes!=query_bytes||
+     !checked_mul(requests,count,&score_values)||!checked_mul(score_values,sizeof(float),&score_bytes))
+    return fail(error,capacity,"invalid Hopper query/output size");
+  std::map<uint32_t,std::vector<uint32_t>> groups;
+  size_t maximum_partial=0;
+  for(size_t i=0;i<count;i++) {
+    if(!rows[i]||rows[i]>INT32_MAX||offsets[i]%16||offsets[i]>gpu->tensor_bytes||
+       !checked_mul(rows[i],dimension,&values)||!checked_mul(values,sizeof(half),&bytes)||bytes>gpu->tensor_bytes-offsets[i])
+      return fail(error,capacity,"invalid Hopper document descriptor");
+    groups[rows[i]].push_back(uint32_t(i));
+  }
+  for(const auto &[r,ids]:groups) {
+    const size_t tiles=(uint64_t(r)+127)/128;
+    size_t partial=0;
+    if(ids.size()*tiles>INT32_MAX||!checked_mul(ids.size(),query_rows,&partial)||
+       !checked_mul(partial,tiles*sizeof(float),&partial))
+      return capacity_fail(error,capacity,"Hopper partial shape overflow");
+    maximum_partial=std::max(maximum_partial,partial);
+  }
+  size_t cursor=0,q=0,dm=0,qo=0,ci=0,partial=0,score=0;
+  if(!reserve_aligned(&cursor,query_bytes,&q)||!reserve_aligned(&cursor,count*sizeof(CUtensorMap),&dm)||
+     !reserve_aligned(&cursor,(size_t(requests)+1)*sizeof(uint32_t),&qo)||!reserve_aligned(&cursor,count*sizeof(uint32_t),&ci)||
+     !reserve_aligned(&cursor,maximum_partial,&partial)||!reserve_aligned(&cursor,score_bytes,&score)||cursor>gpu->workspace_bytes)
+    return capacity_fail(error,capacity,"Hopper request exceeds configured GPU workspace");
+  auto status=cudaSetDevice(gpu->device);
+  if(status!=cudaSuccess){cuda_fail(error,capacity,"Hopper device selection",status);return 3;}
+  constexpr uint32_t shared=2*(2*64*64+128*64)*sizeof(uint16_t);
+  // Per-function opt-in; no GPU-wide resource policy changes.
+  if(!gpu->hopper_configured) {
+    status=cudaFuncSetAttribute(vctm_hopper::pipelined_fp16_kernel<128,2,2>,cudaFuncAttributeMaxDynamicSharedMemorySize,shared);
+    if(status!=cudaSuccess){cudaGetLastError();return fail(error,capacity,"Hopper kernel unavailable");}
+    gpu->hopper_configured=true;
+  }
+  // Keep --help and portable image inspection usable without an injected driver.
+  // The process retains one driver-library reference, never one per request.
+  static void *driver=dlopen("libcuda.so.1",RTLD_NOW|RTLD_LOCAL);
+  static auto encode_map=driver?reinterpret_cast<decltype(&cuTensorMapEncodeTiled)>(dlsym(driver,"cuTensorMapEncodeTiled")):nullptr;
+  if(!encode_map)return fail(error,capacity,"Hopper tensor-map driver API unavailable");
+  auto ws=gpu->allocation+gpu->tensor_bytes;
+  const auto encode=[&](const void *input,uint32_t n,uint32_t box_rows,CUtensorMap *map) {
+    const uint64_t shape[2]={dimension,n},stride[1]={uint64_t(dimension)*sizeof(half)};
+    const uint32_t box[2]={64,box_rows},element_stride[2]={1,1};
+    return encode_map(map,CU_TENSOR_MAP_DATA_TYPE_FLOAT16,2,const_cast<void*>(input),shape,stride,box,element_stride,
+      CU_TENSOR_MAP_INTERLEAVE_NONE,CU_TENSOR_MAP_SWIZZLE_128B,CU_TENSOR_MAP_L2_PROMOTION_NONE,CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
+  };
+  CUtensorMap query_map{};
+  if(encode(ws+q,query_rows,64,&query_map)!=CUDA_SUCCESS)return fail(error,capacity,"Hopper query encoding declined");
+  const bool reuse=gpu->hopper_dimension==dimension&&gpu->hopper_offsets.size()==count&&gpu->hopper_rows.size()==count&&
+    std::equal(gpu->hopper_offsets.begin(),gpu->hopper_offsets.end(),offsets)&&std::equal(gpu->hopper_rows.begin(),gpu->hopper_rows.end(),rows);
+  if(!reuse) {
+    // Build a replacement before publishing its key, including failure paths.
+    std::vector<CUtensorMap> maps(count);std::vector<uint32_t> ids;ids.reserve(count);
+    for(const auto &[r,indexes]:groups)for(uint32_t id:indexes) {
+      if(encode(gpu->allocation+offsets[id],r,128,&maps[ids.size()])!=CUDA_SUCCESS)
+        return fail(error,capacity,"Hopper document encoding declined");
+      ids.push_back(id);
+    }
+    gpu->hopper_dimension=0;
+    gpu->hopper_offsets.assign(offsets,offsets+count);gpu->hopper_rows.assign(rows,rows+count);
+    gpu->hopper_ids=std::move(ids);gpu->hopper_maps=std::move(maps);gpu->hopper_dimension=dimension;
+  }
+  const HostControlSegment control[]={{q,queries,query_bytes},{dm,gpu->hopper_maps.data(),count*sizeof(CUtensorMap)},
+    {qo,query_offsets,(size_t(requests)+1)*sizeof(uint32_t)},{ci,gpu->hopper_ids.data(),count*sizeof(uint32_t)}};
+  status=copy_control_payload(gpu,ws,control,4);
+  size_t begin=0;
+  for(const auto &[r,ids]:groups) {
+    if(status!=cudaSuccess)break;
+    const uint32_t tiles=uint32_t((uint64_t(r)+127)/128);
+    const dim3 grid(uint32_t(tiles*ids.size()),(query_rows+127)/128);
+    vctm_hopper::pipelined_fp16_kernel<128,2,2><<<grid,128,shared,gpu->compute_stream>>>(query_map,query_rows,r,dimension,tiles,
+      reinterpret_cast<float*>(ws+partial),reinterpret_cast<const CUtensorMap*>(ws+dm)+begin,uint32_t(ids.size()));
+    status=cudaGetLastError();
+    if(status!=cudaSuccess)break;
+    const size_t tasks=ids.size()*requests;
+    vctm_hopper::fused_merge_maxima<<<uint32_t(std::min((tasks+127)/128,size_t(65535))),128,0,gpu->compute_stream>>>(
+      reinterpret_cast<const float*>(ws+partial),query_rows,tiles,reinterpret_cast<const uint32_t*>(ws+qo),requests,
+      reinterpret_cast<const uint32_t*>(ws+ci)+begin,uint32_t(ids.size()),count,reinterpret_cast<float*>(ws+score));
+    status=cudaGetLastError();begin+=ids.size();
+  }
+  if(status==cudaSuccess)status=cudaMemcpyAsync(output,ws+score,score_bytes,cudaMemcpyDeviceToHost,gpu->compute_stream);
+  // Drain even after submission/copy failure before caller can release inputs.
+  const auto finished=cudaStreamSynchronize(gpu->compute_stream);
+  if(status!=cudaSuccess||finished!=cudaSuccess) {
+    cuda_fail(error,capacity,"Hopper MaxSim execution",status!=cudaSuccess?status:finished);return 3;
+  }
+  return 0;
+#endif
 }
 
 template <typename QueryScalar>

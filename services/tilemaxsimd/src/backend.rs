@@ -72,6 +72,9 @@ pub struct DeviceInfo {
 
 #[derive(Clone, Debug, Default)]
 pub struct AdaptiveStatus {
+    pub hopper_fused_enabled: bool,
+    pub hopper_fused_calls: u64,
+    pub hopper_fused_declines: u64,
     pub tensor_threshold_rows: u32,
     pub calibration_complete: bool,
     pub batch_vector_calls: u64,

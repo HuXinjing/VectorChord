@@ -30,6 +30,7 @@ fn main() {
         return;
     }
     println!("cargo:rerun-if-changed=native/tilemaxsim_cuda.cu");
+    println!("cargo:rerun-if-changed=native/hopper_maxsim.cuh");
     println!("cargo:rerun-if-env-changed=TILEMAXSIM_CUDA_ARCHS");
     let architectures = std::env::var("TILEMAXSIM_CUDA_ARCHS")
         .unwrap_or_else(|_| "80,89,90,90a,90-virtual".to_owned());
@@ -63,10 +64,14 @@ fn main() {
         );
         build.flag(format!("-gencode=arch=compute_{target},code={code}"));
     }
+    if architectures.split(',').any(|a| a.trim() == "90a") {
+        build.define("VCTM_HAS_SM90A", "1");
+    }
     build
         .file("native/tilemaxsim_cuda.cu")
         .compile("tilemaxsim_cuda");
     println!("cargo:rustc-link-lib=cudart");
     println!("cargo:rustc-link-lib=cublas");
+    println!("cargo:rustc-link-lib=dl");
     println!("cargo:rustc-link-search=native=/usr/local/cuda/lib64");
 }
