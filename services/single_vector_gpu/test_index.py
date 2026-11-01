@@ -6,6 +6,7 @@ import numpy as np
 
 from single_vector_gpu.index import Contract, SingleVectorIndex, normalized
 from single_vector_gpu.server import packet, unpack, handler
+from single_vector_gpu.client import BatchClient
 
 
 class IndexTest(unittest.TestCase):
@@ -88,6 +89,21 @@ class IndexTest(unittest.TestCase):
                 if expected == 200:
                     meta, payload = unpack(body)
                     self.assertEqual((meta["rows"], meta["k"], len(payload)), (2, 3, 72))
+        finally:
+            server.shutdown(); server.server_close(); worker.join(timeout=3)
+
+    def test_persistent_client_streams_matrix_and_reuses_connection(self):
+        server = ThreadingHTTPServer(("127.0.0.1", 0), handler(self.index, "b"*64))
+        worker = threading.Thread(target=server.serve_forever, daemon=True); worker.start()
+        try:
+            with BatchClient("127.0.0.1", server.server_port, "b"*64, self.contract, timeout=3) as client:
+                socket = None
+                for _ in range(2):
+                    ids, scores, timing = client.search(self.docs[:2], 4, [0, 1, 2])
+                    self.assertEqual(ids.shape, (2, 4)); self.assertTrue(np.isfinite(scores).all())
+                    self.assertGreater(timing["full_wall_ms"], 0)
+                    if socket is not None: self.assertIs(client._connection.sock, socket)
+                    socket = client._connection.sock
         finally:
             server.shutdown(); server.server_close(); worker.join(timeout=3)
 
