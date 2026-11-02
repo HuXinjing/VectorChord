@@ -312,7 +312,9 @@ class Broker:
         result = {"version": 1, "manifestId": manifest.identity, "epoch": metadata["epoch"], "runtime": self.runtime,
                   "results": [{"backend": "cpu"} for _ in values]}
         if policy is None or not self.prepare(manifest, metadata["epoch"]): return result
+        started=time.perf_counter()
         proof = Proof(self.pool, manifest, metadata["epoch"], metadata["leases"], self.config["resource_group"],len(values) if force else 0)
+        borrowed_at=time.perf_counter(); dispatched_at=borrowed_at; scored_at=borrowed_at; verified_at=borrowed_at
         handles = []
         try:
             with self.dispatch.cohort():
@@ -320,8 +322,11 @@ class Broker:
                     self.admission.local.proof, self.admission.local.parent = proof, parent
                     handles.append(self.dispatch.submit(vector, contract=manifest.contract(metadata["epoch"]), sources=[0],
                         k=metadata["k"], deadline=time.monotonic()+2, authorize=proof.check, cpu=lambda: None, policy=policy))
+            dispatched_at=time.perf_counter()
             rows = [handle.result.result() for handle in handles]
+            scored_at=time.perf_counter()
             proof.check(force=True)
+            verified_at=time.perf_counter()
             result["results"] = [{"backend": row["backend"], **({"candidates": row["result"]} if row["backend"] == "gpu" else {})} for row in rows]
             return result
         finally:
@@ -330,6 +335,11 @@ class Broker:
                 try: handle.result.result()
                 except Exception: pass
             proof.release()
+            if self.config.get("profile_timings",False):
+                print(json.dumps({"event":"vector_request_timing","rows":len(values),"borrow_ms":(borrowed_at-started)*1000,
+                  "enqueue_ms":(dispatched_at-borrowed_at)*1000,"dispatch_score_ms":(scored_at-dispatched_at)*1000,
+                  "final_proof_ms":(verified_at-scored_at)*1000,"release_ms":(time.perf_counter()-verified_at)*1000,
+                  "wall_ms":(time.perf_counter()-started)*1000,"ended_at":time.time()}),flush=True)
             self.admission.local.proof = self.admission.local.parent = None
 
     def close(self):
