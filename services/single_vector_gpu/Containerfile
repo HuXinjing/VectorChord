@@ -1,0 +1,13 @@
+ARG BASE_IMAGE
+FROM ${BASE_IMAGE}
+ARG SOURCE_REVISION=unknown
+LABEL org.opencontainers.image.revision=${SOURCE_REVISION}
+RUN python3 -c "import torch; assert torch.__version__.split('+')[0]=='2.8.0'; assert torch.version.cuda=='12.8'"
+RUN python3 -m pip install --no-cache-dir numpy==2.2.6 'psycopg[binary]==3.3.6'
+WORKDIR /app
+COPY single_vector_gpu /app/single_vector_gpu
+ENV PYTHONPATH=/app OMP_NUM_THREADS=4 OPENBLAS_NUM_THREADS=4 MKL_NUM_THREADS=4 PYTHONUNBUFFERED=1 HOME=/tmp XDG_CACHE_HOME=/tmp/.cache CUDA_CACHE_PATH=/tmp/cuda-cache
+USER 10001:10001
+HEALTHCHECK --interval=15s --timeout=5s --start-period=30s CMD python3 -c "import urllib.request,json; assert json.load(urllib.request.urlopen('http://127.0.0.1:29421/health',timeout=3))['ready']"
+ENTRYPOINT ["python3","-m","single_vector_gpu.registered"]
+CMD ["--config","/run/secrets/vector-gpu.json"]
