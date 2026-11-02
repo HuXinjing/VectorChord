@@ -65,6 +65,22 @@ class RegisteredTest(unittest.TestCase):
         self.assertEqual(result['results'][0]['candidates'][0]['id'],self.identity)
         self.assertEqual(self.owner.execute('SELECT count(*) FROM knowledge_vector_gpu_borrows WHERE parent_token=%s',(self.token,)).fetchone()[0],0)
 
+    def test_large_wire_cohort_borrows_and_releases_each_parent(self):
+        tokens=[str(uuid.uuid4()) for _ in range(512)]
+        self.owner.execute("UPDATE retrieval_capacity_groups SET max_inflight=1024,max_tenant_inflight=1024 WHERE resource_group=%s",(self.config['resource_group'],))
+        self.owner.execute("""INSERT INTO retrieval_capacity_leases(token,resource_group,tenant_key,weight,expires_at,gpu_borrowable)
+          SELECT token,%s,'fixture-tenant',1,now()+interval '1 minute',true FROM unnest(%s::text[])AS input(token)""",(self.config['resource_group'],tokens))
+        try:
+            result=self.broker.search({**self.metadata,'rows':512,'leases':tokens},self.query*512,force=True)
+            self.assertEqual(len(result['results']),512)
+            self.assertTrue(all(row['backend']=='gpu' and row['candidates'][0]['id']==self.identity for row in result['results']))
+            self.assertEqual(self.owner.execute('SELECT count(*) FROM knowledge_vector_gpu_borrows WHERE parent_token=ANY(%s::text[])',(tokens,)).fetchone()[0],0)
+            with self.assertRaises(ValueError):
+                self.broker.search({**self.metadata,'rows':513,'leases':tokens+[self.token]},self.query*513,force=True)
+        finally:
+            self.owner.execute('DELETE FROM retrieval_capacity_leases WHERE token=ANY(%s::text[])',(tokens,))
+            self.owner.execute("UPDATE retrieval_capacity_groups SET max_inflight=16,max_tenant_inflight=16 WHERE resource_group=%s",(self.config['resource_group'],))
+
     def test_reader_cannot_read_document_text_or_mutate_native_vectors(self):
         with psycopg.connect(self.config['database'],autocommit=True, application_name="neobrain-schema-writer-v161")as reader:
             with self.assertRaises(psycopg.errors.InsufficientPrivilege):reader.execute('SELECT chunk_text FROM content_chunks')

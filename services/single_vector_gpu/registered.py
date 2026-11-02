@@ -173,7 +173,7 @@ class Broker:
         self.loader = ThreadPoolExecutor(max_workers=1, thread_name_prefix="vector-snapshot")
         self.stop = threading.Event()
         self.database_ready_at = 0.
-        self.dispatch = Dispatcher(self.catalog, Policy(1, "disabled", 0, max_pending=256), self.admission,
+        self.dispatch = Dispatcher(self.catalog, Policy(1, "disabled", 0, max_batch=512, max_pending=2048, max_pending_per_tenant=1024), self.admission,
                                    self._score, cpu_workers=2, observe=lambda event: print(json.dumps({"event":"vector_dispatch",**event}),flush=True))
         self.maintenance = threading.Thread(target=self._maintain, daemon=True)
         self.maintenance.start()
@@ -194,14 +194,14 @@ class Broker:
 
     def policy(self, manifest, epoch, force=False):
         if force:
-            return Policy(1, manifest.identity+epoch, time.monotonic()+30, force_gpu=True)
+            return Policy(1, manifest.identity+epoch, time.monotonic()+30, force_gpu=True, max_batch=512)
         with self.pool.connection() as conn:
             row = conn.execute("""SELECT crossover,margin,expires_at FROM knowledge_vector_gpu_calibrations
               WHERE manifest_id=%s AND epoch=%s AND transport_fingerprint=%s AND runtime_fingerprint=%s AND expires_at>now()""",
               (manifest.identity, epoch, self.config["transport"], self.runtime)).fetchone()
         if row is None: return None
         return Policy(float(row[0]), manifest.identity+epoch,
-                      time.monotonic()+max(0, row[2].timestamp()-time.time()), margin=max(2.,float(row[1])))
+                      time.monotonic()+max(0, row[2].timestamp()-time.time()), margin=max(2.,float(row[1])), max_batch=512)
 
     def prepare(self, manifest, epoch):
         calibration = manifest.identity+epoch
@@ -249,8 +249,10 @@ class Broker:
                         position += 1
                 if position != count: raise RuntimeError("snapshot_rows")
             contract = manifest.contract(epoch)
+            # Wire cohorts may be larger; preserve the previous FP32 GEMM row
+            # limit so transport tuning does not also change rounding/ranking.
             index = SingleVectorIndex(vectors, identities, np.zeros(count, dtype=np.int64), contract,
-                                      device=self.config.get("device", "cuda:0"), profile="fp32",
+                                      device=self.config.get("device", "cuda:0"), profile="fp32", query_block=64,
                                       memory_limit_bytes=self.catalog.limit)
             snapshot = Snapshot(contract, frozenset([0]), vectors.shape[1], size, index,
                                 manifest.identity+epoch, time.monotonic()+300)
@@ -294,7 +296,7 @@ class Broker:
     def search(self, metadata, payload, force=False):
         required = {"version", "manifestId", "epoch", "leases", "transport", "rows", "k"}
         if (set(metadata) != required or type(metadata["version"]) is not int or metadata["version"] != 1
-            or type(metadata["rows"]) is not int or not 1 <= metadata["rows"] <= 64
+            or type(metadata["rows"]) is not int or not 1 <= metadata["rows"] <= 512
             or type(metadata["k"]) is not int or not 1 <= metadata["k"] <= 1024
             or not isinstance(metadata["leases"], list) or len(metadata["leases"]) != metadata["rows"]
             or any(not isinstance(s, str) or len(s)>128 for s in metadata["leases"])
@@ -360,7 +362,7 @@ def handler(broker):
                 self.close_connection = True; self.send(404, {}); return
             try:
                 size = int(self.headers.get("Content-Length", "-1"))
-                if not 4 <= size <= 64*65536*4+32772: raise ValueError("request_size")
+                if not 4 <= size <= 16*1024**2: raise ValueError("request_size")
                 meta, payload = unpack(self.rfile.read(size),max_header=32768)
                 force = False
                 supplied = self.headers.get("X-Vector-Operator", "")
