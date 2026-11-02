@@ -32,3 +32,11 @@ Verification: pure tests default to CPU and make no GPU throughput claim.
 column permissions, tenant leases, source changes, parent cancellation,
 transaction ordering, and expired metadata cleanup. Never point these tests
 at a business database.
+
+Pipeline bounds: the registered endpoint accepts at most 512 rows and a 16 MiB
+request. Dispatcher budgets remain finite (2,048 globally, 1,024 per tenant),
+with one GPU worker and a bounded waiting slot. Transport cohorts are split
+into at most 64-row FP32 compute blocks to retain the previous numerical
+behavior. Optional `profile_timings` logs request lifecycle durations without
+logging query vectors, source contents or credentials. Matching NeoBrain uses
+two in-flight endpoint RPCs and independent bounded result projection.
