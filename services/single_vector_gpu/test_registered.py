@@ -14,7 +14,7 @@ from concurrent.futures import ThreadPoolExecutor
 import numpy as np
 import psycopg
 
-from single_vector_gpu.registered import Broker, EPOCH_SQL, Proof
+from single_vector_gpu.registered import Broker, EPOCH_SQL, Proof, Pool, WRITER_APPLICATION_NAME, WRITER_SCHEMA_VERSION
 
 
 CONFIG = os.environ.get("NEOBRAIN_VECTOR_GPU_TEST_CONFIG")
@@ -25,7 +25,8 @@ class RegisteredTest(unittest.TestCase):
     def setUp(self):
         self.config = json.loads(Path(CONFIG).read_text())
         self.source = "gpu-fixture-"+uuid.uuid4().hex[:12]
-        self.owner = psycopg.connect(self.config["admin"], autocommit=True, application_name="neobrain-schema-writer-v161")
+        self.owner = psycopg.connect(self.config["admin"], autocommit=True, application_name=WRITER_APPLICATION_NAME)
+        self.assertEqual(self.owner.execute("SELECT value FROM config WHERE key='writer.min_schema_version'").fetchone()[0], str(WRITER_SCHEMA_VERSION))
         self.owner.execute("INSERT INTO sources(id,name)VALUES(%s,%s)", (self.source,self.source))
         page = self.owner.execute("INSERT INTO pages(source_id,slug,type,title)VALUES(%s,'fixture','document','Fixture')RETURNING id", (self.source,)).fetchone()[0]
         vector = '['+','.join(['1']+['0']*1535)+']'
@@ -81,8 +82,33 @@ class RegisteredTest(unittest.TestCase):
             self.owner.execute('DELETE FROM retrieval_capacity_leases WHERE token=ANY(%s::text[])',(tokens,))
             self.owner.execute("UPDATE retrieval_capacity_groups SET max_inflight=16,max_tenant_inflight=16 WHERE resource_group=%s",(self.config['resource_group'],))
 
+    def test_new_connection_probes_fence_without_changing_existing_leases(self):
+        before = self.owner.execute("SELECT token,weight,expires_at,closing FROM retrieval_capacity_leases ORDER BY token").fetchall()
+        pool = Pool(self.config['database'])
+        try:
+            with pool.connection() as conn:
+                self.assertEqual(conn.execute("SELECT current_setting('application_name')").fetchone()[0], WRITER_APPLICATION_NAME)
+            self.assertEqual(self.owner.execute("SELECT token,weight,expires_at,closing FROM retrieval_capacity_leases ORDER BY token").fetchall(), before)
+        finally:
+            pool.close()
+
+    def test_older_writer_is_rejected_before_pool_connection_is_released(self):
+        from unittest.mock import patch
+        pool = Pool(self.config['database'])
+        try:
+            with patch('single_vector_gpu.registered.WRITER_APPLICATION_NAME', f"neobrain-schema-writer-v{WRITER_SCHEMA_VERSION-1}"):
+                with self.assertRaises(psycopg.Error) as rejected:
+                    with pool.connection():
+                        self.fail('An obsolete writer must not reach caller work')
+                self.assertEqual(rejected.exception.sqlstate, '55000')
+            self.assertEqual(pool.idle.qsize(), 0)
+            with pool.connection() as conn:
+                self.assertEqual(conn.execute("SELECT current_setting('application_name')").fetchone()[0], WRITER_APPLICATION_NAME)
+        finally:
+            pool.close()
+
     def test_reader_cannot_read_document_text_or_mutate_native_vectors(self):
-        with psycopg.connect(self.config['database'],autocommit=True, application_name="neobrain-schema-writer-v161")as reader:
+        with psycopg.connect(self.config['database'],autocommit=True, application_name=WRITER_APPLICATION_NAME)as reader:
             with self.assertRaises(psycopg.errors.InsufficientPrivilege):reader.execute('SELECT chunk_text FROM content_chunks')
             with self.assertRaises(psycopg.errors.InsufficientPrivilege):reader.execute('DELETE FROM content_chunks')
             with self.assertRaises(psycopg.errors.InsufficientPrivilege):
@@ -142,14 +168,14 @@ class RegisteredTest(unittest.TestCase):
 
     def test_witnesses_see_out_of_order_commits_and_compaction_preserves_epoch(self):
         before=self.owner.execute(EPOCH_SQL,([self.source],)).fetchone()[0]
-        with psycopg.connect(self.config['admin'], application_name="neobrain-schema-writer-v161")as first,psycopg.connect(self.config['admin'], application_name="neobrain-schema-writer-v161")as second:
+        with psycopg.connect(self.config['admin'], application_name=WRITER_APPLICATION_NAME)as first,psycopg.connect(self.config['admin'], application_name=WRITER_APPLICATION_NAME)as second:
             for conn in [first,second]:conn.execute('INSERT INTO knowledge_vector_gpu_changes VALUES(%s,txid_current(),1)',(self.source,))
             second.commit()
             middle=self.owner.execute(EPOCH_SQL,([self.source],)).fetchone()[0]
             first.commit()
         after=self.owner.execute(EPOCH_SQL,([self.source],)).fetchone()[0]
         self.assertNotEqual(before,middle);self.assertNotEqual(middle,after)
-        with psycopg.connect(self.config['database'],autocommit=True, application_name="neobrain-schema-writer-v161")as reader:reader.execute('SELECT knowledge_vector_gpu_compact()')
+        with psycopg.connect(self.config['database'],autocommit=True, application_name=WRITER_APPLICATION_NAME)as reader:reader.execute('SELECT knowledge_vector_gpu_compact()')
         self.assertEqual(self.owner.execute(EPOCH_SQL,([self.source],)).fetchone()[0],after)
 
 

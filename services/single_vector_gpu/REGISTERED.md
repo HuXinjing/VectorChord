@@ -5,7 +5,7 @@ an optional candidate scorer. The separate experimental `server` is not the
 production integration endpoint. Python configuration must be mode 0600 and
 owned by the runtime UID.
 
-The broker accepts planner manifests registered by NeoBrain schema 161, reads
+The broker accepts planner manifests registered by NeoBrain schema 164, reads
 vectors through a dedicated restricted PostgreSQL role, and borrows already
 admitted tenant leases. It does not call an encoder, accept SQL in HTTP, grant
 new tenant quota, or replace final PostgreSQL evidence/ranking checks.
@@ -19,7 +19,7 @@ Snapshots, pending batches, loader work and resident bytes are bounded. A
 cohort uses a short ownership receipt that never outlives its parents; final
 HTTP delivery forces a fresh ownership and epoch check. Cancellation cannot
 free borrowed capacity before actual work finishes. Database connections
-carry schema writer version 161; the service must be upgraded with the schema,
+carry schema writer version 164; the service must be upgraded with the schema,
 not allowed to bypass an upgrade fence.
 
 Use the optional Containerfile with build context `services`, a pinned PyTorch
@@ -40,3 +40,20 @@ into at most 64-row FP32 compute blocks to retain the previous numerical
 behavior. Optional `profile_timings` logs request lifecycle durations without
 logging query vectors, source contents or credentials. Matching NeoBrain uses
 two in-flight endpoint RPCs and independent bounded result projection.
+
+Each newly opened connection exercises the real database write fence using
+the already-granted release function with empty identities in a rollback-only
+transaction. An incompatible writer is closed before entering the pool. This
+probe neither changes leases nor grants access to the configuration table.
+The declared supported version is part of the binary, never copied from the
+database minimum or overridden by operator configuration. Upgrades beyond the
+supported version still require a tested broker release.
+
+Schema 164 compatibility verification includes 38 CPU functional tests on an
+isolated current-schema PostgreSQL fixture. They cover permission rejection,
+lease borrowing/release, source epoch changes, cancellation, and the connection
+probe's unchanged lease rows. A connection claiming the prior writer version
+is rejected before caller work and is not returned to the pool. These are
+correctness tests, not GPU throughput measurements. A changed broker source
+fingerprint invalidates old calibrations; ordinary requests retain CPU fallback
+until a current calibration is available.

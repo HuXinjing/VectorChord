@@ -38,6 +38,11 @@ EPOCH_SQL = """SELECT COALESCE(jsonb_object_agg(source_id,units),'{}'::jsonb)::t
  SELECT source_id,sum(units)::text AS units FROM knowledge_vector_gpu_changes
  WHERE source_id=ANY(%s::text[]) GROUP BY source_id) witnesses"""
 
+# Verified against NeoBrain schema 164; never derive this claim from a live
+# database minimum or an operator override.
+WRITER_SCHEMA_VERSION = 164
+WRITER_APPLICATION_NAME = f"neobrain-schema-writer-v{WRITER_SCHEMA_VERSION}"
+
 
 class Pool:
     def __init__(self, database, maximum=4):
@@ -51,9 +56,21 @@ class Pool:
         conn = None
         try:
             try: conn = self.idle.get_nowait()
-            except queue.Empty: conn = psycopg.connect(self.database, autocommit=True, connect_timeout=3,
-                application_name="neobrain-schema-writer-v161",
-                options="-c statement_timeout=3000 -c lock_timeout=1000 -c idle_in_transaction_session_timeout=10000")
+            except queue.Empty:
+                conn = psycopg.connect(self.database, autocommit=True, connect_timeout=3,
+                    application_name=WRITER_APPLICATION_NAME,
+                    options="-c statement_timeout=3000 -c lock_timeout=1000 -c idle_in_transaction_session_timeout=10000")
+                try:
+                    # This already-granted lifecycle function performs statement
+                    # writes and therefore exercises the real database writer
+                    # fence even with empty identities. Roll back the probe;
+                    # do not grant config reads or alter any quota/lease.
+                    with conn.transaction(force_rollback=True):
+                        conn.execute("SELECT knowledge_vector_gpu_release(%s::text[],%s::text[])", ([], []))
+                except BaseException:
+                    conn.close()
+                    conn = None
+                    raise
             yield conn
         finally:
             if conn is not None:
