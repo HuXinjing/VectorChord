@@ -120,3 +120,29 @@ The GPU driver version reported by nvidia-smi is not the application's CUDA
 runtime version. This alternative avoids downloading a duplicate multi-gigabyte
 CUDA development image on an already provisioned build machine. Rust test tools
 and small Ubuntu runtime dependencies may still need network access.
+
+## Bounded parallel tensor loading
+
+`--tensor-read-workers` configures immutable object/shard read and checksum
+workers (default 8, configurable 1 through 32, capped by available CPU
+parallelism). It is a loader concurrency budget, not a cgroup CPU limit.
+File identity/length/checksum validation remains mandatory. Loose object reads
+fill one shared allocation directly; packed reads avoid an intermediate payload
+copy. Cache access/admission mutations for loose objects retain descriptor order,
+including error-prefix behavior. Existing packed-shard admission ordering remains
+unchanged. Speculative reads can avoid repeated I/O for duplicate immutable
+objects; storage counters include verified reads actually performed.
+
+Host-cache eviction uses global and per-owner priority indexes. Its density/age
+policy, tenant/global byte limits and rejection rules remain unchanged. Equal
+priorities now use a deterministic content-key tie-break, rather than HashMap
+iteration order. Cache eviction does not invalidate payloads already borrowed by
+a request. No forced pinning, quota increase or checksum bypass is involved.
+
+A CPU-only comparison on 30.100 used the same frozen checkpoint with 45,438
+entries and 21,720,627,200 payload bytes, a 16 GiB host cache and the existing 80%
+per-owner limit. Verified reads took 40.60 / 18.33 / 12.97 / 9.23 seconds with
+1 / 4 / 8 / 16 workers respectively. These are read/validation/cache timings on
+a shared host, not GPU recovery or Agent end-to-end timings. The deployment uses
+16 workers. Its container and cgroup ancestors had no CPU quota, no throttling,
+and 192 available logical CPUs; no CPU hard limit was introduced.
