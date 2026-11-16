@@ -8,6 +8,7 @@
 //
 // Copyright (c) 2026 Hu Xinjing
 
+mod io_pipeline;
 mod recovery;
 use crate::backend::{AcceleratorBackend, DeviceInfo};
 use crate::cache::{Admission, GpuCache};
@@ -15,6 +16,7 @@ use crate::protocol::{Descriptor, Request, ScoringProfile};
 use crate::quant::{ActiveQuantizer, QuantizationRegistry};
 use crate::shard::{HostCacheStatus, ShardStore, cache_key};
 use anyhow::{Result, anyhow, bail};
+pub use io_pipeline::IoPipelineMode;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::mem::size_of;
 use std::sync::{Arc, Mutex, OnceLock, Weak};
@@ -127,7 +129,9 @@ struct ResidencyProofs {
 pub struct Engine {
     devices: Vec<DeviceState>,
     recovery_entries: Option<HashMap<Arc<str>, crate::recovery::Entry>>,
-    store: ShardStore,
+    store: Arc<Mutex<ShardStore>>,
+    io_pipeline: IoPipelineMode,
+    io_batch_bytes: usize,
     next_device: usize,
     quantization_registry: Option<QuantizationRegistry>,
     resident_selection_plans: VecDeque<ResidentSelectionPlan>,
@@ -262,7 +266,9 @@ impl Engine {
         Ok(Self {
             devices,
             recovery_entries: None,
-            store,
+            store: Arc::new(Mutex::new(store)),
+            io_pipeline: IoPipelineMode::Disabled,
+            io_batch_bytes: 64 * 1024 * 1024,
             next_device: 0,
             quantization_registry,
             resident_selection_plans: VecDeque::new(),
@@ -288,7 +294,10 @@ impl Engine {
             .unwrap_or_else(|e| e.into_inner())
             .entries
             .clear();
-        self.store.reload()
+        self.store
+            .lock()
+            .map_err(|_| anyhow!("tensor store lock poisoned"))?
+            .reload()
     }
 
     pub fn prewarm(&mut self, descriptors: &[Descriptor], batch_size: usize) -> Result<()> {
@@ -333,7 +342,11 @@ impl Engine {
         // allocation.
         let descriptors = unique_descriptors(descriptors);
         for batch in descriptors.chunks(batch_size) {
-            let payloads = self.store.resolve_many(batch, "__resident__")?;
+            let payloads = self
+                .store
+                .lock()
+                .map_err(|_| anyhow!("tensor store lock poisoned"))?
+                .resolve_many(batch, "__resident__")?;
             let mut uploads = (0..self.devices.len())
                 .map(|_| Vec::<(u64, &[u8])>::new())
                 .collect::<Vec<_>>();
@@ -947,6 +960,19 @@ impl Engine {
         hit_result?;
         hit_cleanup?;
 
+        if self.io_pipeline != IoPipelineMode::Disabled
+            && request.scoring_profile == ScoringProfile::ExactFp16
+            && !missing_descriptors.is_empty()
+        {
+            self.score_missing_pipeline(
+                request,
+                missing_indices,
+                missing_descriptors,
+                &mut scores,
+            )?;
+            return finalize_scores(request, scores, duplicate_candidates);
+        }
+
         let payloads = if let Some(active) = active_quantizer.as_ref() {
             let registry = self.quantization_registry.as_ref().unwrap();
             missing_descriptors
@@ -961,6 +987,8 @@ impl Engine {
                 .collect::<Result<Vec<_>>>()?
         } else {
             self.store
+                .lock()
+                .map_err(|_| anyhow!("tensor store lock poisoned"))?
                 .resolve_many(&missing_descriptors, &request.tenant)?
         };
         let mut pending = missing_indices
@@ -986,6 +1014,26 @@ impl Engine {
             })
             .collect::<Result<Vec<_>>>()?;
 
+        self.score_pending(
+            request,
+            active_quantizer.as_ref(),
+            &mut pending,
+            &mut scores,
+        )?;
+
+        // Equal content-addressed tensors have equal TileMaxSim scores. Preserve
+        // every logical candidate id while avoiding duplicate cache acquisitions,
+        // uploads, and kernel work inside one request.
+        finalize_scores(request, scores, duplicate_candidates)
+    }
+
+    fn score_pending(
+        &mut self,
+        request: &Request,
+        active_quantizer: Option<&ActiveQuantizer>,
+        pending: &mut Vec<MissingTensor>,
+        scores: &mut [Option<f32>],
+    ) -> Result<()> {
         while !pending.is_empty() {
             let mut chunks = (0..self.devices.len())
                 .map(|_| Vec::<ResidentTensor>::new())
@@ -994,7 +1042,7 @@ impl Engine {
                 .map(|_| Vec::<(u64, &[u8])>::new())
                 .collect::<Vec<_>>();
             let mut consumed = 0;
-            for tensor in &pending {
+            for tensor in pending.iter() {
                 if let Some((device_index, entry)) =
                     self.devices
                         .iter_mut()
@@ -1094,18 +1142,14 @@ impl Engine {
                 }
             };
             debug_assert!(upload_succeeded.iter().all(|succeeded| *succeeded));
-            let score_result =
-                self.score_devices(request, active_quantizer.as_ref(), &chunks, &mut scores);
+            let score_result = self.score_devices(request, active_quantizer, &chunks, scores);
             let cleanup_result = self.release_chunks(&chunks);
             score_result?;
             cleanup_result?;
             pending.drain(..consumed);
         }
 
-        // Equal content-addressed tensors have equal TileMaxSim scores. Preserve
-        // every logical candidate id while avoiding duplicate cache acquisitions,
-        // uploads, and kernel work inside one request.
-        finalize_scores(request, scores, duplicate_candidates)
+        Ok(())
     }
 
     /// Score an exact-profile microbatch that shares the same candidate list.
@@ -1642,11 +1686,12 @@ impl Engine {
                 }
             })
             .collect();
+        let store = self.store.lock().unwrap_or_else(|e| e.into_inner());
         EngineStatus {
             devices,
-            host: self.store.host_status(),
-            batch_read_calls: self.store.batch_read_calls,
-            batch_read_bytes: self.store.batch_read_bytes,
+            host: store.host_status(),
+            batch_read_calls: store.batch_read_calls,
+            batch_read_bytes: store.batch_read_bytes,
         }
     }
 

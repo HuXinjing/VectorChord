@@ -227,6 +227,11 @@ struct Args {
     /// Bounded immutable tensor read/checksum workers; cache policy stays ordered.
     #[arg(long, default_value_t = 8, value_parser = clap::value_parser!(u16).range(1..=256))]
     tensor_read_workers: u16,
+    /// Experimental bounded read/compute pipeline. Disabled preserves the legacy path.
+    #[arg(long, value_enum, default_value_t = crate::engine::IoPipelineMode::Disabled)]
+    io_pipeline: crate::engine::IoPipelineMode,
+    #[arg(long, default_value_t = 64, value_parser = clap::value_parser!(u16).range(1..=1024))]
+    io_batch_mib: u16,
     #[arg(long, default_value_t = 256)]
     prewarm_batch_size: usize,
     #[arg(long, default_value_t = 80, value_parser = clap::value_parser!(u8).range(1..=100))]
@@ -468,6 +473,10 @@ where
         &tenant_cache_reservations,
         quantization_registry,
     )?;
+    engine.configure_io_pipeline(
+        args.io_pipeline,
+        usize::from(args.io_batch_mib) * 1024 * 1024,
+    )?;
     if let Some(file) = recovery.as_mut() {
         let started = Instant::now();
         let entries = recovered_entries.as_deref().unwrap_or_default();
@@ -546,6 +555,8 @@ where
             "pinned_max_percent": args.pinned_cache_max_percent,
             "prewarm_batch_size": args.prewarm_batch_size,
             "tensor_read_workers": tensor_read_workers,
+            "io_pipeline": args.io_pipeline,
+            "io_batch_bytes": usize::from(args.io_batch_mib) * 1024 * 1024,
         },
         "admission": {
             "max_connections": args.max_connections,
@@ -4269,6 +4280,40 @@ mod tests {
                 .map(|(_, result)| result.unwrap().0)
                 .collect::<Vec<_>>();
             assert_eq!(remaining, scores[1..]);
+        }
+    }
+
+    #[test]
+    fn io_pipeline_cli_preserves_default_and_bounds() {
+        use clap::Parser;
+        let parse = |extra: &[&str]| {
+            let mut args = vec![
+                "tilemaxsimd",
+                "--socket",
+                "/tmp/io-test.sock",
+                "--device-memory-gb",
+                "0=4",
+                "--contract-root",
+                "test@1=/tmp/tensors",
+            ];
+            args.extend_from_slice(extra);
+            super::Args::try_parse_from(args)
+        };
+        let defaults = parse(&[]).unwrap();
+        assert_eq!(
+            defaults.io_pipeline,
+            crate::engine::IoPipelineMode::Disabled
+        );
+        assert_eq!(defaults.io_batch_mib, 64);
+        assert_eq!(
+            parse(&["--io-pipeline", "overlap", "--io-batch-mib", "1024"])
+                .unwrap()
+                .io_pipeline,
+            crate::engine::IoPipelineMode::Overlap
+        );
+        assert!(parse(&["--io-pipeline", "unknown"]).is_err());
+        for budget in ["0", "1025"] {
+            assert!(parse(&["--io-batch-mib", budget]).is_err());
         }
     }
 
