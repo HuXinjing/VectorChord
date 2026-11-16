@@ -411,6 +411,17 @@ where
     if block_bytes == 0 || block_bytes % 256 != 0 {
         bail!("GPU block size must be positive and 256-byte aligned");
     }
+    // Acquire the durable-state lease and validate the checkpoint before any
+    // accelerator allocation. A duplicate owner must not compete for HBM.
+    if args.cache_recovery_state.is_some() && args.gpu_cache_mode != "lru" {
+        bail!("cache recovery state is supported only with LRU cache mode");
+    }
+    let mut recovery = args
+        .cache_recovery_state
+        .clone()
+        .map(crate::recovery::RecoveryFile::open)
+        .transpose()?;
+    let recovered_entries = recovery.as_ref().map(|file| file.load()).transpose()?;
     let store = ShardStore::open(
         &args.contract_roots,
         args.host_cache_gb,
@@ -452,18 +463,10 @@ where
         &tenant_cache_reservations,
         quantization_registry,
     )?;
-    if args.cache_recovery_state.is_some() && args.gpu_cache_mode != "lru" {
-        bail!("cache recovery state is supported only with LRU cache mode");
-    }
-    let mut recovery = args
-        .cache_recovery_state
-        .clone()
-        .map(crate::recovery::RecoveryFile::open)
-        .transpose()?;
     if let Some(file) = recovery.as_mut() {
         let started = Instant::now();
-        let entries = file.load()?;
-        engine.restore_recovery(&entries, args.prewarm_batch_size)?;
+        let entries = recovered_entries.as_deref().unwrap_or_default();
+        engine.restore_recovery(entries, args.prewarm_batch_size)?;
         file.commit(&mut engine, true)?;
         println!(
             "{}",

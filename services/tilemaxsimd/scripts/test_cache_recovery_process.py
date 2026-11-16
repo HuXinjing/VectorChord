@@ -87,6 +87,12 @@ def run(binary):
 
         try:
             start()
+            # The lease must reject a duplicate before backend construction.
+            duplicate_args = args.copy()
+            duplicate_args[duplicate_args.index("0=0.01")] = "1=0.01"
+            duplicate = subprocess.run(duplicate_args, capture_output=True, timeout=10)
+            assert duplicate.returncode != 0
+            assert b"already owned by another daemon" in duplicate.stderr, duplicate.stderr
             expected = [query("tenant-a", 1), query("tenant-b", 2)]
             envelope = json.loads(state.read_text())
             checkpoint = json.loads(envelope["payload"])
