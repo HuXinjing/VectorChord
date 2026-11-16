@@ -30,6 +30,7 @@ FROM ${UBUNTU_IMAGE} AS runtime
 ARG SOURCE_REVISION=unknown
 ARG SOURCE_BRANCH=unknown
 ARG CUDA_TOOLKIT_SHA256=unknown
+ARG CUDA_LIBRARY_MAJOR=12
 LABEL org.opencontainers.image.source="https://github.com/HuXinjing/VectorChord" \
       org.opencontainers.image.revision="${SOURCE_REVISION}" \
       io.vectorchord.source.branch="${SOURCE_BRANCH}" \
@@ -37,9 +38,9 @@ LABEL org.opencontainers.image.source="https://github.com/HuXinjing/VectorChord"
 RUN apt-get update \
     && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends libstdc++6 ca-certificates \
     && rm -rf /var/lib/apt/lists/*
-COPY --from=cuda-toolkit /targets/x86_64-linux/lib/libcublas.so.* /usr/local/lib/
-COPY --from=cuda-toolkit /targets/x86_64-linux/lib/libcublasLt.so.* /usr/local/lib/
-COPY --from=cuda-toolkit /targets/x86_64-linux/lib/libcudart.so.* /usr/local/lib/
+COPY --from=cuda-toolkit /targets/x86_64-linux/lib/libcublas.so.${CUDA_LIBRARY_MAJOR} /usr/local/lib/
+COPY --from=cuda-toolkit /targets/x86_64-linux/lib/libcublasLt.so.${CUDA_LIBRARY_MAJOR} /usr/local/lib/
+COPY --from=cuda-toolkit /targets/x86_64-linux/lib/libcudart.so.${CUDA_LIBRARY_MAJOR} /usr/local/lib/
 COPY --from=build /build/services/tilemaxsimd/target/release/tilemaxsimd /usr/local/bin/tilemaxsimd
 COPY --from=build /build/services/tilemaxsimd/target/release/tilemaxsimctl /usr/local/bin/tilemaxsimctl
 ENV LD_LIBRARY_PATH=/usr/local/lib
