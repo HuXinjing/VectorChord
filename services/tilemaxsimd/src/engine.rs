@@ -965,6 +965,12 @@ impl Engine {
         if self.io_pipeline != IoPipelineMode::Disabled
             && request.scoring_profile == ScoringProfile::ExactFp16
             && !missing_descriptors.is_empty()
+            && !(self.io_pipeline == IoPipelineMode::Adaptive
+                && self
+                    .store
+                    .lock()
+                    .map_err(|_| anyhow!("tensor store lock poisoned"))?
+                    .all_cached(&missing_descriptors))
         {
             self.score_missing_pipeline(
                 request,

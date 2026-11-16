@@ -10,6 +10,7 @@ pub enum IoPipelineMode {
     Disabled,
     Serial,
     Overlap,
+    Adaptive,
 }
 
 impl Engine {
@@ -51,7 +52,10 @@ impl Engine {
         let mut completed = 0usize;
         let mut upload_groups = 0usize;
         let mut grouping = UploadGroup::new(self.io_upload_batch_bytes);
-        let overlap = self.io_pipeline == IoPipelineMode::Overlap;
+        let overlap = matches!(
+            self.io_pipeline,
+            IoPipelineMode::Overlap | IoPipelineMode::Adaptive
+        );
         let result = {
             let mut consume = |pending: &mut Vec<MissingTensor>| {
                 let started = std::time::Instant::now();
@@ -436,6 +440,67 @@ mod tests {
     }
 
     #[test]
+    fn adaptive_host_hits_keep_the_original_upload_and_cache_policy() {
+        let fixture = Fixture::new(37);
+        let mut legacy = fixture.engine(IoPipelineMode::Disabled, 65536, 65536);
+        let mut adaptive = fixture.engine(IoPipelineMode::Adaptive, 65536, 65536);
+        adaptive.configure_io_upload_batch(4096).unwrap();
+        for engine in [&mut legacy, &mut adaptive] {
+            drop(
+                engine
+                    .store
+                    .lock()
+                    .unwrap()
+                    .resolve_many(fixture.request.candidate_slice(), "owner-a")
+                    .unwrap(),
+            );
+            let store = engine.store.lock().unwrap();
+            let before = store.host_status();
+            assert!(store.all_cached(fixture.request.candidate_slice()));
+            let after = store.host_status();
+            assert_eq!(before.hits, after.hits);
+            assert_eq!(before.misses, after.misses);
+        }
+        let expected = legacy.score(&fixture.request).unwrap();
+        let read_before = adaptive.status_snapshot().batch_read_bytes;
+        assert_eq!(adaptive.score(&fixture.request).unwrap(), expected);
+        let status = adaptive.status_snapshot();
+        assert_eq!(status.batch_read_bytes, read_before);
+        assert_eq!(status.devices[0].h2d_batches, 1);
+        fixture.assert_released(&adaptive);
+    }
+
+    #[test]
+    fn adaptive_partial_host_hit_still_resolves_and_checks_missing_objects() {
+        let fixture = Fixture::new(37);
+        let mut engine = fixture.engine(IoPipelineMode::Adaptive, 65536, 65536);
+        engine.configure_io_upload_batch(2048).unwrap();
+        drop(
+            engine
+                .store
+                .lock()
+                .unwrap()
+                .resolve_many(&fixture.request.candidates[..5], "owner-a")
+                .unwrap(),
+        );
+        assert!(
+            !engine
+                .store
+                .lock()
+                .unwrap()
+                .all_cached(fixture.request.candidate_slice())
+        );
+        let before = engine.status_snapshot().batch_read_bytes;
+        let expected = fixture
+            .engine(IoPipelineMode::Disabled, 65536, 0)
+            .score(&fixture.request)
+            .unwrap();
+        assert_eq!(engine.score(&fixture.request).unwrap(), expected);
+        assert!(engine.status_snapshot().batch_read_bytes > before);
+        fixture.assert_released(&engine);
+    }
+
+    #[test]
     fn upload_groups_preserve_order_and_payload_budget() {
         let fixture = Fixture::new(37);
         for budget in [1, 128, 1024, 8192] {
@@ -476,7 +541,11 @@ mod tests {
             .engine(IoPipelineMode::Disabled, 65536, 0)
             .score(&fixture.request)
             .unwrap();
-        for mode in [IoPipelineMode::Serial, IoPipelineMode::Overlap] {
+        for mode in [
+            IoPipelineMode::Serial,
+            IoPipelineMode::Overlap,
+            IoPipelineMode::Adaptive,
+        ] {
             for upload in [128, 1024, 4096, 65536] {
                 for capacity in [4096, 65536] {
                     let mut engine = fixture.engine(mode, capacity, 0);
@@ -520,7 +589,11 @@ mod tests {
             .engine(IoPipelineMode::Disabled, 65536, 0)
             .score(&fixture.request)
             .unwrap();
-        for mode in [IoPipelineMode::Serial, IoPipelineMode::Overlap] {
+        for mode in [
+            IoPipelineMode::Serial,
+            IoPipelineMode::Overlap,
+            IoPipelineMode::Adaptive,
+        ] {
             for (capacity, host) in [(4096, 0), (4096, 2048), (65536, 65536)] {
                 let mut engine = fixture.engine(mode, capacity, host);
                 for _ in 0..3 {
@@ -578,7 +651,11 @@ mod tests {
             .engine(IoPipelineMode::Disabled, 65536, 0)
             .score(&fixture.request)
             .unwrap();
-        for mode in [IoPipelineMode::Serial, IoPipelineMode::Overlap] {
+        for mode in [
+            IoPipelineMode::Serial,
+            IoPipelineMode::Overlap,
+            IoPipelineMode::Adaptive,
+        ] {
             let mut engine = fixture.engine(mode, 8192, 0);
             assert_eq!(engine.score(&fixture.request).unwrap(), baseline);
             fixture.assert_released(&engine);
@@ -627,7 +704,11 @@ mod tests {
             .join(&d.digest[..2])
             .join(format!("{}.tensor", d.digest));
         std::fs::write(file, [0u8]).unwrap();
-        for mode in [IoPipelineMode::Serial, IoPipelineMode::Overlap] {
+        for mode in [
+            IoPipelineMode::Serial,
+            IoPipelineMode::Overlap,
+            IoPipelineMode::Adaptive,
+        ] {
             let mut engine = fixture.engine(mode, 4096, 0);
             assert!(engine.score(&fixture.request).is_err());
             fixture.assert_released(&engine);

@@ -4314,6 +4314,10 @@ mod tests {
         assert_eq!(defaults.io_batch_mib, 64);
         assert_eq!(defaults.io_upload_batch_mib, None);
         assert_eq!(
+            parse(&["--io-pipeline", "adaptive"]).unwrap().io_pipeline,
+            crate::engine::IoPipelineMode::Adaptive
+        );
+        assert_eq!(
             parse(&["--io-upload-batch-mib", "4096"])
                 .unwrap()
                 .io_upload_batch_mib,

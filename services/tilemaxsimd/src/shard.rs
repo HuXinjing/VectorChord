@@ -331,6 +331,15 @@ impl ShardStore {
         self.read_workers
     }
 
+    /// Routing hint only. Callers must still resolve and validate normally.
+    /// No policy get/touch is performed, so choosing a path cannot add hits or
+    /// change TinyLFU frequency/ownership. A later miss remains safe to resolve.
+    pub fn all_cached(&self, descriptors: &[Descriptor]) -> bool {
+        descriptors
+            .iter()
+            .all(|d| self.host_cache.entries.contains_key(&cache_key(d)))
+    }
+
     // Prefetch only immutable bytes. Policy-changing cache get/put operations
     // still run in original descriptor order in resolve_many, including on errors.
     fn prefetch_objects(
