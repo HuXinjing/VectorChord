@@ -4,7 +4,7 @@ use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::fs::{self, OpenOptions};
-use std::io::{Read, Write};
+use std::io::{BufWriter, Read, Write};
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::PathBuf;
@@ -199,10 +199,15 @@ impl RecoveryFile {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
             Err(e) => return Err(e.into()),
         }
+        // Container restarts commonly reuse PID 1. An orphan from a crash
+        // must not collide with the next process's first temporary filename.
+        let mut nonce = [0u8; 16];
+        fs::File::open("/dev/urandom")?.read_exact(&mut nonce)?;
         let temp = parent.join(format!(
-            ".cache-recovery-{}-{}.tmp",
+            ".cache-recovery-{}-{}-{}.tmp",
             std::process::id(),
-            SEQUENCE.fetch_add(1, Ordering::Relaxed)
+            SEQUENCE.fetch_add(1, Ordering::Relaxed),
+            hex::encode(nonce),
         ));
         let result = (|| {
             let mut file = OpenOptions::new()
@@ -212,11 +217,14 @@ impl RecoveryFile {
                 .custom_flags(libc::O_NOFOLLOW)
                 .open(&temp)?;
             let mut writer = BoundedWriter {
-                inner: &mut file,
+                inner: BufWriter::with_capacity(256 * 1024, &mut file),
                 written: 0,
                 limit: MAX_BYTES,
             };
             serde_json::to_writer(&mut writer, &envelope)?;
+            // Flush userspace buffering before fsync and atomic publication.
+            writer.flush()?;
+            drop(writer);
             file.sync_all()?;
             fs::rename(&temp, &self.path)?;
             fs::File::open(parent)?.sync_all()?;
@@ -341,6 +349,16 @@ mod tests {
         // A crash before publication must leave the preceding committed state readable.
         fs::write(root.0.join(".cache-recovery-incomplete.tmp"), b"{partial").unwrap();
         assert_eq!(file.load().unwrap().len(), 1);
+        // Simulate a PID/sequence reused by a new container after a partial write.
+        let orphan = root.0.join(format!(
+            ".cache-recovery-{}-{}.tmp",
+            std::process::id(),
+            SEQUENCE.load(Ordering::Relaxed)
+        ));
+        fs::write(&orphan, b"{partial").unwrap();
+        file.publish(&[entry()]).unwrap();
+        assert_eq!(file.load().unwrap().len(), 1);
+        assert_eq!(fs::read(orphan).unwrap(), b"{partial");
     }
     #[test]
     fn corrupt_version_and_unsafe_entries_are_rejected_without_replacing_them() {
@@ -366,6 +384,31 @@ mod tests {
         e = entry();
         e.profile = "unknown".into();
         assert!(validate(&e).is_err());
+    }
+    #[test]
+    fn large_checkpoint_preserves_every_logical_entry() {
+        let root = Root::new();
+        let file = RecoveryFile::open(root.file()).unwrap();
+        let entries: Vec<_> = (0..32768)
+            .map(|i| {
+                let mut value = entry();
+                value.descriptor.digest = format!("{i:064x}");
+                value.tenant = format!("tenant-{}", i % 3);
+                value.pinned = i % 5 == 0;
+                value
+            })
+            .collect();
+        let started = std::time::Instant::now();
+        file.publish(&entries).unwrap();
+        println!(
+            "large checkpoint publish_ms={}",
+            started.elapsed().as_secs_f64() * 1000.0
+        );
+        let restored = file.load().unwrap();
+        assert_eq!(
+            serde_json::to_vec(&restored).unwrap(),
+            serde_json::to_vec(&entries).unwrap()
+        );
     }
     #[test]
     fn checkpoint_text_limits_match_the_scoring_protocol() {
