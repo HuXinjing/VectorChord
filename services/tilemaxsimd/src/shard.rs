@@ -319,8 +319,8 @@ impl ShardStore {
     }
 
     pub fn set_read_workers(&mut self, workers: usize) -> Result<()> {
-        if !(1..=32).contains(&workers) {
-            bail!("tensor read workers must be between 1 and 32");
+        if !(1..=256).contains(&workers) {
+            bail!("tensor read workers must be between 1 and 256");
         }
         self.read_workers =
             workers.min(std::thread::available_parallelism().map_or(1, usize::from));
@@ -910,6 +910,24 @@ mod tests {
             let _ = fs::remove_dir_all(&self.root);
         }
     }
+    #[test]
+    fn configured_read_workers_preserve_cpu_bound() {
+        let objects = Objects::new(1);
+        let mut store = objects.store(1, 1024);
+        for workers in [1, 32, 256] {
+            store.set_read_workers(workers).unwrap();
+            assert_eq!(
+                store.read_workers(),
+                workers.min(std::thread::available_parallelism().map_or(1, usize::from))
+            );
+        }
+        for workers in [0, 257, usize::MAX] {
+            let before = store.read_workers();
+            assert!(store.set_read_workers(workers).is_err());
+            assert_eq!(store.read_workers(), before);
+        }
+    }
+
     fn same_policy(a: &HostCache, b: &HostCache) {
         assert_host_policy(a);
         assert_host_policy(b);

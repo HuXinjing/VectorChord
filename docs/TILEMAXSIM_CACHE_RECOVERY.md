@@ -124,7 +124,7 @@ and small Ubuntu runtime dependencies may still need network access.
 ## Bounded parallel tensor loading
 
 `--tensor-read-workers` configures immutable object/shard read and checksum
-workers (default 8, configurable 1 through 32, capped by available CPU
+workers (default 8, configurable 1 through 256, capped by available CPU
 parallelism). It is a loader concurrency budget, not a cgroup CPU limit.
 File identity/length/checksum validation remains mandatory. Loose object reads
 fill one shared allocation directly; packed reads avoid an intermediate payload

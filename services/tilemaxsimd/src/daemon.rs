@@ -225,8 +225,8 @@ struct Args {
     #[arg(long)]
     cache_recovery_state: Option<PathBuf>,
     /// Bounded immutable tensor read/checksum workers; cache policy stays ordered.
-    #[arg(long, default_value_t = 8, value_parser = clap::value_parser!(u8).range(1..=32))]
-    tensor_read_workers: u8,
+    #[arg(long, default_value_t = 8, value_parser = clap::value_parser!(u16).range(1..=256))]
+    tensor_read_workers: u16,
     #[arg(long, default_value_t = 256)]
     prewarm_batch_size: usize,
     #[arg(long, default_value_t = 80, value_parser = clap::value_parser!(u8).range(1..=100))]
@@ -4269,6 +4269,42 @@ mod tests {
                 .map(|(_, result)| result.unwrap().0)
                 .collect::<Vec<_>>();
             assert_eq!(remaining, scores[1..]);
+        }
+    }
+
+    #[test]
+    fn tensor_read_worker_cli_boundaries() {
+        use clap::Parser;
+        for workers in ["1", "32", "256"] {
+            let args = super::Args::try_parse_from([
+                "tilemaxsimd",
+                "--socket",
+                "/tmp/tilemaxsim-test.sock",
+                "--device-memory-gb",
+                "0=4",
+                "--contract-root",
+                "test@1=/tmp/tensors",
+                "--tensor-read-workers",
+                workers,
+            ])
+            .unwrap();
+            assert_eq!(args.tensor_read_workers, workers.parse::<u16>().unwrap());
+        }
+        for workers in ["0", "257", "65536"] {
+            assert!(
+                super::Args::try_parse_from([
+                    "tilemaxsimd",
+                    "--socket",
+                    "/tmp/tilemaxsim-test.sock",
+                    "--device-memory-gb",
+                    "0=4",
+                    "--contract-root",
+                    "test@1=/tmp/tensors",
+                    "--tensor-read-workers",
+                    workers
+                ])
+                .is_err()
+            );
         }
     }
 
