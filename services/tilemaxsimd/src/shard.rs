@@ -13,7 +13,7 @@ use crate::protocol::Descriptor;
 use anyhow::{Context, Result, anyhow, bail};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::fs::{File, OpenOptions};
 use std::io::Read;
 use std::os::unix::fs::{FileExt, OpenOptionsExt};
@@ -79,10 +79,38 @@ struct HostEntry {
     owner_tenant: String,
 }
 
+// Minimum density/age remains the eviction rule; equal priorities use a
+// deterministic key tie-break instead of HashMap iteration order.
+#[derive(Clone, Debug)]
+struct HostRank {
+    priority: f64,
+    key: String,
+}
+impl PartialEq for HostRank {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other).is_eq()
+    }
+}
+impl Eq for HostRank {}
+impl PartialOrd for HostRank {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+impl Ord for HostRank {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.priority
+            .total_cmp(&other.priority)
+            .then_with(|| self.key.cmp(&other.key))
+    }
+}
+
 struct HostCache {
     maximum_bytes: usize,
     current_bytes: usize,
     entries: HashMap<String, HostEntry>,
+    ranks: BTreeSet<HostRank>,
+    tenant_ranks: HashMap<String, BTreeSet<HostRank>>,
     sketch: TinyLfu,
     inflation: f64,
     tenant_bytes: HashMap<String, usize>,
@@ -99,6 +127,8 @@ impl HostCache {
             maximum_bytes,
             current_bytes: 0,
             entries: HashMap::new(),
+            ranks: BTreeSet::new(),
+            tenant_ranks: HashMap::new(),
             sketch: TinyLfu::new(4096),
             inflation: 0.0,
             tenant_bytes: HashMap::new(),
@@ -110,21 +140,54 @@ impl HostCache {
         }
     }
 
+    fn insert_rank(&mut self, key: &str, owner: &str, priority: f64) {
+        let rank = HostRank {
+            priority,
+            key: key.to_owned(),
+        };
+        self.ranks.insert(rank.clone());
+        self.tenant_ranks
+            .entry(owner.to_owned())
+            .or_default()
+            .insert(rank);
+    }
+
+    fn remove_rank(&mut self, key: &str, owner: &str, priority: f64) {
+        let rank = HostRank {
+            priority,
+            key: key.to_owned(),
+        };
+        self.ranks.remove(&rank);
+        if let Some(ranks) = self.tenant_ranks.get_mut(owner) {
+            ranks.remove(&rank);
+            if ranks.is_empty() {
+                self.tenant_ranks.remove(owner);
+            }
+        }
+    }
+
     fn get(&mut self, key: &str) -> Option<Arc<[u8]>> {
         let frequency = self.sketch.increment(&key);
-        let entry = self.entries.get_mut(key);
-        if let Some(entry) = entry {
-            entry.priority = self.inflation + f64::from(frequency) / entry.payload.len() as f64;
-            self.hits += 1;
-            Some(entry.payload.clone())
-        } else {
+        let Some(entry) = self.entries.get_mut(key) else {
             self.misses += 1;
-            None
+            return None;
+        };
+        let old = entry.priority;
+        let priority = self.inflation + f64::from(frequency) / entry.payload.len() as f64;
+        entry.priority = priority;
+        let owner = entry.owner_tenant.clone();
+        let payload = Arc::clone(&entry.payload);
+        if old.total_cmp(&priority).is_ne() {
+            self.remove_rank(key, &owner, old);
+            self.insert_rank(key, &owner, priority);
         }
+        self.hits += 1;
+        Some(payload)
     }
 
     fn remove(&mut self, key: &str) -> Option<HostEntry> {
         let entry = self.entries.remove(key)?;
+        self.remove_rank(key, &entry.owner_tenant, entry.priority);
         self.current_bytes = self.current_bytes.saturating_sub(entry.payload.len());
         let remove_tenant = if let Some(bytes) = self.tenant_bytes.get_mut(&entry.owner_tenant) {
             *bytes = bytes.saturating_sub(entry.payload.len());
@@ -154,11 +217,10 @@ impl HostCache {
             > self.default_tenant_max_bytes
         {
             let Some((victim_key, victim_priority)) = self
-                .entries
-                .iter()
-                .filter(|(_, entry)| entry.owner_tenant == tenant)
-                .min_by(|left, right| left.1.priority.total_cmp(&right.1.priority))
-                .map(|(key, entry)| (key.clone(), entry.priority))
+                .tenant_ranks
+                .get(tenant)
+                .and_then(|ranks| ranks.first())
+                .map(|rank| (rank.key.clone(), rank.priority))
             else {
                 return;
             };
@@ -175,10 +237,9 @@ impl HostCache {
         }
         while self.current_bytes + payload.len() > self.maximum_bytes {
             let Some((victim_key, victim_priority)) = self
-                .entries
-                .iter()
-                .min_by(|left, right| left.1.priority.total_cmp(&right.1.priority))
-                .map(|(key, entry)| (key.clone(), entry.priority))
+                .ranks
+                .first()
+                .map(|rank| (rank.key.clone(), rank.priority))
             else {
                 return;
             };
@@ -193,6 +254,7 @@ impl HostCache {
         }
         self.current_bytes += payload.len();
         *self.tenant_bytes.entry(tenant.to_owned()).or_default() += payload.len();
+        self.insert_rank(&key, tenant, priority);
         self.entries.insert(
             key,
             HostEntry {
@@ -588,6 +650,104 @@ pub fn cache_key(descriptor: &Descriptor) -> String {
 mod tests {
     use super::*;
     use std::fs;
+
+    fn assert_host_policy(cache: &HostCache) {
+        assert!(cache.current_bytes <= cache.maximum_bytes);
+        assert_eq!(
+            cache.current_bytes,
+            cache
+                .entries
+                .values()
+                .map(|e| e.payload.len())
+                .sum::<usize>()
+        );
+        assert_eq!(cache.ranks.len(), cache.entries.len());
+        assert_eq!(
+            cache
+                .tenant_ranks
+                .values()
+                .map(BTreeSet::len)
+                .sum::<usize>(),
+            cache.entries.len()
+        );
+        let mut owners = HashMap::<String, usize>::new();
+        for (key, value) in &cache.entries {
+            *owners.entry(value.owner_tenant.clone()).or_default() += value.payload.len();
+            let rank = HostRank {
+                priority: value.priority,
+                key: key.clone(),
+            };
+            assert!(cache.ranks.contains(&rank));
+            assert!(cache.tenant_ranks[&value.owner_tenant].contains(&rank));
+        }
+        assert_eq!(owners, cache.tenant_bytes);
+        for (owner, bytes) in &owners {
+            assert!(*bytes <= cache.default_tenant_max_bytes);
+            let minimum = cache
+                .entries
+                .values()
+                .filter(|e| &e.owner_tenant == owner)
+                .map(|e| e.priority)
+                .min_by(f64::total_cmp)
+                .unwrap();
+            assert_eq!(cache.tenant_ranks[owner].first().unwrap().priority, minimum);
+        }
+        assert_eq!(
+            cache.ranks.first().map(|r| r.priority),
+            cache
+                .entries
+                .values()
+                .map(|e| e.priority)
+                .min_by(f64::total_cmp)
+        );
+    }
+
+    #[test]
+    fn host_eviction_indexes_remain_bounded_through_access_replacement_and_removal() {
+        let mut cache = HostCache::new(1024, 60);
+        let mut random = 918273_u64;
+        for _ in 0..5000 {
+            random = random.wrapping_mul(6364136223846793005).wrapping_add(1);
+            let key = format!("object-{}", (random >> 8) % 97);
+            let owner = format!("owner-{}", (random >> 24) % 3);
+            match random % 5 {
+                0 => {
+                    cache.remove(&key);
+                }
+                1 | 2 => {
+                    cache.get(&key);
+                }
+                _ => {
+                    cache.put(
+                        &owner,
+                        key,
+                        Arc::from(vec![7; 1 + ((random >> 32) % 127) as usize]),
+                    );
+                }
+            }
+            assert_host_policy(&cache);
+        }
+    }
+
+    #[test]
+    fn host_tenant_pressure_preserves_other_owners_and_borrowed_payloads() {
+        let mut cache = HostCache::new(100, 50);
+        cache.put("a", "old-a".into(), Arc::from(vec![1; 30]));
+        cache.put("b", "old-b".into(), Arc::from(vec![2; 30]));
+        let held = cache.get("old-a").unwrap();
+        for _ in 0..4 {
+            cache.get("new-a");
+        }
+        cache.put("a", "new-a".into(), Arc::from(vec![3; 40]));
+        assert!(!cache.entries.contains_key("old-a"));
+        assert_eq!(&*held, &[1; 30]);
+        assert_eq!(&*cache.get("old-b").unwrap(), &[2; 30]);
+        assert_host_policy(&cache);
+        cache.put("c", "new-a".into(), Arc::from(vec![4; 20]));
+        assert!(!cache.tenant_ranks.contains_key("a"));
+        assert_eq!(cache.entries["new-a"].owner_tenant, "c");
+        assert_host_policy(&cache);
+    }
 
     #[test]
     fn tensor_length_matches_all_protocol_storage_types() {
