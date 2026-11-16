@@ -232,6 +232,9 @@ struct Args {
     io_pipeline: crate::engine::IoPipelineMode,
     #[arg(long, default_value_t = 64, value_parser = clap::value_parser!(u16).range(1..=1024))]
     io_batch_mib: u16,
+    /// Coalesce reads into this upload budget; absent retains the read budget.
+    #[arg(long, value_parser = clap::value_parser!(u16).range(1..=4096))]
+    io_upload_batch_mib: Option<u16>,
     #[arg(long, default_value_t = 256)]
     prewarm_batch_size: usize,
     #[arg(long, default_value_t = 80, value_parser = clap::value_parser!(u8).range(1..=100))]
@@ -477,6 +480,9 @@ where
         args.io_pipeline,
         usize::from(args.io_batch_mib) * 1024 * 1024,
     )?;
+    if let Some(mib) = args.io_upload_batch_mib {
+        engine.configure_io_upload_batch(usize::from(mib) * 1024 * 1024)?;
+    }
     if let Some(file) = recovery.as_mut() {
         let started = Instant::now();
         let entries = recovered_entries.as_deref().unwrap_or_default();
@@ -557,6 +563,7 @@ where
             "tensor_read_workers": tensor_read_workers,
             "io_pipeline": args.io_pipeline,
             "io_batch_bytes": usize::from(args.io_batch_mib) * 1024 * 1024,
+            "io_upload_batch_bytes": usize::from(args.io_upload_batch_mib.unwrap_or(args.io_batch_mib)) * 1024 * 1024,
         },
         "admission": {
             "max_connections": args.max_connections,
@@ -4305,6 +4312,16 @@ mod tests {
             crate::engine::IoPipelineMode::Disabled
         );
         assert_eq!(defaults.io_batch_mib, 64);
+        assert_eq!(defaults.io_upload_batch_mib, None);
+        assert_eq!(
+            parse(&["--io-upload-batch-mib", "4096"])
+                .unwrap()
+                .io_upload_batch_mib,
+            Some(4096)
+        );
+        for budget in ["0", "4097"] {
+            assert!(parse(&["--io-upload-batch-mib", budget]).is_err());
+        }
         assert_eq!(
             parse(&["--io-pipeline", "overlap", "--io-batch-mib", "1024"])
                 .unwrap()

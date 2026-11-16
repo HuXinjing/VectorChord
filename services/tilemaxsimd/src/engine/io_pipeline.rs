@@ -23,6 +23,15 @@ impl Engine {
         }
         self.io_pipeline = mode;
         self.io_batch_bytes = batch_bytes;
+        self.io_upload_batch_bytes = batch_bytes;
+        Ok(())
+    }
+
+    pub fn configure_io_upload_batch(&mut self, bytes: usize) -> Result<()> {
+        if bytes == 0 || bytes > 4096usize * 1024 * 1024 {
+            bail!("upload batch bytes must be between 1 and 4294967296");
+        }
+        self.io_upload_batch_bytes = bytes;
         Ok(())
     }
 
@@ -40,33 +49,96 @@ impl Engine {
         let mut resolve_us = 0u128;
         let mut consume_us = 0u128;
         let mut completed = 0usize;
-        let result = run_batches(
-            batches,
-            self.io_pipeline == IoPipelineMode::Overlap,
-            move |batch| {
+        let mut upload_groups = 0usize;
+        let mut grouping = UploadGroup::new(self.io_upload_batch_bytes);
+        let overlap = self.io_pipeline == IoPipelineMode::Overlap;
+        let result = {
+            let mut consume = |pending: &mut Vec<MissingTensor>| {
                 let started = std::time::Instant::now();
-                let pending = resolve(&store, batch, tenant)?;
-                Ok((pending, started.elapsed().as_micros()))
-            },
-            |(mut pending, elapsed)| {
-                resolve_us += elapsed;
-                let started = std::time::Instant::now();
-                let result = self.score_pending(request, None, &mut pending, scores);
+                let result = self.score_pending(request, None, pending, scores);
                 consume_us += started.elapsed().as_micros();
-                completed += 1;
+                upload_groups += 1;
                 result
-            },
-        );
+            };
+            run_batches(
+                batches,
+                overlap,
+                move |batch| {
+                    let started = std::time::Instant::now();
+                    let pending = resolve(&store, batch, tenant)?;
+                    Ok((pending, started.elapsed().as_micros()))
+                },
+                |(pending, elapsed)| {
+                    resolve_us += elapsed;
+                    completed += 1;
+                    for tensor in pending {
+                        grouping.push(tensor, &mut consume)?;
+                    }
+                    Ok(())
+                },
+            )
+            .and_then(|()| grouping.flush(&mut consume))
+        };
         eprintln!(
             "{}",
             serde_json::json!({
                 "event": "tilemaxsim_io_pipeline", "mode": self.io_pipeline,
                 "batch_bytes": self.io_batch_bytes, "completed_batches": completed,
+                "upload_batch_bytes": self.io_upload_batch_bytes, "upload_groups": upload_groups,
                 "resolve_us": resolve_us, "consume_us": consume_us,
                 "elapsed_us": started.elapsed().as_micros(), "success": result.is_ok()
             })
         );
         result
+    }
+}
+
+// Coalesce immutable read results without changing their order or GPU policy.
+// Payload bound: upload budget plus three read batches (incoming, queued and
+// resolving). An indivisible oversized tensor remains subject to GPU capacity.
+struct UploadGroup {
+    pending: Vec<MissingTensor>,
+    bytes: usize,
+    budget: usize,
+}
+impl UploadGroup {
+    fn new(budget: usize) -> Self {
+        Self {
+            pending: Vec::new(),
+            bytes: 0,
+            budget,
+        }
+    }
+    fn push(
+        &mut self,
+        tensor: MissingTensor,
+        consume: &mut impl FnMut(&mut Vec<MissingTensor>) -> Result<()>,
+    ) -> Result<()> {
+        let bytes = tensor.payload.len();
+        if !self.pending.is_empty() && self.bytes.saturating_add(bytes) > self.budget {
+            self.flush(consume)?;
+        }
+        self.bytes = self
+            .bytes
+            .checked_add(bytes)
+            .ok_or_else(|| anyhow!("upload grouping size overflow"))?;
+        self.pending.push(tensor);
+        if self.bytes >= self.budget {
+            self.flush(consume)?;
+        }
+        Ok(())
+    }
+    fn flush(
+        &mut self,
+        consume: &mut impl FnMut(&mut Vec<MissingTensor>) -> Result<()>,
+    ) -> Result<()> {
+        if self.pending.is_empty() {
+            return Ok(());
+        }
+        consume(&mut self.pending)?;
+        self.pending.clear();
+        self.bytes = 0;
+        Ok(())
     }
 }
 
@@ -361,6 +433,84 @@ mod tests {
             ))
             .is_err()
         );
+    }
+
+    #[test]
+    fn upload_groups_preserve_order_and_payload_budget() {
+        let fixture = Fixture::new(37);
+        for budget in [1, 128, 1024, 8192] {
+            let mut engine = fixture.engine(IoPipelineMode::Overlap, 65536, 0);
+            engine.configure_io_upload_batch(budget).unwrap();
+            let mut grouping = UploadGroup::new(budget);
+            let descriptors = fixture.request.candidates.as_ref().clone();
+            let pending = resolve(
+                &engine.store,
+                (0..descriptors.len()).zip(descriptors).collect(),
+                "owner-a",
+            )
+            .unwrap();
+            let mut seen = Vec::new();
+            let mut consume = |batch: &mut Vec<MissingTensor>| {
+                let bytes = batch.iter().map(|t| t.payload.len()).sum::<usize>();
+                assert!(bytes <= budget || batch.len() == 1);
+                seen.extend(batch.iter().map(|t| t.candidate_index));
+                Ok(())
+            };
+            for tensor in pending {
+                grouping.push(tensor, &mut consume).unwrap();
+            }
+            grouping.flush(&mut consume).unwrap();
+            assert!(grouping.pending.is_empty());
+            assert_eq!(grouping.bytes, 0);
+            assert_eq!(
+                seen,
+                (0..fixture.request.candidates.len()).collect::<Vec<_>>()
+            );
+        }
+    }
+
+    #[test]
+    fn independent_upload_budget_keeps_scores_owners_and_releases_leases() {
+        let fixture = Fixture::new(37);
+        let baseline = fixture
+            .engine(IoPipelineMode::Disabled, 65536, 0)
+            .score(&fixture.request)
+            .unwrap();
+        for mode in [IoPipelineMode::Serial, IoPipelineMode::Overlap] {
+            for upload in [128, 1024, 4096, 65536] {
+                for capacity in [4096, 65536] {
+                    let mut engine = fixture.engine(mode, capacity, 0);
+                    engine.configure_io_upload_batch(upload).unwrap();
+                    assert_eq!(engine.score(&fixture.request).unwrap(), baseline);
+                    fixture.assert_released(&engine);
+                    assert!(
+                        engine
+                            .recovery_snapshot()
+                            .unwrap()
+                            .iter()
+                            .all(|e| e.tenant == "owner-a")
+                    );
+                }
+            }
+        }
+        let mut old = fixture.engine(IoPipelineMode::Overlap, 65536, 0);
+        old.score(&fixture.request).unwrap();
+        let mut combined = fixture.engine(IoPipelineMode::Overlap, 65536, 0);
+        combined.configure_io_upload_batch(65536).unwrap();
+        combined.score(&fixture.request).unwrap();
+        assert!(
+            combined.status_snapshot().devices[0].h2d_batches
+                < old.status_snapshot().devices[0].h2d_batches
+        );
+    }
+
+    #[test]
+    fn coalescing_consumer_error_stops_producer_and_drops_unscored_payloads() {
+        let fixture = Fixture::new(37);
+        let mut engine = fixture.engine(IoPipelineMode::Overlap, 256, 0);
+        engine.configure_io_upload_batch(65536).unwrap();
+        assert!(engine.score(&fixture.request).is_err());
+        fixture.assert_released(&engine);
     }
 
     #[test]
