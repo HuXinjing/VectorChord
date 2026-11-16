@@ -14,6 +14,7 @@ pub mod gpu;
 pub mod metal;
 pub mod protocol;
 pub mod quant;
+pub mod recovery;
 pub mod scheduler;
 pub use tilemaxsim_protocol as protocol_codec;
 pub mod shard;

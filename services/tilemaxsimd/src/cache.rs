@@ -267,7 +267,7 @@ pub struct CacheEntry {
     /// False while an H2D upload is in progress. Loading entries reserve pages
     /// but are never visible as cache hits.
     pub ready: bool,
-    owner_tenant: String,
+    pub(crate) owner_tenant: String,
     priority: f64,
 }
 
@@ -289,6 +289,7 @@ pub struct GpuCache {
     pinned_max_bytes: usize,
     pinned_bytes: usize,
     generation: u64,
+    durability_generation: u64,
     pub hits: u64,
     pub misses: u64,
     pub evictions: u64,
@@ -326,6 +327,7 @@ impl GpuCache {
             pinned_max_bytes: capacity * pinned_max_percent as usize / 100,
             pinned_bytes: 0,
             generation: 0,
+            durability_generation: 0,
             hits: 0,
             misses: 0,
             evictions: 0,
@@ -355,6 +357,10 @@ impl GpuCache {
 
     pub fn pinned_bytes(&self) -> usize {
         self.pinned_bytes
+    }
+
+    pub(crate) fn durability_generation(&self) -> u64 {
+        self.durability_generation
     }
 
     pub fn generation(&self) -> u64 {
@@ -470,6 +476,7 @@ impl GpuCache {
             .remove(key)
             .ok_or("GPU cache entry disappeared")?;
         self.generation = self.generation.wrapping_add(1);
+        self.durability_generation = self.durability_generation.wrapping_add(1);
         self.allocator.release(entry.offset as usize)?;
         if entry.pinned {
             self.pinned_bytes = self.pinned_bytes.saturating_sub(entry.allocated_bytes);
@@ -612,6 +619,7 @@ impl GpuCache {
             },
         );
         self.generation = self.generation.wrapping_add(1);
+        self.durability_generation = self.durability_generation.wrapping_add(1);
         *self.tenant_allocated.entry(tenant.to_owned()).or_default() += allocated_bytes;
         if pinned {
             self.pinned_bytes += allocated_bytes;
@@ -643,8 +651,7 @@ impl GpuCache {
         Ok(())
     }
 
-    #[cfg(test)]
-    pub fn entry(&self, key: &str) -> Option<&CacheEntry> {
+    pub(crate) fn entry(&self, key: &str) -> Option<&CacheEntry> {
         self.entries.get(key)
     }
 
@@ -672,6 +679,7 @@ impl GpuCache {
             self.pinned_bytes = self.pinned_bytes.saturating_sub(entry.allocated_bytes);
         }
         entry.pinned = pinned;
+        self.durability_generation = self.durability_generation.wrapping_add(1);
         Ok(())
     }
 }

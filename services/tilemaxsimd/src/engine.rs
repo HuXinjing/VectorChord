@@ -8,6 +8,7 @@
 //
 // Copyright (c) 2026 Hu Xinjing
 
+mod recovery;
 use crate::backend::{AcceleratorBackend, DeviceInfo};
 use crate::cache::{Admission, GpuCache};
 use crate::protocol::{Descriptor, Request, ScoringProfile};
@@ -125,6 +126,7 @@ struct ResidencyProofs {
 
 pub struct Engine {
     devices: Vec<DeviceState>,
+    recovery_entries: Option<HashMap<Arc<str>, crate::recovery::Entry>>,
     store: ShardStore,
     next_device: usize,
     quantization_registry: Option<QuantizationRegistry>,
@@ -259,6 +261,7 @@ impl Engine {
             .collect::<Result<Vec<_>>>()?;
         Ok(Self {
             devices,
+            recovery_entries: None,
             store,
             next_device: 0,
             quantization_registry,
@@ -302,6 +305,18 @@ impl Engine {
     }
 
     fn prewarm_internal(
+        &mut self,
+        descriptors: &[Descriptor],
+        batch_size: usize,
+        pin: bool,
+        force_admission: bool,
+    ) -> Result<()> {
+        let result = self.prewarm_inner(descriptors, batch_size, pin, force_admission);
+        self.record_prepared_recovery(descriptors);
+        result
+    }
+
+    fn prewarm_inner(
         &mut self,
         descriptors: &[Descriptor],
         batch_size: usize,
@@ -786,6 +801,12 @@ impl Engine {
     }
 
     pub fn score(&mut self, request: &Request) -> Result<Vec<(u32, f32)>> {
+        let result = self.score_inner(request);
+        self.record_recovery(request);
+        result
+    }
+
+    fn score_inner(&mut self, request: &Request) -> Result<Vec<(u32, f32)>> {
         let native_profile = request.scoring_profile.native_code();
         if self
             .devices

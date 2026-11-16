@@ -220,6 +220,10 @@ struct Args {
     gpu_cache_mode: String,
     #[arg(long = "resident-manifest", value_parser = parse_contract_root)]
     resident_manifests: Vec<(String, PathBuf)>,
+    /// Durable LRU working-set checkpoint. Restore and verify before readiness;
+    /// commit cache mutations before acknowledging completed scoring/admin work.
+    #[arg(long)]
+    cache_recovery_state: Option<PathBuf>,
     #[arg(long, default_value_t = 256)]
     prewarm_batch_size: usize,
     #[arg(long, default_value_t = 80, value_parser = clap::value_parser!(u8).range(1..=100))]
@@ -448,6 +452,24 @@ where
         &tenant_cache_reservations,
         quantization_registry,
     )?;
+    if args.cache_recovery_state.is_some() && args.gpu_cache_mode != "lru" {
+        bail!("cache recovery state is supported only with LRU cache mode");
+    }
+    let mut recovery = args
+        .cache_recovery_state
+        .clone()
+        .map(crate::recovery::RecoveryFile::open)
+        .transpose()?;
+    if let Some(file) = recovery.as_mut() {
+        let started = Instant::now();
+        let entries = file.load()?;
+        engine.restore_recovery(&entries, args.prewarm_batch_size)?;
+        file.commit(&mut engine, true)?;
+        println!(
+            "{}",
+            serde_json::json!({"event":"tilemaxsim_cache_recovery_complete","entries":entries.len(),"elapsed_ms":started.elapsed().as_secs_f64()*1000.0})
+        );
+    }
     if args.gpu_cache_mode == "resident" && args.resident_manifests.is_empty() {
         bail!("resident GPU cache mode requires at least one resident manifest");
     }
@@ -619,6 +641,7 @@ where
                 scheduler_metrics,
                 admin_receiver,
                 scheduler_operations,
+                recovery,
             )
         })?;
     let status_server = if let Some(path) = args.status_socket.clone() {
@@ -1902,6 +1925,8 @@ fn prepared_batch_deadline(ready: Instant, deadline: Instant, window: Duration) 
     ready.checked_add(window).unwrap_or(deadline).min(deadline)
 }
 
+// The checkpoint lease is owned by this executor, alongside its control channels.
+#[allow(clippy::too_many_arguments)]
 fn run_scheduler(
     mut engine: Engine,
     receiver: mpsc::Receiver<Work>,
@@ -1910,6 +1935,7 @@ fn run_scheduler(
     metrics: Arc<RuntimeMetrics>,
     admin_receiver: mpsc::Receiver<AdminCommand>,
     operations: Arc<Mutex<OperationRegistry>>,
+    mut recovery: Option<crate::recovery::RecoveryFile>,
 ) -> Result<()> {
     let mut queue = RequestQueue::new(
         config.policy,
@@ -1935,6 +1961,17 @@ fn run_scheduler(
                 AdminAction::Unpin(descriptors) => engine.set_pinned(&descriptors, false),
                 AdminAction::ProbeTensorCircuit { device } => engine.request_tensor_probe(device),
             };
+            if let Some(file) = recovery.as_mut()
+                && let Err(error) = file.commit(&mut engine, true)
+            {
+                metrics.ready.store(false, Ordering::Release);
+                let failure = Err(error.context("cache recovery durability failed"));
+                operations
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .finish(command.operation_id, &failure);
+                return failure;
+            }
             if matches!(&result, Ok(())) {
                 if reload_operation {
                     metrics.reload_succeeded.fetch_add(1, Ordering::Relaxed);
@@ -2291,6 +2328,35 @@ fn run_scheduler(
             work.connection
                 .set_write_timeout(Some(config.socket_io_timeout))
                 .ok();
+            if let Some(file) = recovery.as_mut() {
+                // A successful response is the durability boundary. If storage
+                // cannot commit, return through the existing fatal scheduler
+                // path rather than acknowledge state that cannot be recovered.
+                if let Err(error) = file.commit(&mut engine, false) {
+                    metrics.ready.store(false, Ordering::Release);
+                    write_response_nonfatal(
+                        &mut work.connection,
+                        &protocol::failure(
+                            version,
+                            request_id,
+                            4,
+                            "cache checkpoint could not be committed",
+                        ),
+                    );
+                    notify_completion(&work);
+                    return Err(error.context("cache recovery durability failed"));
+                }
+            }
+            let response = if Instant::now() >= work.deadline {
+                protocol::failure(
+                    version,
+                    request_id,
+                    2,
+                    "request deadline expired before durable delivery",
+                )
+            } else {
+                response
+            };
             write_response_nonfatal(&mut work.connection, &response);
             notify_completion(&work);
             metrics.observe_latency(work.accepted_at.elapsed(), work.gpu_elapsed);

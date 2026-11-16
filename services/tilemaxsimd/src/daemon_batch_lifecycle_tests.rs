@@ -260,6 +260,7 @@ fn execute(
         metrics,
         admin_receiver,
         Arc::new(Mutex::new(OperationRegistry::default())),
+        None,
     )
     .unwrap();
 }
@@ -360,6 +361,7 @@ fn queued_expiry_and_reload_keep_surviving_slots_and_release_every_permit() {
         Arc::clone(&metrics),
         admin_receiver,
         Arc::new(Mutex::new(OperationRegistry::default())),
+        None,
     )
     .unwrap();
     assert_eq!(response(ca), vec![(10, 1.0), (12, 1.0), (11, 0.0)]);
@@ -378,4 +380,85 @@ fn queued_expiry_and_reload_keep_surviving_slots_and_release_every_permit() {
     assert_eq!(metrics.completed.load(Ordering::Relaxed), 2);
     assert_eq!(metrics.pending_requests.load(Ordering::Relaxed), 0);
     assert_eq!(metrics.inflight_request_bytes.load(Ordering::Relaxed), 0);
+}
+
+#[test]
+fn recovered_cache_preserves_results_and_owner_without_another_tensor_read() {
+    let (mut source, requests, root, _) = fixture(Arc::new(Mutex::new(None)));
+    // The fixture's explicit resident preload predates tracking. A scored
+    // request observes its original owner and pin state instead of relabeling it.
+    source.enable_recovery();
+    let request = requests.request("reader-b", 1, 20, 0x3c00);
+    let expected = source.score(&request).unwrap();
+    let snapshot = source.recovery_snapshot().unwrap();
+    assert_eq!(snapshot.len(), 3);
+    assert!(
+        snapshot
+            .iter()
+            .all(|e| e.tenant == "__resident__" && e.pinned)
+    );
+    let store =
+        ShardStore::open(&[("model-v1".into(), root.0.clone())], 16384, 100, false).unwrap();
+    let backend = CpuBackend::create(0, 65536, 32768).unwrap();
+    let mut restored =
+        Engine::new(vec![backend], 256, store, 100, 100, &HashMap::new(), None).unwrap();
+    restored.restore_recovery(&snapshot, 2).unwrap();
+    let reads = restored.status_json()["batch_read_bytes"].clone();
+    let before = restored.status_snapshot().devices[0].h2d_bytes;
+    assert_eq!(restored.score(&request).unwrap(), expected);
+    assert_eq!(restored.status_snapshot().devices[0].h2d_bytes, before);
+    assert_eq!(restored.status_json()["batch_read_bytes"], reads);
+    assert_eq!(restored.recovery_snapshot().unwrap().len(), 3);
+}
+
+#[test]
+fn recovery_rejects_corrupt_content_capacity_loss_and_duplicate_identity() {
+    let (mut source, requests, root, _) = fixture(Arc::new(Mutex::new(None)));
+    source.enable_recovery();
+    source.score(&requests.request("a", 1, 0, 0x3c00)).unwrap();
+    let snapshot = source.recovery_snapshot().unwrap();
+    let make = |bytes: usize| {
+        let store =
+            ShardStore::open(&[("model-v1".into(), root.0.clone())], 16384, 100, false).unwrap();
+        Engine::new(
+            vec![CpuBackend::create(0, bytes + 32768, 32768).unwrap()],
+            256,
+            store,
+            100,
+            100,
+            &HashMap::new(),
+            None,
+        )
+        .unwrap()
+    };
+    let mut duplicate = snapshot.clone();
+    duplicate.push(snapshot[0].clone());
+    assert!(make(32768).restore_recovery(&duplicate, 2).is_err());
+    assert!(make(256).restore_recovery(&snapshot, 2).is_err());
+    // Enough total capacity does not authorize exceeding tenant or pin quotas.
+    for (capacity, tenant_percent, pin_percent) in [(1024, 50, 100), (32768, 100, 0)] {
+        let store =
+            ShardStore::open(&[("model-v1".into(), root.0.clone())], 16384, 100, false).unwrap();
+        let mut limited = Engine::new(
+            vec![CpuBackend::create(0, capacity + 32768, 32768).unwrap()],
+            256,
+            store,
+            tenant_percent,
+            pin_percent,
+            &HashMap::new(),
+            None,
+        )
+        .unwrap();
+        assert!(limited.restore_recovery(&snapshot, 2).is_err());
+    }
+    let d = &snapshot[0].descriptor;
+    fs::write(
+        root.0
+            .join("objects")
+            .join(&d.digest[..2])
+            .join(format!("{}.tensor", d.digest)),
+        [0u8; 4],
+    )
+    .unwrap();
+    assert!(make(32768).restore_recovery(&snapshot, 2).is_err());
 }
