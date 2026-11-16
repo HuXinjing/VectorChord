@@ -13,7 +13,7 @@ use crate::protocol::Descriptor;
 use anyhow::{Context, Result, anyhow, bail};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fs::{File, OpenOptions};
 use std::io::Read;
 use std::os::unix::fs::{FileExt, OpenOptionsExt};
@@ -273,6 +273,7 @@ pub struct ShardStore {
     pub batch_read_calls: u64,
     pub batch_read_bytes: u64,
     verify_full_shards: bool,
+    read_workers: usize,
 }
 
 #[derive(Clone, Debug, Default, serde::Serialize)]
@@ -311,7 +312,87 @@ impl ShardStore {
             batch_read_calls: 0,
             batch_read_bytes: 0,
             verify_full_shards,
+            read_workers: std::thread::available_parallelism()
+                .map_or(1, usize::from)
+                .min(8),
         })
+    }
+
+    pub fn set_read_workers(&mut self, workers: usize) -> Result<()> {
+        if !(1..=32).contains(&workers) {
+            bail!("tensor read workers must be between 1 and 32");
+        }
+        self.read_workers =
+            workers.min(std::thread::available_parallelism().map_or(1, usize::from));
+        Ok(())
+    }
+
+    pub fn read_workers(&self) -> usize {
+        self.read_workers
+    }
+
+    // Prefetch only immutable bytes. Policy-changing cache get/put operations
+    // still run in original descriptor order in resolve_many, including on errors.
+    fn prefetch_objects(
+        &mut self,
+        descriptors: &[Descriptor],
+    ) -> Result<HashMap<String, Result<Arc<[u8]>>>> {
+        let mut prefetched = HashMap::new();
+        let mut seen = HashSet::new();
+        let mut jobs = Vec::new();
+        for descriptor in descriptors {
+            let key = cache_key(descriptor);
+            if !seen.insert(key.clone()) {
+                continue;
+            }
+            if self.host_cache.entries.contains_key(&key) {
+                continue;
+            }
+            let Some(contract) = self.contracts.get(&descriptor.contract) else {
+                prefetched.insert(
+                    key,
+                    Err(anyhow!("model contract has no immutable shard root")),
+                );
+                continue;
+            };
+            if !contract.entries.contains_key(&descriptor.digest) {
+                jobs.push((key, descriptor, contract.root.as_path()));
+            }
+        }
+        if jobs.is_empty() {
+            return Ok(prefetched);
+        }
+        let count = jobs.len().min(self.read_workers);
+        let results = std::thread::scope(|scope| -> Result<Vec<_>> {
+            let mut workers = Vec::new();
+            for batch in jobs.chunks(jobs.len().div_ceil(count)) {
+                workers.push(scope.spawn(move || {
+                    batch
+                        .iter()
+                        .map(|(key, descriptor, root)| {
+                            (key.clone(), read_object_payload(root, descriptor))
+                        })
+                        .collect::<Vec<_>>()
+                }));
+            }
+            let mut out = Vec::new();
+            for worker in workers {
+                out.extend(
+                    worker
+                        .join()
+                        .map_err(|_| anyhow!("object reader worker panicked"))?,
+                );
+            }
+            Ok(out)
+        })?;
+        for (key, result) in results {
+            if let Ok(payload) = &result {
+                self.batch_read_calls += 1;
+                self.batch_read_bytes += payload.len() as u64;
+            }
+            prefetched.insert(key, result);
+        }
+        Ok(prefetched)
     }
 
     /// Re-open every immutable contract index and publish the new generation
@@ -331,6 +412,11 @@ impl ShardStore {
         descriptors: &[Descriptor],
         tenant: &str,
     ) -> Result<Vec<Arc<[u8]>>> {
+        let mut prefetched = if self.read_workers > 1 {
+            Some(self.prefetch_objects(descriptors)?)
+        } else {
+            None
+        };
         let mut output = vec![None; descriptors.len()];
         let mut groups = HashMap::<(String, String), Vec<(usize, Entry)>>::new();
         for (index, descriptor) in descriptors.iter().enumerate() {
@@ -344,21 +430,23 @@ impl ShardStore {
                 .get(&descriptor.contract)
                 .ok_or_else(|| anyhow!("model contract has no immutable shard root"))?;
             let Some(entry) = contract.entries.get(&descriptor.digest).cloned() else {
-                let expected =
-                    tensor_bytes(descriptor.rows, descriptor.dimension, descriptor.dtype)?;
-                let mut file = open_object(&contract.root, &descriptor.digest)
-                    .with_context(|| "tensor is missing from immutable shards and objects")?;
-                if file.metadata()?.len() != expected as u64 {
-                    bail!("immutable tensor object length disagrees with its descriptor");
-                }
-                let mut payload = Vec::with_capacity(expected);
-                file.read_to_end(&mut payload)?;
-                if hex::encode(Sha256::digest(&payload)) != descriptor.digest {
-                    bail!("immutable tensor object checksum mismatch");
-                }
-                self.batch_read_calls += 1;
-                self.batch_read_bytes += payload.len() as u64;
-                let payload: Arc<[u8]> = payload.into();
+                let payload = match prefetched.as_mut() {
+                    Some(prefetched) if prefetched.contains_key(&key) => {
+                        match prefetched.get(&key).unwrap() {
+                            Ok(payload) => Arc::clone(payload),
+                            Err(_) => return Err(prefetched.remove(&key).unwrap().unwrap_err()),
+                        }
+                    }
+                    _ => {
+                        // A prior admission can evict an item that was cached at
+                        // prefetch time. Resolve it normally rather than retaining
+                        // an evicted cache entry or bypassing its validation.
+                        let payload = read_object_payload(&contract.root, descriptor)?;
+                        self.batch_read_calls += 1;
+                        self.batch_read_bytes += payload.len() as u64;
+                        payload
+                    }
+                };
                 output[index] = Some(Arc::clone(&payload));
                 self.host_cache.put(tenant, key, payload);
                 continue;
@@ -404,20 +492,21 @@ impl ShardStore {
                 ranges.push((start, end, entries[cursor..limit].to_vec()));
                 cursor = limit;
             }
-            let worker_count = ranges.len().min(8);
+            let worker_count = ranges.len().min(self.read_workers);
             let ranges_per_worker = ranges.len().div_ceil(worker_count);
             let resolved = std::thread::scope(|scope| -> Result<Vec<_>> {
                 let mut workers = Vec::new();
                 for ranges in ranges.chunks(ranges_per_worker) {
                     let file = shard.file.try_clone()?;
-                    workers.push(scope.spawn(move || -> Result<Vec<(usize, Vec<u8>)>> {
+                    workers.push(scope.spawn(move || -> Result<Vec<(usize, Arc<[u8]>)>> {
                         let mut resolved = Vec::new();
                         for (start, end, entries) in ranges {
                             let mut range = vec![0_u8; (end - start) as usize];
                             file.read_exact_at(&mut range, *start)?;
                             for (output_index, entry) in entries {
                                 let local = (entry.offset - start) as usize;
-                                let payload = range[local..local + entry.length].to_vec();
+                                let payload =
+                                    Arc::<[u8]>::from(&range[local..local + entry.length]);
                                 let actual = hex::encode(Sha256::digest(&payload));
                                 if actual != descriptors[*output_index].digest {
                                     bail!("tensor checksum mismatch inside immutable shard");
@@ -444,7 +533,6 @@ impl ShardStore {
                 .map(|(start, end, _)| end - start)
                 .sum::<u64>();
             for (output_index, payload) in resolved {
-                let payload: Arc<[u8]> = payload.into();
                 output[output_index] = Some(Arc::clone(&payload));
                 self.host_cache
                     .put(tenant, cache_key(&descriptors[output_index]), payload);
@@ -579,6 +667,29 @@ fn object_path(root: &Path, digest: &str) -> Result<PathBuf> {
         .join("objects")
         .join(&digest[..2])
         .join(format!("{digest}.tensor")))
+}
+
+fn read_object_payload(root: &Path, descriptor: &Descriptor) -> Result<Arc<[u8]>> {
+    let expected = tensor_bytes(descriptor.rows, descriptor.dimension, descriptor.dtype)?;
+    let mut file = open_object(root, &descriptor.digest)
+        .with_context(|| "tensor is missing from immutable shards and objects")?;
+    if file.metadata()?.len() != expected as u64 {
+        bail!("immutable tensor object length disagrees with its descriptor");
+    }
+    // SAFETY: new_zeroed_slice initializes every byte, and every u8 bit pattern
+    // is valid. The unique Arc is filled in place before it is ever shared.
+    let mut payload = unsafe { Arc::<[u8]>::new_zeroed_slice(expected).assume_init() };
+    file.read_exact(Arc::get_mut(&mut payload).expect("new tensor payload is unique"))?;
+    let mut trailing = [0u8; 1];
+    match file.read_exact(&mut trailing) {
+        Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => {}
+        Ok(()) => bail!("immutable tensor object length changed while reading"),
+        Err(error) => return Err(error.into()),
+    }
+    if hex::encode(Sha256::digest(&payload)) != descriptor.digest {
+        bail!("immutable tensor object checksum mismatch");
+    }
+    Ok(payload)
 }
 
 fn open_object(root: &Path, digest: &str) -> Result<File> {
@@ -747,6 +858,267 @@ mod tests {
         assert!(!cache.tenant_ranks.contains_key("a"));
         assert_eq!(cache.entries["new-a"].owner_tenant, "c");
         assert_host_policy(&cache);
+    }
+
+    struct Objects {
+        root: PathBuf,
+        descriptors: Vec<Descriptor>,
+    }
+    impl Objects {
+        fn new(count: usize) -> Self {
+            static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+            let root = std::env::temp_dir().join(format!(
+                "tilemaxsim-parallel-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            ));
+            fs::create_dir(&root).unwrap();
+            let descriptors = (0..count)
+                .map(|i| {
+                    let rows = 1 + (i % 7) as u32;
+                    let payload: Vec<_> = (0..rows * 2)
+                        .flat_map(|j| ((i as u16 * 113 + j as u16) % 1024).to_le_bytes())
+                        .collect();
+                    let digest = hex::encode(Sha256::digest(&payload));
+                    let parent = root.join("objects").join(&digest[..2]);
+                    fs::create_dir_all(&parent).unwrap();
+                    fs::write(parent.join(format!("{digest}.tensor")), payload).unwrap();
+                    Descriptor {
+                        candidate_id: i as u32,
+                        contract: "objects@1".into(),
+                        digest,
+                        rows,
+                        dimension: 2,
+                        dtype: 2,
+                        raw_fp8_cache_key: Default::default(),
+                    }
+                })
+                .collect();
+            Self { root, descriptors }
+        }
+        fn store(&self, workers: usize, bytes: usize) -> ShardStore {
+            let mut store =
+                ShardStore::open(&[("objects@1".into(), self.root.clone())], bytes, 60, false)
+                    .unwrap();
+            // Exercise concurrency even on a single-CPU CI runner.
+            store.read_workers = workers;
+            store
+        }
+    }
+    impl Drop for Objects {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.root);
+        }
+    }
+    fn same_policy(a: &HostCache, b: &HostCache) {
+        assert_host_policy(a);
+        assert_host_policy(b);
+        assert_eq!(
+            (
+                a.current_bytes,
+                a.hits,
+                a.misses,
+                a.evictions,
+                a.admission_rejections
+            ),
+            (
+                b.current_bytes,
+                b.hits,
+                b.misses,
+                b.evictions,
+                b.admission_rejections
+            )
+        );
+        assert_eq!(a.tenant_bytes, b.tenant_bytes);
+        assert_eq!(a.entries.len(), b.entries.len());
+        for (key, value) in &a.entries {
+            let other = &b.entries[key];
+            assert_eq!(value.owner_tenant, other.owner_tenant);
+            assert_eq!(value.priority.to_bits(), other.priority.to_bits());
+            assert_eq!(value.payload, other.payload);
+        }
+    }
+    #[test]
+    fn parallel_object_reads_preserve_results_and_ordered_tenant_policy() {
+        let objects = Objects::new(32);
+        let mut serial = objects.store(1, 192);
+        let mut parallel = objects.store(4, 192);
+        for round in 0..20 {
+            let descriptors: Vec<_> = (0..24)
+                .map(|i| objects.descriptors[(i * 7 + round * 3) % 32].clone())
+                .collect();
+            let owner = format!("owner-{}", round % 3);
+            let expected = serial.resolve_many(&descriptors, &owner).unwrap();
+            let actual = parallel.resolve_many(&descriptors, &owner).unwrap();
+            assert_eq!(actual, expected);
+            same_policy(&serial.host_cache, &parallel.host_cache);
+        }
+    }
+    #[test]
+    fn parallel_object_corruption_preserves_error_and_prior_cache_admissions() {
+        for truncate in [false, true] {
+            let objects = Objects::new(8);
+            let bad = &objects.descriptors[3];
+            let file = objects
+                .root
+                .join("objects")
+                .join(&bad.digest[..2])
+                .join(format!("{}.tensor", bad.digest));
+            if truncate {
+                fs::write(file, [0u8]).unwrap();
+            } else {
+                let bytes = fs::read(&file).unwrap();
+                fs::write(file, vec![0xff; bytes.len()]).unwrap();
+            }
+            let mut serial = objects.store(1, 4096);
+            let mut parallel = objects.store(4, 4096);
+            let a = serial
+                .resolve_many(&objects.descriptors, "owner")
+                .unwrap_err();
+            let b = parallel
+                .resolve_many(&objects.descriptors, "owner")
+                .unwrap_err();
+            assert_eq!(a.to_string(), b.to_string());
+            assert_eq!(serial.host_cache.entries.len(), 3);
+            same_policy(&serial.host_cache, &parallel.host_cache);
+        }
+    }
+    #[test]
+    fn cached_item_evicted_during_resolution_is_revalidated_if_not_prefetched() {
+        let objects = Objects::new(8);
+        let future = objects.descriptors[6].clone();
+        let mut serial = objects.store(1, 64);
+        let mut parallel = objects.store(4, 64);
+        serial
+            .resolve_many(std::slice::from_ref(&future), "a")
+            .unwrap();
+        parallel
+            .resolve_many(std::slice::from_ref(&future), "a")
+            .unwrap();
+        fs::remove_file(
+            objects
+                .root
+                .join("objects")
+                .join(&future.digest[..2])
+                .join(format!("{}.tensor", future.digest)),
+        )
+        .unwrap();
+        let input = [
+            objects.descriptors[0].clone(),
+            objects.descriptors[1].clone(),
+            future,
+        ];
+        assert_eq!(
+            serial.resolve_many(&input, "a").unwrap_err().to_string(),
+            parallel.resolve_many(&input, "a").unwrap_err().to_string()
+        );
+        same_policy(&serial.host_cache, &parallel.host_cache);
+    }
+
+    #[test]
+    fn parallel_objects_preserve_all_canonical_storage_types() {
+        let objects = Objects::new(8);
+        for (dtype, dimension) in [(1, 1), (2, 2), (3, 4)] {
+            let descriptors: Vec<_> = objects
+                .descriptors
+                .iter()
+                .map(|d| {
+                    let mut value = d.clone();
+                    value.dtype = dtype;
+                    value.dimension = dimension;
+                    value
+                })
+                .collect();
+            let expected = objects
+                .store(1, 4096)
+                .resolve_many(&descriptors, "owner")
+                .unwrap();
+            let actual = objects
+                .store(4, 4096)
+                .resolve_many(&descriptors, "owner")
+                .unwrap();
+            assert_eq!(actual, expected);
+        }
+    }
+
+    #[test]
+    fn mixed_packed_and_loose_objects_keep_payloads_and_corruption_checks() {
+        let objects = Objects::new(8);
+        let mut packed = Vec::new();
+        let mut entries = Vec::new();
+        for d in &objects.descriptors[..4] {
+            let offset = packed.len().next_multiple_of(16);
+            packed.resize(offset, 0);
+            let payload = fs::read(
+                objects
+                    .root
+                    .join("objects")
+                    .join(&d.digest[..2])
+                    .join(format!("{}.tensor", d.digest)),
+            )
+            .unwrap();
+            entries.push(serde_json::json!({"digest":d.digest,"offset":offset,"length":payload.len(),"rows":d.rows,"dimension":d.dimension,"dtype":"float16"}));
+            packed.extend(payload);
+        }
+        let digest = hex::encode(Sha256::digest(&packed));
+        let name = format!("shards/sha256-{digest}.vts");
+        fs::create_dir(objects.root.join("shards")).unwrap();
+        fs::write(objects.root.join(&name), &packed).unwrap();
+        for entry in &mut entries {
+            entry["shard"] = name.clone().into();
+        }
+        let index = serde_json::json!({"format":"vectorchord.tilemaxsim.shards","version":1,"alignment":16,
+            "shards":[{"name":name,"bytes":packed.len(),"checksum":format!("sha256:{digest}")}],"entries":entries});
+        fs::write(
+            objects.root.join(INDEX_NAME),
+            serde_json::to_vec(&index).unwrap(),
+        )
+        .unwrap();
+        let mut serial = objects.store(1, 128);
+        let mut parallel = objects.store(4, 128);
+        let a = serial.resolve_many(&objects.descriptors, "owner").unwrap();
+        let b = parallel
+            .resolve_many(&objects.descriptors, "owner")
+            .unwrap();
+        assert_eq!(a, b);
+        same_policy(&serial.host_cache, &parallel.host_cache);
+        packed[0] ^= 0xff;
+        fs::write(objects.root.join(&name), packed).unwrap();
+        assert!(
+            objects
+                .store(4, 128)
+                .resolve_many(&objects.descriptors, "owner")
+                .unwrap_err()
+                .to_string()
+                .contains("checksum mismatch")
+        );
+    }
+
+    #[test]
+    fn object_reader_checks_symlinks_length_and_cached_immutable_reuse() {
+        let objects = Objects::new(2);
+        let descriptor = objects.descriptors[0].clone();
+        let path = objects
+            .root
+            .join("objects")
+            .join(&descriptor.digest[..2])
+            .join(format!("{}.tensor", descriptor.digest));
+        let mut store = objects.store(4, 4096);
+        let expected = store
+            .resolve_many(std::slice::from_ref(&descriptor), "a")
+            .unwrap();
+        fs::remove_file(&path).unwrap();
+        assert_eq!(
+            store
+                .resolve_many(std::slice::from_ref(&descriptor), "b")
+                .unwrap(),
+            expected
+        );
+        let target = objects.root.join("other");
+        fs::write(&target, &*expected[0]).unwrap();
+        std::os::unix::fs::symlink(target, &path).unwrap();
+        let mut empty = objects.store(4, 4096);
+        assert!(empty.resolve_many(&[descriptor], "a").is_err());
     }
 
     #[test]

@@ -224,6 +224,9 @@ struct Args {
     /// commit cache mutations before acknowledging completed scoring/admin work.
     #[arg(long)]
     cache_recovery_state: Option<PathBuf>,
+    /// Bounded immutable tensor read/checksum workers; cache policy stays ordered.
+    #[arg(long, default_value_t = 8, value_parser = clap::value_parser!(u8).range(1..=32))]
+    tensor_read_workers: u8,
     #[arg(long, default_value_t = 256)]
     prewarm_batch_size: usize,
     #[arg(long, default_value_t = 80, value_parser = clap::value_parser!(u8).range(1..=100))]
@@ -422,12 +425,14 @@ where
         .map(crate::recovery::RecoveryFile::open)
         .transpose()?;
     let recovered_entries = recovery.as_ref().map(|file| file.load()).transpose()?;
-    let store = ShardStore::open(
+    let mut store = ShardStore::open(
         &args.contract_roots,
         args.host_cache_gb,
         args.host_tenant_cache_max_percent,
         args.verify_full_shards,
     )?;
+    store.set_read_workers(usize::from(args.tensor_read_workers))?;
+    let tensor_read_workers = store.read_workers();
     let quantization_registry = args
         .quantization_registry_root
         .map(QuantizationRegistry::open)
@@ -540,6 +545,7 @@ where
             "host_tenant_max_percent": args.host_tenant_cache_max_percent,
             "pinned_max_percent": args.pinned_cache_max_percent,
             "prewarm_batch_size": args.prewarm_batch_size,
+            "tensor_read_workers": tensor_read_workers,
         },
         "admission": {
             "max_connections": args.max_connections,
