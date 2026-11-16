@@ -12,7 +12,10 @@ RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
 
 ENV PATH=/root/.cargo/bin:${PATH}
 ENV TILEMAXSIM_CUDA_ARCHS=80,89,90,90a,90-virtual
-WORKDIR /build/tilemaxsimd
+WORKDIR /build/services/tilemaxsimd
+COPY Cargo.toml /build/Cargo.toml
+COPY src/ /build/src/
+COPY crates/tilemaxsim-protocol/ /build/crates/tilemaxsim-protocol/
 COPY services/tilemaxsimd/ .
 RUN cargo build --release --locked
 
@@ -34,8 +37,14 @@ RUN apt-get update \
 
 FROM runtime-base AS runtime
 
-COPY --from=build /build/tilemaxsimd/target/release/tilemaxsimd /usr/local/bin/tilemaxsimd
-COPY --from=build /build/tilemaxsimd/target/release/tilemaxsimctl /usr/local/bin/tilemaxsimctl
+ARG SOURCE_REVISION=unknown
+ARG SOURCE_BRANCH=unknown
+LABEL org.opencontainers.image.source="https://github.com/HuXinjing/VectorChord" \
+      org.opencontainers.image.revision="${SOURCE_REVISION}" \
+      io.vectorchord.source.branch="${SOURCE_BRANCH}"
+
+COPY --from=build /build/services/tilemaxsimd/target/release/tilemaxsimd /usr/local/bin/tilemaxsimd
+COPY --from=build /build/services/tilemaxsimd/target/release/tilemaxsimctl /usr/local/bin/tilemaxsimctl
 RUN /usr/local/bin/tilemaxsimd --help >/dev/null \
     && /usr/local/bin/tilemaxsimctl --help >/dev/null \
     && ! ldd /usr/local/bin/tilemaxsimd | grep -q 'not found' \

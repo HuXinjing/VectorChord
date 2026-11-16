@@ -1,0 +1,58 @@
+# Local-cache build: provide read-only BuildKit contexts cuda-toolkit and
+# cargo-registry. Both binaries are built from source, never copied from an
+# earlier application image. See docs/TILEMAXSIM_CACHE_RECOVERY.md.
+ARG RUST_IMAGE=rust:1.96.0-bookworm@sha256:5e2214abe154fe26e39f64488952e5c991eeed1d6d6da7cc8381ae83927f0cfc
+ARG UBUNTU_IMAGE=ubuntu:24.04@sha256:008173c23f95b170204355c12626cb5a965d779a7e1283b09e9cffbb1bf33ca3
+FROM ${RUST_IMAGE} AS build
+ENV PATH=/usr/local/cuda/bin:${PATH}
+ENV LD_LIBRARY_PATH=/usr/local/cuda/lib64
+ENV TILEMAXSIM_CUDA_ARCHS=80,89,90,90a,90-virtual
+ENV CARGO_BUILD_JOBS=4
+WORKDIR /build/services/tilemaxsimd
+COPY Cargo.toml /build/Cargo.toml
+COPY src/ /build/src/
+COPY crates/tilemaxsim-protocol/ /build/crates/tilemaxsim-protocol/
+COPY services/tilemaxsimd/ .
+RUN --mount=type=bind,from=cuda-toolkit,target=/usr/local/cuda \
+    --mount=type=bind,from=cargo-registry,target=/usr/local/cargo/registry \
+    nvcc --version && cargo build --release --locked --offline
+
+FROM build AS test
+RUN rustup component add clippy rustfmt
+RUN --mount=type=bind,from=cuda-toolkit,target=/usr/local/cuda \
+    --mount=type=bind,from=cargo-registry,target=/usr/local/cargo/registry \
+    cargo fmt --check \
+    && cargo clippy --release --all-targets --locked --offline -- -D warnings \
+    && cargo test --release --locked --offline \
+    && scripts/verify_cuda_artifact.sh
+
+FROM ${UBUNTU_IMAGE} AS runtime
+ARG SOURCE_REVISION=unknown
+ARG SOURCE_BRANCH=unknown
+ARG CUDA_TOOLKIT_SHA256=unknown
+LABEL org.opencontainers.image.source="https://github.com/HuXinjing/VectorChord" \
+      org.opencontainers.image.revision="${SOURCE_REVISION}" \
+      io.vectorchord.source.branch="${SOURCE_BRANCH}" \
+      io.vectorchord.cuda.toolkit.sha256="${CUDA_TOOLKIT_SHA256}"
+RUN apt-get update \
+    && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends libstdc++6 ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+COPY --from=cuda-toolkit /targets/x86_64-linux/lib/libcublas.so.* /usr/local/lib/
+COPY --from=cuda-toolkit /targets/x86_64-linux/lib/libcublasLt.so.* /usr/local/lib/
+COPY --from=cuda-toolkit /targets/x86_64-linux/lib/libcudart.so.* /usr/local/lib/
+COPY --from=build /build/services/tilemaxsimd/target/release/tilemaxsimd /usr/local/bin/tilemaxsimd
+COPY --from=build /build/services/tilemaxsimd/target/release/tilemaxsimctl /usr/local/bin/tilemaxsimctl
+ENV LD_LIBRARY_PATH=/usr/local/lib
+ENV NVIDIA_DRIVER_CAPABILITIES=compute,utility
+RUN /usr/local/bin/tilemaxsimd --help >/dev/null \
+    && /usr/local/bin/tilemaxsimctl --help >/dev/null \
+    && ! ldd /usr/local/bin/tilemaxsimd | grep -q 'not found' \
+    && groupadd --system vectorchord \
+    && useradd --system --gid vectorchord --home-dir /nonexistent \
+        --shell /usr/sbin/nologin vectorchord \
+    && install -d -o vectorchord -g vectorchord -m 0750 /run/vectorchord /var/lib/vectorchord
+USER vectorchord:vectorchord
+STOPSIGNAL SIGTERM
+HEALTHCHECK --interval=10s --timeout=2s --start-period=10m --retries=3 \
+    CMD ["/usr/local/bin/tilemaxsimctl", "--socket", "/run/vectorchord/tilemaxsim-status.sock"]
+ENTRYPOINT ["/usr/local/bin/tilemaxsimd"]
