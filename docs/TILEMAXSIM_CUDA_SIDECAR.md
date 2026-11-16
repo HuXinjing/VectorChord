@@ -240,3 +240,82 @@ available, multi-GPU, resident-cache, oversized-working-set, concurrent-reader,
 health, and score-equivalence paths. Application-level corpus recall and
 end-to-end latency remain a release acceptance gate rather than an inference
 from synthetic service tests.
+
+## Bounded read/compute overlap on the Hopper release
+
+The optional pipeline reads and verifies the next immutable tensor batch while
+this batch is uploaded and scored. It does not change canonical tensor shapes,
+bytes, GPU layout, quantization contracts, or the Hopper fused kernel. The
+accelerator worker retains exclusive ownership: upload and compute calls are
+still serialized through the existing backend interface. This ports the storage
+prefetch part of `feature/tutti-io-pipeline`, not its concurrent GPU aliases or a
+GPUDirect Storage implementation.
+
+```shell
+--io-pipeline overlap --io-batch-mib 64 --tensor-read-workers 16
+```
+
+- `disabled` is the default and retains the original whole-quantum loader.
+- `serial` uses the same bounded batches without overlapping, for ablation.
+- `overlap` uses a capacity-one channel. At most one batch is consumed, one is
+  queued and one is resolving. Each is bounded by the configured payload budget
+  (1 through 1024 MiB), except one indivisible tensor may exceed that budget and
+  remains subject to the existing descriptor and device capacity checks.
+- Only the exact profile uses the new path. Quantized paths retain their loader
+  and encoding checks. Fully resident requests retain their existing fast paths.
+- Host-cache admissions remain ordered and retain per-owner limits. GPU quota,
+  lease, transient admission, ready-state and error cleanup use the existing
+  common implementation. Early consumer errors drop the receiver before joining
+  the worker, so a blocked sender cannot deadlock shutdown. This does not change
+  cooperative cancellation/deadline boundaries or interrupt running I/O/kernels.
+- `tilemaxsim_io_pipeline` events report completed batches, resolve time,
+  consumer time and elapsed time. Resolve and consumer times overlap and must not
+  be added to estimate wall time. Consumer time includes existing admission,
+  upload, compute and cleanup, not just a CUDA kernel.
+
+### H200 experiment, 2026-11-16
+
+A separate process used the already assigned scorer GPU, a 2 GiB total GPU
+allocation (0.5 GiB workspace), a 1 MiB host cache, 16 readers and 64 MiB batches.
+Production was neither restarted nor reconfigured. Inputs came from the frozen
+resident descriptor snapshot and immutable corpus. A deterministic 32-row,
+320-dimensional query tensor was taken from corpus tensor bytes; this is a
+storage/compute experiment, not an Agent query or recall benchmark.
+
+Each mode had a fresh daemon cache. Shared filesystem page caches were not
+purged, so these are application-cold and over-capacity results, not physical
+SSD cold-read measurements. Mode order was reversed in the second trial.
+Medians of two requests per mode, measured through the local Unix scoring socket:
+
+| Candidates | Original loader | Batched serial | Batched overlap |
+| ---: | ---: | ---: | ---: |
+| 512 | 0.230 s | 0.237 s | 0.189 s |
+| 8,192 | 3.125 s | 3.541 s | 2.139 s |
+| 45,438 | 16.488 s | 17.045 s | 12.150 s |
+
+All candidate IDs and single-request scores matched exactly. In the full case,
+process peak RSS was approximately 20.7 GiB with the original loader and at most
+0.63 GiB with overlap. Fully resident requests showed no established speedup.
+These two-sample measurements do not establish P95, concurrent tenant throughput,
+physical SSD performance, end-to-end RAG latency or cache-recovery speedup.
+
+A separate shape check submitted four resident requests, each with 32 query rows
+and dimension 320. All three loader modes actually invoked the Hopper fused
+kernel. Their maximum deviation from the single-request reference was the same
+`3.6239624e-5`, below the existing GPU test tolerance `1e-4`.
+
+Reproduce a scoped ablation with an explicitly supplied binary and resources:
+
+```shell
+python -m services.benchmark_tilemaxsim_io_pipeline \
+  --descriptor-manifest "$DESCRIPTORS_JSONL" \
+  --query-embedding "$QUERY_NPY" --shard-root "$SHARD_ROOT" \
+  --rust-binary "$DAEMON_BINARY" --contract "$MODEL_CONTRACT" \
+  --device 0 --gpu-memory-gb 2 --workspace-gb 0.5 \
+  --host-cache-gb 0.001 --io-batch-mib 64 --candidates 8192 --trials 3
+```
+
+The benchmark starts isolated processes, compares original/serial/overlap modes,
+checks candidate/score equivalence and does not evict shared filesystem caches.
+Its oversized cooperative quantum is for isolated ablation only; keep production
+fairness and deadline settings when evaluating a rollout.
