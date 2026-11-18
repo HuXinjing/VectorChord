@@ -5,7 +5,7 @@ an optional candidate scorer. The separate experimental `server` is not the
 production integration endpoint. Python configuration must be mode 0600 and
 owned by the runtime UID.
 
-The broker accepts planner manifests registered by NeoBrain schema 164, reads
+The broker accepts planner manifests registered by NeoBrain schema 167, reads
 vectors through a dedicated restricted PostgreSQL role, and borrows already
 admitted tenant leases. It does not call an encoder, accept SQL in HTTP, grant
 new tenant quota, or replace final PostgreSQL evidence/ranking checks.
@@ -19,7 +19,7 @@ Snapshots, pending batches, loader work and resident bytes are bounded. A
 cohort uses a short ownership receipt that never outlives its parents; final
 HTTP delivery forces a fresh ownership and epoch check. Cancellation cannot
 free borrowed capacity before actual work finishes. Database connections
-carry schema writer version 164; the service must be upgraded with the schema,
+carry schema writer version 167; the service must be upgraded with the schema,
 not allowed to bypass an upgrade fence.
 
 Use the optional Containerfile with build context `services`, a pinned PyTorch
@@ -49,7 +49,7 @@ The declared supported version is part of the binary, never copied from the
 database minimum or overridden by operator configuration. Upgrades beyond the
 supported version still require a tested broker release.
 
-Schema 164 compatibility verification includes 38 CPU functional tests on an
+Schema 167 compatibility verification includes 39 CPU functional tests on an
 isolated current-schema PostgreSQL fixture. They cover permission rejection,
 lease borrowing/release, source epoch changes, cancellation, and the connection
 probe's unchanged lease rows. A connection claiming the prior writer version
@@ -57,3 +57,17 @@ is rejected before caller work and is not returned to the pool. These are
 correctness tests, not GPU throughput measurements. A changed broker source
 fingerprint invalidates old calibrations; ordinary requests retain CPU fallback
 until a current calibration is available.
+
+The schema 167 release also verifies a registered 2048-dimensional shadow recipe
+alongside legacy 1536-dimensional vectors. Schema 165 widens shadow vector
+storage; 166 adds publication state and 167 replaces transcript storage. The
+broker does not write those new tables. Its restricted vector reads and the
+existing borrowed-capacity functions remain the integration contract. All 39
+checks pass against an isolated migrated schema 167 database, including the
+real writer-fence probe and rejection of an older writer.
+
+This service is deployed independently of the NeoBrain Compose project. Before
+advancing the database schema, release a verified compatible broker image as
+well; HTTP readiness alone does not establish writer compatibility. Preserve
+its private configuration, GPU allocation and previous image. Do not change
+application_name on a running process or derive its claim from the database.

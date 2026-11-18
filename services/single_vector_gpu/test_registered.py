@@ -66,6 +66,35 @@ class RegisteredTest(unittest.TestCase):
         self.assertEqual(result['results'][0]['candidates'][0]['id'],self.identity)
         self.assertEqual(self.owner.execute('SELECT count(*) FROM knowledge_vector_gpu_borrows WHERE parent_token=%s',(self.token,)).fetchone()[0],0)
 
+    def test_registered_shadow_recipe_supports_2048_dimensions(self):
+        vector = '['+','.join(['1']+['0']*2047)+']'
+        self.owner.execute("""INSERT INTO knowledge_chunk_embedding_generations
+          (chunk_id,source_id,representation,recipe_version,input_hash,chunk_text_hash,page_generation,embedding,model)
+          SELECT cc.id,p.source_id,'raw_evidence','registered-v2',%s,cc.chunk_text_hash,p.generation,%s::vector,'encoder-v2'
+          FROM content_chunks cc JOIN pages p ON p.id=cc.page_id WHERE cc.id=%s""",
+          ('a'*64,vector,self.identity))
+        definition = {**self.broker.manifest(self.manifest).definition, 'dimensions':2048, 'model':'encoder-v2',
+            'select':"SELECT cc.id,g.embedding FROM knowledge_chunk_embedding_generations g JOIN content_chunks cc ON cc.id=g.chunk_id WHERE g.source_id=$1 AND g.recipe_version=$2",
+            'params':[self.source,'registered-v2']}
+        encoded = json.dumps(definition,separators=(',',':'))
+        identity = hashlib.sha256(encoded.encode()).hexdigest()
+        self.owner.execute("""INSERT INTO knowledge_vector_gpu_manifests(manifest_id,tenant_key,definition,source_ids)
+          VALUES(%s,'fixture-tenant',%s,%s)""",(identity,encoded,[self.source]))
+        try:
+            epoch = self.owner.execute(EPOCH_SQL,([self.source],)).fetchone()[0]
+            manifest = self.broker.manifest(identity)
+            end = time.monotonic()+8
+            while not self.broker.prepare(manifest,epoch):
+                if time.monotonic()>end: self.fail("registered shadow snapshot did not load")
+                time.sleep(.02)
+            metadata = {**self.metadata,'manifestId':identity,'epoch':epoch}
+            result = self.broker.search(metadata,np.array([[1]+[0]*2047],dtype='<f4').tobytes(),force=True)
+            self.assertEqual(result['results'][0]['backend'],'gpu')
+            self.assertEqual(result['results'][0]['candidates'][0]['id'],self.identity)
+            self.assertEqual(self.owner.execute('SELECT count(*) FROM knowledge_vector_gpu_borrows WHERE parent_token=%s',(self.token,)).fetchone()[0],0)
+        finally:
+            self.owner.execute('DELETE FROM knowledge_vector_gpu_manifests WHERE manifest_id=%s',(identity,))
+
     def test_large_wire_cohort_borrows_and_releases_each_parent(self):
         tokens=[str(uuid.uuid4()) for _ in range(512)]
         self.owner.execute("UPDATE retrieval_capacity_groups SET max_inflight=1024,max_tenant_inflight=1024 WHERE resource_group=%s",(self.config['resource_group'],))

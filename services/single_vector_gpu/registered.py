@@ -38,9 +38,9 @@ EPOCH_SQL = """SELECT COALESCE(jsonb_object_agg(source_id,units),'{}'::jsonb)::t
  SELECT source_id,sum(units)::text AS units FROM knowledge_vector_gpu_changes
  WHERE source_id=ANY(%s::text[]) GROUP BY source_id) witnesses"""
 
-# Verified against NeoBrain schema 164; never derive this claim from a live
+# Verified against NeoBrain schema 167; never derive this claim from a live
 # database minimum or an operator override.
-WRITER_SCHEMA_VERSION = 164
+WRITER_SCHEMA_VERSION = 167
 WRITER_APPLICATION_NAME = f"neobrain-schema-writer-v{WRITER_SCHEMA_VERSION}"
 
 
