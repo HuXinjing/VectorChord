@@ -77,7 +77,8 @@ format, `oci_overlay.py` can construct the code-only layer without downloading
 or rewriting CUDA dependencies. Read the immutable base manifest and its config
 from containerd's content store; pass their files, the reviewed `registered.py`,
 a full source commit and the new image reference to the tool. Import its archive
-into the same content store with `ctr images import --no-unpack`. The base blobs
+into the same content store with `ctr images import`. Use `--no-unpack` only
+when staging content; unpack it before starting a container. The base blobs
 must already exist there. Keep the old image tagged until rollout validation.
 The archive changes only the module and provenance labels; it preserves the base
 entrypoint, user, environment, health check, layer descriptors and rootfs chain.
