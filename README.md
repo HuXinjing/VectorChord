@@ -6,6 +6,8 @@
 
 </div>
 
+Roadmap, implementation backlog and acceptance criteria: [Outlook and TODO](README.zh-CN.md#展望ai-infra-的检索平面).
+
 This fork extends VectorChord's `vchordrq` index with exact late-interaction
 TileMaxSim retrieval. It is intended for applications that store one array of
 token vectors per document and need PostgreSQL-native multi-vector search.
