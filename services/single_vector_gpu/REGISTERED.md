@@ -71,3 +71,15 @@ advancing the database schema, release a verified compatible broker image as
 well; HTTP readiness alone does not establish writer compatibility. Preserve
 its private configuration, GPU allocation and previous image. Do not change
 application_name on a running process or derive its claim from the database.
+
+For a host whose legacy image builder cannot convert an existing cached layer
+format, `oci_overlay.py` can construct the code-only layer without downloading
+or rewriting CUDA dependencies. Read the immutable base manifest and its config
+from containerd's content store; pass their files, the reviewed `registered.py`,
+a full source commit and the new image reference to the tool. Import its archive
+into the same content store with `ctr images import --no-unpack`. The base blobs
+must already exist there. Keep the old image tagged until rollout validation.
+The archive changes only the module and provenance labels; it preserves the base
+entrypoint, user, environment, health check, layer descriptors and rootfs chain.
+Two pure archive tests verify those invariants, digest checks and deterministic
+output. This is image construction, never an edit of a running container.
