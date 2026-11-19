@@ -38,9 +38,9 @@ EPOCH_SQL = """SELECT COALESCE(jsonb_object_agg(source_id,units),'{}'::jsonb)::t
  SELECT source_id,sum(units)::text AS units FROM knowledge_vector_gpu_changes
  WHERE source_id=ANY(%s::text[]) GROUP BY source_id) witnesses"""
 
-# Verified against NeoBrain schema 167; never derive this claim from a live
+# Verified against NeoBrain schema 169; never derive this claim from a live
 # database minimum or an operator override.
-WRITER_SCHEMA_VERSION = 167
+WRITER_SCHEMA_VERSION = 169
 WRITER_APPLICATION_NAME = f"neobrain-schema-writer-v{WRITER_SCHEMA_VERSION}"
 
 
@@ -380,7 +380,7 @@ def handler(broker):
         def do_GET(self):
             self.send(200 if self.path == "/health" else 404,
                       {"ready": not broker.stop.is_set() and time.monotonic()-broker.database_ready_at<15,
-                       "runtime": broker.runtime})
+                       "runtime": broker.runtime, "writer_schema_version": WRITER_SCHEMA_VERSION})
         def do_POST(self):
             self.connection.settimeout(5)
             if not hmac.compare_digest(self.headers.get("Authorization", ""), "Bearer "+broker.config["token"]):
