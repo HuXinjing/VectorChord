@@ -18,6 +18,7 @@ from typing import Callable, Protocol
 import numpy as np
 
 from .index import Contract, validated
+from .ipc_query import IpcQuery
 
 
 class Lease(Protocol):
@@ -164,7 +165,7 @@ class Handle:
 
 @dataclass
 class _Request:
-    vector: np.ndarray
+    vector: np.ndarray | IpcQuery
     contract: Contract
     sources: tuple[int, ...]
     k: int
@@ -229,10 +230,15 @@ class Dispatcher:
     def submit(self, vector, *, contract: Contract, sources: list[int], k: int,
                deadline: float, authorize: Callable[[], None], cpu: Callable[[], object],
                policy: Policy | None = None) -> Handle:
-        raw = np.asarray(vector)
-        if raw.ndim != 1 or not 1 <= len(raw) <= 65536:
-            raise ValueError("invalid_dispatch_dimensions")
-        value = validated(raw[None, :]).copy()[0]
+        ipc = isinstance(vector, IpcQuery)
+        if ipc:
+            value = vector
+        else:
+            raw = np.asarray(vector)
+            if raw.ndim != 1 or not 1 <= len(raw) <= 65536:
+                raise ValueError("invalid_dispatch_dimensions")
+            value = validated(raw[None, :]).copy()[0]
+        dimension = value.dimension if ipc else len(value)
         if (type(k) is not int or not 1 <= k <= 1024 or not math.isfinite(deadline)
             or deadline <= time.monotonic() or not all((contract.tenant, contract.model, contract.generation))
             or any(type(s) is not int for s in sources)):
@@ -247,7 +253,7 @@ class Dispatcher:
         # converting the same database expiry to monotonic time varies by RPC.
         identity = (policy.crossover, policy.calibration, policy.margin,
                     policy.collect_seconds, policy.max_batch, policy.force_gpu)
-        key = (contract, allowed, k, len(value), identity)
+        key = (contract, allowed, k, dimension, ipc, identity)
         try:
             with self._condition:
                 if self._closed: raise RuntimeError("dispatcher_closed")
@@ -322,9 +328,12 @@ class Dispatcher:
             if not self.catalog.current(version):
                 raise RuntimeError("snapshot_changed")
             snapshot = version.snapshot
-            if any(len(r.vector) != snapshot.dimensions for r in valid):
+            vectors = [r.vector for r in valid]
+            ipc = isinstance(vectors[0], IpcQuery)
+            if any((q.dimension if ipc else len(q)) != snapshot.dimensions for q in vectors):
                 raise ValueError("snapshot_dimension_mismatch")
-            result = self.gpu(snapshot, np.stack([r.vector for r in valid]), valid[0].k, valid[0].sources)
+            values = vectors if ipc else np.stack(vectors)
+            result = self.gpu(snapshot, values, valid[0].k, valid[0].sources)
             if len(result) != len(valid): raise RuntimeError("gpu_result_rows")
             if not self.catalog.current(version): raise RuntimeError("snapshot_changed")
         except Exception:

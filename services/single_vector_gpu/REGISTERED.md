@@ -98,3 +98,24 @@ media upload assembly retry and evaluation execution lease migrations. The
 updated broker can connect before the migration and passes the registered
 vector and restricted lease tests after the migration, including rejection of
 an older writer. The migrations do not change broker vector or lease SQL.
+
+## CUDA IPC query input
+
+The default request format remains version 1 with FP32 query data. A broker
+with `query_ipc_socket` and `query_ipc_model` configured also accepts version 2
+on `/v1/registered-vector/search`. Use the same header fields with
+`version: 2` and supply one 16-byte opaque reference per row in request order.
+The configured model must match the registered manifest. Use a dedicated
+socket directory accessible only to the broker and the trusted encoder.
+The encoder and broker run on the same host and must have access to the private socket. Linux 6.5 or newer supports peer lifetime monitoring across PID namespaces.
+
+The encoder publishes the `SVQ1` frame and its lease digest over Unix IPC.
+The broker checks the existing manifest, calibration, epoch and borrowed
+tenant lease and then claims the reference once. The encoder publishes the handle only after the CUDA event completes. The worker copies the query within GPU memory and uses the same FP32 cosine index. A different scorer GPU requires CUDA peer access to the producer.
+A failed claim or unsupported topology leaves version 1 available for
+fallback. A disconnected sender, an expired reference, and a closed CUDA
+mapping are handled independently. No query payloads or handles are logged.
+
+Normal NeoBrain callers still use version 1 until their planner selects the
+reference transport. Calibrate this transport before switching traffic. The
+CPU HNSW path continues to use PostgreSQL vector parameters.

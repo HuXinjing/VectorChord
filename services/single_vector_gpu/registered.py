@@ -7,7 +7,7 @@ leases, and returns only candidate identities/scores. It never encodes text.
 from __future__ import annotations
 
 import argparse
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 import hashlib
@@ -31,6 +31,7 @@ from psycopg.types import TypeInfo
 
 from .dispatch import Dispatcher, Policy, Snapshot, SnapshotCatalog
 from .index import Contract, SingleVectorIndex
+from .ipc_query import IpcInbox, IpcQuery, IpcUnavailable
 from .server import unpack
 
 
@@ -172,7 +173,7 @@ class Broker:
         if str(config.get("device","cuda:0")).startswith("cuda"):
             properties = torch.cuda.get_device_properties(config.get("device","cuda:0"))
             identity += [str(getattr(properties,"uuid",properties.name)),str(properties.total_memory)]
-        for name in ["registered.py","dispatch.py","index.py"]:
+        for name in ["registered.py","dispatch.py","index.py","ipc_query.py"]:
             identity.append(hashlib.sha256(Path(__file__).with_name(name).read_bytes()).hexdigest())
         self.runtime = hashlib.sha256(json.dumps(identity).encode()).hexdigest()
         self.pool = Pool(config["database"], config.get("database_connections", 4))
@@ -192,6 +193,11 @@ class Broker:
         self.database_ready_at = 0.
         self.dispatch = Dispatcher(self.catalog, Policy(1, "disabled", 0, max_batch=512, max_pending=2048, max_pending_per_tenant=1024), self.admission,
                                    self._score, cpu_workers=2, observe=lambda event: print(json.dumps({"event":"vector_dispatch",**event}),flush=True))
+        self.ipc_inbox = None
+        if socket_path := config.get("query_ipc_socket"):
+            if not config.get("query_ipc_model") or not str(config.get("device", "cuda:0")).startswith("cuda"):
+                raise ValueError("ipc_query_requires_cuda_and_model")
+            self.ipc_inbox = IpcInbox(socket_path)
         self.maintenance = threading.Thread(target=self._maintain, daemon=True)
         self.maintenance.start()
 
@@ -304,6 +310,16 @@ class Broker:
             self.stop.wait(2)
 
     def _score(self, snapshot, values, k, sources):
+        if isinstance(values[0], IpcQuery):
+            matrix = torch.empty((len(values), snapshot.dimensions), device=snapshot.backend.device, dtype=torch.float32)
+            try:
+                for row, query in zip(matrix, values, strict=True):
+                    query.copy_to(row)
+            except (RuntimeError, ValueError) as error:
+                print(json.dumps({"event": "single_vector_ipc_fallback",
+                                  "reason": "cuda_import_failed", "rows": len(values)}), flush=True)
+                raise IpcUnavailable("cuda_import_failed") from error
+            values = matrix
         ids, scores, metrics = snapshot.backend.search(values, k, contract=snapshot.contract, allowed_sources=sources)
         if self.config.get("profile_timings",False):
             print(json.dumps({"event":"vector_score_timing",**metrics}),flush=True)
@@ -312,7 +328,7 @@ class Broker:
 
     def search(self, metadata, payload, force=False):
         required = {"version", "manifestId", "epoch", "leases", "transport", "rows", "k"}
-        if (set(metadata) != required or type(metadata["version"]) is not int or metadata["version"] != 1
+        if (set(metadata) != required or type(metadata["version"]) is not int or metadata["version"] not in (1, 2)
             or type(metadata["rows"]) is not int or not 1 <= metadata["rows"] <= 512
             or type(metadata["k"]) is not int or not 1 <= metadata["k"] <= 1024
             or not isinstance(metadata["leases"], list) or len(metadata["leases"]) != metadata["rows"]
@@ -322,18 +338,34 @@ class Broker:
         manifest = self.manifest(metadata["manifestId"])
         if metadata["k"] != manifest.definition["candidate_k"]: raise ValueError("candidate_contract_changed")
         dimensions = manifest.definition["dimensions"]
-        if len(payload) != metadata["rows"]*dimensions*4: raise ValueError("vector_wire_shape")
-        values = np.frombuffer(payload, dtype="<f4").reshape(metadata["rows"], dimensions)
-        if not np.isfinite(values).all() or np.any(np.all(values == 0, axis=1)): raise ValueError("invalid_vectors")
+        ipc = metadata["version"] == 2
+        row_count = metadata["rows"]
+        if len(payload) != row_count * (16 if ipc else dimensions * 4):
+            raise ValueError("vector_wire_shape")
+        if ipc:
+            if self.ipc_inbox is None:
+                raise IpcUnavailable("receiver_disabled")
+            if manifest.definition["model"] != self.config.get("query_ipc_model"):
+                raise ValueError("ipc_model_contract_mismatch")
+            refs = [payload[offset:offset + 16] for offset in range(0, len(payload), 16)]
+        else:
+            values = np.frombuffer(payload, dtype="<f4").reshape(row_count, dimensions)
+            if not np.isfinite(values).all() or np.any(np.all(values == 0, axis=1)):
+                raise ValueError("invalid_vectors")
         policy = self.policy(manifest, metadata["epoch"], force)
-        result = {"version": 1, "manifestId": manifest.identity, "epoch": metadata["epoch"], "runtime": self.runtime,
-                  "results": [{"backend": "cpu"} for _ in values]}
-        if policy is None or not self.prepare(manifest, metadata["epoch"]): return result
-        started=time.perf_counter()
-        proof = Proof(self.pool, manifest, metadata["epoch"], metadata["leases"], self.config["resource_group"],len(values) if force else 0)
+        result = {"version": metadata["version"], "manifestId": manifest.identity, "epoch": metadata["epoch"], "runtime": self.runtime,
+                  "results": [{"backend": "cpu"} for _ in range(row_count)]}
+        if policy is None or not self.prepare(manifest, metadata["epoch"]):
+            return result
+        started = time.perf_counter()
+        proof = Proof(self.pool, manifest, metadata["epoch"], metadata["leases"],
+                      self.config["resource_group"], row_count if force else 0)
         borrowed_at=time.perf_counter(); dispatched_at=borrowed_at; scored_at=borrowed_at; verified_at=borrowed_at
+        exports = ExitStack()
         handles = []
         try:
+            if ipc:
+                values = exports.enter_context(self.ipc_inbox.claim(refs, metadata["leases"], dimensions))
             with self.dispatch.cohort():
                 for vector, parent in zip(values, metadata["leases"]):
                     self.admission.local.proof, self.admission.local.parent = proof, parent
@@ -351,6 +383,7 @@ class Broker:
             for handle in handles:
                 try: handle.result.result()
                 except Exception: pass
+            exports.close()
             proof.release()
             if self.config.get("profile_timings",False):
                 print(json.dumps({"event":"vector_request_timing","rows":len(values),"borrow_ms":(borrowed_at-started)*1000,
@@ -364,6 +397,8 @@ class Broker:
         self.maintenance.join()
         self.loader.shutdown(wait=True)
         self.dispatch.close()
+        if self.ipc_inbox is not None:
+            self.ipc_inbox.close()
         self.pool.close()
 
 
@@ -398,6 +433,10 @@ def handler(broker):
                     if not expected or not hmac.compare_digest(supplied, expected): raise PermissionError("operator_denied")
                     force = True
                 self.send(200, broker.search(meta, payload, force))
+            except IpcUnavailable as error:
+                print(json.dumps({"event": "single_vector_ipc_fallback", "reason": error.reason}), flush=True)
+                self.close_connection = True
+                self.send(503, {"error": "query_transport_unavailable", "retryable": True})
             except PermissionError:
                 self.close_connection = True; self.send(403, {"error": "scope_or_lease"})
             except (ValueError, TypeError, KeyError):

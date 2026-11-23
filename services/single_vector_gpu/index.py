@@ -80,7 +80,7 @@ class SingleVectorIndex:
         self.load_ms = (time.perf_counter() - started) * 1000
 
     @torch.inference_mode()
-    def search(self, queries: np.ndarray, k: int, *, contract: Contract,
+    def search(self, queries: np.ndarray | torch.Tensor, k: int, *, contract: Contract,
                allowed_sources: Iterable[int]) -> tuple[np.ndarray, np.ndarray, dict]:
         started = time.perf_counter()
         if contract != self.contract:
@@ -95,7 +95,16 @@ class SingleVectorIndex:
         if not allowed.issubset(known):
             raise PermissionError("source_not_in_snapshot")
         prepare = time.perf_counter()
-        q = validated(queries, self.dimensions)
+        if isinstance(queries, torch.Tensor):
+            q = queries
+            if (self.device.type != "cuda" or not q.is_cuda or q.device != self.vectors.device
+                    or q.dtype != torch.float32 or q.ndim != 2 or q.shape[1] != self.dimensions):
+                raise ValueError("invalid_device_vector_shape")
+            valid_rows = torch.isfinite(q).all(dim=1) & (q != 0).any(dim=1)
+            if not bool(valid_rows.all()):
+                raise ValueError("invalid_device_vector")
+        else:
+            q = validated(queries, self.dimensions)
         k = min(k, len(self.sources))
         output_ids = np.full((len(q), k), -1, dtype=np.int64)
         output_scores = np.full((len(q), k), -np.inf, dtype=np.float32)
