@@ -2847,6 +2847,22 @@ REVOKE ALL ON FUNCTION vchordrq_tilemaxsim_rerank(regclass, halfvec[], bigint[],
 GRANT EXECUTE ON FUNCTION vchordrq_tilemaxsim_rerank(regclass, vector[], bigint[], integer) TO PUBLIC;
 GRANT EXECUTE ON FUNCTION vchordrq_tilemaxsim_rerank(regclass, halfvec[], bigint[], integer) TO PUBLIC;
 
+CREATE FUNCTION vchordrq_tilemaxsim_rerank_ref(
+    source_relation regclass,
+    query_reference text,
+    query_rows integer,
+    query_dimension integer,
+    candidate_ids bigint[],
+    top_k integer
+)
+RETURNS TABLE(public_id bigint, similarity real)
+STRICT VOLATILE PARALLEL UNSAFE LANGUAGE c
+AS 'MODULE_PATHNAME', '_vchordrq_tilemaxsim_rerank_ref_wrapper';
+
+COMMENT ON FUNCTION vchordrq_tilemaxsim_rerank_ref(regclass, text, integer, integer, bigint[], integer)
+IS 'Exact FP16 over the current role-scoped candidates with an opaque CUDA IPC query reference.';
+REVOKE ALL ON FUNCTION vchordrq_tilemaxsim_rerank_ref(regclass, text, integer, integer, bigint[], integer) FROM PUBLIC;
+
 CREATE FUNCTION vchordrq_tilemaxsim_rerank_scoped(source_relation regclass, query vector[], candidate_ids bigint[], scoped_candidate_ids bigint[], top_k integer)
 RETURNS TABLE(scope smallint, public_id bigint, similarity real)
 STRICT VOLATILE PARALLEL UNSAFE LANGUAGE c

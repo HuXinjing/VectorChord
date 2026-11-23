@@ -144,6 +144,15 @@ pub trait AcceleratorBackend: Send {
         document_rows: &[u32],
     ) -> Result<Vec<f32>>;
 
+    fn score_ipc(
+        &mut self,
+        _query: &crate::query_ipc::QueryLease,
+        _document_offsets: &[u64],
+        _document_rows: &[u32],
+    ) -> Result<Vec<f32>> {
+        anyhow::bail!("CUDA IPC query scoring is unavailable on this backend");
+    }
+
     fn score_pq(
         &mut self,
         contract_id: &str,

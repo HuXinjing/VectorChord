@@ -260,6 +260,32 @@ unsafe extern "C" {
         error: *mut c_char,
         error_capacity: usize,
     ) -> c_int;
+    fn vctm_gpu_open_ipc_fp16(
+        gpu: *mut NativeGpu,
+        memory: *const [u8; 64],
+        ready: *const [u8; 64],
+        bytes: usize,
+        rows: u32,
+        dimension: u32,
+        output: *mut *mut std::ffi::c_void,
+        error: *mut c_char,
+        error_capacity: usize,
+    ) -> c_int;
+    fn vctm_gpu_score_ipc_fp16(
+        gpu: *mut NativeGpu,
+        query: *const std::ffi::c_void,
+        offsets: *const u64,
+        rows: *const u32,
+        count: usize,
+        output: *mut f32,
+        error: *mut c_char,
+        error_capacity: usize,
+    ) -> c_int;
+    fn vctm_gpu_close_ipc_fp16(
+        query: *mut std::ffi::c_void,
+        error: *mut c_char,
+        error_capacity: usize,
+    ) -> c_int;
     fn vctm_gpu_score_batch(
         gpu: *mut NativeGpu,
         queries: *const c_uchar,
@@ -2152,6 +2178,65 @@ impl AcceleratorBackend for Gpu {
             document_offsets,
             document_rows,
         )
+    }
+
+    fn score_ipc(
+        &mut self,
+        query: &crate::query_ipc::QueryLease,
+        offsets: &[u64],
+        rows: &[u32],
+    ) -> Result<Vec<f32>> {
+        if offsets.len() != rows.len() || offsets.is_empty() {
+            bail!("invalid native document metadata");
+        }
+        let mut mapping = std::ptr::null_mut();
+        let mut error = [0_i8; 512];
+        // SAFETY: handles are fixed-width and the query lease outlives the
+        // synchronous mapping, scoring, and close calls below.
+        let opened = unsafe {
+            vctm_gpu_open_ipc_fp16(
+                self.native.as_ptr(),
+                &query.memory,
+                &query.ready,
+                query.bytes as usize,
+                query.rows,
+                query.dimension,
+                &mut mapping,
+                error.as_mut_ptr(),
+                error.len(),
+            )
+        };
+        if opened != 0 {
+            bail!(native_error(&error));
+        }
+        let mut output = vec![0.0_f32; offsets.len()];
+        let status = unsafe {
+            vctm_gpu_score_ipc_fp16(
+                self.native.as_ptr(),
+                mapping,
+                offsets.as_ptr(),
+                rows.as_ptr(),
+                offsets.len(),
+                output.as_mut_ptr(),
+                error.as_mut_ptr(),
+                error.len(),
+            )
+        };
+        let mut close_error = [0_i8; 512];
+        let closed = unsafe {
+            vctm_gpu_close_ipc_fp16(mapping, close_error.as_mut_ptr(), close_error.len())
+        };
+        if closed != 0 {
+            query.pin_after_failed_unmap();
+            bail!(native_error(&close_error));
+        }
+        if status != 0 {
+            bail!(native_error(&error));
+        }
+        if output.iter().any(|score| !score.is_finite()) {
+            bail!("native TileMaxSim returned a non-finite score");
+        }
+        Ok(output)
     }
 
     fn score_pq(

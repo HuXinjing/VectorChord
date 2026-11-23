@@ -108,6 +108,8 @@ pub struct CatalogRequest<'a> {
     pub quantization_contract: Option<&'a str>,
     pub top_k: usize,
     pub query: &'a [u8],
+    /// True when the wire payload is a 16-byte CUDA IPC reference.
+    pub query_reference: bool,
     /// Stable catalog revision. The wire carries its SHA-256 digest.
     pub catalog_revision: &'a str,
 }
@@ -349,7 +351,11 @@ fn common_prefix(
     frame.extend_from_slice(&request.dimension.to_le_bytes());
     frame.extend_from_slice(&request.query_rows.to_le_bytes());
     frame.extend_from_slice(&(candidate_count as u32).to_le_bytes());
-    frame.push(request.query_dtype as u8);
+    frame.push(if request.query_reference {
+        0x82
+    } else {
+        request.query_dtype as u8
+    });
     frame.push(1);
     frame.push(request.scoring_profile as u8);
     frame.push(if request.query_dtype == request.candidate_dtype {
@@ -412,7 +418,22 @@ fn validate_request(
         .checked_mul(request.dimension as usize)
         .and_then(|value| value.checked_mul(request.query_dtype.scalar_bytes()))
         .ok_or(ProtocolError::InvalidRequest("query tensor size overflow"))?;
-    if request.query.len() != expected {
+    let wire_bytes = if request.query_reference {
+        if request.query_dtype != TensorDtype::Float16
+            || request.candidate_dtype != TensorDtype::Float16
+            || request.scoring_profile != ScoringProfile::ExactFp16
+            || expected > 32 * 1024 * 1024
+            || request.query.iter().all(|value| *value == 0)
+        {
+            return Err(ProtocolError::InvalidRequest(
+                "invalid CUDA IPC query reference",
+            ));
+        }
+        16
+    } else {
+        expected
+    };
+    if request.query.len() != wire_bytes {
         return Err(ProtocolError::InvalidRequest(
             "query payload disagrees with its shape and dtype",
         ));
@@ -532,6 +553,7 @@ mod tests {
             quantization_contract: None,
             top_k: 2,
             query,
+            query_reference: false,
             catalog_revision: "catalog-17",
         }
     }

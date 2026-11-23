@@ -43,8 +43,9 @@ fn _vchordrq_tilemaxsim_rerank_vector(
 ) -> TableIterator<'static, (name!(public_id, i64), name!(similarity, f32))> {
     let rows = collect_vector_query(query)
         .and_then(|query| {
-            collect_candidate_ids(candidate_ids)
-                .and_then(|candidate_ids| execute_rerank(source_oid, query, candidate_ids, top_k))
+            collect_candidate_ids(candidate_ids).and_then(|candidate_ids| {
+                execute_rerank(source_oid, query, candidate_ids, top_k, None)
+            })
         })
         .unwrap_or_else(|error| pgrx::error!("{error}"));
     TableIterator::new(rows)
@@ -60,11 +61,44 @@ fn _vchordrq_tilemaxsim_rerank_halfvec(
 ) -> TableIterator<'static, (name!(public_id, i64), name!(similarity, f32))> {
     let rows = collect_halfvec_query(query)
         .and_then(|query| {
-            collect_candidate_ids(candidate_ids)
-                .and_then(|candidate_ids| execute_rerank(source_oid, query, candidate_ids, top_k))
+            collect_candidate_ids(candidate_ids).and_then(|candidate_ids| {
+                execute_rerank(source_oid, query, candidate_ids, top_k, None)
+            })
         })
         .unwrap_or_else(|error| pgrx::error!("{error}"));
     TableIterator::new(rows)
+}
+
+/// Exact FP16 lookup of an opaque query already published to the local scorer.
+#[pg_extern(sql = "")]
+fn _vchordrq_tilemaxsim_rerank_ref(
+    source_oid: pgrx::pg_sys::Oid,
+    query_ref: &str,
+    query_rows: i32,
+    query_dimension: i32,
+    candidate_ids: Array<'_, i64>,
+    top_k: i32,
+) -> TableIterator<'static, (name!(public_id, i64), name!(similarity, f32))> {
+    let mut reference = [0; 16];
+    if query_rows <= 0
+        || !(1..=60_000).contains(&query_dimension)
+        || hex::decode_to_slice(query_ref, &mut reference).is_err()
+        || reference == [0; 16]
+    {
+        pgrx::error!("invalid TileMaxSim query reference");
+    }
+    let result = collect_candidate_ids(candidate_ids)
+        .and_then(|ids| {
+            execute_rerank(
+                source_oid,
+                Vec::new(),
+                ids,
+                top_k,
+                Some((reference, query_rows as u32, query_dimension as u32)),
+            )
+        })
+        .unwrap_or_else(|error| pgrx::error!("{error}"));
+    TableIterator::new(result)
 }
 
 /// One exact scan with two independently ranked result windows. The daemon
@@ -200,6 +234,7 @@ fn execute_rerank(
     query: Vec<OwnedVector>,
     candidate_ids: Vec<i64>,
     top_k: i32,
+    reference: Option<([u8; 16], u32, u32)>,
 ) -> Result<std::vec::IntoIter<(i64, f32)>, RerankError> {
     validate_top_k(candidate_ids.len(), top_k)?;
     if !matches!(gucs::vchordrq_maxsim_backend(), PostgresMaxsimBackend::Gpu) {
@@ -212,7 +247,7 @@ fn execute_rerank(
     let profile_guard = profile::ProfileGuard::start(gucs::vchordrq_maxsim_profile());
     let total_timer = profile::ProfileTimer::start();
     profile::update(|profile| {
-        profile.query_tokens = query.len() as u64;
+        profile.query_tokens = reference.map_or(query.len() as u64, |(_, rows, _)| u64::from(rows));
         profile.generated_candidates = candidate_ids.len() as u64;
     });
 
@@ -257,10 +292,11 @@ fn execute_rerank(
     // A catalog revision replaces descriptor transport, never current SQL
     // visibility. Read IDs through the same source/descriptor join under this
     // snapshot and role before probing a resident FP16 catalog.
-    let mut sorted_candidate_ids = if matches!(
-        gucs::vchordrq_maxsim_scoring_profile(),
-        PostgresMaxsimScoringProfile::ExactFp16
-    ) && backend.catalog_probe_available(&query)?
+    let mut sorted_candidate_ids = if reference.is_some()
+        || (matches!(
+            gucs::vchordrq_maxsim_scoring_profile(),
+            PostgresMaxsimScoringProfile::ExactFp16
+        ) && backend.catalog_probe_available(&query)?)
     {
         load_visible_public_ids(&binding, &candidate_ids)?
     } else {
@@ -268,7 +304,17 @@ fn execute_rerank(
     };
     sorted_candidate_ids.sort_unstable();
     let fast_public_ids = public_id_map(&sorted_candidate_ids)?;
-    let (results, public_ids) =
+    let (results, public_ids) = if let Some((id, rows, dimension)) = reference {
+        profile::update(|profile| profile.visible_candidates = fast_public_ids.len() as u64);
+        let results = backend.rerank_catalog_ipc(
+            &id,
+            rows,
+            dimension,
+            &sorted_candidate_ids,
+            result_limit,
+        )?;
+        (results, fast_public_ids)
+    } else {
         match backend.rerank_catalog(&query, &sorted_candidate_ids, result_limit)? {
             CatalogSelectionOutcome::Hit(results) => {
                 profile::update(|profile| {
@@ -297,7 +343,8 @@ fn execute_rerank(
                     backend.rerank_logical(&query, &mut candidates, &mut source, result_limit)?;
                 (results, public_ids)
             }
-        };
+        }
+    };
     let mut best = BinaryHeap::with_capacity(result_limit.saturating_add(1));
     for result in results {
         let public_id = public_ids.get(&result.heap_key).copied().ok_or_else(|| {

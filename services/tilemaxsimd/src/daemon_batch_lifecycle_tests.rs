@@ -171,6 +171,8 @@ impl RequestFixture {
             scoring_profile: protocol::ScoringProfile::ExactFp16,
             quantization_contract: None,
             top_k: Some(3),
+            query_reference: None,
+            query_ipc: None,
             query: (0..rows)
                 .flat_map(|_| [marker, 0u16].into_iter().flat_map(u16::to_le_bytes))
                 .collect(),

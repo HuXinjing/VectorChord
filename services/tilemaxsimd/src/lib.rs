@@ -14,6 +14,7 @@ pub mod gpu;
 pub mod metal;
 pub mod protocol;
 pub mod quant;
+pub mod query_ipc;
 pub mod recovery;
 pub mod scheduler;
 pub use tilemaxsim_protocol as protocol_codec;
@@ -42,6 +43,7 @@ mod protocol_codec_contract_tests {
             quantization_contract: None,
             top_k: 2,
             query: &query,
+            query_reference: false,
             catalog_revision: "catalog-17",
         };
         let ids = [11, 20, 42];

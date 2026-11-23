@@ -21,6 +21,7 @@
 #include <cstring>
 #include <limits>
 #include <map>
+#include <new>
 #include <vector>
 #include "hopper_maxsim.cuh"
 #include <dlfcn.h>
@@ -1537,9 +1538,9 @@ static bool reserve_aligned(size_t *cursor, size_t bytes, size_t *offset) {
   return true;
 }
 
-extern "C" int vctm_gpu_score(
+static int score_single_query(
     VctmGpu *gpu, const unsigned char *query, size_t query_bytes,
-    uint32_t query_rows, uint32_t dimension, uint8_t dtype,
+    bool query_on_device, uint32_t query_rows, uint32_t dimension, uint8_t dtype,
     uint8_t scoring_profile,
     const uint64_t *document_offsets, const uint32_t *document_rows,
     size_t count, float *output, char *error, size_t error_capacity) {
@@ -1569,7 +1570,8 @@ extern "C" int vctm_gpu_score(
   size_t rows_offset = 0;
   size_t maxima_offset = 0;
   size_t scores_offset = 0;
-  if (!reserve_aligned(&cursor, query_bytes, &query_offset) ||
+  if ((!query_on_device &&
+       !reserve_aligned(&cursor, query_bytes, &query_offset)) ||
       !reserve_aligned(&cursor, count * sizeof(uint64_t), &offsets_offset) ||
       !reserve_aligned(&cursor, count * sizeof(uint32_t), &rows_offset) ||
       !reserve_aligned(&cursor, maxima_count * sizeof(float), &maxima_offset) ||
@@ -1585,8 +1587,10 @@ extern "C" int vctm_gpu_score(
       {offsets_offset, document_offsets, count * sizeof(uint64_t)},
       {rows_offset, document_rows, count * sizeof(uint32_t)},
   };
-  status = copy_control_payload(gpu, workspace, control,
-                                sizeof(control) / sizeof(control[0]));
+  constexpr size_t control_count = sizeof(control) / sizeof(control[0]);
+  const size_t first_control = query_on_device ? 1 : 0;
+  status = copy_control_payload(gpu, workspace, control + first_control,
+                                control_count - first_control);
   if (status != cudaSuccess) {
     return cuda_fail(error, error_capacity, "CUDA workspace initialization",
                      status);
@@ -1599,9 +1603,10 @@ extern "C" int vctm_gpu_score(
   const size_t kernel_blocks = std::min(maxima_count, maximum_kernel_blocks);
   dim3 grid(static_cast<unsigned int>(kernel_blocks));
   dim3 block(256);
+  const auto *query_data = query_on_device ? query : workspace + query_offset;
   if (scoring_profile == 1 && dtype == 2) {
     tilemaxsim_kernel<half><<<grid, block, 0, gpu->compute_stream>>>(
-        reinterpret_cast<const half *>(workspace + query_offset), query_rows,
+        reinterpret_cast<const half *>(query_data), query_rows,
         dimension, gpu->allocation,
         reinterpret_cast<const uint64_t *>(workspace + offsets_offset),
         reinterpret_cast<const uint32_t *>(workspace + rows_offset),
@@ -1661,6 +1666,128 @@ extern "C" int vctm_gpu_score(
   if (status == cudaSuccess) status = cudaStreamSynchronize(gpu->compute_stream);
   if (status != cudaSuccess) {
     return cuda_fail(error, error_capacity, "TileMaxSim CUDA execution", status);
+  }
+  return 0;
+}
+
+extern "C" int vctm_gpu_score(
+    VctmGpu *gpu, const unsigned char *query, size_t query_bytes,
+    uint32_t query_rows, uint32_t dimension, uint8_t dtype,
+    uint8_t scoring_profile, const uint64_t *document_offsets,
+    const uint32_t *document_rows, size_t count, float *output, char *error,
+    size_t error_capacity) {
+  return score_single_query(gpu, query, query_bytes, false, query_rows,
+                            dimension, dtype, scoring_profile, document_offsets,
+                            document_rows, count, output, error, error_capacity);
+}
+
+struct VctmIpcQuery {
+  int device;
+  void *data;
+  cudaEvent_t ready;
+  size_t bytes;
+  uint32_t rows;
+  uint32_t dimension;
+};
+
+// Only a trusted local transfer service may supply CUDA handles. The producer
+// must retain its allocation and recorded event until the consumer closes it.
+extern "C" int vctm_gpu_open_ipc_fp16(
+    VctmGpu *gpu, const cudaIpcMemHandle_t *memory_handle,
+    const cudaIpcEventHandle_t *ready_handle, size_t query_bytes,
+    uint32_t query_rows, uint32_t dimension, VctmIpcQuery **output,
+    char *error, size_t error_capacity) {
+  size_t values = 0, expected_bytes = 0;
+  if (output != nullptr) *output = nullptr;
+  if (gpu == nullptr || memory_handle == nullptr || ready_handle == nullptr ||
+      output == nullptr || query_rows == 0 || dimension == 0 ||
+      !checked_mul(query_rows, dimension, &values) ||
+      !checked_mul(values, sizeof(half), &expected_bytes) ||
+      query_bytes != expected_bytes) {
+    return fail(error, error_capacity, "invalid IPC FP16 query shape");
+  }
+  cudaError_t status = cudaSetDevice(gpu->device);
+  if (status != cudaSuccess) {
+    return cuda_fail(error, error_capacity, "cudaSetDevice", status);
+  }
+  void *query = nullptr;
+  status = cudaIpcOpenMemHandle(&query, *memory_handle,
+                                cudaIpcMemLazyEnablePeerAccess);
+  if (status != cudaSuccess) {
+    return cuda_fail(error, error_capacity, "cudaIpcOpenMemHandle", status);
+  }
+  static void *driver = dlopen("libcuda.so.1", RTLD_NOW | RTLD_LOCAL);
+  static auto allocation_range = driver
+      ? reinterpret_cast<decltype(&cuMemGetAddressRange)>(
+            dlsym(driver, "cuMemGetAddressRange_v2"))
+      : nullptr;
+  CUdeviceptr base = 0;
+  size_t allocation_bytes = 0;
+  const auto address = reinterpret_cast<CUdeviceptr>(query);
+  if (allocation_range == nullptr ||
+      allocation_range(&base, &allocation_bytes, address) != CUDA_SUCCESS ||
+      base != address || query_bytes > allocation_bytes) {
+    cudaIpcCloseMemHandle(query);
+    return fail(error, error_capacity, "IPC query exceeds its CUDA allocation");
+  }
+  cudaEvent_t ready = nullptr;
+  const cudaIpcEventHandle_t already_ready{};
+  if (std::memcmp(ready_handle, &already_ready, sizeof(already_ready)) != 0) {
+    status = cudaIpcOpenEventHandle(&ready, *ready_handle);
+    if (status != cudaSuccess) {
+      cudaIpcCloseMemHandle(query);
+      return cuda_fail(error, error_capacity, "cudaIpcOpenEventHandle", status);
+    }
+  }
+  auto *mapping = new (std::nothrow) VctmIpcQuery{
+      gpu->device, query, ready, query_bytes, query_rows, dimension};
+  if (mapping == nullptr) {
+    if (ready != nullptr) cudaEventDestroy(ready);
+    cudaIpcCloseMemHandle(query);
+    return fail(error, error_capacity, "unable to allocate IPC query mapping");
+  }
+  *output = mapping;
+  return 0;
+}
+
+// Callers serialize scoring and closing a mapping, as with the GPU workspace.
+extern "C" int vctm_gpu_score_ipc_fp16(
+    VctmGpu *gpu, const VctmIpcQuery *query, const uint64_t *document_offsets,
+    const uint32_t *document_rows, size_t count, float *output, char *error,
+    size_t error_capacity) {
+  if (gpu == nullptr || query == nullptr || gpu->device != query->device) {
+    return fail(error, error_capacity, "invalid TileMaxSim IPC query mapping");
+  }
+  cudaError_t status = cudaSetDevice(gpu->device);
+  if (status == cudaSuccess && query->ready != nullptr) {
+    status = cudaStreamWaitEvent(gpu->compute_stream, query->ready, 0);
+  }
+  if (status != cudaSuccess) {
+    return cuda_fail(error, error_capacity, "CUDA IPC readiness", status);
+  }
+  const int result = score_single_query(
+      gpu, static_cast<const unsigned char *>(query->data), query->bytes, true,
+      query->rows, query->dimension, 2, 1, document_offsets, document_rows,
+      count, output, error, error_capacity);
+  if (result != 0) cudaStreamSynchronize(gpu->compute_stream);
+  return result;
+}
+
+extern "C" int vctm_gpu_close_ipc_fp16(VctmIpcQuery *query, char *error,
+                                       size_t error_capacity) {
+  if (query == nullptr) return 0;
+  const auto selected = cudaSetDevice(query->device);
+  if (selected != cudaSuccess) {
+    return cuda_fail(error, error_capacity, "cudaSetDevice", selected);
+  }
+  const auto event = query->ready == nullptr ? cudaSuccess : cudaEventDestroy(query->ready);
+  const auto memory = cudaIpcCloseMemHandle(query->data);
+  delete query;
+  if (event != cudaSuccess) {
+    return cuda_fail(error, error_capacity, "cudaEventDestroy", event);
+  }
+  if (memory != cudaSuccess) {
+    return cuda_fail(error, error_capacity, "cudaIpcCloseMemHandle", memory);
   }
   return 0;
 }

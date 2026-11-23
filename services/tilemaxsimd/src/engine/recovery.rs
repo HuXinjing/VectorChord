@@ -185,6 +185,8 @@ impl Engine {
                     scoring_profile: profile,
                     quantization_contract: first.quantization_contract.clone(),
                     top_k: Some(1),
+                    query_reference: None,
+                    query_ipc: None,
                     query: vec![0; first.descriptor.dimension as usize * width],
                     candidate_start: 0,
                     candidate_end: descriptors.len(),

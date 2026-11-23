@@ -208,6 +208,9 @@ struct Args {
     socket_mode: u32,
     #[arg(long)]
     status_socket: Option<PathBuf>,
+    /// Private local ingress for CUDA IPC query exports.
+    #[arg(long)]
+    query_ipc_socket: Option<PathBuf>,
     #[arg(long)]
     status_listen: Option<SocketAddr>,
     #[arg(long, default_value = "600", value_parser = parse_mode)]
@@ -728,6 +731,34 @@ where
         })
     );
 
+    let ipc_inbox = args
+        .query_ipc_socket
+        .as_ref()
+        .map(|path| {
+            if path == &args.socket || args.status_socket.as_ref() == Some(path) {
+                bail!("query IPC ingress must use a dedicated socket");
+            }
+            let lock = acquire_instance_lock(path)?;
+            remove_stale_socket(path)?;
+            let listener = UnixListener::bind(path)?;
+            fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
+            listener.set_nonblocking(true)?;
+            let inbox = Arc::new(crate::query_ipc::QueryInbox::default());
+            let worker_inbox = Arc::clone(&inbox);
+            let worker = thread::Builder::new()
+                .name("tilemaxsim-query-ipc".into())
+                .spawn(move || {
+                    while !SHUTDOWN_REQUESTED.load(Ordering::Relaxed) {
+                        if crate::query_ipc::accept_once(&listener, &worker_inbox).is_err() {
+                            eprintln!("{{\"event\":\"tilemaxsim_query_ipc_ingress_rejected\"}}");
+                        }
+                        worker_inbox.prune();
+                        thread::sleep(Duration::from_millis(1));
+                    }
+                })?;
+            Ok((inbox, lock, worker))
+        })
+        .transpose()?;
     let mut readers = Vec::new();
     let mut accepted = 0_usize;
     let mut status_failed = false;
@@ -812,6 +843,7 @@ where
             accepted += 1;
             let reader_sender = sender.clone();
             let reader_metrics = Arc::clone(&metrics);
+            let reader_ipc = ipc_inbox.as_ref().map(|(inbox, _, _)| Arc::clone(inbox));
             let reader_admission = Arc::clone(&pending_admission);
             let request_metrics = Arc::clone(&metrics);
             let reader_frame_admission = Arc::clone(&frame_admission);
@@ -833,6 +865,7 @@ where
                         reader_admission,
                         request_metrics,
                         reader_frame_admission,
+                        reader_ipc,
                     );
                 }) {
                 Ok(reader) => readers.push(reader),
@@ -1678,6 +1711,7 @@ fn read_and_enqueue(
     pending_admission: Arc<PendingAdmission>,
     metrics: Arc<RuntimeMetrics>,
     frame_admission: Arc<ByteAdmission>,
+    ipc_inbox: Option<Arc<crate::query_ipc::QueryInbox>>,
 ) {
     if let Err(error) = connection.set_read_timeout(Some(config.io_timeout)) {
         eprintln!("cannot configure TileMaxSim socket read timeout: {error}");
@@ -1731,6 +1765,25 @@ fn read_and_enqueue(
                 return;
             }
         };
+        if let Some(reference) = request.query_reference.take() {
+            let lease = ipc_inbox.as_ref().and_then(|inbox| {
+                inbox
+                    .claim(reference, request.query_rows, request.dimension)
+                    .ok()
+            });
+            let Some(lease) = lease else {
+                metrics.failed.fetch_add(1, Ordering::Relaxed);
+                eprintln!(
+                    "{{\"event\":\"tilemaxsim_query_ipc_fallback\",\"reason\":\"reference_unavailable\"}}"
+                );
+                write_response_nonfatal(
+                    &mut connection,
+                    &protocol::failure(version, request_id, 4, "query reference unavailable"),
+                );
+                return;
+            };
+            request.query_ipc = Some(lease);
+        }
         if !resolve_descriptor_catalog(&mut request, &metrics) {
             metrics.failed.fetch_add(1, Ordering::Relaxed);
             write_response_nonfatal(
@@ -2474,7 +2527,9 @@ fn work_can_batch(work: &Work, now: Instant) -> bool {
 /// quantum. Public IDs may differ: the engine attaches each request's IDs to
 /// its own slot after scoring the same tensor sequence.
 fn exact_quantum_prefix(left: &protocol::Request, right: &protocol::Request) -> Option<usize> {
-    if left.tenant != right.tenant
+    if left.query_ipc.is_some()
+        || right.query_ipc.is_some()
+        || left.tenant != right.tenant
         || left.priority != right.priority
         || left.model_contract != right.model_contract
         || left.dimension != right.dimension
@@ -2549,6 +2604,8 @@ fn request_quantum_to_end(work: &Work, end: usize) -> protocol::Request {
         quantization_contract: work.request.quantization_contract.clone(),
         top_k: work.request.top_k,
         query: work.request.query.clone(),
+        query_reference: None,
+        query_ipc: work.request.query_ipc.clone(),
         candidates: Arc::clone(&work.request.candidates),
         candidate_start: work.next_candidate,
         candidate_end: end,
@@ -4351,6 +4408,8 @@ mod tests {
             scoring_profile: ScoringProfile::RawFp8E4m3,
             quantization_contract: None,
             top_k: Some(1),
+            query_reference: None,
+            query_ipc: None,
             query: vec![0; 8],
             candidates: Arc::new(if registration {
                 vec![

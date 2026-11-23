@@ -76,6 +76,8 @@ pub struct Request {
     pub quantization_contract: Option<String>,
     pub top_k: Option<usize>,
     pub query: Vec<u8>,
+    pub query_reference: Option<crate::query_ipc::QueryId>,
+    pub query_ipc: Option<Arc<crate::query_ipc::QueryLease>>,
     pub candidates: Arc<Vec<Descriptor>>,
     pub candidate_start: usize,
     pub candidate_end: usize,
@@ -314,7 +316,9 @@ pub fn parse(frame: &[u8]) -> Result<Request> {
     let dimension = reader.u32()?;
     let query_rows = reader.u32()?;
     let candidate_count = reader.u32()?;
-    let dtype = reader.u8()?;
+    let wire_dtype = reader.u8()?;
+    let query_reference_mode = wire_dtype == crate::query_ipc::WIRE_DTYPE_FP16_REFERENCE;
+    let dtype = if query_reference_mode { 2 } else { wire_dtype };
     let scoring = reader.u8()?;
     let scoring_profile = if matches!(
         version,
@@ -490,8 +494,23 @@ pub fn parse(frame: &[u8]) -> Result<Request> {
         "__default__".to_owned()
     };
     let query_bytes = tensor_bytes(query_rows, dimension, dtype)?;
-    let query = reader.take(query_bytes)?.to_vec();
-    validate_finite(&query, dtype)?;
+    let (query, query_reference) = if query_reference_mode {
+        if scoring_profile != ScoringProfile::ExactFp16
+            || !matches!(storage_dtype, 0 | 2)
+            || query_bytes > 32 * 1024 * 1024
+        {
+            bail!("reference query requires exact FP16 scoring");
+        }
+        let reference: crate::query_ipc::QueryId = reader.take(16)?.try_into().unwrap();
+        if reference == [0; 16] {
+            bail!("invalid query IPC reference");
+        }
+        (Vec::new(), Some(reference))
+    } else {
+        let query = reader.take(query_bytes)?.to_vec();
+        validate_finite(&query, dtype)?;
+        (query, None)
+    };
     let manifest_digest = if version == VERSION_MANIFEST_LOGICAL_EXTERNAL {
         Some(reader.take(32)?.try_into().unwrap())
     } else {
@@ -752,6 +771,8 @@ pub fn parse(frame: &[u8]) -> Result<Request> {
         quantization_contract,
         top_k,
         query,
+        query_reference,
+        query_ipc: None,
         candidates,
         candidate_start: 0,
         candidate_end,

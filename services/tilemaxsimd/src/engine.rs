@@ -1116,7 +1116,7 @@ impl Engine {
         &mut self,
         requests: &[Request],
     ) -> Result<Option<BatchedCandidateScores>> {
-        if requests.len() < 2 {
+        if requests.len() < 2 || requests.iter().any(|request| request.query_ipc.is_some()) {
             return Ok(None);
         }
         let leader = &requests[0];
@@ -1501,7 +1501,9 @@ impl Engine {
                 workers.push(scope.spawn(move || -> Result<Vec<(usize, f32)>> {
                     let offsets = chunk.iter().map(|item| item.offset).collect::<Vec<_>>();
                     let rows = chunk.iter().map(|item| item.rows).collect::<Vec<_>>();
-                    let computed = if let Some(active) = active_quantizer {
+                    let computed = if let Some(query) = request.query_ipc.as_ref() {
+                        device.gpu.score_ipc(query, &offsets, &rows)?
+                    } else if let Some(active) = active_quantizer {
                         device.gpu.score_pq(
                             &active.contract_id,
                             &request.query,
@@ -2227,6 +2229,8 @@ mod tests {
             scoring_profile: ScoringProfile::ExactFp16,
             quantization_contract: None,
             top_k: None,
+            query_reference: None,
+            query_ipc: None,
             query: vec![0; 640],
             candidates: Arc::new(vec![descriptor(1, "content-a", 1)]),
             candidate_start: 0,
@@ -2756,6 +2760,8 @@ mod tests {
             scoring_profile: ScoringProfile::ExactFp16,
             quantization_contract: None,
             top_k: None,
+            query_reference: None,
+            query_ipc: None,
             query: vec![0; 640],
             candidates: Arc::new(vec![descriptor(candidate_id, "same-content", 1)]),
             candidate_start: 0,

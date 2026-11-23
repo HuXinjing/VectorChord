@@ -467,6 +467,82 @@ impl<T: TileMaxsimTransport> GpuExternalTileMaxsimBackend<T> {
         Ok(CatalogSelectionOutcome::Miss)
     }
 
+    pub(super) fn rerank_catalog_ipc(
+        &mut self,
+        query_reference: &[u8; 16],
+        query_rows: u32,
+        dimension: u32,
+        public_ids: &[i64],
+        top_k: usize,
+    ) -> Result<RerankResults, RerankError> {
+        let revision = self
+            .catalog_revision
+            .as_deref()
+            .ok_or(RerankError::Configuration(
+                "CUDA IPC requires a registered descriptor catalog",
+            ))?;
+        if self.scoring_profile != PostgresMaxsimScoringProfile::ExactFp16
+            || self
+                .catalog_storage_dtype
+                .is_some_and(|dtype| dtype != TensorDtype::F16)
+        {
+            return Err(RerankError::Configuration(
+                "CUDA IPC requires exact FP16 scoring",
+            ));
+        }
+        if public_ids.is_empty() {
+            return Ok(RerankResults {
+                inner: BinaryHeap::new(),
+            });
+        }
+        if query_rows as usize > self.max_batch_tokens
+            || tensor_bytes(query_rows, dimension, TensorDtype::F16)? > self.max_batch_bytes
+            || public_ids.len() > MAX_EXTERNAL_CANDIDATES_PER_BATCH
+        {
+            return Err(RerankError::RequestTooLarge);
+        }
+        let top_k = top_k.min(public_ids.len());
+        let request_id = NEXT_REQUEST_ID.fetch_add(1, Ordering::Relaxed);
+        let request = CatalogRequest {
+            request_id,
+            model_contract: &self.model_contract_id,
+            tenant: self
+                .scheduling
+                .as_ref()
+                .map_or("__default__", |value| value.tenant.as_str()),
+            priority: self.scheduling.as_ref().map_or(0, |value| value.priority),
+            timeout_ms: self.timeout.as_millis().clamp(1, 600_000) as u32,
+            query_rows,
+            dimension,
+            query_dtype: WireTensorDtype::Float16,
+            candidate_dtype: WireTensorDtype::Float16,
+            scoring_profile: WireScoringProfile::ExactFp16,
+            quantization_contract: None,
+            top_k,
+            query: query_reference,
+            query_reference: true,
+            catalog_revision: revision,
+        };
+        let frame = tilemaxsim_protocol::encode_catalog_selection_reference(
+            &request, public_ids, None, false,
+        )
+        .map_err(map_protocol_error)?;
+        if frame.len() > self.max_batch_bytes {
+            return Err(RerankError::RequestTooLarge);
+        }
+        let response_limit = HEADER_LEN + 8 + (top_k * 8).max(MAX_REMOTE_ERROR_BYTES);
+        let response = self
+            .transport
+            .round_trip(&frame, self.timeout, response_limit)?;
+        decode_response_for_version(
+            &response,
+            CATALOG_SELECTION_REFERENCE_VERSION,
+            request_id,
+            &catalog_heap_keys(public_ids)?,
+            top_k,
+        )
+    }
+
     /// Score one catalog selection once while retaining two independent
     /// windows in the daemon. This avoids both a second GPU request and the
     /// full-score response previously needed to derive an additive scope.
@@ -1008,6 +1084,7 @@ fn encode_catalog_request(
         quantization_contract: None,
         top_k,
         query: &query_payload,
+        query_reference: false,
         catalog_revision: revision,
     };
     let frame = if reference {
