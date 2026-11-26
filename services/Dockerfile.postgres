@@ -1,5 +1,15 @@
-ARG POSTGRES_VERSION=16
-ARG POSTGRES_RUNTIME_IMAGE=pgvector/pgvector:pg16@sha256:1d533553fefe4f12e5d80c7b80622ba0c382abb5758856f52983d8789179f0fb
+ARG POSTGRES_VERSION=18
+ARG POSTGRES_RUNTIME_IMAGE=postgres:18.7-bookworm@sha256:e742a2668255221388004f3a42b6150a2103f5054ab3a4a93ae9e4f01e551c35
+
+FROM ${POSTGRES_RUNTIME_IMAGE} AS vector-build
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential ca-certificates git postgresql-server-dev-18 \
+    && rm -rf /var/lib/apt/lists/*
+WORKDIR /build
+RUN git clone https://github.com/pgvector/pgvector.git \
+    && cd pgvector && git checkout 159b79aaad5983fb7459c1e3df2897fbb2d11788 \
+    && make OPTFLAGS= PG_CONFIG=/usr/lib/postgresql/18/bin/pg_config \
+    && make PG_CONFIG=/usr/lib/postgresql/18/bin/pg_config DESTDIR=/opt/pgvector install
 
 FROM rust:1.96.0-bookworm@sha256:5e2214abe154fe26e39f64488952e5c991eeed1d6d6da7cc8381ae83927f0cfc AS build
 
@@ -22,13 +32,15 @@ RUN make PG_CONFIG=/usr/lib/postgresql/${POSTGRES_VERSION}/bin/pg_config build \
 FROM ${POSTGRES_RUNTIME_IMAGE}
 
 ARG POSTGRES_VERSION
+COPY --from=vector-build /opt/pgvector/ /
 COPY --from=build /opt/vectorchord/ /
 
 # The upstream PostgreSQL entrypoint only uses gosu to become the postgres
 # account. Replace that call with Debian's maintained setpriv and remove the
 # statically linked Go binary, whose embedded standard library otherwise leaves
 # scanners unable to distinguish unreachable Go CVEs from exploitable code.
-RUN postgres --version | grep -Eq "PostgreSQL\\) ${POSTGRES_VERSION}([.[:space:]]|$)" \
+RUN test "$(postgres --version | awk '{print $3}')" = 18.7 \
+    && postgres --version | grep -Eq "PostgreSQL\\) ${POSTGRES_VERSION}([.[:space:]]|$)" \
     && sed -ri \
         's!exec gosu postgres "\$BASH_SOURCE" "\$@"!exec setpriv --reuid=postgres --regid=postgres --init-groups "\$BASH_SOURCE" "\$@"!' \
         /usr/local/bin/docker-entrypoint.sh \
